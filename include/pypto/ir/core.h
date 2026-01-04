@@ -17,6 +17,8 @@
 #include <string>
 #include <utility>
 
+#include "pypto/ir/reflection/field_traits.h"
+
 namespace pypto {
 namespace ir {
 
@@ -75,14 +77,18 @@ class Span {
  */
 class IRNode {
  public:
-  explicit IRNode(Span s) : span(std::move(s)) {}
+  explicit IRNode(Span s) : span_(std::move(s)) {}
   virtual ~IRNode() = default;
 
   // Disable copying and moving to enforce immutability
   IRNode(IRNode&&) = delete;
   IRNode& operator=(IRNode&&) = delete;
 
-  Span span;  // Source location
+  Span span_;  // Source location
+
+  static constexpr auto GetFieldDescriptors() {
+    return std::make_tuple(reflection::IgnoreField(&IRNode::span_, "span"));
+  }
 };
 using IRNodePtr = std::shared_ptr<const IRNode>;
 

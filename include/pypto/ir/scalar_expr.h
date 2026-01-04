@@ -14,10 +14,13 @@
 
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/ir/core.h"
+#include "pypto/ir/reflection/field_traits.h"
 
 namespace pypto {
 namespace ir {
@@ -49,6 +52,15 @@ using OpPtr = std::shared_ptr<const Op>;
  */
 class Expr : public IRNode {
  public:
+  DataType dtype_;
+
+  /**
+   * @brief Create an expression
+   *
+   * @param span Source location
+   * @param dtype Data type
+   */
+  Expr(Span s, DataType dtype) : IRNode(std::move(s)), dtype_(dtype) {}
   ~Expr() override = default;
 
   /**
@@ -58,8 +70,10 @@ class Expr : public IRNode {
    */
   [[nodiscard]] virtual const char* type_name() const { return "Expr"; }
 
- protected:
-  explicit Expr(Span s) : IRNode(std::move(s)) {}
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(IRNode::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&Expr::dtype_, "dtype")));
+  }
 };
 
 using ExprPtr = std::shared_ptr<const Expr>;
@@ -72,7 +86,6 @@ using ExprPtr = std::shared_ptr<const Expr>;
 class Var : public Expr {
  public:
   std::string name_;
-  // TODO(siyuan): add dtype
 
   /**
    * @brief Create a variable reference
@@ -81,9 +94,19 @@ class Var : public Expr {
    * @param span Source location
    * @return Shared pointer to const Var expression
    */
-  Var(std::string name, Span span) : Expr(std::move(span)), name_(std::move(name)) {}
+  Var(std::string name, DataType dtype, Span span) : Expr(std::move(span), dtype), name_(std::move(name)) {}
 
   [[nodiscard]] const char* type_name() const override { return "Var"; }
+
+  /**
+   * @brief Get field descriptors for reflection-based visitation
+   *
+   * @return Tuple of field descriptors (name_ as DEF field for auto-mapping)
+   */
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Expr::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&Var::name_, "name")));
+  }
 };
 
 using VarPtr = std::shared_ptr<const Var>;
@@ -95,7 +118,7 @@ using VarPtr = std::shared_ptr<const Var>;
  */
 class ConstInt : public Expr {
  public:
-  const int value;  // Numeric constant value (immutable)
+  const int value_;  // Numeric constant value (immutable)
 
   /**
    * @brief Create a constant expression
@@ -103,9 +126,19 @@ class ConstInt : public Expr {
    * @param value Numeric value
    * @param span Source location
    */
-  ConstInt(int value, Span span) : Expr(std::move(span)), value(value) {}
+  ConstInt(int value, DataType dtype, Span span) : Expr(std::move(span), dtype), value_(value) {}
 
   [[nodiscard]] const char* type_name() const override { return "ConstInt"; }
+
+  /**
+   * @brief Get field descriptors for reflection-based visitation
+   *
+   * @return Tuple of field descriptors (value as USUAL field)
+   */
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Expr::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&ConstInt::value_, "value")));
+  }
 };
 
 using ConstIntPtr = std::shared_ptr<const ConstInt>;
@@ -127,10 +160,21 @@ class Call : public Expr {
    * @param args List of argument expressions
    * @param span Source location
    */
-  Call(OpPtr op, std::vector<ExprPtr> args, Span span)
-      : Expr(std::move(span)), op_(std::move(op)), args_(std::move(args)) {}
+  Call(OpPtr op, std::vector<ExprPtr> args, DataType dtype, Span span)
+      : Expr(std::move(span), dtype), op_(std::move(op)), args_(std::move(args)) {}
 
   [[nodiscard]] const char* type_name() const override { return "Call"; }
+
+  /**
+   * @brief Get field descriptors for reflection-based visitation
+   *
+   * @return Tuple of field descriptors (op and args as USUAL fields)
+   */
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Expr::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&Call::op_, "op"),
+                                          reflection::UsualField(&Call::args_, "args")));
+  }
 };
 
 using CallPtr = std::shared_ptr<const Call>;
@@ -145,23 +189,34 @@ class BinaryExpr : public Expr {
   ExprPtr left_;   // Left operand
   ExprPtr right_;  // Right operand
 
-  BinaryExpr(ExprPtr left, ExprPtr right, Span span)
-      : Expr(std::move(span)), left_(std::move(left)), right_(std::move(right)) {}
+  BinaryExpr(ExprPtr left, ExprPtr right, DataType dtype, Span span)
+      : Expr(std::move(span), dtype), left_(std::move(left)), right_(std::move(right)) {}
+
+  /**
+   * @brief Get field descriptors for reflection-based visitation
+   *
+   * @return Tuple of field descriptors (left and right as USUAL fields)
+   */
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Expr::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&BinaryExpr::left_, "left"),
+                                          reflection::UsualField(&BinaryExpr::right_, "right")));
+  }
 };
 
 using BinaryExprPtr = std::shared_ptr<const BinaryExpr>;
 
 // Macro to define binary expression node classes
 // Usage: DEFINE_BINARY_EXPR_NODE(Add, "Addition expression (left + right)")
-#define DEFINE_BINARY_EXPR_NODE(OpName, Description)                         \
-  /* Description */                                                          \
-  class OpName : public BinaryExpr {                                         \
-   public:                                                                   \
-    OpName(ExprPtr left, ExprPtr right, Span span)                           \
-        : BinaryExpr(std::move(left), std::move(right), std::move(span)) {}  \
-    [[nodiscard]] const char* type_name() const override { return #OpName; } \
-  };                                                                         \
-                                                                             \
+#define DEFINE_BINARY_EXPR_NODE(OpName, Description)                               \
+  /* Description */                                                                \
+  class OpName : public BinaryExpr {                                               \
+   public:                                                                         \
+    OpName(ExprPtr left, ExprPtr right, DataType dtype, Span span)                 \
+        : BinaryExpr(std::move(left), std::move(right), dtype, std::move(span)) {} \
+    [[nodiscard]] const char* type_name() const override { return #OpName; }       \
+  };                                                                               \
+                                                                                   \
   using OpName##Ptr = std::shared_ptr<const OpName>;
 
 DEFINE_BINARY_EXPR_NODE(Add, "Addition expression (left + right)");
@@ -199,21 +254,32 @@ class UnaryExpr : public Expr {
  public:
   ExprPtr operand_;  // Operand
 
-  UnaryExpr(ExprPtr operand, Span span) : Expr(std::move(span)), operand_(std::move(operand)) {}
+  UnaryExpr(ExprPtr operand, DataType dtype, Span span)
+      : Expr(std::move(span), dtype), operand_(std::move(operand)) {}
+
+  /**
+   * @brief Get field descriptors for reflection-based visitation
+   *
+   * @return Tuple of field descriptors (operand_ as USUAL field)
+   */
+  static constexpr auto GetFieldDescriptors() {
+    return std::make_tuple(reflection::UsualField(&UnaryExpr::operand_, "operand"));
+  }
 };
 
 using UnaryExprPtr = std::shared_ptr<const UnaryExpr>;
 
 // Macro to define unary expression node classes
 // Usage: DEFINE_UNARY_EXPR_NODE(Neg, "Negation expression (-operand)")
-#define DEFINE_UNARY_EXPR_NODE(OpName, Description)                                        \
-  /* Description */                                                                        \
-  class OpName : public UnaryExpr {                                                        \
-   public:                                                                                 \
-    OpName(ExprPtr operand, Span span) : UnaryExpr(std::move(operand), std::move(span)) {} \
-    [[nodiscard]] const char* type_name() const override { return #OpName; }               \
-  };                                                                                       \
-                                                                                           \
+#define DEFINE_UNARY_EXPR_NODE(OpName, Description)                          \
+  /* Description */                                                          \
+  class OpName : public UnaryExpr {                                          \
+   public:                                                                   \
+    OpName(ExprPtr operand, DataType dtype, Span span)                       \
+        : UnaryExpr(std::move(operand), dtype, std::move(span)) {}           \
+    [[nodiscard]] const char* type_name() const override { return #OpName; } \
+  };                                                                         \
+                                                                             \
   using OpName##Ptr = std::shared_ptr<const OpName>;
 
 DEFINE_UNARY_EXPR_NODE(Abs, "Absolute value expression (abs(operand))")

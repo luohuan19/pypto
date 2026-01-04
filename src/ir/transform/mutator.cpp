@@ -57,22 +57,23 @@ ExprPtr ExprMutator::VisitExpr_(const CallPtr& op) {
 
   // Copy-on-write: only create new node if arguments changed
   if (changed) {
-    return std::make_shared<const Call>(op->op_, std::move(new_args), op->span);
+    return std::make_shared<const Call>(op->op_, std::move(new_args), op->dtype_, op->span_);
   } else {
     return *g_current_expr;
   }
 }
 
 // Macro to generate binary operation mutators with copy-on-write
-#define DEFINE_BINARY_MUTATOR(OpType)                                                             \
-  ExprPtr ExprMutator::VisitExpr_(const OpType##Ptr& op) {                                        \
-    ExprPtr new_left = VisitExpr(op->left_);                                                      \
-    ExprPtr new_right = VisitExpr(op->right_);                                                    \
-    if (new_left.get() != op->left_.get() || new_right.get() != op->right_.get()) {               \
-      return std::make_shared<const OpType>(std::move(new_left), std::move(new_right), op->span); \
-    } else {                                                                                      \
-      return *g_current_expr;                                                                     \
-    }                                                                                             \
+#define DEFINE_BINARY_MUTATOR(OpType)                                                              \
+  ExprPtr ExprMutator::VisitExpr_(const OpType##Ptr& op) {                                         \
+    ExprPtr new_left = VisitExpr(op->left_);                                                       \
+    ExprPtr new_right = VisitExpr(op->right_);                                                     \
+    if (new_left.get() != op->left_.get() || new_right.get() != op->right_.get()) {                \
+      return std::make_shared<const OpType>(std::move(new_left), std::move(new_right), op->dtype_, \
+                                            op->span_);                                            \
+    } else {                                                                                       \
+      return *g_current_expr;                                                                      \
+    }                                                                                              \
   }
 
 // Binary operations
@@ -103,14 +104,14 @@ DEFINE_BINARY_MUTATOR(BitShiftRight)
 #undef DEFINE_BINARY_MUTATOR
 
 // Macro to generate unary operation mutators with copy-on-write
-#define DEFINE_UNARY_MUTATOR(OpType)                                           \
-  ExprPtr ExprMutator::VisitExpr_(const OpType##Ptr& op) {                     \
-    ExprPtr new_operand = VisitExpr(op->operand_);                             \
-    if (new_operand.get() != op->operand_.get()) {                             \
-      return std::make_shared<const OpType>(std::move(new_operand), op->span); \
-    } else {                                                                   \
-      return *g_current_expr;                                                  \
-    }                                                                          \
+#define DEFINE_UNARY_MUTATOR(OpType)                                                        \
+  ExprPtr ExprMutator::VisitExpr_(const OpType##Ptr& op) {                                  \
+    ExprPtr new_operand = VisitExpr(op->operand_);                                          \
+    if (new_operand.get() != op->operand_.get()) {                                          \
+      return std::make_shared<const OpType>(std::move(new_operand), op->dtype_, op->span_); \
+    } else {                                                                                \
+      return *g_current_expr;                                                               \
+    }                                                                                       \
   }
 
 // Unary operations

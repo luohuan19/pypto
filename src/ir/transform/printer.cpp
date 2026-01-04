@@ -81,7 +81,7 @@ std::string ExprPrinter::Print(const ExprPtr& expr) {
 // Leaf nodes
 void ExprPrinter::VisitExpr_(const VarPtr& op) { stream_ << op->name_; }
 
-void ExprPrinter::VisitExpr_(const ConstIntPtr& op) { stream_ << op->value; }
+void ExprPrinter::VisitExpr_(const ConstIntPtr& op) { stream_ << op->value_; }
 
 void ExprPrinter::VisitExpr_(const CallPtr& op) {
   stream_ << op->op_->name_ << "(";
