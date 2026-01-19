@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Type stubs for PyPTO IR (Intermediate Representation) module."""
 
-from typing import Final, Sequence, Union, overload
+from typing import Final, Mapping, Sequence, Union, overload
 
 from pypto import DataType
 
@@ -471,7 +471,10 @@ class Call(Expr):
     """Operation/function."""
 
     args: Final[Sequence[Expr]]
-    """Arguments."""
+    """Positional arguments."""
+
+    kwargs: Final[Mapping[str, Union[int, bool, str, float, DataType]]]
+    """Keyword arguments (metadata)."""
 
     @overload
     def __init__(self, op: Op, args: Sequence[Expr], span: Span) -> None:
@@ -480,17 +483,26 @@ class Call(Expr):
         Args:
             op: Operation/function to call
             args: List of argument expressions
+            kwargs: Keyword arguments (metadata)
             span: Source location
         """
         ...
 
     @overload
-    def __init__(self, op: Op, args: Sequence[Expr], type: Type, span: Span) -> None:
+    def __init__(
+        self,
+        op: Op,
+        args: Sequence[Expr],
+        kwargs: Mapping[str, Union[int, bool, str, float, DataType]],
+        type: Type,
+        span: Span,
+    ) -> None:
         """Create a function call expression with explicit type.
 
         Args:
             op: Operation/function to call
             args: List of argument expressions
+            kwargs: Keyword arguments (metadata)
             type: Explicit result type
             span: Source location
         """
@@ -1392,12 +1404,35 @@ def deserialize_from_file(path: str) -> IRNode:
 
 # ========== Operator Registry ==========
 
+@overload
 def create_op_call(op_name: str, args: Sequence[Expr], span: Span) -> Call:
-    """Create a Call expression for a registered operator with automatic type deduction.
+    """Create a Call expression (backward compatibility).
 
     Args:
         op_name: Name of the registered operator
         args: List of argument expressions
+        span: Source location
+
+    Returns:
+        Call expression with automatically deduced result type
+
+    Raises:
+        Exception: If operator is not registered or type deduction fails
+    """
+
+@overload
+def create_op_call(
+    op_name: str,
+    args: Sequence[Expr],
+    kwargs: Mapping[str, int | bool | str | float | DataType],
+    span: Span,
+) -> Call:
+    """Create a Call expression with args and kwargs.
+
+    Args:
+        op_name: Name of the registered operator
+        args: Positional Expr arguments
+        kwargs: Keyword arguments (metadata)
         span: Source location
 
     Returns:
