@@ -158,6 +158,7 @@ def type_check() -> Pass:
 
 __all__ = [
     "Pass",
+<<<<<<< HEAD
     "identity",
     "init_mem_ref",
     "basic_memory_reuse",
@@ -168,4 +169,12 @@ __all__ = [
     "verify_ssa",
     "TypeCheckErrorType",
     "type_check",
+=======
+    "IdentityPass",
+    "InitMemRefPass",
+    "OutOfOrderSchedulerPass",
+    "BasicMemoryReusePass",
+    "InsertSyncPass",
+    "AddAllocPass",
+>>>>>>> 13a64ff (feat(pass): Add OutOfOrderSchedulerPass for cross-pipe dependency optimization)
 ]

@@ -111,6 +111,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/passes.cpp
     src/ir/transforms/identity_pass.cpp
     src/ir/transforms/init_memref.cpp
+    src/ir/transforms/out_of_order_scheduler_pass.cpp
     src/ir/transforms/basic_memory_reuse_pass.cpp
     src/ir/transforms/insert_sync_pass.cpp
     src/ir/transforms/add_alloc_pass.cpp
