@@ -16,7 +16,7 @@ automatic span tracking via the inspect module.
 
 import inspect
 from contextlib import contextmanager
-from typing import Iterator, List, Optional, Sequence, Union
+from typing import Iterator, Optional, Sequence, Union
 
 from pypto.pypto_core import DataType, ir
 from pypto.pypto_core.ir import IRBuilder as CppIRBuilder
@@ -48,16 +48,20 @@ class IRBuilder:
 
         self._builder = CppIRBuilder()
         self._begin_spans: dict[int, ir.Span] = {}  # Track begin spans for multi-line contexts
+        self._ctx_counter = 0  # Counter for unique context IDs
 
     # ========== Context Managers for Multi-line Constructs ==========
 
     @contextmanager
-    def function(self, name: str, span: Optional[ir.Span] = None) -> Iterator["FunctionBuilder"]:
+    def function(
+        self, name: str, span: Optional[ir.Span] = None, type: ir.FunctionType = ir.FunctionType.Opaque
+    ) -> Iterator["FunctionBuilder"]:
         """Context manager for building functions.
 
         Args:
             name: Function name
             span: Optional explicit span. If None, automatically captured from call site.
+            type: Function type (default: Opaque)
 
         Yields:
             FunctionBuilder: Helper object for building the function
@@ -66,12 +70,16 @@ class IRBuilder:
             >>> with ib.function("add") as f:
             ...     x = f.param("x", ir.ScalarType(ir.DataType.INT64))
             ...     f.return_type(ir.ScalarType(ir.DataType.INT64))
+            >>> # With function type:
+            >>> with ib.function("orchestrator", type=ir.FunctionType.Orchestration) as f:
+            ...     pass
         """
         begin_span = span if span is not None else self._capture_call_span()
-        ctx_id = id(begin_span)
+        ctx_id = self._ctx_counter
+        self._ctx_counter += 1
         self._begin_spans[ctx_id] = begin_span
 
-        self._builder.begin_function(name, begin_span)
+        self._builder.begin_function(name, begin_span, type)
         builder_obj = FunctionBuilder(self)
         try:
             yield builder_obj
@@ -90,6 +98,7 @@ class IRBuilder:
         stop: Union[int, ir.Expr],
         step: Union[int, ir.Expr],
         span: Optional[ir.Span] = None,
+        kind: ir.ForKind = ir.ForKind.Sequential,
     ) -> Iterator["ForLoopBuilder"]:
         """Context manager for building for loops.
 
@@ -99,6 +108,7 @@ class IRBuilder:
             stop: Stop value (int or Expr)
             step: Step value (int or Expr)
             span: Optional explicit span. If None, automatically captured.
+            kind: Loop kind (default: Sequential)
 
         Yields:
             ForLoopBuilder: Helper object for building the loop
@@ -109,7 +119,8 @@ class IRBuilder:
             ...     sum_iter = loop.iter_arg("sum", init_val)
         """
         begin_span = span if span is not None else self._capture_call_span()
-        ctx_id = id(begin_span) + 1  # Different id
+        ctx_id = self._ctx_counter
+        self._ctx_counter += 1
         self._begin_spans[ctx_id] = begin_span
 
         # Normalize all expression parameters
@@ -117,7 +128,7 @@ class IRBuilder:
         stop_expr = _normalize_expr(stop, begin_span)
         step_expr = _normalize_expr(step, begin_span)
 
-        self._builder.begin_for_loop(loop_var, start_expr, stop_expr, step_expr, begin_span)
+        self._builder.begin_for_loop(loop_var, start_expr, stop_expr, step_expr, begin_span, kind)
         builder_obj = ForLoopBuilder(self)
         try:
             yield builder_obj
@@ -125,6 +136,42 @@ class IRBuilder:
             end_span = self._capture_call_span() if span is None else span
             combined_span = self._combine_spans(self._begin_spans[ctx_id], end_span)
             result = self._builder.end_for_loop(combined_span)
+            builder_obj._result = result
+            del self._begin_spans[ctx_id]
+
+    @contextmanager
+    def while_loop(
+        self, condition: Union[int, ir.Expr], span: Optional[ir.Span] = None
+    ) -> Iterator["WhileLoopBuilder"]:
+        """Context manager for building while loops.
+
+        Args:
+            condition: Condition expression (int or Expr)
+            span: Optional explicit span. If None, automatically captured.
+
+        Yields:
+            WhileLoopBuilder: Helper object for building the loop
+
+        Example:
+            >>> x = ib.var("x", ir.ScalarType(ir.DataType.INT64))
+            >>> with ib.while_loop(ir.Lt(x, ir.ConstInt(10, ir.DataType.INT64, span), span)) as loop:
+            ...     x_iter = loop.iter_arg("x_iter", x)
+            ...     # ... loop body ...
+        """
+        begin_span = span if span is not None else self._capture_call_span()
+        ctx_id = self._ctx_counter
+        self._ctx_counter += 1
+        self._begin_spans[ctx_id] = begin_span
+
+        condition_expr = _normalize_expr(condition, begin_span)
+        self._builder.begin_while_loop(condition_expr, begin_span)
+        builder_obj = WhileLoopBuilder(self)
+        try:
+            yield builder_obj
+        finally:
+            end_span = self._capture_call_span() if span is None else span
+            combined_span = self._combine_spans(self._begin_spans[ctx_id], end_span)
+            result = self._builder.end_while_loop(combined_span)
             builder_obj._result = result
             del self._begin_spans[ctx_id]
 
@@ -150,7 +197,8 @@ class IRBuilder:
             ...     ib.assign(x, other_value)
         """
         begin_span = span if span is not None else self._capture_call_span()
-        ctx_id = id(begin_span) + 2
+        ctx_id = self._ctx_counter
+        self._ctx_counter += 1
         self._begin_spans[ctx_id] = begin_span
 
         condition_expr = _normalize_expr(condition, begin_span)
@@ -162,6 +210,38 @@ class IRBuilder:
             end_span = self._capture_call_span() if span is None else span
             combined_span = self._combine_spans(self._begin_spans[ctx_id], end_span)
             result = self._builder.end_if(combined_span)
+            builder_obj._result = result
+            del self._begin_spans[ctx_id]
+
+    @contextmanager
+    def scope(self, scope_kind: ir.ScopeKind, span: Optional[ir.Span] = None) -> Iterator["ScopeBuilder"]:
+        """Context manager for building scope statements.
+
+        Args:
+            scope_kind: The kind of scope (e.g., ir.ScopeKind.InCore)
+            span: Optional explicit span. If None, automatically captured.
+
+        Yields:
+            ScopeBuilder: Helper object for building the scope statement
+
+        Example:
+            >>> with ib.scope(ir.ScopeKind.InCore) as scope_builder:
+            ...     # InCore scope body
+            ...     ib.assign(y, add_expr)
+        """
+        begin_span = span if span is not None else self._capture_call_span()
+        ctx_id = self._ctx_counter
+        self._ctx_counter += 1
+        self._begin_spans[ctx_id] = begin_span
+
+        self._builder.begin_scope(scope_kind, begin_span)
+        builder_obj = ScopeBuilder(self)
+        try:
+            yield builder_obj
+        finally:
+            end_span = self._capture_call_span() if span is None else span
+            combined_span = self._combine_spans(self._begin_spans[ctx_id], end_span)
+            result = self._builder.end_scope(combined_span)
             builder_obj._result = result
             del self._begin_spans[ctx_id]
 
@@ -195,7 +275,8 @@ class IRBuilder:
             >>> program = p.get_result()
         """
         begin_span = span if span is not None else self._capture_call_span()
-        ctx_id = id(begin_span) + 3  # Different id
+        ctx_id = self._ctx_counter
+        self._ctx_counter += 1
         self._begin_spans[ctx_id] = begin_span
 
         self._builder.begin_program(name, begin_span)
@@ -317,6 +398,29 @@ class IRBuilder:
         var = self._builder.var(name, final_type, actual_span)
         self._builder.assign(var, value_expr, actual_span)
         return var
+
+    def make_tuple(
+        self,
+        elements: Sequence[Union[ir.Expr, ir.Var]],
+        span: Optional[ir.Span] = None,
+    ) -> ir.MakeTuple:
+        """Create a tuple construction expression.
+
+        Args:
+            elements: Expressions to be tuple elements
+            span: Optional explicit span. If None, captured from call site.
+
+        Returns:
+            MakeTuple: The created tuple expression
+
+        Example:
+            >>> with builder.function("my_func") as func:
+            ...     x = builder.func_arg("x", ir.ScalarType(DataType.INT64))
+            ...     y = builder.func_arg("y", ir.ScalarType(DataType.FP32))
+            ...     tuple_val = builder.make_tuple([x, y])
+        """
+        actual_span = span if span is not None else self._capture_call_span()
+        return ir.MakeTuple(list(elements), actual_span)
 
     def emit(self, stmt: ir.Stmt) -> None:
         """Add a statement to the current context.
@@ -453,19 +557,45 @@ class IRBuilder:
         start_offset_expr = _normalize_expr(start_offset, actual_span)
         return ir.TileView(valid_shape_exprs, stride_exprs, start_offset_expr)
 
+    def tensor_view(
+        self,
+        stride: Sequence[Union[int, ir.Expr]],
+        layout: ir.TensorLayout,
+        span: Optional[ir.Span] = None,
+    ) -> ir.TensorView:
+        """Create a TensorView with normalized stride expressions.
+
+        Args:
+            stride: Stride for each dimension (list of int or Expr)
+            layout: Tensor layout type (ND, DN, or NZ)
+            span: Optional explicit span. If None, captured from call site.
+
+        Returns:
+            TensorView: The created tensor view
+
+        Example:
+            >>> stride = [1, 256]
+            >>> tv = ib.tensor_view(stride, ir.TensorLayout.ND)
+        """
+        actual_span = span if span is not None else self._capture_call_span()
+        stride_exprs = [_normalize_expr(s, actual_span) for s in stride]
+        return ir.TensorView(stride_exprs, layout)
+
     def tensor_type(
         self,
         shape: Sequence[Union[int, ir.Expr]],
         dtype: DataType,
         memref: Optional[ir.MemRef] = None,
+        tensor_view: Optional[ir.TensorView] = None,
         span: Optional[ir.Span] = None,
     ) -> ir.TensorType:
-        """Create a TensorType with normalized shape and optional memref.
+        """Create a TensorType with normalized shape, optional memref and tensor_view.
 
         Args:
             shape: Shape dimensions (list of int or Expr)
             dtype: Element data type
             memref: Optional memory reference
+            tensor_view: Optional tensor view information
             span: Optional explicit span. If None, captured from call site.
 
         Returns:
@@ -477,10 +607,13 @@ class IRBuilder:
             >>> # Tensor type with memref
             >>> memref = ib.memref(ir.MemorySpace.DDR, 0x1000, 1024)
             >>> tensor_t = ib.tensor_type([64, 128], DataType.FP32, memref=memref)
+            >>> # Tensor type with tensor_view
+            >>> tv = ib.tensor_view([1, 64], ir.TensorLayout.ND)
+            >>> tensor_t = ib.tensor_type([64, 128], DataType.FP32, tensor_view=tv)
         """
         actual_span = span if span is not None else self._capture_call_span()
         shape_exprs = [_normalize_expr(dim, actual_span) for dim in shape]
-        return ir.TensorType(shape_exprs, dtype, memref)
+        return ir.TensorType(shape_exprs, dtype, memref, tensor_view)
 
     def tile_type(
         self,
@@ -493,7 +626,7 @@ class IRBuilder:
         """Create a TileType with normalized shape, optional memref and tile_view.
 
         Args:
-            shape: Shape dimensions (list of int or Expr, at most 2 dimensions)
+            shape: Shape dimensions (list of int or Expr)
             dtype: Element data type
             memref: Optional memory reference
             tile_view: Optional tile view information
@@ -501,9 +634,6 @@ class IRBuilder:
 
         Returns:
             TileType: The created tile type
-
-        Raises:
-            ValueError: If shape has more than 2 dimensions
 
         Example:
             >>> # Simple tile type
@@ -534,7 +664,7 @@ class IRBuilder:
             frame = frame.f_back.f_back
         if frame is not None:
             info = inspect.getframeinfo(frame)
-            return ir.Span(info.filename, info.lineno, 0)
+            return ir.Span(info.filename, info.lineno, -1)
         return ir.Span.unknown()
 
     def _combine_spans(self, begin: ir.Span, end: ir.Span) -> ir.Span:
@@ -611,7 +741,7 @@ class ForLoopBuilder:
         """
         self._builder = builder
         self._result: Optional[ir.ForStmt] = None
-        self._iter_args: List[ir.IterArg] = []  # Track iter_args for type inference
+        self._iter_args: list[ir.IterArg] = []  # Track iter_args for type inference
         self._return_var_count = 0  # Track number of return_vars added
 
     def iter_arg(
@@ -751,14 +881,14 @@ class ForLoopBuilder:
             )
         return self._result.return_vars[index]
 
-    def outputs(self) -> List[ir.Var]:
+    def outputs(self) -> list[ir.Var]:
         """Get all output return variables from the for loop.
 
         This is a convenience method to access all return variables at once after
         the for loop is built.
 
         Returns:
-            List[Var]: List of all return variables
+            List of all return variables
 
         Raises:
             AssertionError: If called before for loop is complete
@@ -780,6 +910,228 @@ class ForLoopBuilder:
 
         Returns:
             ForStmt: The completed for loop IR node
+        """
+        assert self._result is not None
+        return self._result
+
+
+class WhileLoopBuilder:
+    """Helper for building while loops within a loop context."""
+
+    def __init__(self, builder: IRBuilder) -> None:
+        """Initialize while loop builder.
+
+        Args:
+            builder: Parent IR builder
+        """
+        self._builder = builder
+        self._result: Optional[ir.WhileStmt] = None
+        self._iter_args: list[ir.IterArg] = []  # Track iter_args for type inference
+        self._return_var_count = 0  # Track number of return_vars added
+
+    def iter_arg(
+        self,
+        name: str,
+        init_value: Union[int, float, ir.Expr],
+        type: Optional[ir.Type] = None,
+        span: Optional[ir.Span] = None,
+    ) -> ir.IterArg:
+        """Add iteration argument (loop-carried value).
+
+        The type is automatically inferred from the init_value expression. If an explicit
+        type is provided, it is used to validate that the inferred type matches.
+
+        Args:
+            name: Iteration argument name
+            init_value: Initial value (int, float, or Expr)
+            type: Optional type for validation. If provided, must match the inferred type.
+            span: Optional explicit span. If None, captured from call site.
+
+        Returns:
+            IterArg: The iteration argument variable
+
+        Raises:
+            ValueError: If explicit type is provided and doesn't match inferred type
+
+        Example:
+            >>> # Type is inferred from the initial value:
+            >>> x_iter = loop.iter_arg("x_iter", x_0)
+            >>> # Or with explicit type validation:
+            >>> x_iter = loop.iter_arg("x_iter", x_0, type=ir.ScalarType(ir.DataType.INT64))
+        """
+        actual_span = span if span is not None else self._builder._capture_call_span()
+        init_expr = _normalize_expr(init_value, actual_span)
+
+        # Infer type from the init_value expression
+        inferred_type = init_expr.type
+
+        # If explicit type is provided, validate it matches the inferred type
+        if type is not None and type != inferred_type:
+            raise ValueError(
+                f"Type mismatch in iter_arg for '{name}':\n"
+                f"  Inferred type: {inferred_type}\n"
+                f"  Provided type: {type}"
+            )
+        final_type = inferred_type
+
+        iter_arg = ir.IterArg(name, final_type, init_expr, actual_span)
+        self._builder._builder.add_while_iter_arg(iter_arg)
+        self._iter_args.append(iter_arg)  # Track for return_var type inference
+        return iter_arg
+
+    def set_condition(self, condition: Union[int, ir.Expr]) -> None:
+        """Set the condition for the while loop.
+
+        Used to update the loop condition after setting up iter_args. This allows
+        the condition to reference iter_arg variables.
+
+        Args:
+            condition: Condition expression (int or Expr)
+
+        Example:
+            >>> with ib.while_loop(ir.ConstBool(True, span), span) as loop:
+            ...     x_iter = loop.iter_arg("x", x_0)
+            ...     loop.set_condition(ir.Lt(x_iter, ir.ConstInt(10, ir.DataType.INT64, span), span))
+        """
+        actual_span = self._builder._capture_call_span()
+        condition_expr = _normalize_expr(condition, actual_span)
+        self._builder._builder.set_while_loop_condition(condition_expr)
+
+    def return_var(self, name: str, type: Optional[ir.Type] = None, span: Optional[ir.Span] = None) -> ir.Var:
+        """Add return variable to capture final iteration value.
+
+        The type can be automatically inferred from the corresponding iter_arg (by index).
+        If explicit type is provided, it is used to validate against the inferred type.
+
+        Args:
+            name: Return variable name
+            type: Optional type. If None, inferred from corresponding iter_arg by index.
+            span: Optional explicit span. If None, captured from call site.
+
+        Returns:
+            Var: The return variable
+
+        Raises:
+            ValueError: If type cannot be inferred or provided type doesn't match
+
+        Example:
+            >>> # Type is inferred from corresponding iter_arg:
+            >>> x_final = loop.return_var("x_final")
+            >>> # Or with explicit type validation:
+            >>> x_final = loop.return_var("x_final", type=ir.ScalarType(ir.DataType.INT64))
+        """
+        actual_span = span if span is not None else self._builder._capture_call_span()
+
+        # Try to infer type from corresponding iter_arg by index
+        inferred_type = None
+        if self._return_var_count < len(self._iter_args):
+            inferred_type = self._iter_args[self._return_var_count].type
+
+        # Determine final type
+        if type is None:
+            if inferred_type is None:
+                raise ValueError(
+                    f"Cannot infer type for return_var '{name}': "
+                    f"no corresponding iter_arg found. Please provide explicit type."
+                )
+            final_type = inferred_type
+        else:
+            # Validate provided type if we have inferred type
+            if inferred_type is not None and type != inferred_type:
+                raise ValueError(
+                    f"Type mismatch in return_var '{name}':\n"
+                    f"  Inferred type (from iter_arg): {inferred_type}\n"
+                    f"  Provided type: {type}"
+                )
+            final_type = type
+
+        var = ir.Var(name, final_type, actual_span)
+        self._builder._builder.add_while_return_var(var)
+        self._return_var_count += 1
+        return var
+
+    def output(self, index: int = 0) -> ir.Var:
+        """Get a single output return variable from the while loop.
+
+        This is a convenience method to access the return variables after the while
+        loop is built. Use the index parameter to select which return variable.
+
+        Args:
+            index: Index of the return variable to get (default: 0)
+
+        Returns:
+            Var: The return variable at the specified index
+
+        Raises:
+            AssertionError: If called before while loop is complete
+            IndexError: If index is out of range
+
+        Example:
+            >>> with ib.while_loop(condition) as loop:
+            ...     x_iter = loop.iter_arg("x_iter", 0)
+            ...     loop.return_var("x_final")
+            ...     # ... loop body ...
+            >>> result = loop.output()  # Get the first return variable
+        """
+        assert self._result is not None, "While loop not yet complete"
+        if index >= len(self._result.return_vars):
+            raise IndexError(
+                f"Return variable index {index} out of range "
+                f"(while loop has {len(self._result.return_vars)} return vars)"
+            )
+        return self._result.return_vars[index]
+
+    def outputs(self) -> list[ir.Var]:
+        """Get all output return variables from the while loop.
+
+        This is a convenience method to access all return variables at once after
+        the while loop is built.
+
+        Returns:
+            List of all return variables
+
+        Raises:
+            AssertionError: If called before while loop is complete
+
+        Example:
+            >>> with ib.while_loop(condition) as loop:
+            ...     x_iter = loop.iter_arg("x_iter", 0)
+            ...     y_iter = loop.iter_arg("y_iter", 1)
+            ...     loop.return_var("x_final")
+            ...     loop.return_var("y_final")
+            ...     # ... loop body ...
+            >>> x_result, y_result = loop.outputs()  # Get all return variables
+        """
+        assert self._result is not None, "While loop not yet complete"
+        return list(self._result.return_vars)
+
+    def get_result(self) -> ir.WhileStmt:
+        """Get the built WhileStmt.
+
+        Returns:
+            WhileStmt: The completed while loop IR node
+        """
+        assert self._result is not None
+        return self._result
+
+
+class ScopeBuilder:
+    """Helper for building scope statements within a scope context."""
+
+    def __init__(self, builder: IRBuilder) -> None:
+        """Initialize scope statement builder.
+
+        Args:
+            builder: Parent IR builder
+        """
+        self._builder = builder
+        self._result: Optional[ir.ScopeStmt] = None
+
+    def get_result(self) -> ir.ScopeStmt:
+        """Get the built ScopeStmt.
+
+        Returns:
+            ScopeStmt: The completed scope statement IR node
         """
         assert self._result is not None
         return self._result
@@ -859,14 +1211,14 @@ class IfStmtBuilder:
             )
         return self._result.return_vars[index]
 
-    def outputs(self) -> List[ir.Var]:
+    def outputs(self) -> list[ir.Var]:
         """Get all output return variables from the if statement.
 
         This is a convenience method to access all return variables at once after
         the if statement is built.
 
         Returns:
-            List[Var]: List of all return variables
+            List of all return variables
 
         Raises:
             AssertionError: If called before if statement is complete
@@ -973,4 +1325,11 @@ class ProgramBuilder:
         return self._result
 
 
-__all__ = ["IRBuilder", "FunctionBuilder", "ForLoopBuilder", "IfStmtBuilder", "ProgramBuilder"]
+__all__ = [
+    "IRBuilder",
+    "FunctionBuilder",
+    "ForLoopBuilder",
+    "WhileLoopBuilder",
+    "IfStmtBuilder",
+    "ProgramBuilder",
+]

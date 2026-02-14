@@ -80,7 +80,7 @@ void BindIRBuilder(nanobind::module_& m);
  * @brief Register Pass classes for IR transformations
  *
  * Registers the Pass base class and concrete pass implementations
- * (e.g., IdentityPass) for IR transformations.
+ * (e.g., InitMemRef, AddAlloc) for IR transformations.
  *
  * @param m The nanobind module object
  */
@@ -95,6 +95,25 @@ void BindPass(nanobind::module_& m);
  * @param m The nanobind module object
  */
 void BindLogging(nanobind::module_& m);
+
+/**
+ * @brief Register code generation (codegen) classes
+ *
+ * Registers the CCECodegen class and related code generation functionality
+ * for converting PyPTO IR to pto-isa C++ code.
+ *
+ * @param m The nanobind module object
+ */
+void BindCodegen(nanobind::module_& m);
+
+/**
+ * @brief Register backend classes
+ *
+ * Registers SoC hierarchy, builders, and backend implementations.
+ *
+ * @param m The nanobind module object
+ */
+void BindBackend(nanobind::module_& m);
 
 // Future binding declarations can be added here:
 // void BindTensors(nanobind::module_& m);

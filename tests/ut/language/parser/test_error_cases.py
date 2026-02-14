@@ -39,7 +39,7 @@ class TestErrorCases:
 
         @pl.function
         def no_return_type(x: pl.Tensor[[64], pl.FP32]):
-            result: pl.Tensor[[64], pl.FP32] = pl.op.tensor.mul(x, 2.0)
+            result: pl.Tensor[[64], pl.FP32] = pl.mul(x, 2.0)
             return result
 
         # Should still parse successfully
@@ -52,7 +52,7 @@ class TestErrorCases:
 
             @pl.function
             def undefined_var(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                result: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(x, undefined)  # noqa: F821 # type: ignore
+                result: pl.Tensor[[64], pl.FP32] = pl.add(x, undefined)  # noqa: F821 # type: ignore
                 return result
 
     def test_invalid_tensor_type_syntax(self):
@@ -71,11 +71,11 @@ class TestErrorCases:
 
             @pl.function
             def mismatch(n: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                init1: pl.Tensor[[1], pl.INT32] = pl.op.tensor.create([1], dtype=pl.INT32)
-                init2: pl.Tensor[[1], pl.INT32] = pl.op.tensor.create([1], dtype=pl.INT32)
+                init1: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
+                init2: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
 
                 # 3 iter_args but only 2 init_values
-                for i, (v1, v2, v3) in pl.range(5, init_values=[init1, init2]):
+                for i, (v1, v2, v3) in pl.range(5, init_values=(init1, init2)):  # type: ignore
                     out1, out2, out3 = pl.yield_(v1, v2, v3)
 
                 return out1
@@ -89,7 +89,7 @@ class TestErrorCases:
             def unsupported(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 # Try/except is not supported
                 try:
-                    result: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(x, 1.0)
+                    result: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
                 except:  # noqa: E722
                     result: pl.Tensor[[64], pl.FP32] = x
                 return result
@@ -104,7 +104,7 @@ class TestErrorCases:
                 result: pl.Tensor[[1], pl.INT32] = n
                 # Using Python range() instead of pl.range()
                 for i in range(10):
-                    result = pl.op.tensor.add(result, 1)
+                    result = pl.add(result, 1)
                 return result
 
     def test_invalid_loop_target_format(self):
@@ -114,11 +114,11 @@ class TestErrorCases:
 
             @pl.function
             def bad_target(n: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                init: pl.Tensor[[1], pl.INT32] = pl.op.tensor.create([1], dtype=pl.INT32)
+                init: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
 
                 # Missing iter_args tuple
-                for i in pl.range(5, init_values=[init]):
-                    result = pl.yield_(i)
+                for i in pl.range(5, init_values=(init,)):
+                    result = pl.yield_(i)  # type: ignore
 
                 return result
 
@@ -130,7 +130,7 @@ class TestErrorCases:
             @pl.function
             def unknown_op(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 # nonexistent_op doesn't exist
-                result: pl.Tensor[[64], pl.FP32] = pl.op.tensor.nonexistent_op(x)  # type: ignore
+                result: pl.Tensor[[64], pl.FP32] = pl.nonexistent_op(x)  # type: ignore
                 return result
 
 
@@ -138,16 +138,16 @@ class TestSSAValidation:
     """Tests for SSA validation."""
 
     def test_ssa_violation_double_assignment(self):
-        """Test that double assignment in same scope is caught."""
+        """Test that double assignment in same scope is caught with strict_ssa=True."""
 
         with pytest.raises(SSAViolationError):
 
-            @pl.function
+            @pl.function(strict_ssa=True)
             def double_assign(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 # First assignment
-                result: pl.Tensor[[64], pl.FP32] = pl.op.tensor.mul(x, 2.0)
+                result: pl.Tensor[[64], pl.FP32] = pl.mul(x, 2.0)
                 # Second assignment (SSA violation)
-                result: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(x, 1.0)
+                result: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
                 return result
 
     def test_variable_from_inner_scope_not_accessible(self):
@@ -157,10 +157,10 @@ class TestSSAValidation:
         # The current implementation tracks yields, so this should work correctly
         @pl.function
         def scope_test(n: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[64], pl.FP32]:
-            init: pl.Tensor[[64], pl.FP32] = pl.op.tensor.create([64], dtype=pl.FP32)
+            init: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
 
-            for i, (acc,) in pl.range(5, init_values=[init]):
-                temp: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(acc, 1.0)
+            for i, (acc,) in pl.range(5, init_values=(init,)):
+                temp: pl.Tensor[[64], pl.FP32] = pl.add(acc, 1.0)
                 # temp is yielded, so it's accessible as 'result'
                 result = pl.yield_(temp)
 
@@ -187,7 +187,7 @@ class TestEdgeCases:
 
         @pl.function
         def single_dim(x: pl.Tensor[[128], pl.FP32]) -> pl.Tensor[[128], pl.FP32]:
-            result: pl.Tensor[[128], pl.FP32] = pl.op.tensor.mul(x, 2.0)
+            result: pl.Tensor[[128], pl.FP32] = pl.mul(x, 2.0)
             return result
 
         assert isinstance(single_dim, pypto.ir.Function)
@@ -208,7 +208,7 @@ class TestEdgeCases:
 
         @pl.function
         def one_iteration(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            for i, (acc,) in pl.range(1, init_values=[x]):
+            for i, (acc,) in pl.range(1, init_values=(x,)):
                 result = pl.yield_(acc)
 
             return result
@@ -220,8 +220,8 @@ class TestEdgeCases:
 
         @pl.function
         def custom_range(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            for i, (acc,) in pl.range(2, 10, 2, init_values=[x]):
-                new_acc: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(acc, 1.0)
+            for i, (acc,) in pl.range(2, 10, 2, init_values=(x,)):
+                new_acc: pl.Tensor[[64], pl.FP32] = pl.add(acc, 1.0)
                 result = pl.yield_(new_acc)
 
             return result
@@ -233,16 +233,16 @@ class TestEdgeCases:
 
         @pl.function
         def many_vars(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            v1: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(x, 1.0)
-            v2: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(v1, 2.0)
-            v3: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(v2, 3.0)
-            v4: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(v3, 4.0)
-            v5: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(v4, 5.0)
-            v6: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(v5, 6.0)
-            v7: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(v6, 7.0)
-            v8: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(v7, 8.0)
-            v9: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(v8, 9.0)
-            v10: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(v9, 10.0)
+            v1: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+            v2: pl.Tensor[[64], pl.FP32] = pl.add(v1, 2.0)
+            v3: pl.Tensor[[64], pl.FP32] = pl.add(v2, 3.0)
+            v4: pl.Tensor[[64], pl.FP32] = pl.add(v3, 4.0)
+            v5: pl.Tensor[[64], pl.FP32] = pl.add(v4, 5.0)
+            v6: pl.Tensor[[64], pl.FP32] = pl.add(v5, 6.0)
+            v7: pl.Tensor[[64], pl.FP32] = pl.add(v6, 7.0)
+            v8: pl.Tensor[[64], pl.FP32] = pl.add(v7, 8.0)
+            v9: pl.Tensor[[64], pl.FP32] = pl.add(v8, 9.0)
+            v10: pl.Tensor[[64], pl.FP32] = pl.add(v9, 10.0)
             return v10
 
         assert isinstance(many_vars, pypto.ir.Function)
@@ -260,3 +260,15 @@ class TestEdgeCases:
 
         assert isinstance(diff_shapes, pypto.ir.Function)
         assert len(diff_shapes.params) == 3
+
+
+class TestScalarTypeErrors:
+    """Tests for Scalar type error handling."""
+
+    def test_scalar_without_dtype(self):
+        """Test that Scalar without dtype raises error."""
+        with pytest.raises(pl.parser.ParserError):
+
+            @pl.function
+            def bad_scalar(x: pl.Scalar) -> pl.Scalar:  # Missing [dtype]
+                return x

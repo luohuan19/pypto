@@ -13,20 +13,44 @@ This module provides type-safe wrappers around pypto.ir.op.tensor operations
 that accept and return Tensor types instead of raw Expr/Call objects.
 """
 
-from typing import List, Literal, Optional, Union
+from typing import Literal, Optional, Union
+
+__all__ = [
+    "create_tensor",
+    "read",
+    "dim",
+    "view",
+    "matmul",
+    "mul",
+    "mul_scalar",
+    "add",
+    "add_scalar",
+    "sub",
+    "sub_scalar",
+    "div",
+    "div_scalar",
+    "maximum",
+    "row_max",
+    "row_sum",
+    "exp",
+    "cast",
+    "assemble",
+    "reshape",
+    "transpose",
+]
 
 from pypto.ir.op import tensor_ops as _ir_ops
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import Expr
 
-from ..tensor import Tensor
+from ..typing import Scalar, Tensor
 
 
-def create(shape: List[int], dtype: DataType) -> Tensor:
+def create_tensor(shape: list[int], dtype: DataType) -> Tensor:
     """Create a new tensor with specified shape and dtype.
 
     Args:
-        shape: List of dimension sizes
+        shape: List of dimension sizes (int or Expr)
         dtype: Data type of tensor elements
 
     Returns:
@@ -36,7 +60,37 @@ def create(shape: List[int], dtype: DataType) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def view(tensor: Tensor, shape: List[Union[int, Expr]], offset: List[Union[int, Expr]]) -> Tensor:
+def read(tensor: Tensor, indices: list[Union[int, Expr]]) -> Scalar:
+    """Read a scalar value from a tensor at given indices.
+
+    Args:
+        tensor: Input tensor
+        indices: List of index expressions (one per tensor dimension)
+
+    Returns:
+        Scalar wrapping the read operation
+    """
+    tensor_expr = tensor.unwrap()
+    call_expr = _ir_ops.read(tensor_expr, indices)
+    return Scalar(expr=call_expr)
+
+
+def dim(tensor: Tensor, axis: int) -> Scalar:
+    """Extract a shape dimension from a tensor as a scalar value.
+
+    Args:
+        tensor: Input tensor
+        axis: Dimension index (supports negative indexing)
+
+    Returns:
+        Scalar wrapping the dim operation (INT64)
+    """
+    tensor_expr = tensor.unwrap()
+    call_expr = _ir_ops.dim(tensor_expr, axis)
+    return Scalar(expr=call_expr)
+
+
+def view(tensor: Tensor, shape: list[Union[int, Expr]], offset: list[Union[int, Expr]]) -> Tensor:
     """Create a view/slice of a tensor with new shape and offset.
 
     Args:
@@ -79,7 +133,7 @@ def matmul(
     return Tensor(expr=call_expr)
 
 
-def mul(lhs: Tensor, rhs: Union[int, float, Tensor]) -> Tensor:
+def mul(lhs: Tensor, rhs: Union[int, float, Tensor, Scalar]) -> Tensor:
     """Element-wise multiplication of tensor and tensor or scalar.
 
     Automatically selects between tensor.mul (tensor x tensor) and
@@ -87,13 +141,15 @@ def mul(lhs: Tensor, rhs: Union[int, float, Tensor]) -> Tensor:
 
     Args:
         lhs: Left-hand side tensor
-        rhs: Right-hand side tensor or scalar (int/float/Tensor)
+        rhs: Right-hand side tensor or scalar (int/float/Tensor/Scalar)
 
     Returns:
         Tensor wrapping the mul operation
     """
     lhs_expr = lhs.unwrap()
     if isinstance(rhs, Tensor):
+        rhs_expr = rhs.unwrap()
+    elif isinstance(rhs, Scalar):
         rhs_expr = rhs.unwrap()
     else:
         rhs_expr = rhs
@@ -116,7 +172,7 @@ def mul_scalar(lhs: Tensor, rhs: Union[int, float, Expr]) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def add(lhs: Tensor, rhs: Union[int, float, Tensor]) -> Tensor:
+def add(lhs: Tensor, rhs: Union[int, float, Tensor, Scalar]) -> Tensor:
     """Element-wise addition of tensor and tensor or scalar.
 
     Automatically selects between tensor.add (tensor + tensor) and
@@ -124,13 +180,15 @@ def add(lhs: Tensor, rhs: Union[int, float, Tensor]) -> Tensor:
 
     Args:
         lhs: Left-hand side tensor
-        rhs: Right-hand side tensor or scalar (int/float/Tensor)
+        rhs: Right-hand side tensor or scalar (int/float/Tensor/Scalar)
 
     Returns:
         Tensor wrapping the add operation
     """
     lhs_expr = lhs.unwrap()
     if isinstance(rhs, Tensor):
+        rhs_expr = rhs.unwrap()
+    elif isinstance(rhs, Scalar):
         rhs_expr = rhs.unwrap()
     else:
         rhs_expr = rhs
@@ -153,7 +211,7 @@ def add_scalar(lhs: Tensor, rhs: Union[int, float, Expr]) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def sub(lhs: Tensor, rhs: Union[int, float, Tensor]) -> Tensor:
+def sub(lhs: Tensor, rhs: Union[int, float, Tensor, Scalar]) -> Tensor:
     """Element-wise subtraction of tensor and tensor or scalar.
 
     Automatically selects between tensor.sub (tensor - tensor) and
@@ -161,13 +219,15 @@ def sub(lhs: Tensor, rhs: Union[int, float, Tensor]) -> Tensor:
 
     Args:
         lhs: Left-hand side tensor
-        rhs: Right-hand side tensor or scalar (int/float/Tensor)
+        rhs: Right-hand side tensor or scalar (int/float/Tensor/Scalar)
 
     Returns:
         Tensor wrapping the sub operation
     """
     lhs_expr = lhs.unwrap()
     if isinstance(rhs, Tensor):
+        rhs_expr = rhs.unwrap()
+    elif isinstance(rhs, Scalar):
         rhs_expr = rhs.unwrap()
     else:
         rhs_expr = rhs
@@ -190,7 +250,7 @@ def sub_scalar(lhs: Tensor, rhs: Union[int, float, Expr]) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def div(lhs: Tensor, rhs: Union[int, float, Tensor]) -> Tensor:
+def div(lhs: Tensor, rhs: Union[int, float, Tensor, Scalar]) -> Tensor:
     """Element-wise division of tensor and tensor or scalar.
 
     Automatically selects between tensor.div (tensor / tensor) and
@@ -198,7 +258,7 @@ def div(lhs: Tensor, rhs: Union[int, float, Tensor]) -> Tensor:
 
     Args:
         lhs: Left-hand side tensor
-        rhs: Right-hand side tensor or scalar (int/float/Tensor)
+        rhs: Right-hand side tensor or scalar (int/float/Tensor/Scalar)
 
     Returns:
         Tensor wrapping the div operation
@@ -206,24 +266,30 @@ def div(lhs: Tensor, rhs: Union[int, float, Tensor]) -> Tensor:
     lhs_expr = lhs.unwrap()
     if isinstance(rhs, Tensor):
         rhs_expr = rhs.unwrap()
+    elif isinstance(rhs, Scalar):
+        rhs_expr = rhs.unwrap()
     else:
         rhs_expr = rhs
     call_expr = _ir_ops.div(lhs_expr, rhs_expr)
     return Tensor(expr=call_expr)
 
 
-def div_scalar(lhs: Tensor, rhs: Union[int, float, Expr]) -> Tensor:
+def div_scalar(lhs: Tensor, rhs: Union[int, float, Expr, Scalar]) -> Tensor:
     """Element-wise division of tensor and scalar.
 
     Args:
         lhs: Left-hand side tensor
-        rhs: Right-hand side scalar (int/float/Expr with ScalarType)
+        rhs: Right-hand side scalar (int/float/Expr/Scalar)
 
     Returns:
         Tensor wrapping the div_scalar operation
     """
     lhs_expr = lhs.unwrap()
-    call_expr = _ir_ops.div_scalar(lhs_expr, rhs)
+    if isinstance(rhs, Scalar):
+        rhs_expr = rhs.unwrap()
+    else:
+        rhs_expr = rhs
+    call_expr = _ir_ops.div_scalar(lhs_expr, rhs_expr)
     return Tensor(expr=call_expr)
 
 
@@ -243,35 +309,31 @@ def maximum(lhs: Tensor, rhs: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def row_max(input: Tensor, axis: int = -1, keep_dim: Union[int, bool] = 1) -> Tensor:
-    """Row-wise maximum reduction along specified axis.
+def row_max(input: Tensor) -> Tensor:
+    """Row-wise max reduction (reduces along last axis, keeps dim).
 
     Args:
         input: Input tensor
-        axis: Reduction axis (default: -1, last axis)
-        keep_dim: Keep reduced dimension as 1
 
     Returns:
         Tensor wrapping the row_max operation
     """
     input_expr = input.unwrap()
-    call_expr = _ir_ops.row_max(input_expr, axis, keep_dim)
+    call_expr = _ir_ops.row_max(input_expr)
     return Tensor(expr=call_expr)
 
 
-def row_sum(input: Tensor, axis: int = -1, keep_dim: Union[int, bool] = 1) -> Tensor:
-    """Row-wise sum reduction along specified axis.
+def row_sum(input: Tensor) -> Tensor:
+    """Row-wise sum reduction (reduces along last axis, keeps dim).
 
     Args:
         input: Input tensor
-        axis: Reduction axis (default: -1, last axis)
-        keep_dim: Keep reduced dimension as 1
 
     Returns:
         Tensor wrapping the row_sum operation
     """
     input_expr = input.unwrap()
-    call_expr = _ir_ops.row_sum(input_expr, axis, keep_dim)
+    call_expr = _ir_ops.row_sum(input_expr)
     return Tensor(expr=call_expr)
 
 
@@ -292,7 +354,7 @@ def exp(input: Tensor) -> Tensor:
 def cast(
     input: Tensor,
     target_type: Union[int, DataType],
-    mode: Literal["round", "floor", "ceil"] = "round",
+    mode: Literal["none", "rint", "round", "floor", "ceil", "trunc", "odd"] = "round",
 ) -> Tensor:
     """Type casting operation.
 
@@ -309,7 +371,7 @@ def cast(
     return Tensor(expr=call_expr)
 
 
-def assemble(target: Tensor, source: Tensor, offset: List[Union[int, Expr]]) -> Tensor:
+def assemble(target: Tensor, source: Tensor, offset: list[Union[int, Expr]]) -> Tensor:
     """Write/update tensor values at specified offset.
 
     Args:
@@ -323,4 +385,35 @@ def assemble(target: Tensor, source: Tensor, offset: List[Union[int, Expr]]) -> 
     target_expr = target.unwrap()
     source_expr = source.unwrap()
     call_expr = _ir_ops.assemble(target_expr, source_expr, offset)
+    return Tensor(expr=call_expr)
+
+
+def reshape(tensor: Tensor, shape: list[Union[int, Expr]]) -> Tensor:
+    """Reshape tensor to new shape.
+
+    Args:
+        tensor: Input tensor
+        shape: New shape dimensions
+
+    Returns:
+        Tensor wrapping the reshape operation
+    """
+    tensor_expr = tensor.unwrap()
+    call_expr = _ir_ops.reshape(tensor_expr, shape)
+    return Tensor(expr=call_expr)
+
+
+def transpose(tensor: Tensor, axis1: int, axis2: int) -> Tensor:
+    """Transpose tensor by swapping two axes.
+
+    Args:
+        tensor: Input tensor
+        axis1: First axis to swap (supports negative indexing)
+        axis2: Second axis to swap (supports negative indexing)
+
+    Returns:
+        Tensor wrapping the transpose operation
+    """
+    tensor_expr = tensor.unwrap()
+    call_expr = _ir_ops.transpose(tensor_expr, axis1, axis2)
     return Tensor(expr=call_expr)

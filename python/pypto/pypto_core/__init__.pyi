@@ -13,7 +13,7 @@ PyPTO - Python Tensor Operations Library
 This package provides Python bindings for the PyPTO C++ library.
 """
 
-from . import ir, passes, testing
+from . import codegen, ir, passes, testing
 from .logging import (
     InternalError,
     LogLevel,
@@ -44,7 +44,8 @@ class DataType:
     UINT32: DataType  # 32-bit unsigned integer
     UINT64: DataType  # 64-bit unsigned integer
     FP4: DataType  # 4-bit floating point
-    FP8: DataType  # 8-bit floating point
+    FP8E4M3FN: DataType  # 8-bit floating point (IEEE 754 e4m3fn format)
+    FP8E5M2: DataType  # 8-bit floating point (IEEE 754 e5m2 format)
     FP16: DataType  # 16-bit floating point (IEEE 754 half precision)
     FP32: DataType  # 32-bit floating point (IEEE 754 single precision)
     BF16: DataType  # 16-bit brain floating point
@@ -66,6 +67,17 @@ class DataType:
 
         Returns:
             The string representation of the data type
+        """
+
+    def to_c_type_string(self) -> str:
+        """
+        Get C style type string for code generation (e.g., 'float', 'half', 'int32_t').
+
+        Returns:
+            C style type string
+
+        Raises:
+            ValueError: If the data type is not supported for code generation
         """
 
     def is_float(self) -> bool:
@@ -127,6 +139,8 @@ __all__ = [
     "passes",
     # Testing utilities
     "testing",
+    # Code generation
+    "codegen",
     # Error classes
     "InternalError",
     # Logging framework

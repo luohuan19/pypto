@@ -44,7 +44,7 @@ class TestPythonPrinterProgram:
         assert "class SingleFunc:" in code
         assert "@pl.function" in code
         assert "def add(self," in code  # Should have self parameter
-        assert "x: pl.INT64" in code or "x: pl.INT64" in code
+        assert "x: pl.Scalar[pl.INT64]" in code
 
     def test_print_program_with_multiple_functions(self):
         """Test printing a program with multiple functions."""
@@ -134,7 +134,7 @@ class TestPythonPrinterProgram:
         class Original:
             @pl.function
             def add(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                result: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(x, 1.0)
+                result: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
                 return result
 
         # Print to code
@@ -155,7 +155,7 @@ class TestPythonPrinterProgram:
         class WithCalls:
             @pl.function
             def square(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.mul(x, x)
+                result: pl.Tensor[[1], pl.INT32] = pl.mul(x, x)
                 return result
 
             @pl.function
@@ -164,7 +164,7 @@ class TestPythonPrinterProgram:
             ) -> pl.Tensor[[1], pl.INT32]:
                 a_sq: pl.Tensor[[1], pl.INT32] = self.square(a)
                 b_sq: pl.Tensor[[1], pl.INT32] = self.square(b)
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.add(a_sq, b_sq)
+                result: pl.Tensor[[1], pl.INT32] = pl.add(a_sq, b_sq)
                 return result
 
         # Print

@@ -30,14 +30,14 @@ IRBuilder::~IRBuilder() = default;
 
 // ========== Function Building ==========
 
-void IRBuilder::BeginFunction(const std::string& name, const Span& span) {
+void IRBuilder::BeginFunction(const std::string& name, const Span& span, FunctionType type) {
   if (InFunction()) {
     throw pypto::RuntimeError("Cannot begin function '" + name + "': already inside function '" +
                               static_cast<FunctionContext*>(CurrentContext())->GetName() + "' at " +
                               CurrentContext()->GetBeginSpan().to_string());
   }
 
-  context_stack_.push_back(std::make_unique<FunctionContext>(name, span));
+  context_stack_.push_back(std::make_unique<FunctionContext>(name, span, type));
 }
 
 VarPtr IRBuilder::FuncArg(const std::string& name, const TypePtr& type, const Span& span) {
@@ -76,8 +76,9 @@ FunctionPtr IRBuilder::EndFunction(const Span& end_span) {
                      end_span.begin_line_, end_span.begin_column_);
 
   // Create function
-  auto func = std::make_shared<Function>(func_ctx->GetName(), func_ctx->GetParams(),
-                                         func_ctx->GetReturnTypes(), body, combined_span);
+  auto func =
+      std::make_shared<Function>(func_ctx->GetName(), func_ctx->GetParams(), func_ctx->GetReturnTypes(), body,
+                                 combined_span, func_ctx->GetFuncType());
 
   // Pop context
   context_stack_.pop_back();
@@ -88,13 +89,13 @@ FunctionPtr IRBuilder::EndFunction(const Span& end_span) {
 // ========== For Loop Building ==========
 
 void IRBuilder::BeginForLoop(const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop,
-                             const ExprPtr& step, const Span& span) {
+                             const ExprPtr& step, const Span& span, ForKind kind) {
   if (context_stack_.empty()) {
     throw pypto::RuntimeError("Cannot begin for loop: not inside a function or another valid context at " +
                               span.to_string());
   }
 
-  context_stack_.push_back(std::make_unique<ForLoopContext>(loop_var, start, stop, step, span));
+  context_stack_.push_back(std::make_unique<ForLoopContext>(loop_var, start, stop, step, span, kind));
 }
 
 void IRBuilder::AddIterArg(const IterArgPtr& iter_arg) {
@@ -142,7 +143,7 @@ StmtPtr IRBuilder::EndForLoop(const Span& end_span) {
   // Create for statement
   auto for_stmt = std::make_shared<ForStmt>(loop_ctx->GetLoopVar(), loop_ctx->GetStart(), loop_ctx->GetStop(),
                                             loop_ctx->GetStep(), loop_ctx->GetIterArgs(), body,
-                                            loop_ctx->GetReturnVars(), combined_span);
+                                            loop_ctx->GetReturnVars(), combined_span, loop_ctx->GetKind());
 
   // Pop context
   context_stack_.pop_back();
@@ -153,6 +154,79 @@ StmtPtr IRBuilder::EndForLoop(const Span& end_span) {
   }
 
   return for_stmt;
+}
+
+// ========== While Loop Building ==========
+
+void IRBuilder::BeginWhileLoop(const ExprPtr& condition, const Span& span) {
+  if (context_stack_.empty()) {
+    throw pypto::RuntimeError("Cannot begin while loop: not inside a function or another valid context at " +
+                              span.to_string());
+  }
+
+  context_stack_.push_back(std::make_unique<WhileLoopContext>(condition, span));
+}
+
+void IRBuilder::AddWhileIterArg(const IterArgPtr& iter_arg) {
+  ValidateInWhileLoop("AddWhileIterArg");
+  static_cast<WhileLoopContext*>(CurrentContext())->AddIterArg(iter_arg);
+}
+
+void IRBuilder::AddWhileReturnVar(const VarPtr& var) {
+  ValidateInWhileLoop("AddWhileReturnVar");
+  static_cast<WhileLoopContext*>(CurrentContext())->AddReturnVar(var);
+}
+
+void IRBuilder::SetWhileLoopCondition(const ExprPtr& condition) {
+  ValidateInWhileLoop("SetWhileLoopCondition");
+  static_cast<WhileLoopContext*>(CurrentContext())->SetCondition(condition);
+}
+
+StmtPtr IRBuilder::EndWhileLoop(const Span& end_span) {
+  ValidateInWhileLoop("EndWhileLoop");
+
+  auto* loop_ctx = static_cast<WhileLoopContext*>(CurrentContext());
+
+  // Validate iter_args and return_vars match
+  if (loop_ctx->GetIterArgs().size() != loop_ctx->GetReturnVars().size()) {
+    // Pop context before throwing to maintain stack consistency
+    context_stack_.pop_back();
+
+    std::ostringstream oss;
+    oss << "While loop has " << loop_ctx->GetIterArgs().size() << " iteration arguments but "
+        << loop_ctx->GetReturnVars().size() << " return variables. They must match.";
+    throw pypto::RuntimeError(oss.str());
+  }
+
+  // Build body from accumulated statements
+  StmtPtr body;
+  const auto& stmts = loop_ctx->GetStmts();
+  if (stmts.empty()) {
+    body = std::make_shared<SeqStmts>(std::vector<StmtPtr>(), end_span);
+  } else if (stmts.size() == 1) {
+    body = stmts[0];
+  } else {
+    body = std::make_shared<SeqStmts>(stmts, end_span);
+  }
+
+  // Combine begin and end spans
+  const Span& begin_span = loop_ctx->GetBeginSpan();
+  Span combined_span(begin_span.filename_, begin_span.begin_line_, begin_span.begin_column_,
+                     end_span.begin_line_, end_span.begin_column_);
+
+  // Create while statement
+  auto while_stmt = std::make_shared<WhileStmt>(loop_ctx->GetCondition(), loop_ctx->GetIterArgs(), body,
+                                                loop_ctx->GetReturnVars(), combined_span);
+
+  // Pop context
+  context_stack_.pop_back();
+
+  // Emit to parent context if it exists
+  if (!context_stack_.empty()) {
+    CurrentContext()->AddStmt(while_stmt);
+  }
+
+  return while_stmt;
 }
 
 // ========== If Statement Building ==========
@@ -225,6 +299,50 @@ StmtPtr IRBuilder::EndIf(const Span& end_span) {
   }
 
   return if_stmt;
+}
+
+// ========== Scope Building ==========
+
+void IRBuilder::BeginScope(ScopeKind scope_kind, const Span& span) {
+  CHECK(!context_stack_.empty()) << "Cannot begin scope: not inside a function or another valid context at "
+                                 << span.to_string();
+  context_stack_.push_back(std::make_unique<ScopeContext>(scope_kind, span));
+}
+
+StmtPtr IRBuilder::EndScope(const Span& end_span) {
+  CHECK(!context_stack_.empty() && CurrentContext()->GetType() == BuildContext::Type::SCOPE)
+      << "Cannot end scope: not inside a scope context at " << end_span.to_string();
+
+  auto* scope_ctx = static_cast<ScopeContext*>(CurrentContext());
+
+  // Build body
+  StmtPtr body;
+  const auto& stmts = scope_ctx->GetStmts();
+  if (stmts.empty()) {
+    body = std::make_shared<SeqStmts>(std::vector<StmtPtr>(), end_span);
+  } else if (stmts.size() == 1) {
+    body = stmts[0];
+  } else {
+    body = std::make_shared<SeqStmts>(stmts, end_span);
+  }
+
+  // Combine spans
+  const Span& begin_span = scope_ctx->GetBeginSpan();
+  Span combined_span(begin_span.filename_, begin_span.begin_line_, begin_span.begin_column_,
+                     end_span.begin_line_, end_span.begin_column_);
+
+  // Create scope statement
+  auto scope_stmt = std::make_shared<ScopeStmt>(scope_ctx->GetScopeKind(), body, combined_span);
+
+  // Pop context
+  context_stack_.pop_back();
+
+  // Emit to parent context if it exists
+  if (!context_stack_.empty()) {
+    CurrentContext()->AddStmt(scope_stmt);
+  }
+
+  return scope_stmt;
 }
 
 // ========== Program Building ==========
@@ -362,6 +480,13 @@ bool IRBuilder::InIf() const {
   return context_stack_.back()->GetType() == BuildContext::Type::IF_STMT;
 }
 
+bool IRBuilder::InWhileLoop() const {
+  if (context_stack_.empty()) {
+    return false;
+  }
+  return context_stack_.back()->GetType() == BuildContext::Type::WHILE_LOOP;
+}
+
 // ========== Private Helpers ==========
 
 template <typename T>
@@ -385,6 +510,10 @@ void IRBuilder::ValidateInLoop(const std::string& operation) {
 
 void IRBuilder::ValidateInIf(const std::string& operation) {
   CHECK(InIf()) << operation << " can only be called inside an if statement context";
+}
+
+void IRBuilder::ValidateInWhileLoop(const std::string& operation) {
+  CHECK(InWhileLoop()) << operation << " can only be called inside a while loop context";
 }
 
 void IRBuilder::ValidateInProgram(const std::string& operation) {

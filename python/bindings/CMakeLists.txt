@@ -19,6 +19,8 @@ set(PYPTO_BINDING_SOURCES
     modules/ir.cpp
     modules/ir_builder.cpp
     modules/passes.cpp
+    modules/codegen.cpp
+    modules/backend.cpp
 )
 
 # Make paths absolute

@@ -120,7 +120,7 @@ def test_tensor_row_max():
     tensor_var = ir.Var("t", tensor_type, span)
 
     # Row max reduction (reduce last axis)
-    call = ir.op.tensor.row_max(tensor_var, axis=-1, keep_dim=1)
+    call = ir.op.tensor.row_max(tensor_var)
 
     assert isinstance(call, ir.Call)
     assert call.op.name == "tensor.row_max"
@@ -143,7 +143,7 @@ def test_tensor_row_sum():
     tensor_var = ir.Var("t", tensor_type, span)
 
     # Row sum reduction (reduce last axis)
-    call = ir.op.tensor.row_sum(tensor_var, axis=-1, keep_dim=1)
+    call = ir.op.tensor.row_sum(tensor_var)
 
     assert isinstance(call, ir.Call)
     assert call.op.name == "tensor.row_sum"
@@ -343,10 +343,112 @@ def test_const_float():
     assert const_float_zero.value == 0.0
 
 
+def test_tensor_read():
+    """Test tensor.read operation."""
+    span = ir.Span.unknown()
+
+    # Create a 2D tensor [4, 8] with FP32
+    dim4 = ir.ConstInt(4, DataType.INT32, span)
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim4, dim8], DataType.FP32)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    # Read at indices [2, 3]
+    call = ir.op.tensor.read(tensor_var, [2, 3])
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.read"
+
+    # Result should be ScalarType with tensor's element dtype
+    result_type = call.type
+    assert isinstance(result_type, ir.ScalarType)
+    assert result_type.dtype == DataType.FP32
+
+
+def test_tensor_read_with_expr_indices():
+    """Test tensor.read with expression indices."""
+    span = ir.Span.unknown()
+
+    # Create a 1D tensor [64] with FP16
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    # Read at a variable index
+    idx_var = ir.Var("i", ir.ScalarType(DataType.INT64), span)
+    call = ir.op.tensor.read(tensor_var, [idx_var])
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.read"
+    result_type = call.type
+    assert isinstance(result_type, ir.ScalarType)
+    assert result_type.dtype == DataType.FP16
+
+
+def test_tensor_dim():
+    """Test tensor.dim operation extracts shape dimension as scalar."""
+    span = ir.Span.unknown()
+
+    # Create a 3D tensor [4, 8, 16]
+    dim4 = ir.ConstInt(4, DataType.INT32, span)
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    dim16 = ir.ConstInt(16, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim4, dim8, dim16], DataType.FP32)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    # Extract dimension at axis 1
+    call = ir.op.tensor.dim(tensor_var, 1)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.dim"
+
+    # Result should be ScalarType(INT64)
+    result_type = call.type
+    assert isinstance(result_type, ir.ScalarType)
+    assert result_type.dtype == DataType.INT64
+
+
+def test_tensor_dim_negative_axis():
+    """Test tensor.dim with negative axis indexing."""
+    span = ir.Span.unknown()
+
+    # Create a 2D tensor [32, 64]
+    dim32 = ir.ConstInt(32, DataType.INT32, span)
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim32, dim64], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    # Extract last dimension using negative index
+    call = ir.op.tensor.dim(tensor_var, -1)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.dim"
+    result_type = call.type
+    assert isinstance(result_type, ir.ScalarType)
+    assert result_type.dtype == DataType.INT64
+
+
+def test_tensor_create_dynamic_shape():
+    """Test tensor.create with dynamic (Expr) shape dimensions."""
+    span = ir.Span.unknown()
+
+    # Create with a mix of int and Expr dimensions
+    dim_n = ir.Var("n", ir.ScalarType(DataType.UINT64), span)
+    call = ir.op.tensor.create([dim_n, 128], DataType.FP32)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.create"
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP32
+    assert len(result_type.shape) == 2
+
+
 def test_operator_registration():
     """Test that all new operators are registered."""
     # Check that our new operators are registered
     assert ir.is_op_registered("tensor.create")
+    assert ir.is_op_registered("tensor.read")
     assert ir.is_op_registered("tensor.view")
     assert ir.is_op_registered("tensor.matmul")
     assert ir.is_op_registered("tensor.row_max")
@@ -355,6 +457,99 @@ def test_operator_registration():
     assert ir.is_op_registered("tensor.cast")
     assert ir.is_op_registered("tensor.assemble")
     assert ir.is_op_registered("tensor.maximum")
+    assert ir.is_op_registered("tensor.dim")
+    # Check transform operators
+    assert ir.is_op_registered("tensor.reshape")
+    assert ir.is_op_registered("tensor.transpose")
+
+
+def test_tensor_reshape():
+    """Test tensor.reshape operation."""
+    span = ir.Span.unknown()
+
+    # Create a tensor variable [4, 8]
+    dim4 = ir.ConstInt(4, DataType.INT32, span)
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim4, dim8], DataType.FP32)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    # Reshape to [32] (flatten)
+    call = ir.op.tensor.reshape(tensor_var, [32])
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.reshape"
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP32
+    assert len(result_type.shape) == 1
+
+    # Reshape to [2, 16]
+    call2 = ir.op.tensor.reshape(tensor_var, [2, 16])
+    result_type2 = call2.type
+    assert isinstance(result_type2, ir.TensorType)
+    assert len(result_type2.shape) == 2
+
+
+def test_tensor_reshape_dynamic():
+    """Test tensor.reshape with dynamic shapes."""
+    span = ir.Span.unknown()
+
+    # Create a tensor with dynamic dimensions
+    dim_n = ir.Var("n", ir.ScalarType(DataType.INT64), span)
+    dim_m = ir.Var("m", ir.ScalarType(DataType.INT64), span)
+    tensor_type = ir.TensorType([dim_n, dim_m], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    # Reshape with dynamic shape (cannot verify element count at compile time)
+    dim_k = ir.Var("k", ir.ScalarType(DataType.INT64), span)
+    call = ir.op.tensor.reshape(tensor_var, [dim_k])
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.reshape"
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+
+
+def test_tensor_transpose():
+    """Test tensor.transpose operation."""
+    span = ir.Span.unknown()
+
+    # Create a 3D tensor [2, 3, 4]
+    dim2 = ir.ConstInt(2, DataType.INT32, span)
+    dim3 = ir.ConstInt(3, DataType.INT32, span)
+    dim4 = ir.ConstInt(4, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim2, dim3, dim4], DataType.FP32)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    # Transpose by swapping axis 0 and 2: [2, 3, 4] -> [4, 3, 2]
+    call = ir.op.tensor.transpose(tensor_var, 0, 2)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.transpose"
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP32
+    assert len(result_type.shape) == 3
+
+
+def test_tensor_transpose_negative_axis():
+    """Test tensor.transpose with negative axis indices."""
+    span = ir.Span.unknown()
+
+    # Create a 2D tensor [8, 16]
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    dim16 = ir.ConstInt(16, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim8, dim16], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    # Transpose using negative indices: axis1=-2 (0), axis2=-1 (1)
+    # [8, 16] -> [16, 8]
+    call = ir.op.tensor.transpose(tensor_var, -2, -1)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.transpose"
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
 
 
 def test_get_new_ops():

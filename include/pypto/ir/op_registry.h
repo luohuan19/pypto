@@ -21,6 +21,7 @@
 #ifndef PYPTO_IR_OP_REGISTRY_H_
 #define PYPTO_IR_OP_REGISTRY_H_
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -35,6 +36,10 @@
 
 namespace pypto {
 namespace ir {
+
+// Forward declaration
+class Call;
+using CallPtr = std::shared_ptr<const Call>;
 
 /**
  * @brief Type-erased operator registration entry
@@ -383,6 +388,15 @@ class OpRegistry {
    * @return true if the operator is registered
    */
   bool IsRegistered(const std::string& op_name) const { return registry_.find(op_name) != registry_.end(); }
+
+  /**
+   * @brief Get the operator registry entry by name
+   *
+   * @param op_name Name of the operator
+   * @return Const reference to the operator registry entry
+   * @throws ValueError if operator not found
+   */
+  const OpRegistryEntry& GetEntry(const std::string& op_name) const;
 
   /**
    * @brief Get the operator instance by name

@@ -14,23 +14,10 @@
 
 #include <string>
 
-#include "pypto/ir/core.h"
+#include "pypto/ir/span.h"
 
 namespace pypto {
 namespace ir {
-
-/**
- * @brief Unified verification error structure
- *
- * This structure is used by all verification passes to report errors.
- * The error_code field contains the specific error type from different
- * error type enumerations (ssa::ErrorType, typecheck::ErrorType, etc.)
- */
-struct VerificationError {
-  int error_code;       // Error type code
-  std::string message;  // Error message
-  Span span;            // Source location
-};
 
 /**
  * @brief SSA verification error types and utilities
@@ -62,11 +49,13 @@ namespace typecheck {
  * @brief Error types for type checking
  */
 enum class ErrorType : int {
-  TYPE_KIND_MISMATCH = 101,        // Type kind mismatch (e.g., ScalarType vs TensorType)
-  DTYPE_MISMATCH = 102,            // Data type mismatch
-  SHAPE_DIMENSION_MISMATCH = 103,  // Shape dimension count mismatch
-  SHAPE_VALUE_MISMATCH = 104,      // Shape dimension value mismatch
-  SIZE_MISMATCH = 105              // Vector size mismatch in control flow
+  TYPE_KIND_MISMATCH = 101,           // Type kind mismatch (e.g., ScalarType vs TensorType)
+  DTYPE_MISMATCH = 102,               // Data type mismatch
+  SHAPE_DIMENSION_MISMATCH = 103,     // Shape dimension count mismatch
+  SHAPE_VALUE_MISMATCH = 104,         // Shape dimension value mismatch
+  SIZE_MISMATCH = 105,                // Vector size mismatch in control flow
+  IF_CONDITION_MUST_BE_SCALAR = 106,  // IfStmt condition must be ScalarType
+  FOR_RANGE_MUST_BE_SCALAR = 107      // ForStmt range must be ScalarType
 };
 
 /**
@@ -75,6 +64,30 @@ enum class ErrorType : int {
 std::string ErrorTypeToString(ErrorType type);
 
 }  // namespace typecheck
+
+/**
+ * @brief Nested call verification error types and utilities
+ */
+namespace nested_call {
+
+/**
+ * @brief Error types for nested call verification
+ */
+enum class ErrorType : int {
+  CALL_IN_CALL_ARGS = 201,       // Call expression appears in call arguments
+  CALL_IN_IF_CONDITION = 202,    // Call expression appears in if condition
+  CALL_IN_FOR_RANGE = 203,       // Call expression appears in for range (start/stop/step)
+  CALL_IN_BINARY_EXPR = 204,     // Call expression appears in binary expression operands
+  CALL_IN_UNARY_EXPR = 205,      // Call expression appears in unary expression operand
+  CALL_IN_WHILE_CONDITION = 206  // Call expression appears in while condition
+};
+
+/**
+ * @brief Convert nested call error type to string
+ */
+std::string ErrorTypeToString(ErrorType type);
+
+}  // namespace nested_call
 
 }  // namespace ir
 }  // namespace pypto

@@ -102,14 +102,6 @@ BroadcastResult BroadcastShapes(const std::vector<ExprPtr>& shape1, const std::v
 std::optional<DataType> PromoteDataTypes(DataType dtype1, DataType dtype2);
 
 /**
- * @brief Validate that a shape is valid for tile operations (at most 2 dimensions)
- *
- * @param shape Shape to validate
- * @return true if shape has at most 2 dimensions
- */
-bool ValidateTileShape(const std::vector<ExprPtr>& shape);
-
-/**
  * @brief Check if two types are compatible for binary operations
  *
  * Types are compatible if:
@@ -175,6 +167,22 @@ bool DimensionsEqual(const ExprPtr& dim1, const ExprPtr& dim2);
  * @return true if source can be broadcast to target
  */
 bool IsBroadcastable(const ExprPtr& source_dim, const ExprPtr& target_dim);
+
+/**
+ * @brief Format a shape vector as a string for error messages
+ *
+ * Converts a shape (vector of ExprPtr) to a human-readable string.
+ * Constant dimensions show their values, symbolic dimensions show as "?".
+ *
+ * Examples:
+ * - [ConstInt(64), ConstInt(128)] -> "[64, 128]"
+ * - [ConstInt(64), Var("N")] -> "[64, ?]"
+ * - [] -> "[]"
+ *
+ * @param shape Shape vector to format
+ * @return String representation of the shape
+ */
+std::string FormatShape(const std::vector<ExprPtr>& shape);
 
 }  // namespace ir
 }  // namespace pypto

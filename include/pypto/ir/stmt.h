@@ -31,6 +31,79 @@ class IRVisitor;
 class IRMutator;
 
 /**
+ * @brief Distinguishes sequential vs parallel for loops
+ */
+enum class ForKind : uint8_t {
+  Sequential = 0,  ///< Standard sequential for loop (default)
+  Parallel = 1     ///< Parallel for loop
+};
+
+/**
+ * @brief Distinguishes different scope kinds
+ */
+enum class ScopeKind : uint8_t {
+  InCore = 0  ///< InCore scope for AICore sub-graphs
+};
+
+/**
+ * @brief Convert ForKind to string
+ * @param kind The for loop kind
+ * @return String representation ("Sequential" or "Parallel")
+ */
+inline std::string ForKindToString(ForKind kind) {
+  switch (kind) {
+    case ForKind::Sequential:
+      return "Sequential";
+    case ForKind::Parallel:
+      return "Parallel";
+  }
+  throw pypto::TypeError("Unknown ForKind");
+}
+
+/**
+ * @brief Convert string to ForKind
+ * @param str String representation
+ * @return ForKind enum value
+ * @throws std::invalid_argument if string is not recognized
+ */
+inline ForKind StringToForKind(const std::string& str) {
+  if (str == "Sequential") {
+    return ForKind::Sequential;
+  } else if (str == "Parallel") {
+    return ForKind::Parallel;
+  } else {
+    throw std::invalid_argument("Unknown ForKind: " + str);
+  }
+}
+
+/**
+ * @brief Convert ScopeKind to string
+ * @param kind The scope kind
+ * @return String representation ("InCore")
+ */
+inline std::string ScopeKindToString(ScopeKind kind) {
+  switch (kind) {
+    case ScopeKind::InCore:
+      return "InCore";
+  }
+  throw pypto::TypeError("Unknown ScopeKind");
+}
+
+/**
+ * @brief Convert string to ScopeKind
+ * @param str String representation
+ * @return ScopeKind enum value
+ * @throws pypto::TypeError if string is not recognized
+ */
+inline ScopeKind StringToScopeKind(const std::string& str) {
+  if (str == "InCore") {
+    return ScopeKind::InCore;
+  } else {
+    throw pypto::TypeError("Unknown ScopeKind: " + str);
+  }
+}
+
+/**
  * @brief Base class for all statements in the IR
  *
  * Statements represent operations that perform side effects or control flow.
@@ -238,7 +311,7 @@ using ReturnStmtPtr = std::shared_ptr<const ReturnStmt>;
  * **Basic loop:** for loop_var in range(start, stop, step): body
  *
  * **Loop with iteration arguments:**
- * for loop_var, (iter_arg1, iter_arg2) in pl.range(start, stop, step, init_values=[...]):
+ * for loop_var, (iter_arg1, iter_arg2) in pl.range(start, stop, step, init_values=(...)):
  *     iter_arg1, iter_arg2 = pl.yield_(new_val1, new_val2)
  * return_var1 = iter_arg1
  * return_var2 = iter_arg2
@@ -263,9 +336,10 @@ class ForStmt : public Stmt {
    * @param body Loop body statement (must yield values matching iter_args if non-empty)
    * @param return_vars Return variables (capture final values, accessible after loop)
    * @param span Source location
+   * @param kind Loop kind (Sequential or Parallel, default: Sequential)
    */
   ForStmt(VarPtr loop_var, ExprPtr start, ExprPtr stop, ExprPtr step, std::vector<IterArgPtr> iter_args,
-          StmtPtr body, std::vector<VarPtr> return_vars, Span span)
+          StmtPtr body, std::vector<VarPtr> return_vars, Span span, ForKind kind = ForKind::Sequential)
       : Stmt(std::move(span)),
         loop_var_(std::move(loop_var)),
         start_(std::move(start)),
@@ -273,7 +347,8 @@ class ForStmt : public Stmt {
         step_(std::move(step)),
         iter_args_(std::move(iter_args)),
         body_(std::move(body)),
-        return_vars_(std::move(return_vars)) {}
+        return_vars_(std::move(return_vars)),
+        kind_(kind) {}
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::ForStmt; }
   [[nodiscard]] std::string TypeName() const override { return "ForStmt"; }
@@ -291,7 +366,8 @@ class ForStmt : public Stmt {
                                           reflection::UsualField(&ForStmt::step_, "step"),
                                           reflection::DefField(&ForStmt::iter_args_, "iter_args"),
                                           reflection::UsualField(&ForStmt::body_, "body"),
-                                          reflection::DefField(&ForStmt::return_vars_, "return_vars")));
+                                          reflection::DefField(&ForStmt::return_vars_, "return_vars"),
+                                          reflection::UsualField(&ForStmt::kind_, "kind")));
   }
 
  public:
@@ -302,9 +378,143 @@ class ForStmt : public Stmt {
   std::vector<IterArgPtr> iter_args_;  // Loop-carried values (scoped to loop body)
   StmtPtr body_;                       // Loop body statement (must yield if iter_args non-empty)
   std::vector<VarPtr> return_vars_;    // Variables capturing final iteration values (accessible after loop)
+  ForKind kind_;                       // Loop kind (Sequential or Parallel)
 };
 
 using ForStmtPtr = std::shared_ptr<const ForStmt>;
+
+/**
+ * @brief While loop statement
+ *
+ * Represents a while loop with optional loop-carried state (iter_args) and return variables.
+ *
+ * **Syntax:**
+ * Natural form (non-SSA, parsed from user code):
+ *   while condition:
+ *       body
+ *
+ * SSA form (after ConvertToSSA or explicit Python DSL):
+ *   for iter_args in pl.while_(init_values=(...)):
+ *       with pl.cond(condition):
+ *           body
+ *           iter_args = pl.yield_(new_values)
+ *   return_vars = iter_args
+ *
+ * Note: The Python surface syntax for pl.while_ does not accept a positional
+ * condition argument; conditions must be expressed via pl.cond(...) inside
+ * the loop body as shown above.
+ *
+ * **Semantics:**
+ * - Each iteration: evaluate condition using current iter_arg values (via pl.cond)
+ * - If condition is true, execute body
+ * - Body ends with YieldStmt feeding next iteration
+ * - When condition is false, return_vars get final iter_arg values
+ *
+ * **Key Relationships:**
+ * - condition: Boolean expression evaluated each iteration using current iter_args
+ * - iter_args: IterArg variables scoped to loop body, carry values between iterations
+ * - return_vars: Var variables that capture final iteration values, accessible after loop
+ * - Number of iter_args must equal number of return_vars
+ * - Number of yielded values must equal number of iter_args
+ */
+class WhileStmt : public Stmt {
+ public:
+  /**
+   * @brief Create a while loop statement
+   *
+   * @param condition Boolean condition expression
+   * @param iter_args Iteration arguments (loop-carried values, scoped to loop body)
+   * @param body Loop body statement (must yield values matching iter_args if non-empty)
+   * @param return_vars Return variables (capture final values, accessible after loop)
+   * @param span Source location
+   */
+  WhileStmt(ExprPtr condition, std::vector<IterArgPtr> iter_args, StmtPtr body,
+            std::vector<VarPtr> return_vars, Span span)
+      : Stmt(std::move(span)),
+        condition_(std::move(condition)),
+        iter_args_(std::move(iter_args)),
+        body_(std::move(body)),
+        return_vars_(std::move(return_vars)) {}
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::WhileStmt; }
+  [[nodiscard]] std::string TypeName() const override { return "WhileStmt"; }
+
+  /**
+   * @brief Get field descriptors for reflection-based visitation
+   *
+   * @return Tuple of field descriptors (condition as USUAL, iter_args as DEF, body as USUAL, return_vars as
+   * DEF)
+   */
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Stmt::GetFieldDescriptors(),
+                          std::make_tuple(reflection::DefField(&WhileStmt::iter_args_, "iter_args"),
+                                          reflection::UsualField(&WhileStmt::condition_, "condition"),
+                                          reflection::UsualField(&WhileStmt::body_, "body"),
+                                          reflection::DefField(&WhileStmt::return_vars_, "return_vars")));
+  }
+
+ public:
+  ExprPtr condition_;                  // Condition expression (evaluated each iteration)
+  std::vector<IterArgPtr> iter_args_;  // Loop-carried values (scoped to loop body)
+  StmtPtr body_;                       // Loop body statement (must yield if iter_args non-empty)
+  std::vector<VarPtr> return_vars_;    // Variables capturing final iteration values (accessible after loop)
+};
+
+using WhileStmtPtr = std::shared_ptr<const WhileStmt>;
+
+/**
+ * @brief Scope statement
+ *
+ * Represents a scoped region of code with a specific execution context.
+ * This is NOT a control flow node — it executes its body exactly once, linearly.
+ *
+ * **Syntax:**
+ * with pl.incore():
+ *     body
+ *
+ * **Semantics:**
+ * - Marks a region of code as belonging to a specific scope (e.g., InCore for AICore)
+ * - Executes body exactly once (no iteration, no branching)
+ * - Variables flow through transparently (no iter_args/return_vars needed)
+ * - SSA conversion treats it as transparent (just visits body)
+ * - OutlineIncoreScopes pass extracts InCore scopes into separate functions
+ *
+ * **Key Properties:**
+ * - scope_kind: The kind of scope (e.g., InCore)
+ * - body: The nested statements to execute within this scope
+ */
+class ScopeStmt : public Stmt {
+ public:
+  /**
+   * @brief Create a scope statement
+   *
+   * @param scope_kind The kind of scope
+   * @param body The nested statements
+   * @param span Source location
+   */
+  ScopeStmt(ScopeKind scope_kind, StmtPtr body, Span span)
+      : Stmt(std::move(span)), scope_kind_(scope_kind), body_(std::move(body)) {}
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::ScopeStmt; }
+  [[nodiscard]] std::string TypeName() const override { return "ScopeStmt"; }
+
+  /**
+   * @brief Get field descriptors for reflection-based visitation
+   *
+   * @return Tuple of field descriptors (scope_kind and body as USUAL fields)
+   */
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Stmt::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&ScopeStmt::scope_kind_, "scope_kind"),
+                                          reflection::UsualField(&ScopeStmt::body_, "body")));
+  }
+
+ public:
+  ScopeKind scope_kind_;  // The kind of scope (e.g., InCore)
+  StmtPtr body_;          // The nested statements
+};
+
+using ScopeStmtPtr = std::shared_ptr<const ScopeStmt>;
 
 /**
  * @brief Sequence of statements
@@ -344,18 +554,22 @@ using SeqStmtsPtr = std::shared_ptr<const SeqStmts>;
 /**
  * @brief Operation statements
  *
- * Represents a sequence of assignment statements: assign1; assign2; ... assignN
- * where stmts is a list of assignment statements.
+ * Represents a sequence of assignment and/or evaluation statements.
+ * This is used to group operations that should be treated as a unit,
+ * such as a block of tensor operations with optional synchronization calls.
+ *
+ * OpStmts only accepts AssignStmt and EvalStmt types. An error will be raised
+ * at construction time if other statement types are provided.
  */
 class OpStmts : public Stmt {
  public:
   /**
    * @brief Create an operation statements
    *
-   * @param stmts List of assignment statements
+   * @param stmts List of assignment and/or evaluation statements
    * @param span Source location
    */
-  OpStmts(std::vector<AssignStmtPtr> stmts, Span span) : Stmt(std::move(span)), stmts_(std::move(stmts)) {}
+  OpStmts(std::vector<StmtPtr> stmts, Span span);
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::OpStmts; }
   [[nodiscard]] std::string TypeName() const override { return "OpStmts"; }
@@ -371,7 +585,7 @@ class OpStmts : public Stmt {
   }
 
  public:
-  std::vector<AssignStmtPtr> stmts_;  // List of assignment statements
+  std::vector<StmtPtr> stmts_;  // List of assignment and/or evaluation statements
 };
 
 using OpStmtsPtr = std::shared_ptr<const OpStmts>;
@@ -412,6 +626,40 @@ class EvalStmt : public Stmt {
 };
 
 using EvalStmtPtr = std::shared_ptr<const EvalStmt>;
+
+/**
+ * @brief Break statement
+ *
+ * Represents a break statement used to exit a loop: break
+ */
+class BreakStmt : public Stmt {
+ public:
+  explicit BreakStmt(Span span) : Stmt(std::move(span)) {}
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::BreakStmt; }
+  [[nodiscard]] std::string TypeName() const override { return "BreakStmt"; }
+
+  static constexpr auto GetFieldDescriptors() { return Stmt::GetFieldDescriptors(); }
+};
+
+using BreakStmtPtr = std::shared_ptr<const BreakStmt>;
+
+/**
+ * @brief Continue statement
+ *
+ * Represents a continue statement used to skip to the next loop iteration: continue
+ */
+class ContinueStmt : public Stmt {
+ public:
+  explicit ContinueStmt(Span span) : Stmt(std::move(span)) {}
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::ContinueStmt; }
+  [[nodiscard]] std::string TypeName() const override { return "ContinueStmt"; }
+
+  static constexpr auto GetFieldDescriptors() { return Stmt::GetFieldDescriptors(); }
+};
+
+using ContinueStmtPtr = std::shared_ptr<const ContinueStmt>;
 
 }  // namespace ir
 }  // namespace pypto

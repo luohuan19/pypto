@@ -26,7 +26,6 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
-#include "pypto/ir/pipe.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
@@ -178,7 +177,6 @@ TypePtr DeduceBlockMatMulAccType(const std::vector<ExprPtr>& args,
 REGISTER_OP("block.matmul")
     .set_op_category("BlockOp")
     .set_description("Matrix multiplication of two tiles")
-    .set_pipe(PipeType::M)
     .add_argument("lhs", "Left-hand side tile (TileType, 2D)")
     .add_argument("rhs", "Right-hand side tile (TileType, 2D)")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
@@ -189,7 +187,6 @@ REGISTER_OP("block.matmul")
 REGISTER_OP("block.matmul_acc")
     .set_op_category("BlockOp")
     .set_description("Matrix multiplication with accumulation: acc = acc + lhs @ rhs")
-    .set_pipe(PipeType::M)
     .add_argument("acc", "Accumulator tile (TileType, 2D)")
     .add_argument("lhs", "Left-hand side tile (TileType, 2D)")
     .add_argument("rhs", "Right-hand side tile (TileType, 2D)")

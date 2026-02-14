@@ -56,6 +56,7 @@ class ExprFunctor {
   virtual R VisitExpr_(const ConstFloatPtr& op, Args... args) = 0;
   virtual R VisitExpr_(const ConstBoolPtr& op, Args... args) = 0;
   virtual R VisitExpr_(const CallPtr& op, Args... args) = 0;
+  virtual R VisitExpr_(const MakeTuplePtr& op, Args... args) = 0;
   virtual R VisitExpr_(const TupleGetItemExprPtr& op, Args... args) = 0;
 
   // Binary operations (22 types)
@@ -108,6 +109,7 @@ R ExprFunctor<R, Args...>::VisitExpr(const ExprPtr& expr, Args... args) {
   EXPR_FUNCTOR_DISPATCH(ConstFloat);
   EXPR_FUNCTOR_DISPATCH(ConstBool);
   EXPR_FUNCTOR_DISPATCH(Call);
+  EXPR_FUNCTOR_DISPATCH(MakeTuple);
   EXPR_FUNCTOR_DISPATCH(TupleGetItemExpr);
 
   // Binary operations
@@ -180,9 +182,13 @@ class StmtFunctor {
   virtual R VisitStmt_(const YieldStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const ReturnStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const ForStmtPtr& op, Args... args) = 0;
+  virtual R VisitStmt_(const WhileStmtPtr& op, Args... args) = 0;
+  virtual R VisitStmt_(const ScopeStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const SeqStmtsPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const OpStmtsPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const EvalStmtPtr& op, Args... args) = 0;
+  virtual R VisitStmt_(const BreakStmtPtr& op, Args... args) = 0;
+  virtual R VisitStmt_(const ContinueStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const StmtPtr& op, Args... args) = 0;
 };
 
@@ -200,9 +206,13 @@ R StmtFunctor<R, Args...>::VisitStmt(const StmtPtr& stmt, Args... args) {
   STMT_FUNCTOR_DISPATCH(YieldStmt);
   STMT_FUNCTOR_DISPATCH(ReturnStmt);
   STMT_FUNCTOR_DISPATCH(ForStmt);
+  STMT_FUNCTOR_DISPATCH(WhileStmt);
+  STMT_FUNCTOR_DISPATCH(ScopeStmt);
   STMT_FUNCTOR_DISPATCH(SeqStmts);
   STMT_FUNCTOR_DISPATCH(OpStmts);
   STMT_FUNCTOR_DISPATCH(EvalStmt);
+  STMT_FUNCTOR_DISPATCH(BreakStmt);
+  STMT_FUNCTOR_DISPATCH(ContinueStmt);
 
   // Should never reach here if all types are handled
   throw pypto::TypeError("Unknown statement type in StmtFunctor::VisitStmt");

@@ -144,6 +144,18 @@ class StructuralHasher {
     return static_cast<result_type>(std::hash<uint8_t>{}(field.Code()));
   }
 
+  result_type VisitLeafField(const FunctionType& field) {
+    return static_cast<result_type>(std::hash<uint8_t>{}(static_cast<uint8_t>(field)));
+  }
+
+  result_type VisitLeafField(const ForKind& field) {
+    return static_cast<result_type>(std::hash<uint8_t>{}(static_cast<uint8_t>(field)));
+  }
+
+  result_type VisitLeafField(const ScopeKind& field) {
+    return static_cast<result_type>(std::hash<uint8_t>{}(static_cast<uint8_t>(field)));
+  }
+
   result_type VisitLeafField(const MemorySpace& field) {
     return static_cast<result_type>(std::hash<int>{}(static_cast<int>(field)));
   }
@@ -294,8 +306,8 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       INTERNAL_CHECK(t) << "structural_hash encountered null type in TupleType";
       h = hash_combine(h, HashType(t));
     }
-  } else if (IsA<UnknownType>(type)) {
-    // UnknownType has no fields, so only hash the type name (already done above)
+  } else if (IsA<MemRefType>(type) || IsA<UnknownType>(type)) {
+    // MemRefType and UnknownType have no fields, only hash type name (already done above)
   } else {
     INTERNAL_CHECK(false) << "HashType encountered unhandled Type: " << type->TypeName();
   }
@@ -329,6 +341,8 @@ StructuralHasher::result_type StructuralHasher::HashNode(const IRNodePtr& node) 
   result_type hash_value = 0;
   bool dispatched = false;
 
+  // MemRef needs special handling: dispatch for fields, then add Var mapping
+  HASH_DISPATCH(MemRef)
   // IterArg needs special handling: dispatch for fields, then add Var mapping
   HASH_DISPATCH(IterArg)
   HASH_DISPATCH(Var)
@@ -336,6 +350,7 @@ StructuralHasher::result_type StructuralHasher::HashNode(const IRNodePtr& node) 
   HASH_DISPATCH(ConstFloat)
   HASH_DISPATCH(ConstBool)
   HASH_DISPATCH(Call)
+  HASH_DISPATCH(MakeTuple)
   HASH_DISPATCH(TupleGetItemExpr)
 
   // BinaryExpr and UnaryExpr are abstract base classes, use dynamic_pointer_cast
@@ -347,16 +362,26 @@ StructuralHasher::result_type StructuralHasher::HashNode(const IRNodePtr& node) 
   HASH_DISPATCH(YieldStmt)
   HASH_DISPATCH(ReturnStmt)
   HASH_DISPATCH(ForStmt)
+  HASH_DISPATCH(WhileStmt)
+  HASH_DISPATCH(ScopeStmt)
   HASH_DISPATCH(SeqStmts)
   HASH_DISPATCH(OpStmts)
   HASH_DISPATCH(EvalStmt)
+  HASH_DISPATCH(BreakStmt)
+  HASH_DISPATCH(ContinueStmt)
   HASH_DISPATCH(Function)
   HASH_DISPATCH(Program)
 
-  // Free Var types (including IterArg) that may be mapped to other free vars
-  // Note: IterArg has already been dispatched above for field hashing,
+  // Free Var types (including MemRef and IterArg) that may be mapped to other free vars
+  // Note: These have already been dispatched above for field hashing,
   // here we add the variable-specific hash
-  if (auto iter_arg = As<IterArg>(node)) {
+  if (auto memref = As<MemRef>(node)) {
+    if (enable_auto_mapping_) {
+      hash_value = hash_combine(hash_value, free_var_counter_++);
+    } else {
+      hash_value = hash_combine(hash_value, static_cast<result_type>(std::hash<MemRefPtr>{}(memref)));
+    }
+  } else if (auto iter_arg = As<IterArg>(node)) {
     if (enable_auto_mapping_) {
       hash_value = hash_combine(hash_value, free_var_counter_++);
     } else {

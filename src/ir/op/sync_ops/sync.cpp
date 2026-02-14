@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "pypto/ir/expr.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/pipe.h"
 #include "pypto/ir/type.h"
@@ -29,12 +30,15 @@ TypePtr DeduceUnknownType(const std::vector<ExprPtr>& args,
 
 }  // namespace
 
+// ============================================================================
+// Registration Function for Sync Operations
+// ============================================================================
+
 // Register system.sync_src (Set Flag)
 // Attributes: set_pipe, wait_pipe, event_id
 REGISTER_OP("system.sync_src")
     .set_description("Send a synchronization signal (Set Flag)")
     .set_op_category("SyncOp")
-    .set_pipe(PipeType::S)
     .no_argument()
     .set_attr<int>("set_pipe")
     .set_attr<int>("wait_pipe")
@@ -46,7 +50,6 @@ REGISTER_OP("system.sync_src")
 REGISTER_OP("system.sync_dst")
     .set_description("Wait for a synchronization signal (Wait Flag)")
     .set_op_category("SyncOp")
-    .set_pipe(PipeType::S)
     .no_argument()
     .set_attr<int>("set_pipe")
     .set_attr<int>("wait_pipe")
@@ -58,7 +61,6 @@ REGISTER_OP("system.sync_dst")
 REGISTER_OP("system.bar_v")
     .set_description("Vector unit barrier")
     .set_op_category("SyncOp")
-    .set_pipe(PipeType::S)
     .no_argument()
     .f_deduce_type(DeduceUnknownType);
 
@@ -67,7 +69,6 @@ REGISTER_OP("system.bar_v")
 REGISTER_OP("system.bar_m")
     .set_description("Matrix unit barrier")
     .set_op_category("SyncOp")
-    .set_pipe(PipeType::S)
     .no_argument()
     .f_deduce_type(DeduceUnknownType);
 
@@ -76,7 +77,6 @@ REGISTER_OP("system.bar_m")
 REGISTER_OP("system.bar_all")
     .set_description("Global barrier synchronization")
     .set_op_category("SyncOp")
-    .set_pipe(PipeType::S)
     .no_argument()
     .f_deduce_type(DeduceUnknownType);
 

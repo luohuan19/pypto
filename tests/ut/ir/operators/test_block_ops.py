@@ -9,710 +9,909 @@
 
 """Unit tests for block operations."""
 
+import pypto.language as pl
 import pytest
-from pypto.ir.builder import IRBuilder
 from pypto.ir.op import block
+from pypto.ir.pass_manager import PassManager
 from pypto.pypto_core import DataType, ir
 
 
-class TestBlockMemoryOps:
-    """Tests for block memory operations."""
-
-    def test_load(self):
-        """Test block.load operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_load") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(
-                ir.TileType(
-                    [
-                        ir.ConstInt(32, DataType.INT32, ir.Span.unknown()),
-                        ir.ConstInt(32, DataType.INT32, ir.Span.unknown()),
-                    ],
-                    DataType.FP32,
-                )
-            )
-
-            tile = ib.let("tile", block.load(input_tensor, 0, 0, 32, 32))
-            ib.return_stmt(tile)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.load" in str(func)
-
-    def test_store(self):
-        """Test block.store operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_store") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile = ib.let("tile", block.load(input_tensor, 0, 0, 32, 32))
-            result = ib.let("result", block.store(tile, 0, 0, 32, 32, output_tensor))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.store" in str(func)
-
-    def test_move(self):
-        """Test block.move operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_move") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(
-                ir.TileType(
-                    [
-                        ir.ConstInt(64, DataType.INT32, ir.Span.unknown()),
-                        ir.ConstInt(32, DataType.INT32, ir.Span.unknown()),
-                    ],
-                    DataType.FP32,
-                )
-            )
-
-            tile = ib.let("tile", block.load(input_tensor, 0, 0, 32, 64))
-            # Move with transpose: shape [32, 64] -> [64, 32]
-            moved_tile = ib.let("moved_tile", block.move(tile, target_space=0, transpose=True))
-            ib.return_stmt(moved_tile)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.move" in str(func)
-
-
 class TestBlockElementwiseOps:
-    """Tests for block element-wise operations."""
-
-    def test_block_mul(self):
-        """Test block.mul operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_block_mul") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            input_b = f.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_b = ib.let("tile_b", block.load(input_b, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.mul(tile_a, tile_b))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.mul" in str(func)
-
-    def test_block_muls(self):
-        """Test block.muls operation (tile * scalar)."""
-        ib = IRBuilder()
-
-        with ib.function("test_block_muls") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.muls(tile_a, 2.0))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.muls" in str(func)
+    """Test suite for block-level element-wise operators (tile-tile and tile-scalar)."""
 
     def test_block_add(self):
-        """Test block.add operation."""
-        ib = IRBuilder()
+        """Test block.add operator - element-wise addition of two tiles."""
 
-        with ib.function("test_block_add") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            input_b = f.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.add(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_b = ib.let("tile_b", block.load(input_b, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.add(tile_a, tile_b))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.add" in str(func)
-
-    def test_block_div(self):
-        """Test block.div operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_block_div") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            input_b = f.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_b = ib.let("tile_b", block.load(input_b, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.div(tile_a, tile_b))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.div" in str(func)
+        ir_str = str(Program)
+        assert "block.add" in ir_str
 
     def test_block_sub(self):
-        """Test block.sub operation."""
-        ib = IRBuilder()
+        """Test block.sub operator - element-wise subtraction of two tiles."""
 
-        with ib.function("test_block_sub") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            input_b = f.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.sub(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_b = ib.let("tile_b", block.load(input_b, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.sub(tile_a, tile_b))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
+        ir_str = str(Program)
+        assert "block.sub" in ir_str
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.sub" in str(func)
+    def test_block_mul(self):
+        """Test block.mul operator - element-wise multiplication of two tiles."""
 
-    def test_block_adds(self):
-        """Test block.adds operation (tile + scalar)."""
-        ib = IRBuilder()
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.mul(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-        with ib.function("test_block_adds") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+        ir_str = str(Program)
+        assert "block.mul" in ir_str
 
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.adds(tile_a, 5.0))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
+    def test_block_div(self):
+        """Test block.div operator - element-wise division of two tiles."""
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.adds" in str(func)
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.div(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-    def test_block_divs(self):
-        """Test block.divs operation (tile / scalar)."""
-        ib = IRBuilder()
+        ir_str = str(Program)
+        assert "block.div" in ir_str
 
-        with ib.function("test_block_divs") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+    def test_block_muls(self):
+        """Test block.muls operator - multiply all elements of a tile by scalar."""
 
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.divs(tile_a, 3.0))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.mul(tile_a, 2.0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.divs" in str(func)
+        ir_str = str(Program)
+        assert "block.muls" in ir_str
 
-    def test_block_subs(self):
-        """Test block.subs operation (tile - scalar)."""
-        ib = IRBuilder()
+    def test_block_cmp(self):
+        """Test block.cmp operator - element-wise comparison of two tiles."""
 
-        with ib.function("test_block_subs") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.cmp(tile_a, tile_b, cmp_type=0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.subs(tile_a, 1.0))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
+        ir_str = str(Program)
+        assert "block.cmp" in ir_str
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.subs" in str(func)
+    def test_block_cmps(self):
+        """Test block.cmps operator - compare tile elements with scalar."""
 
-    def test_block_maximum(self):
-        """Test block.maximum operation."""
-        ib = IRBuilder()
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.cmps(tile_a, 0.0, cmp_type=0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-        with ib.function("test_block_maximum") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            input_b = f.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_b = ib.let("tile_b", block.load(input_b, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.maximum(tile_a, tile_b))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.maximum" in str(func)
-
-
-class TestBlockBroadcastOps:
-    """Tests for block row broadcast operations."""
-
-    def test_block_row_expand_sub(self):
-        """Test block.row_expand_sub operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_block_row_expand_sub") as f:
-            input_tile = f.param("input_tile", ir.TensorType([128, 128], DataType.FP32))
-            input_row = f.param("input_row", ir.TensorType([128, 1], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile = ib.let("tile", block.load(input_tile, 0, 0, 32, 128))
-            row_vec = ib.let("row_vec", block.load(input_row, 0, 0, 32, 1))
-            tile_result = ib.let("tile_result", block.row_expand_sub(tile, row_vec))
-            result = ib.let("result", block.store(tile_result, 0, 0, 32, 128, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.row_expand_sub" in str(func)
-
-    def test_block_row_expand_div(self):
-        """Test block.row_expand_div operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_block_row_expand_div") as f:
-            input_tile = f.param("input_tile", ir.TensorType([128, 128], DataType.FP32))
-            input_row = f.param("input_row", ir.TensorType([128, 1], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile = ib.let("tile", block.load(input_tile, 0, 0, 32, 128))
-            row_vec = ib.let("row_vec", block.load(input_row, 0, 0, 32, 1))
-            tile_result = ib.let("tile_result", block.row_expand_div(tile, row_vec))
-            result = ib.let("result", block.store(tile_result, 0, 0, 32, 128, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.row_expand_div" in str(func)
-
-    def test_block_row_expand_mul(self):
-        """Test block.row_expand_mul operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_block_row_expand_mul") as f:
-            input_tile = f.param("input_tile", ir.TensorType([128, 128], DataType.FP32))
-            input_row = f.param("input_row", ir.TensorType([128, 1], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile = ib.let("tile", block.load(input_tile, 0, 0, 32, 128))
-            row_vec = ib.let("row_vec", block.load(input_row, 0, 0, 32, 1))
-            tile_result = ib.let("tile_result", block.row_expand_mul(tile, row_vec))
-            result = ib.let("result", block.store(tile_result, 0, 0, 32, 128, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.row_expand_mul" in str(func)
+        ir_str = str(Program)
+        assert "block.cmps" in ir_str
 
 
 class TestBlockUnaryOps:
-    """Tests for block unary operations."""
+    """Test suite for block-level unary operators."""
 
-    def test_block_neg(self):
-        """Test block.neg operation."""
-        ib = IRBuilder()
+    def test_block_log(self):
+        """Test block.log operator - natural logarithm of all elements."""
 
-        with ib.function("test_block_neg") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.log(tile_a)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 32))
-            tile_neg = ib.let("tile_neg", block.neg(tile_in))
-            result = ib.let("result", block.store(tile_neg, 0, 0, 32, 32, output_tensor))
-            ib.return_stmt(result)
+        ir_str = str(Program)
+        assert "block.log" in ir_str
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.neg" in str(func)
+    def test_block_abs(self):
+        """Test block.abs operator - absolute value of all elements."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.abs(tile_a)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.abs" in ir_str
+
+    def test_block_relu(self):
+        """Test block.relu operator - ReLU activation function."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.relu(tile_a)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.relu" in ir_str
 
     def test_block_exp(self):
-        """Test block.exp operation."""
-        ib = IRBuilder()
+        """Test block.exp operator - exponential of all elements."""
 
-        with ib.function("test_block_exp") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.exp(tile_a)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 32))
-            tile_exp = ib.let("tile_exp", block.exp(tile_in))
-            result = ib.let("result", block.store(tile_exp, 0, 0, 32, 32, output_tensor))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.exp" in str(func)
-
-    def test_block_recip(self):
-        """Test block.recip operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_block_recip") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 32))
-            tile_recip = ib.let("tile_recip", block.recip(tile_in))
-            result = ib.let("result", block.store(tile_recip, 0, 0, 32, 32, output_tensor))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.recip" in str(func)
+        ir_str = str(Program)
+        assert "block.exp" in ir_str
 
     def test_block_sqrt(self):
-        """Test block.sqrt operation."""
-        ib = IRBuilder()
+        """Test block.sqrt operator - square root of all elements."""
 
-        with ib.function("test_block_sqrt") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.sqrt(tile_a)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 32))
-            tile_sqrt = ib.let("tile_sqrt", block.sqrt(tile_in))
-            result = ib.let("result", block.store(tile_sqrt, 0, 0, 32, 32, output_tensor))
-            ib.return_stmt(result)
+        ir_str = str(Program)
+        assert "block.sqrt" in ir_str
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.sqrt" in str(func)
+    def test_block_neg(self):
+        """Test block.neg operator - negate all elements."""
 
-    def test_block_rsqrt(self):
-        """Test block.rsqrt operation."""
-        ib = IRBuilder()
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.neg(tile_a)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-        with ib.function("test_block_rsqrt") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 32))
-            tile_rsqrt = ib.let("tile_rsqrt", block.rsqrt(tile_in))
-            result = ib.let("result", block.store(tile_rsqrt, 0, 0, 32, 32, output_tensor))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.rsqrt" in str(func)
-
-
-class TestBlockMatMulOps:
-    """Tests for block matrix multiplication operations."""
-
-    def test_block_matmul(self):
-        """Test block.matmul operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_block_matmul") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            input_b = f.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 64))
-            tile_b = ib.let("tile_b", block.load(input_b, 0, 0, 64, 32))
-            tile_c = ib.let("tile_c", block.matmul(tile_a, tile_b))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.matmul" in str(func)
-
-    def test_block_matmul_acc(self):
-        """Test block.matmul_acc operation."""
-        ib = IRBuilder()
-
-        with ib.function("test_block_matmul_acc") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 256], DataType.FP16))
-            input_b = f.param("input_b", ir.TensorType([256, 128], DataType.FP16))
-            output = f.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            # Load first K slice
-            tile_a0 = ib.let("tile_a0", block.load(input_a, 0, 0, 32, 64))
-            tile_b0 = ib.let("tile_b0", block.load(input_b, 0, 0, 64, 32))
-
-            # Initial matmul
-            tile_c0 = ib.let("tile_c0", block.matmul(tile_a0, tile_b0))
-
-            # Load second K slice
-            tile_a1 = ib.let("tile_a1", block.load(input_a, 0, 64, 32, 64))
-            tile_b1 = ib.let("tile_b1", block.load(input_b, 64, 0, 64, 32))
-
-            # Accumulate
-            tile_c1 = ib.let("tile_c1", block.matmul_acc(tile_c0, tile_a1, tile_b1))
-
-            # Store result
-            result = ib.let("result", block.store(tile_c1, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.matmul" in str(func)
-        assert "block.matmul_acc" in str(func)
+        ir_str = str(Program)
+        assert "block.neg" in ir_str
 
 
 class TestBlockReductionOps:
-    """Tests for block reduction operations."""
+    """Test suite for block-level reduction operators."""
 
-    def test_block_max(self):
-        """Test block.max operation."""
-        ib = IRBuilder()
+    def test_block_sum_axis0(self):
+        """Test block.sum operator - sum along axis 0 (column-wise)."""
 
-        with ib.function("test_block_max") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 1], DataType.FP32))
-            f.return_type(ir.TensorType([128, 1], DataType.FP32))
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[1, 32], pl.FP32] = pl.sum(tile_a, axis=0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [1, 32], output)
+                return result
 
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 128))
-            tile_max = ib.let("tile_max", block.max(tile_in, axis=1, keepdim=True))
-            result = ib.let("result", block.store(tile_max, 0, 0, 32, 1, output_tensor))
-            ib.return_stmt(result)
+        ir_str = str(Program)
+        assert "block.sum" in ir_str
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.max" in str(func)
+    def test_block_sum_axis1(self):
+        """Test block.sum operator - sum along axis 1 (row-wise)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 1], pl.FP32] = pl.sum(tile_a, axis=1)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 1], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.sum" in ir_str
+
+    def test_block_max_axis0(self):
+        """Test block.max operator - max along axis 0 (column-wise)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[1, 32], pl.FP32] = pl.max(tile_a, axis=0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [1, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.max" in ir_str
+
+    def test_block_max_axis1(self):
+        """Test block.max operator - max along axis 1 (row-wise)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 1], pl.FP32] = pl.max(tile_a, axis=1)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 1], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.max" in ir_str
 
     def test_block_row_max(self):
         """Test block.row_max operation."""
-        ib = IRBuilder()
 
-        with ib.function("test_block_row_max") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 1], DataType.FP32))
-            f.return_type(ir.TensorType([128, 1], DataType.FP32))
+        @pl.program
+        class RowMaxKernel:
+            @pl.function(type=pl.FunctionType.InCore)
+            def row_max_kernel(
+                self, input: pl.Tensor[[128, 128], pl.FP32], output: pl.Tensor[[128, 1], pl.FP32]
+            ) -> pl.Tensor[[128, 1], pl.FP32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tmp_tile: pl.Tile[[32, 1], pl.FP32] = pl.block.create_tile(
+                    [32, 1], dtype=pl.FP32, target_memory=1
+                )
+                tile_max: pl.Tile[[32, 1], pl.FP32] = pl.row_max(tile_in, tmp_tile)
+                result: pl.Tensor[[128, 1], pl.FP32] = pl.store(tile_max, [0, 0], [32, 1], output)
+                return result
 
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 128))
-            tile_row_max = ib.let("tile_row_max", block.row_max(tile_in))
-            result = ib.let("result", block.store(tile_row_max, 0, 0, 32, 1, output_tensor))
-            ib.return_stmt(result)
+        program = RowMaxKernel
+        pm = PassManager.get_strategy()
+        optimized_program = pm.run_passes(program)
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.row_max" in str(func)
+        assert optimized_program is not None
+        assert "block.row_max" in str(optimized_program)
 
     def test_block_row_sum(self):
         """Test block.row_sum operation."""
-        ib = IRBuilder()
 
-        with ib.function("test_block_row_sum") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 1], DataType.FP32))
-            f.return_type(ir.TensorType([128, 1], DataType.FP32))
+        @pl.program
+        class RowSumKernel:
+            @pl.function(type=pl.FunctionType.InCore)
+            def row_sum_kernel(
+                self, input: pl.Tensor[[128, 128], pl.FP32], output: pl.Tensor[[128, 1], pl.FP32]
+            ) -> pl.Tensor[[128, 1], pl.FP32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tmp_tile: pl.Tile[[32, 1], pl.FP32] = pl.block.create_tile(
+                    [32, 1], dtype=pl.FP32, target_memory=1
+                )
+                tile_sum: pl.Tile[[32, 1], pl.FP32] = pl.row_sum(tile_in, tmp_tile)
+                result: pl.Tensor[[128, 1], pl.FP32] = pl.store(tile_sum, [0, 0], [32, 1], output)
+                return result
 
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 128))
-            tile_row_sum = ib.let("tile_row_sum", block.row_sum(tile_in))
-            result = ib.let("result", block.store(tile_row_sum, 0, 0, 32, 1, output_tensor))
-            ib.return_stmt(result)
+        program = RowSumKernel
+        pm = PassManager.get_strategy()
+        optimized_program = pm.run_passes(program)
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.row_sum" in str(func)
+        assert optimized_program is not None
+        assert "block.row_sum" in str(optimized_program)
 
-    def test_block_sum_no_keepdim(self):
-        """Test block.sum operation without keepdim."""
-        ib = IRBuilder()
+    def test_block_row_min(self):
+        """Test block.row_min operation."""
 
-        with ib.function("test_block_sum") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 1], DataType.FP32))
-            f.return_type(ir.TensorType([128, 1], DataType.FP32))
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 1], pl.FP32],
+            ) -> pl.Tensor[[128, 1], pl.FP32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tmp_tile: pl.Tile[[32, 128], pl.FP32] = pl.block.create_tile(
+                    [32, 128], dtype=pl.FP32, target_memory=1
+                )
+                tile_row_min: pl.Tile[[32, 1], pl.FP32] = pl.row_min(tile_in, tmp_tile)
+                result: pl.Tensor[[128, 1], pl.FP32] = pl.store(tile_row_min, [0, 0], [32, 1], output)
+                return result
 
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 128))
-            # Sum along axis 1 (columns), result shape should be (32, 1) with keepdim=True
-            tile_sum = ib.let("tile_sum", block.sum(tile_in, axis=1, keepdim=True))
-            result = ib.let("result", block.store(tile_sum, 0, 0, 32, 1, output_tensor))
-            ib.return_stmt(result)
+        ir_str = str(Program)
+        assert "block.row_min" in ir_str
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.sum" in str(func)
+    def test_block_min_axis0(self):
+        """Test block.min operator - min along axis 0 (column-wise)."""
 
-    def test_block_sum_keepdim(self):
-        """Test block.sum operation with keepdim."""
-        ib = IRBuilder()
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[1, 32], pl.FP32] = pl.min(tile_a, axis=0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [1, 32], output)
+                return result
 
-        with ib.function("test_block_sum_keepdim") as f:
-            input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f.param("output", ir.TensorType([128, 1], DataType.FP32))
-            f.return_type(ir.TensorType([128, 1], DataType.FP32))
+        ir_str = str(Program)
+        assert "block.min" in ir_str
 
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 128))
-            # Sum along axis 1 (columns), result shape should be (32, 1)
-            tile_sum = ib.let("tile_sum", block.sum(tile_in, axis=1, keepdim=True))
-            result = ib.let("result", block.store(tile_sum, 0, 0, 32, 1, output_tensor))
-            ib.return_stmt(result)
+    def test_block_min_axis1(self):
+        """Test block.min operator - min along axis 1 (row-wise)."""
 
-        func = f.get_result()
-        assert func is not None
-        assert "block.sum" in str(func)
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 1], pl.FP32] = pl.min(tile_a, axis=1)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 1], output)
+                return result
 
-
-class TestBlockOpsIntegration:
-    """Integration tests for block operations."""
-
-    def test_build_program_with_block_ops(self):
-        """Test building a complete Program with block operations."""
-        ib = IRBuilder()
-
-        # Build first function: element-wise multiplication
-        with ib.function("block_multiply") as f1:
-            input_a = f1.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            input_b = f1.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-            output = f1.param("output", ir.TensorType([128, 128], DataType.FP32))
-            f1.return_type(ir.TensorType([128, 128], DataType.FP32))
-
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 32))
-            tile_b = ib.let("tile_b", block.load(input_b, 0, 0, 32, 32))
-            tile_c = ib.let("tile_c", block.mul(tile_a, tile_b))
-            result = ib.let("result", block.store(tile_c, 0, 0, 32, 32, output))
-            ib.return_stmt(result)
-
-        func1 = f1.get_result()
-
-        # Build second function: reduction sum
-        with ib.function("block_reduce_sum") as f2:
-            input_tensor = f2.param("input", ir.TensorType([128, 128], DataType.FP32))
-            output_tensor = f2.param("output", ir.TensorType([128, 1], DataType.FP32))
-            f2.return_type(ir.TensorType([128, 1], DataType.FP32))
-
-            tile_in = ib.let("tile_in", block.load(input_tensor, 0, 0, 32, 128))
-            tile_sum = ib.let("tile_sum", block.sum(tile_in, axis=1, keepdim=True))
-            result = ib.let("result", block.store(tile_sum, 0, 0, 32, 1, output_tensor))
-            ib.return_stmt(result)
-
-        func2 = f2.get_result()
-
-        # Create a Program with both functions
-        program = ir.Program([func1, func2], "block_ops_program", ir.Span.unknown())
-
-        assert program is not None
-        assert len(program.functions) == 2
-        assert program.name == "block_ops_program"
-
-        # Verify we can retrieve functions by name
-        retrieved_func1 = program.get_function("block_multiply")
-        assert retrieved_func1 is not None
-        assert retrieved_func1.name == "block_multiply"
-
-        retrieved_func2 = program.get_function("block_reduce_sum")
-        assert retrieved_func2 is not None
-        assert retrieved_func2.name == "block_reduce_sum"
-
-        # Print program
-        print(f"\n{program}")
-
-    def test_complex_block_computation(self):
-        """Test complex block computation combining multiple operations."""
-        ib = IRBuilder()
-
-        with ib.function("complex_block_computation") as f:
-            input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-            input_b = f.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-            input_c = f.param("input_c", ir.TensorType([128, 128], DataType.FP32))
-            output = f.param("output", ir.TensorType([128, 1], DataType.FP32))
-            f.return_type(ir.TensorType([128, 1], DataType.FP32))
-
-            # Load tiles
-            tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 32, 128))
-            tile_b = ib.let("tile_b", block.load(input_b, 0, 0, 32, 128))
-            tile_c = ib.let("tile_c", block.load(input_c, 0, 0, 32, 128))
-
-            # Compute: sqrt(a * b + c)
-            tile_mul = ib.let("tile_mul", block.mul(tile_a, tile_b))
-            tile_add = ib.let("tile_add", block.add(tile_mul, tile_c))
-            tile_sqrt = ib.let("tile_sqrt", block.sqrt(tile_add))
-
-            # Reduce along axis 1
-            tile_sum = ib.let("tile_sum", block.sum(tile_sqrt, axis=1, keepdim=True))
-
-            # Store result
-            result = ib.let("result", block.store(tile_sum, 0, 0, 32, 1, output))
-            ib.return_stmt(result)
-
-        func = f.get_result()
-        assert func is not None
-        assert "block.mul" in str(func)
-        assert "block.add" in str(func)
-        assert "block.sqrt" in str(func)
-        assert "block.sum" in str(func)
-        assert "block.load" in str(func)
-        assert "block.store" in str(func)
-        # Print function
-        print(f"\n{func}")
+        ir_str = str(Program)
+        assert "block.min" in ir_str
 
 
-def test_block_ops_pipe():
-    """Test that block operators have the correct pipe property."""
+class TestBlockBroadcastOps:
+    """Test suite for block-level broadcast operators."""
 
-    # MTE2 ops
-    op = ir.get_op("block.load")
-    assert op.pipe == ir.PipeType.MTE2
+    def test_block_col_expand(self):
+        """Test block.col_expand operator - expand column vector to target shape."""
 
-    # MTE3 ops
-    op = ir.get_op("block.store")
-    assert op.pipe == ir.PipeType.MTE3
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                target: pl.Tensor[[128, 128], pl.FP32],
+                col: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_target: pl.Tile[[32, 32], pl.FP32] = pl.load(target, [0, 0], [32, 32])
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand(tile_target, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-    # M (Matrix Unit) ops
-    matrix_ops = ["block.matmul", "block.matmul_acc"]
-    for op_name in matrix_ops:
-        op = ir.get_op(op_name)
-        assert op.pipe == ir.PipeType.M
+        ir_str = str(Program)
+        assert "block.col_expand" in ir_str
 
-    # MTE1 ops
-    op = ir.get_op("block.move")
-    assert op.pipe == ir.PipeType.MTE1
+    def test_block_col_expand_mul(self):
+        """Test block.col_expand_mul operator - expand column and multiply with tile."""
 
-    # Vector ops
-    vector_ops = [
-        "block.mul",
-        "block.add",
-        "block.div",
-        "block.sub",
-        "block.maximum",
-        "block.sum",
-        "block.max",
-        "block.row_max",
-        "block.row_sum",
-        "block.neg",
-        "block.exp",
-        "block.recip",
-        "block.sqrt",
-        "block.rsqrt",
-        "block.row_expand_sub",
-        "block.row_expand_div",
-        "block.row_expand_mul",
-    ]
-    for op_name in vector_ops:
-        op = ir.get_op(op_name)
-        assert op.pipe == ir.PipeType.V
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                col: pl.Tensor[[128, 128], pl.FP32],
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand_mul(tile_a, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
 
-    # Scalar ops
-    op = ir.get_op("block.get_block_idx")
-    assert op.pipe == ir.PipeType.S
+        ir_str = str(Program)
+        assert "block.col_expand_mul" in ir_str
+
+    def test_block_col_expand_div(self):
+        """Test block.col_expand_div operator - expand column and divide tile."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                col: pl.Tensor[[128, 128], pl.FP32],
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand_div(tile_a, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.col_expand_div" in ir_str
+
+    def test_block_col_expand_sub(self):
+        """Test block.col_expand_sub operator - expand column and subtract from tile."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                col: pl.Tensor[[128, 128], pl.FP32],
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand_sub(tile_a, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.col_expand_sub" in ir_str
+
+    def test_block_row_expand_add(self):
+        """Test block.row_expand_add operator - expand row and add to tile."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_add(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.row_expand_add" in ir_str
+
+    def test_block_expands(self):
+        """Test block.expands operator - expand scalar to tile shape."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.expands(tile_a, 1.0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.expands" in ir_str
+
+
+class TestBlockMatMulOps:
+    """Test suite for block-level matrix multiplication operators."""
+
+    def test_block_matmul(self):
+        """Test block.matmul operator - matrix multiplication."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 64], pl.FP32],
+                b: pl.Tensor[[64, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 16], pl.FP32] = pl.load(a, [0, 0], [32, 16])
+                tile_b: pl.Tile[[16, 32], pl.FP32] = pl.load(b, [0, 0], [16, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.matmul(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.matmul" in ir_str
+
+
+class TestBlockTransformOps:
+    """Test suite for block-level transform operators."""
+
+    def test_block_transpose(self):
+        """Test block.transpose operator - transpose a tile."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 64], pl.FP32],
+                output: pl.Tensor[[64, 128], pl.FP32],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 16], pl.FP32] = pl.load(a, [0, 0], [32, 16])
+                tile_c: pl.Tile[[16, 32], pl.FP32] = pl.transpose(tile_a, axis1=0, axis2=1)
+                result: pl.Tensor[[64, 128], pl.FP32] = pl.store(tile_c, [0, 0], [16, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.transpose" in ir_str
+
+
+class TestTileTransformOps:
+    """Tests for tile transform operations."""
+
+    def test_tile_view(self):
+        """Test tile.view operation."""
+        span = ir.Span.unknown()
+
+        # Create a tile variable [16, 32]
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        dim32 = ir.ConstInt(32, DataType.INT32, span)
+        tile_type = ir.TileType([dim16, dim32], DataType.FP16)
+        tile_var = ir.Var("tile", tile_type, span)
+
+        # Create a view [8, 16] with offset [0, 0]
+        call = block.view(tile_var, [8, 16], [0, 0])
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.view"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP16
+        assert len(result_type.shape) == 2
+
+    def test_tile_reshape(self):
+        """Test tile.reshape operation."""
+        span = ir.Span.unknown()
+
+        # Create a tile variable [4, 8]
+        dim4 = ir.ConstInt(4, DataType.INT32, span)
+        dim8 = ir.ConstInt(8, DataType.INT32, span)
+        tile_type = ir.TileType([dim4, dim8], DataType.FP32)
+        tile_var = ir.Var("tile", tile_type, span)
+
+        # Reshape to [8, 4]
+        call = block.reshape(tile_var, [8, 4])
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.reshape"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP32
+        assert len(result_type.shape) == 2
+
+        # Reshape to [32, 1]
+        call2 = block.reshape(tile_var, [32, 1])
+        result_type2 = call2.type
+        assert isinstance(result_type2, ir.TileType)
+        assert len(result_type2.shape) == 2
+
+    def test_tile_transpose(self):
+        """Test tile.transpose operation."""
+        span = ir.Span.unknown()
+
+        # Create a tile [8, 16]
+        dim8 = ir.ConstInt(8, DataType.INT32, span)
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        tile_type = ir.TileType([dim8, dim16], DataType.FP16)
+        tile_var = ir.Var("tile", tile_type, span)
+
+        # Transpose: [8, 16] -> [16, 8]
+        call = block.transpose(tile_var, 0, 1)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.transpose"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP16
+        assert len(result_type.shape) == 2
+
+    def test_tile_transpose_negative_axis(self):
+        """Test tile.transpose with negative axis indices."""
+        span = ir.Span.unknown()
+
+        # Create a tile [8, 16]
+        dim8 = ir.ConstInt(8, DataType.INT32, span)
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        tile_type = ir.TileType([dim8, dim16], DataType.FP32)
+        tile_var = ir.Var("tile", tile_type, span)
+
+        # Transpose using negative indices: axis1=-2 (0), axis2=-1 (1)
+        # [8, 16] -> [16, 8]
+        call = block.transpose(tile_var, -2, -1)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.transpose"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+
+    def test_transform_operators_registered(self):
+        """Test that transform operators are registered."""
+        assert ir.is_op_registered("block.view")
+        assert ir.is_op_registered("block.reshape")
+        assert ir.is_op_registered("block.transpose")
+
+
+class TestBlockBatchMatMulOps:
+    """Tests for block batch matrix multiplication operations."""
+
+    def test_batch_matmul_2d(self):
+        """Test block.batch_matmul with 2D tiles (equivalent to regular matmul)."""
+        span = ir.Span.unknown()
+
+        # Create 2D tiles: [16, 32] @ [32, 64] -> [16, 64]
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        dim32 = ir.ConstInt(32, DataType.INT32, span)
+        dim64 = ir.ConstInt(64, DataType.INT32, span)
+
+        lhs_type = ir.TileType([dim16, dim32], DataType.FP16)
+        rhs_type = ir.TileType([dim32, dim64], DataType.FP16)
+
+        lhs = ir.Var("lhs", lhs_type, span)
+        rhs = ir.Var("rhs", rhs_type, span)
+
+        # Create batch_matmul call
+        call = ir.create_op_call("block.batch_matmul", [lhs, rhs], {}, span)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.batch_matmul"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert len(result_type.shape) == 2
+        assert result_type.dtype == DataType.FP16
+
+    def test_batch_matmul_3d(self):
+        """Test block.batch_matmul with 3D tiles (batch dimension)."""
+        span = ir.Span.unknown()
+
+        # Create 3D tiles: [4, 16, 32] @ [4, 32, 64] -> [4, 16, 64]
+        dim4 = ir.ConstInt(4, DataType.INT32, span)
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        dim32 = ir.ConstInt(32, DataType.INT32, span)
+        dim64 = ir.ConstInt(64, DataType.INT32, span)
+
+        lhs_type = ir.TileType([dim4, dim16, dim32], DataType.FP32)
+        rhs_type = ir.TileType([dim4, dim32, dim64], DataType.FP32)
+
+        lhs = ir.Var("lhs", lhs_type, span)
+        rhs = ir.Var("rhs", rhs_type, span)
+
+        # Create batch_matmul call
+        call = ir.create_op_call("block.batch_matmul", [lhs, rhs], {}, span)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.batch_matmul"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert len(result_type.shape) == 3
+        assert result_type.dtype == DataType.FP32
+
+    def test_batch_matmul_4d(self):
+        """Test block.batch_matmul with 4D tiles (multiple batch dimensions)."""
+        span = ir.Span.unknown()
+
+        # Create 4D tiles: [2, 3, 16, 32] @ [2, 3, 32, 64] -> [2, 3, 16, 64]
+        dim2 = ir.ConstInt(2, DataType.INT32, span)
+        dim3 = ir.ConstInt(3, DataType.INT32, span)
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        dim32 = ir.ConstInt(32, DataType.INT32, span)
+        dim64 = ir.ConstInt(64, DataType.INT32, span)
+
+        lhs_type = ir.TileType([dim2, dim3, dim16, dim32], DataType.FP16)
+        rhs_type = ir.TileType([dim2, dim3, dim32, dim64], DataType.FP16)
+
+        lhs = ir.Var("lhs", lhs_type, span)
+        rhs = ir.Var("rhs", rhs_type, span)
+
+        # Create batch_matmul call
+        call = ir.create_op_call("block.batch_matmul", [lhs, rhs], {}, span)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.batch_matmul"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert len(result_type.shape) == 4
+        assert result_type.dtype == DataType.FP16
+
+    def test_batch_matmul_broadcast(self):
+        """Test block.batch_matmul with broadcasting batch dimensions."""
+        span = ir.Span.unknown()
+
+        # Create tiles with different batch shapes: [1, 16, 32] @ [4, 32, 64] -> [4, 16, 64]
+        dim1 = ir.ConstInt(1, DataType.INT32, span)
+        dim4 = ir.ConstInt(4, DataType.INT32, span)
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        dim32 = ir.ConstInt(32, DataType.INT32, span)
+        dim64 = ir.ConstInt(64, DataType.INT32, span)
+
+        lhs_type = ir.TileType([dim1, dim16, dim32], DataType.FP32)
+        rhs_type = ir.TileType([dim4, dim32, dim64], DataType.FP32)
+
+        lhs = ir.Var("lhs", lhs_type, span)
+        rhs = ir.Var("rhs", rhs_type, span)
+
+        # Create batch_matmul call
+        call = ir.create_op_call("block.batch_matmul", [lhs, rhs], {}, span)
+
+        assert isinstance(call, ir.Call)
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert len(result_type.shape) == 3
+
+
+class TestMultiDimensionalTileOps:
+    """Tests for multi-dimensional TileType operations."""
+
+    def test_transpose_3d(self):
+        """Test transpose on 3D tile."""
+        span = ir.Span.unknown()
+
+        # Create a 3D tile [4, 8, 16]
+        dim4 = ir.ConstInt(4, DataType.INT32, span)
+        dim8 = ir.ConstInt(8, DataType.INT32, span)
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        tile_type = ir.TileType([dim4, dim8, dim16], DataType.FP16)
+        tile_var = ir.Var("tile", tile_type, span)
+
+        # Transpose axes 0 and 2: [4, 8, 16] -> [16, 8, 4]
+        call = block.transpose(tile_var, 0, 2)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.transpose"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert len(result_type.shape) == 3
+
+    def test_row_max_3d(self):
+        """Test row_max on 3D tile."""
+        span = ir.Span.unknown()
+
+        # Create a 3D tile [4, 16, 32]
+        dim4 = ir.ConstInt(4, DataType.INT32, span)
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        dim32 = ir.ConstInt(32, DataType.INT32, span)
+        tile_type = ir.TileType([dim4, dim16, dim32], DataType.FP32)
+        tile_var = ir.Var("tile", tile_type, span)
+        tmp_tile = ir.Var("tmp_tile", tile_type, span)
+
+        # row_max should reduce the last dimension: [4, 16, 32] -> [4, 16, 1]
+        call = block.row_max(tile_var, tmp_tile)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.row_max"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert len(result_type.shape) == 3
+
+    def test_view_3d(self):
+        """Test view operation on 3D tile."""
+        span = ir.Span.unknown()
+
+        # Create a 3D tile [4, 16, 32]
+        dim4 = ir.ConstInt(4, DataType.INT32, span)
+        dim16 = ir.ConstInt(16, DataType.INT32, span)
+        dim32 = ir.ConstInt(32, DataType.INT32, span)
+        tile_type = ir.TileType([dim4, dim16, dim32], DataType.FP16)
+        tile_var = ir.Var("tile", tile_type, span)
+
+        # Create a view with different shape [2, 8, 16]
+        new_shape = [2, 8, 16]
+        offset = [0, 0, 0]
+        call = block.view(tile_var, new_shape, offset)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "block.view"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert len(result_type.shape) == 3
 
 
 if __name__ == "__main__":

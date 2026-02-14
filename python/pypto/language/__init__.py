@@ -12,8 +12,9 @@ PyPTO Language module - Type-safe DSL API for writing IR functions.
 
 This module provides:
 - function decorator for parsing DSL functions to IR
-- Tensor type for type annotations and runtime wrapping
-- Type-safe operation wrappers (op.tensor.*)
+- Tensor type for tensor annotations and runtime wrapping
+- Tile type for tile/block annotations and runtime wrapping
+- Type-safe operation wrappers (tensor.*, block.*, and unified ops)
 - DSL helpers (range, yield_)
 - DataType constants
 
@@ -22,22 +23,84 @@ Typical usage:
 
     @pl.function
     def my_func(x: pl.Tensor[[64, 128], pl.FP16]) -> pl.Tensor[[64, 128], pl.FP32]:
-        result: pl.Tensor[[64, 128], pl.FP32] = pl.op.tensor.create([64, 128], dtype=pl.FP32)
+        result: pl.Tensor[[64, 128], pl.FP32] = pl.create_tensor([64, 128], dtype=pl.FP32)
         return result
+
+    @pl.function
+    def block_func(x: pl.Tensor[[64, 64], pl.FP32]) -> pl.Tensor[[64, 64], pl.FP32]:
+        tile: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64])
+        result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+        return pl.store(result, [0, 0], [64, 64], x)
+
+    @pl.function
+    def scalar_func(x: pl.Scalar[pl.FP32]) -> pl.Scalar[pl.FP32]:
+        return x
 """
 
 # Import decorators and parsing functions from local parser module
 from pypto.pypto_core import DataType
+from pypto.pypto_core.ir import ForKind, FunctionType
 
-from . import op, parser
-from .dsl_api import range, yield_
+from . import parser
+from .dsl_api import cond, incore, parallel, range, while_, yield_
+from .op import block_ops as block
+from .op import tensor_ops as tensor
+from .op.block_ops import (
+    abs,
+    cmp,
+    cmps,
+    col_expand,
+    col_expand_div,
+    col_expand_mul,
+    col_expand_sub,
+    create_tile,
+    expands,
+    l0c_store,
+    load,
+    log,
+    matmul_acc,
+    max,
+    min,
+    minimum,
+    move,
+    neg,
+    recip,
+    relu,
+    row_expand_add,
+    row_expand_div,
+    row_expand_mul,
+    row_expand_sub,
+    row_min,
+    rsqrt,
+    sqrt,
+    store,
+    sum,
+    ub_copy,
+)
+from .op.tensor_ops import assemble, create_tensor, dim
+from .op.unified_ops import (
+    add,
+    cast,
+    div,
+    exp,
+    matmul,
+    maximum,
+    mul,
+    reshape,
+    row_max,
+    row_sum,
+    sub,
+    transpose,
+    view,
+)
 from .parser.decorator import function, program
-from .parser.text_parser import load, load_program, parse, parse_program
-from .tensor import Tensor
+from .parser.text_parser import loads, loads_program, parse, parse_program
+from .typing import DynVar, Scalar, Tensor, Tile, dynamic
 
 # Re-export DataType constants for convenience
 FP4 = DataType.FP4
-FP8 = DataType.FP8
+FP8E4M3FN = DataType.FP8E4M3FN
+FP8E5M2 = DataType.FP8E5M2
 FP16 = DataType.FP16
 FP32 = DataType.FP32
 BF16 = DataType.BF16
@@ -60,15 +123,76 @@ __all__ = [
     "program",
     "parse",
     "parser",
-    "load",
+    "loads",
     "parse_program",
-    "load_program",
+    "loads_program",
     "Tensor",
+    "Tile",
+    "Scalar",
+    "DynVar",
+    "dynamic",
     "range",
+    "parallel",
+    "while_",
     "yield_",
-    "op",
+    "cond",
+    "incore",
+    "block",
+    "tensor",
+    # Unified dispatch
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "maximum",
+    "exp",
+    "cast",
+    "reshape",
+    "transpose",
+    "view",
+    "matmul",
+    "row_max",
+    "row_sum",
+    # Promoted block-only
+    "create_tile",
+    "load",
+    "store",
+    "l0c_store",
+    "move",
+    "ub_copy",
+    "neg",
+    "sqrt",
+    "rsqrt",
+    "recip",
+    "log",
+    "abs",
+    "relu",
+    "matmul_acc",
+    "minimum",
+    "min",
+    "sum",
+    "max",
+    "cmp",
+    "cmps",
+    "row_min",
+    "row_expand_add",
+    "row_expand_sub",
+    "row_expand_mul",
+    "row_expand_div",
+    "col_expand",
+    "col_expand_mul",
+    "col_expand_div",
+    "col_expand_sub",
+    "expands",
+    # Promoted tensor-only
+    "create_tensor",
+    "assemble",
+    "dim",
+    "FunctionType",
+    "ForKind",
     "FP4",
-    "FP8",
+    "FP8E4M3FN",
+    "FP8E5M2",
     "FP16",
     "FP32",
     "BF16",

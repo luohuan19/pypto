@@ -24,7 +24,6 @@
 #include <vector>
 
 #include "../module.h"
-#include "pypto/codegen/pto_codegen.h"
 #include "pypto/core/any_cast.h"
 #include "pypto/core/common.h"
 #include "pypto/core/error.h"
@@ -42,6 +41,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "pypto/ir/type.h"
 
 namespace nb = nanobind;
@@ -223,19 +223,50 @@ void BindIR(nb::module_& m) {
       },
       nb::arg("other"), "Check if this ShapedType shares the same MemRef object with another ShapedType");
 
+  // TensorLayout enum - must be before TensorView and TensorType
+  nb::enum_<TensorLayout>(ir, "TensorLayout", "Tensor layout enumeration")
+      .value("ND", TensorLayout::ND, "ND layout")
+      .value("DN", TensorLayout::DN, "DN layout")
+      .value("NZ", TensorLayout::NZ, "NZ layout")
+      .export_values();
+
+  // TensorView - struct for tensor view information - must be before TensorType
+  nb::class_<TensorView>(ir, "TensorView", "Tensor view representation with stride and layout")
+      .def(nb::init<>(), "Create an empty tensor view")
+      .def(nb::init<const std::vector<ExprPtr>&, TensorLayout>(), nb::arg("stride"), nb::arg("layout"),
+           "Create a tensor view with stride and layout")
+      .def_rw("stride", &TensorView::stride, "Stride for each dimension")
+      .def_rw("layout", &TensorView::layout, "Tensor layout type");
+
   // TensorType - const shared_ptr
   auto tensor_type_class = nb::class_<TensorType, ShapedType>(ir, "TensorType", "Tensor type representation");
   tensor_type_class.def(nb::init<const std::vector<ExprPtr>&, DataType, std::optional<MemRefPtr>>(),
-                        nb::arg("shape"), nb::arg("dtype"), nb::arg("memref").none(), "Create a tensor type");
+                        nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(),
+                        "Create a tensor type");
+  tensor_type_class.def(nb::init<const std::vector<int64_t>&, DataType, std::optional<MemRefPtr>>(),
+                        nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(),
+                        "Create a tensor type");
+  tensor_type_class.def(
+      nb::init<const std::vector<ExprPtr>&, DataType, std::optional<MemRefPtr>, std::optional<TensorView>>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tensor_view") = nb::none(),
+      "Create a tensor type with optional memory reference and tensor view");
+  tensor_type_class.def(
+      nb::init<const std::vector<int64_t>&, DataType, std::optional<MemRefPtr>, std::optional<TensorView>>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tensor_view") = nb::none(),
+      "Create a tensor type with constant shape, optional memory reference and tensor view");
   BindFields<TensorType>(tensor_type_class);
 
   // TileType - const shared_ptr
-  auto tile_type_class = nb::class_<TileType, ShapedType>(
-      ir, "TileType", "Tile type representation (2D tensor with at most 2 dimensions)");
+  auto tile_type_class =
+      nb::class_<TileType, ShapedType>(ir, "TileType", "Tile type representation (multi-dimensional tensor)");
   tile_type_class.def(
       nb::init<const std::vector<ExprPtr>&, DataType, std::optional<MemRefPtr>, std::optional<TileView>>(),
-      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref").none(), nb::arg("tile_view").none(),
-      "Create a tile type (validates shape has at most 2 dimensions)");
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tile_view") = nb::none(),
+      "Create a tile type (supports multi-dimensional tensors; code generation has constraints)");
+  tile_type_class.def(
+      nb::init<const std::vector<int64_t>&, DataType, std::optional<MemRefPtr>, std::optional<TileView>>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tile_view") = nb::none(),
+      "Create a tile type (supports multi-dimensional tensors; code generation has constraints)");
   BindFields<TileType>(tile_type_class);
 
   // TupleType - const shared_ptr
@@ -421,6 +452,12 @@ void BindIR(nb::module_& m) {
       },
       "Keyword arguments (metadata) for this call");
 
+  // MakeTuple - const shared_ptr
+  auto make_tuple_class = nb::class_<MakeTuple, Expr>(ir, "MakeTuple", "Tuple construction expression");
+  make_tuple_class.def(nb::init<const std::vector<ExprPtr>&, const Span&>(), nb::arg("elements"),
+                       nb::arg("span"), "Create a tuple construction expression");
+  BindFields<MakeTuple>(make_tuple_class);
+
   // TupleGetItemExpr - const shared_ptr
   auto tuple_get_item_class =
       nb::class_<TupleGetItemExpr, Expr>(ir, "TupleGetItemExpr", "Tuple element access expression");
@@ -577,7 +614,7 @@ void BindIR(nb::module_& m) {
       ir, "IfStmt", "Conditional statement: if condition then then_body else else_body");
   if_stmt_class.def(nb::init<const ExprPtr&, const StmtPtr&, const std::optional<StmtPtr>&,
                              const std::vector<VarPtr>&, const Span&>(),
-                    nb::arg("condition"), nb::arg("then_body"), nb::arg("else_body").none(),
+                    nb::arg("condition"), nb::arg("then_body"), nb::arg("else_body") = nb::none(),
                     nb::arg("return_vars"), nb::arg("span"),
                     "Create a conditional statement with then and else branches (else_body can be None)");
   BindFields<IfStmt>(if_stmt_class);
@@ -596,15 +633,43 @@ void BindIR(nb::module_& m) {
   return_stmt_class.def(nb::init<const Span&>(), nb::arg("span"), "Create a return statement without values");
   BindFields<ReturnStmt>(return_stmt_class);
 
+  // ForKind enum (must be before ForStmt which uses it)
+  nb::enum_<ForKind>(ir, "ForKind", "For loop kind classification")
+      .value("Sequential", ForKind::Sequential, "Standard sequential for loop (default)")
+      .value("Parallel", ForKind::Parallel, "Parallel for loop")
+      .export_values();
+
   // ForStmt - const shared_ptr
   auto for_stmt_class = nb::class_<ForStmt, Stmt>(
       ir, "ForStmt", "For loop statement: for loop_var in range(start, stop, step): body");
   for_stmt_class.def(
       nb::init<const VarPtr&, const ExprPtr&, const ExprPtr&, const ExprPtr&, const std::vector<IterArgPtr>&,
-               const StmtPtr&, const std::vector<VarPtr>&, const Span&>(),
+               const StmtPtr&, const std::vector<VarPtr>&, const Span&, ForKind>(),
       nb::arg("loop_var"), nb::arg("start"), nb::arg("stop"), nb::arg("step"), nb::arg("iter_args"),
-      nb::arg("body"), nb::arg("return_vars"), nb::arg("span"), "Create a for loop statement");
+      nb::arg("body"), nb::arg("return_vars"), nb::arg("span"), nb::arg("kind") = ForKind::Sequential,
+      "Create a for loop statement");
   BindFields<ForStmt>(for_stmt_class);
+
+  // WhileStmt - const shared_ptr
+  auto while_stmt_class =
+      nb::class_<WhileStmt, Stmt>(ir, "WhileStmt", "While loop statement: while condition: body");
+  while_stmt_class.def(nb::init<const ExprPtr&, const std::vector<IterArgPtr>&, const StmtPtr&,
+                                const std::vector<VarPtr>&, const Span&>(),
+                       nb::arg("condition"), nb::arg("iter_args"), nb::arg("body"), nb::arg("return_vars"),
+                       nb::arg("span"), "Create a while loop statement");
+  BindFields<WhileStmt>(while_stmt_class);
+
+  // ScopeKind enum
+  nb::enum_<ScopeKind>(ir, "ScopeKind", "Scope kind classification")
+      .value("InCore", ScopeKind::InCore, "InCore scope for AICore sub-graphs")
+      .export_values();
+
+  // ScopeStmt - const shared_ptr
+  auto scope_stmt_class = nb::class_<ScopeStmt, Stmt>(
+      ir, "ScopeStmt", "Scope statement: marks a region with specific execution context");
+  scope_stmt_class.def(nb::init<ScopeKind, const StmtPtr&, const Span&>(), nb::arg("scope_kind"),
+                       nb::arg("body"), nb::arg("span"), "Create a scope statement");
+  BindFields<ScopeStmt>(scope_stmt_class);
 
   // SeqStmts - const shared_ptr
   auto seq_stmts_class =
@@ -614,10 +679,10 @@ void BindIR(nb::module_& m) {
   BindFields<SeqStmts>(seq_stmts_class);
 
   // OpStmts - const shared_ptr
-  auto op_stmts_class =
-      nb::class_<OpStmts, Stmt>(ir, "OpStmts", "Operation statements: a sequence of assignment statements");
-  op_stmts_class.def(nb::init<const std::vector<AssignStmtPtr>&, const Span&>(), nb::arg("stmts"),
-                     nb::arg("span"), "Create an operation statements");
+  auto op_stmts_class = nb::class_<OpStmts, Stmt>(
+      ir, "OpStmts", "Operation statements: a sequence of assignment and/or evaluation statements");
+  op_stmts_class.def(nb::init<const std::vector<StmtPtr>&, const Span&>(), nb::arg("stmts"), nb::arg("span"),
+                     "Create an operation statements");
   BindFields<OpStmts>(op_stmts_class);
 
   // EvalStmt - const shared_ptr
@@ -626,13 +691,31 @@ void BindIR(nb::module_& m) {
                       "Create an evaluation statement");
   BindFields<EvalStmt>(eval_stmt_class);
 
+  // BreakStmt - const shared_ptr
+  auto break_stmt_class = nb::class_<BreakStmt, Stmt>(ir, "BreakStmt", "Break statement: break");
+  break_stmt_class.def(nb::init<const Span&>(), nb::arg("span"), "Create a break statement");
+  BindFields<BreakStmt>(break_stmt_class);
+
+  // ContinueStmt - const shared_ptr
+  auto continue_stmt_class =
+      nb::class_<ContinueStmt, Stmt>(ir, "ContinueStmt", "Continue statement: continue");
+  continue_stmt_class.def(nb::init<const Span&>(), nb::arg("span"), "Create a continue statement");
+  BindFields<ContinueStmt>(continue_stmt_class);
+
+  // FunctionType enum
+  nb::enum_<FunctionType>(ir, "FunctionType", "Function type classification")
+      .value("Opaque", FunctionType::Opaque, "Unspecified function type (default)")
+      .value("Orchestration", FunctionType::Orchestration, "Host/AICPU control and coordination")
+      .value("InCore", FunctionType::InCore, "AICore sub-graph execution")
+      .export_values();
+
   // Function - const shared_ptr
   auto function_class = nb::class_<Function, IRNode>(
       ir, "Function", "Function definition with name, parameters, return types, and body");
   function_class.def(nb::init<const std::string&, const std::vector<VarPtr>&, const std::vector<TypePtr>&,
-                              const StmtPtr&, const Span&>(),
+                              const StmtPtr&, const Span&, FunctionType>(),
                      nb::arg("name"), nb::arg("params"), nb::arg("return_types"), nb::arg("body"),
-                     nb::arg("span"), "Create a function definition");
+                     nb::arg("span"), nb::arg("type") = FunctionType::Opaque, "Create a function definition");
   BindFields<Function>(function_class);
 
   // Program - const shared_ptr
@@ -727,15 +810,58 @@ void BindIR(nb::module_& m) {
   ir.def("bit_not", &MakeBitNot, nb::arg("operand"), nb::arg("span") = Span::unknown(),
          "Bitwise not operator");
 
-  // PTOCodegen - IR to PTO assembly code generator
-  nb::class_<PTOCodegen>(
-      ir, "PTOCodegen",
-      "Code generator that transforms PyPTO IR to PTO assembly (.pto files). "
-      "Generates PTO ISA instructions in SSA form with tile operations, control flow, and type annotations.")
-      .def(nb::init<>(), "Create a new PTO assembly code generator")
-      .def("generate", &PTOCodegen::Generate, nb::arg("program"),
-           "Generate PTO assembly from PyPTO IR Program. Returns PTO assembly code string (.pto format) with "
-           "instructions like tmul, tadd, FOR/ENDFOR, etc.");
+  // ParentStmtAnalysis - utility class for analyzing statement parent relationships
+  auto parent_stmt_analysis_class = nb::class_<ParentStmtAnalysis>(
+      ir, "ParentStmtAnalysis",
+      "Utility class for analyzing parent-child relationships in statement trees.\n\n"
+      "This class builds a mapping from each statement to its parent statement within\n"
+      "a function's body. It is useful for passes that need to traverse upward in the\n"
+      "IR tree or understand the context of a statement.\n\n"
+      "Example usage:\n"
+      "    analysis = ir.ParentStmtAnalysis()\n"
+      "    analysis.build_map(function)\n"
+      "    parent = analysis.get_parent(some_stmt)\n"
+      "    if parent:\n"
+      "        # Use parent statement\n\n"
+      "Note: The analysis becomes invalid after IR transformations. Call build_map again\n"
+      "if the IR tree is modified.");
+
+  parent_stmt_analysis_class.def(nb::init<>(), "Create a ParentStmtAnalysis instance");
+
+  parent_stmt_analysis_class.def(
+      "build_map", &ParentStmtAnalysis::BuildMap, nb::arg("func"),
+      "Build the parent mapping from a function's body.\n\n"
+      "Traverses the function's statement tree and records parent-child relationships.\n"
+      "This method clears any existing mapping before building the new one.\n\n"
+      "Args:\n"
+      "    func: The function to analyze (can be None, resulting in empty map)\n\n"
+      "Parent relationships established:\n"
+      "- For SeqStmts/OpStmts: Each child statement's parent is the SeqStmts/OpStmts\n"
+      "- For IfStmt: then_body and else_body (if present) have IfStmt as parent\n"
+      "- For ForStmt: body has ForStmt as parent\n"
+      "- Root statement (function.body) has no parent");
+
+  parent_stmt_analysis_class.def("get_parent", &ParentStmtAnalysis::GetParent, nb::arg("stmt"),
+                                 "Get the parent statement of a given statement.\n\n"
+                                 "Args:\n"
+                                 "    stmt: The statement to query\n\n"
+                                 "Returns:\n"
+                                 "    Parent statement, or None if:\n"
+                                 "    - stmt is the root statement (function body)\n"
+                                 "    - stmt is not found in the analyzed tree\n"
+                                 "    - stmt is None");
+
+  parent_stmt_analysis_class.def("has_parent", &ParentStmtAnalysis::HasParent, nb::arg("stmt"),
+                                 "Check if a statement has a recorded parent.\n\n"
+                                 "Args:\n"
+                                 "    stmt: The statement to check\n\n"
+                                 "Returns:\n"
+                                 "    True if stmt has a parent in the map, False otherwise");
+
+  parent_stmt_analysis_class.def("clear", &ParentStmtAnalysis::Clear,
+                                 "Clear the parent mapping.\n\n"
+                                 "Removes all recorded parent-child relationships. Useful for reusing\n"
+                                 "the same ParentStmtAnalysis instance with different functions.");
 }
 
 }  // namespace python

@@ -66,7 +66,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 
 # Find Python and nanobind
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
 find_package(nanobind CONFIG REQUIRED)
 
 # Include directories
@@ -78,13 +78,15 @@ include(${CMAKE_SOURCE_DIR}/cmake/msgpack.cmake)
 
 # PyPTO core sources
 set(PYPTO_SOURCES
-    src/codegen/pto_codegen.cpp
+    src/codegen/pto/pto_codegen.cpp
     src/core/backtrace.cpp
     src/core/error.cpp
     src/ir/core.cpp
     src/ir/expr.cpp
+    src/ir/stmt.cpp
     src/ir/function.cpp
     src/ir/program.cpp
+    src/ir/type.cpp
     src/ir/builder.cpp
     src/ir/memref.cpp
     src/ir/op_registry.cpp
@@ -94,12 +96,15 @@ set(PYPTO_SOURCES
     src/ir/op/tensor_ops/reduction.cpp
     src/ir/op/tensor_ops/unary.cpp
     src/ir/op/tensor_ops/memory.cpp
+    src/ir/op/tensor_ops/transform.cpp
     src/ir/op/block_ops/elementwise.cpp
     src/ir/op/block_ops/reduction.cpp
     src/ir/op/block_ops/unary.cpp
     src/ir/op/block_ops/memory.cpp
     src/ir/op/block_ops/matmul.cpp
+    src/ir/op/block_ops/batch_matmul.cpp
     src/ir/op/block_ops/broadcast.cpp
+    src/ir/op/block_ops/transform.cpp
     src/ir/op/sync_ops/sync.cpp
     src/ir/op/testing.cpp
     src/ir/transforms/visitor.cpp
@@ -109,17 +114,40 @@ set(PYPTO_SOURCES
     src/ir/transforms/structural_equal.cpp
     src/ir/transforms/dependency_analyzer.cpp
     src/ir/transforms/passes.cpp
-    src/ir/transforms/identity_pass.cpp
     src/ir/transforms/init_memref.cpp
     src/ir/transforms/basic_memory_reuse_pass.cpp
     src/ir/transforms/insert_sync_pass.cpp
+    src/ir/transforms/verifier.cpp
+    src/codegen/cce/code_emitter.cpp
+    src/codegen/cce/code_context.cpp
+    src/codegen/cce/type_converter.cpp
+    src/codegen/cce/cce_codegen.cpp
+    src/codegen/codegen_base.cpp
+    src/codegen/orchestration_op_registry.cpp
+    src/codegen/tensor_op_codegen.cpp
+    src/codegen/orchestration/orchestration_codegen.cpp
     src/ir/transforms/add_alloc_pass.cpp
     src/ir/transforms/verify_ssa_pass.cpp
     src/ir/transforms/type_check_pass.cpp
+    src/ir/transforms/convert_to_ssa_pass.cpp
+    src/ir/transforms/outline_incore_scopes_pass.cpp
+    src/ir/transforms/flatten_call_expr_pass.cpp
+    src/ir/transforms/verify_no_nested_call_pass.cpp
+    src/ir/transforms/utils/parent_stmt_analysis.cpp
+    src/ir/transforms/utils/normalize_stmt_structure.cpp
+    src/ir/transforms/utils/flatten_single_stmt.cpp
     src/ir/serialization/serializer.cpp
     src/ir/serialization/deserializer.cpp
     src/ir/serialization/type_registry.cpp
     src/ir/serialization/type_deserializers.cpp
+    src/backend/common/soc.cpp
+    src/backend/common/backend.cpp
+    src/backend/common/backend_config.cpp
+    src/backend/common/backend_registry.cpp
+    src/backend/910B_CCE/backend_910b_cce.cpp
+    src/backend/910B_CCE/backend_910b_cce_ops.cpp
+    src/backend/910B_PTO/backend_910b_pto.cpp
+    src/backend/910B_PTO/backend_910b_pto_ops.cpp
 )
 
 # Include Python bindings

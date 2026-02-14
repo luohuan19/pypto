@@ -24,24 +24,28 @@ Part of the pypto.language package - use via:
 
 import os
 import sys
+from types import TracebackType
+from typing import Optional
 
 # Import DSL helpers from parent language module
 from ..dsl_api import range, yield_
-from ..tensor import Tensor
+from ..typing import Scalar, Tensor, Tile
 from .decorator import function, program
 from .diagnostics import ErrorRenderer, ParserError
-from .text_parser import load, load_program, parse, parse_program
+from .text_parser import loads, loads_program, parse, parse_program
 
 __all__ = [
     "function",
     "program",
     "parse",
-    "load",
+    "loads",
     "parse_program",
-    "load_program",
+    "loads_program",
     "range",
     "yield_",
     "Tensor",
+    "Tile",
+    "Scalar",
 ]
 
 
@@ -50,7 +54,11 @@ def _install_parser_excepthook():
     # Save the original excepthook
     original_excepthook = sys.excepthook
 
-    def parser_excepthook(exc_type, exc_value, exc_traceback):
+    def parser_excepthook(
+        exc_type: type,
+        exc_value: BaseException,
+        exc_traceback: Optional[TracebackType],
+    ) -> None:
         """Custom exception hook that pretty-prints ParserError exceptions."""
         if isinstance(exc_value, ParserError):
             # Check environment variable for debug mode

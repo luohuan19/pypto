@@ -98,6 +98,30 @@ ExprPtr IRMutator::VisitExpr_(const CallPtr& op) {
   }
 }
 
+ExprPtr IRMutator::VisitExpr_(const MakeTuplePtr& op) {
+  // Visit all element expressions
+  std::vector<ExprPtr> new_elements;
+  new_elements.reserve(op->elements_.size());
+  bool changed = false;
+
+  for (const auto& elem : op->elements_) {
+    INTERNAL_CHECK(elem) << "MakeTuple has null element";
+    auto new_elem = ExprFunctor<ExprPtr>::VisitExpr(elem);
+    INTERNAL_CHECK(new_elem) << "MakeTuple element mutated to null";
+    new_elements.push_back(new_elem);
+    if (new_elem.get() != elem.get()) {
+      changed = true;
+    }
+  }
+
+  // Copy-on-write: only create new node if elements changed
+  if (changed) {
+    return std::make_shared<const MakeTuple>(std::move(new_elements), op->span_);
+  } else {
+    return op;
+  }
+}
+
 ExprPtr IRMutator::VisitExpr_(const TupleGetItemExprPtr& op) {
   // Visit the tuple expression
   INTERNAL_CHECK(op->tuple_) << "TupleGetItemExpr has null tuple";
@@ -355,7 +379,76 @@ StmtPtr IRMutator::VisitStmt_(const ForStmtPtr& op) {
       body_changed || return_vars_changed) {
     return std::make_shared<const ForStmt>(std::move(new_loop_var), std::move(new_start), std::move(new_stop),
                                            std::move(new_step), std::move(new_iter_args), std::move(new_body),
-                                           std::move(new_return_vars), op->span_);
+                                           std::move(new_return_vars), op->span_, op->kind_);
+  } else {
+    return op;
+  }
+}
+
+StmtPtr IRMutator::VisitStmt_(const WhileStmtPtr& op) {
+  // Visit and potentially mutate the condition expression
+  INTERNAL_CHECK(op->condition_) << "WhileStmt has null condition";
+  auto new_condition = ExprFunctor<ExprPtr>::VisitExpr(op->condition_);
+  INTERNAL_CHECK(new_condition) << "WhileStmt condition mutated to null";
+  bool condition_changed = (new_condition.get() != op->condition_.get());
+
+  // Visit and potentially mutate iter_args
+  std::vector<IterArgPtr> new_iter_args;
+  bool iter_args_changed = false;
+  new_iter_args.reserve(op->iter_args_.size());
+  for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+    INTERNAL_CHECK(op->iter_args_[i]) << "WhileStmt has null iter_args at index " << i;
+    auto new_iter_arg_expr = ExprFunctor<ExprPtr>::VisitExpr(op->iter_args_[i]);
+    INTERNAL_CHECK(new_iter_arg_expr) << "WhileStmt iter_args at index " << i << " mutated to null";
+    auto new_iter_arg = As<IterArg>(std::static_pointer_cast<const IRNode>(new_iter_arg_expr));
+    INTERNAL_CHECK(new_iter_arg) << "WhileStmt iter_args at index " << i
+                                 << " is not an IterArg after mutation";
+    new_iter_args.push_back(new_iter_arg);
+    if (new_iter_arg.get() != op->iter_args_[i].get()) {
+      iter_args_changed = true;
+    }
+  }
+
+  // Visit and potentially mutate the body
+  INTERNAL_CHECK(op->body_) << "WhileStmt has null body";
+  auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
+  INTERNAL_CHECK(new_body) << "WhileStmt body mutated to null";
+  bool body_changed = (new_body.get() != op->body_.get());
+
+  // Visit and potentially mutate return_vars
+  std::vector<VarPtr> new_return_vars;
+  bool return_vars_changed = false;
+  new_return_vars.reserve(op->return_vars_.size());
+  for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+    INTERNAL_CHECK(op->return_vars_[i]) << "WhileStmt has null return_vars at index " << i;
+    auto new_var_expr = ExprFunctor<ExprPtr>::VisitExpr(op->return_vars_[i]);
+    INTERNAL_CHECK(new_var_expr) << "WhileStmt return_vars at index " << i << " mutated to null";
+    auto new_var = As<Var>(new_var_expr);
+    INTERNAL_CHECK(new_var) << "WhileStmt return_vars at index " << i << " is not a Var after mutation";
+    new_return_vars.push_back(new_var);
+    if (new_var.get() != op->return_vars_[i].get()) {
+      return_vars_changed = true;
+    }
+  }
+
+  // Reconstruct if anything changed
+  if (condition_changed || iter_args_changed || body_changed || return_vars_changed) {
+    return std::make_shared<const WhileStmt>(std::move(new_condition), std::move(new_iter_args),
+                                             std::move(new_body), std::move(new_return_vars), op->span_);
+  } else {
+    return op;
+  }
+}
+
+StmtPtr IRMutator::VisitStmt_(const ScopeStmtPtr& op) {
+  // Visit and potentially mutate the body
+  INTERNAL_CHECK(op->body_) << "ScopeStmt has null body";
+  auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
+  INTERNAL_CHECK(new_body) << "ScopeStmt body mutated to null";
+
+  // Reconstruct if body changed
+  if (new_body.get() != op->body_.get()) {
+    return std::make_shared<const ScopeStmt>(op->scope_kind_, std::move(new_body), op->span_);
   } else {
     return op;
   }
@@ -383,19 +476,19 @@ StmtPtr IRMutator::VisitStmt_(const SeqStmtsPtr& op) {
 }
 
 StmtPtr IRMutator::VisitStmt_(const OpStmtsPtr& op) {
-  std::vector<AssignStmtPtr> new_stmts;
+  std::vector<StmtPtr> new_stmts;
   bool changed = false;
   new_stmts.reserve(op->stmts_.size());
   for (size_t i = 0; i < op->stmts_.size(); ++i) {
-    INTERNAL_CHECK(op->stmts_[i]) << "OpStmts has null assignment statement at index " << i;
+    INTERNAL_CHECK(op->stmts_[i]) << "OpStmts has null statement at index " << i;
     auto new_stmt = StmtFunctor<StmtPtr>::VisitStmt(op->stmts_[i]);
-    INTERNAL_CHECK(new_stmt) << "OpStmts assignment statement at index " << i << " mutated to null";
-    // Cast to AssignStmtPtr (required by OpStmts constructor)
-    auto new_assign_stmt = As<AssignStmt>(new_stmt);
-    INTERNAL_CHECK(new_assign_stmt) << "OpStmts statement at index " << i
-                                    << " is not an AssignStmt after mutation";
-    new_stmts.push_back(new_assign_stmt);
-    if (new_assign_stmt.get() != op->stmts_[i].get()) {
+    INTERNAL_CHECK(new_stmt) << "OpStmts statement at index " << i << " mutated to null";
+    // Verify it's still an AssignStmt or EvalStmt after mutation
+    auto kind = new_stmt->GetKind();
+    INTERNAL_CHECK(kind == ObjectKind::AssignStmt || kind == ObjectKind::EvalStmt)
+        << "OpStmts statement at index " << i << " is not an AssignStmt or EvalStmt after mutation";
+    new_stmts.push_back(new_stmt);
+    if (new_stmt.get() != op->stmts_[i].get()) {
       changed = true;
     }
   }
@@ -417,6 +510,16 @@ StmtPtr IRMutator::VisitStmt_(const EvalStmtPtr& op) {
   } else {
     return op;
   }
+}
+
+StmtPtr IRMutator::VisitStmt_(const BreakStmtPtr& op) {
+  // Leaf node, return original
+  return op;
+}
+
+StmtPtr IRMutator::VisitStmt_(const ContinueStmtPtr& op) {
+  // Leaf node, return original
+  return op;
 }
 
 StmtPtr IRMutator::VisitStmt_(const StmtPtr& op) {

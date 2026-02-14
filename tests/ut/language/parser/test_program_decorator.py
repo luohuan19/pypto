@@ -26,7 +26,7 @@ class TestProgramDecorator:
         class SimpleProgram:
             @pl.function
             def add_one(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                result: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(x, 1.0)
+                result: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
                 return result
 
         assert isinstance(SimpleProgram, ir.Program)
@@ -48,13 +48,13 @@ class TestProgramDecorator:
         class MathOps:
             @pl.function
             def square(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.mul(x, x)
+                result: pl.Tensor[[1], pl.INT32] = pl.mul(x, x)
                 return result
 
             @pl.function
             def double(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                two: pl.Tensor[[1], pl.INT32] = pl.op.tensor.create([1], dtype=pl.INT32)
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.mul(x, two)
+                two: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
+                result: pl.Tensor[[1], pl.INT32] = pl.mul(x, two)
                 return result
 
         assert isinstance(MathOps, ir.Program)
@@ -74,7 +74,7 @@ class TestProgramDecorator:
         class CallTest:
             @pl.function
             def square(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.mul(x, x)
+                result: pl.Tensor[[1], pl.INT32] = pl.mul(x, x)
                 return result
 
             @pl.function
@@ -84,7 +84,7 @@ class TestProgramDecorator:
                 # Call square method using self
                 a_squared: pl.Tensor[[1], pl.INT32] = self.square(a)
                 b_squared: pl.Tensor[[1], pl.INT32] = self.square(b)
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.add(a_squared, b_squared)
+                result: pl.Tensor[[1], pl.INT32] = pl.add(a_squared, b_squared)
                 return result
 
         assert isinstance(CallTest, ir.Program)
@@ -109,7 +109,7 @@ class TestProgramDecorator:
 
             @pl.function
             def helper(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.mul(x, 2)
+                result: pl.Tensor[[1], pl.INT32] = pl.mul(x, 2)
                 return result
 
         assert isinstance(ForwardRef, ir.Program)
@@ -122,11 +122,11 @@ class TestProgramDecorator:
         class RecursiveTest:
             @pl.function
             def factorial(self, n: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                _zero: pl.Tensor[[1], pl.INT32] = pl.op.tensor.create([1], dtype=pl.INT32)
-                one: pl.Tensor[[1], pl.INT32] = pl.op.tensor.create([1], dtype=pl.INT32)
+                _zero: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
+                one: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
                 # Note: This is just for testing IR structure, not a real factorial implementation
                 # In real DSL, we'd need if statements for base case
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.add(n, one)
+                result: pl.Tensor[[1], pl.INT32] = pl.add(n, one)
                 return result
 
         assert isinstance(RecursiveTest, ir.Program)
@@ -148,7 +148,7 @@ class TestProgramDecorator:
 
             @pl.function
             def c(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.mul(x, 3)
+                result: pl.Tensor[[1], pl.INT32] = pl.mul(x, 3)
                 return result
 
         assert isinstance(TransitiveCalls, ir.Program)
@@ -163,7 +163,7 @@ class TestProgramDecorator:
             def test_func(
                 self, x: pl.Tensor[[1], pl.INT32], y: pl.Tensor[[1], pl.INT32]
             ) -> pl.Tensor[[1], pl.INT32]:
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.add(x, y)
+                result: pl.Tensor[[1], pl.INT32] = pl.add(x, y)
                 return result
 
         func = SelfTest.get_function("test_func")
@@ -204,6 +204,31 @@ class TestProgramDecorator:
                     result: pl.Tensor[[1], pl.INT32] = self.nonexistent(x)  # type: ignore
                     return result
 
+    def test_tuple_unpacking_from_cross_function_call(self):
+        """Test tuple unpacking from self.func() returning multiple values."""
+
+        @pl.program
+        class TupleUnpack:
+            @pl.function
+            def split(
+                self, x: pl.Tensor[[64], pl.FP32]
+            ) -> tuple[pl.Tensor[[64], pl.FP32], pl.Tensor[[64], pl.FP32]]:
+                a: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+                b: pl.Tensor[[64], pl.FP32] = pl.mul(x, 2.0)
+                return a, b
+
+            @pl.function
+            def caller(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                a, b = self.split(x)
+                result: pl.Tensor[[64], pl.FP32] = pl.add(a, b)
+                return result
+
+        assert isinstance(TupleUnpack, ir.Program)
+        assert len(TupleUnpack.functions) == 2
+
+        caller_func = TupleUnpack.get_function("caller")
+        assert caller_func is not None
+
 
 class TestProgramRoundTrip:
     """Test round-trip: parse → print → parse."""
@@ -215,7 +240,7 @@ class TestProgramRoundTrip:
         class Original:
             @pl.function
             def add(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                result: pl.Tensor[[64], pl.FP32] = pl.op.tensor.add(x, 1.0)
+                result: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
                 return result
 
         # Print to code
@@ -251,7 +276,7 @@ class TestProgramRoundTrip:
         class WithCalls:
             @pl.function
             def helper(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
-                result: pl.Tensor[[1], pl.INT32] = pl.op.tensor.mul(x, 2)
+                result: pl.Tensor[[1], pl.INT32] = pl.mul(x, 2)
                 return result
 
             @pl.function

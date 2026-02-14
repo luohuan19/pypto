@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <memory>
 #include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -130,8 +131,6 @@ std::optional<DataType> PromoteDataTypes(DataType dtype1, DataType dtype2) {
   return dtype1;
 }
 
-bool ValidateTileShape(const std::vector<ExprPtr>& shape) { return shape.size() <= 2; }
-
 bool CheckTypeCompatibility(const TypePtr& type1, const TypePtr& type2) {
   // Check if both are scalar types
   auto scalar1 = As<ScalarType>(type1);
@@ -239,6 +238,28 @@ bool IsBroadcastable(const ExprPtr& source_dim, const ExprPtr& target_dim) {
   }
 
   return false;
+}
+
+std::string FormatShape(const std::vector<ExprPtr>& shape) {
+  if (shape.empty()) {
+    return "[]";
+  }
+
+  std::ostringstream oss;
+  oss << "[";
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i > 0) {
+      oss << ", ";
+    }
+    auto const_dim = GetConstantDimension(shape[i]);
+    if (const_dim) {
+      oss << *const_dim;
+    } else {
+      oss << "?";
+    }
+  }
+  oss << "]";
+  return oss.str();
 }
 
 }  // namespace ir

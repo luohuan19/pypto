@@ -10,12 +10,123 @@
 """
 PyPTO Language operations module.
 
-This module organizes language-level operations by category (e.g., tensor operations).
-Operations accept and return Tensor types for type-safe DSL code.
+This module organizes language-level operations by category:
+- tensor: High-level tensor operations (TensorType)
+- block: Block-level tile operations (TileType)
+
+A unified namespace (``pl.add``, ``pl.exp``, ...) auto-dispatches
+between tensor and block paths based on the input type (Tensor vs Tile).
+The explicit ``pl.tensor.*`` and ``pl.block.*`` namespaces remain
+available for cases where the caller wants to be explicit.
 """
 
+from . import block_ops as block
 from . import tensor_ops as tensor
 
+# Promoted block-only ops (accessible as pl.load, etc.)
+from .block_ops import (
+    abs,
+    cmp,
+    cmps,
+    col_expand,
+    col_expand_div,
+    col_expand_mul,
+    col_expand_sub,
+    create_tile,
+    expands,
+    l0c_store,
+    load,
+    log,
+    matmul_acc,
+    max,
+    min,
+    minimum,
+    move,
+    neg,
+    recip,
+    relu,
+    row_expand_add,
+    row_expand_div,
+    row_expand_mul,
+    row_expand_sub,
+    row_min,
+    rsqrt,
+    sqrt,
+    store,
+    sum,
+    ub_copy,
+)
+
+# Promoted tensor-only ops (accessible as pl.create_tensor, etc.)
+from .tensor_ops import assemble, create_tensor, dim
+
+# Unified dispatch (overlapping ops)
+from .unified_ops import (
+    add,
+    cast,
+    div,
+    exp,
+    matmul,
+    maximum,
+    mul,
+    reshape,
+    row_max,
+    row_sum,
+    sub,
+    transpose,
+    view,
+)
+
 __all__ = [
+    "block",
     "tensor",
+    # Unified dispatch
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "maximum",
+    "min",
+    "sum",
+    "max",
+    "exp",
+    "cast",
+    "reshape",
+    "transpose",
+    "view",
+    "matmul",
+    "row_max",
+    "row_sum",
+    # Promoted block-only
+    "create_tile",
+    "load",
+    "store",
+    "l0c_store",
+    "move",
+    "ub_copy",
+    "neg",
+    "sqrt",
+    "rsqrt",
+    "recip",
+    "log",
+    "abs",
+    "relu",
+    "matmul_acc",
+    "minimum",
+    "cmp",
+    "cmps",
+    "row_min",
+    "row_expand_add",
+    "row_expand_sub",
+    "row_expand_mul",
+    "row_expand_div",
+    "col_expand",
+    "col_expand_mul",
+    "col_expand_div",
+    "col_expand_sub",
+    "expands",
+    # Promoted tensor-only
+    "create_tensor",
+    "assemble",
+    "dim",
 ]

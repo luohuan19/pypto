@@ -124,9 +124,9 @@ def test_add_alloc_pass_simple():
         tile_height = 64
         tile_width = 64
 
-        tile_a = ib.let("tile_a", block.load(input_a, 0, 0, tile_height, tile_width))
+        tile_a = ib.let("tile_a", block.load(input_a, [0, 0], [tile_height, tile_width]))
         tile_b = ib.let("tile_b", block.add(tile_a, tile_a))
-        result = ib.let("result", block.store(tile_b, 0, 0, tile_height, tile_width, output))
+        result = ib.let("result", block.store(tile_b, [0, 0], [tile_height, tile_width], output))
 
         ib.return_stmt(result)
 
@@ -203,10 +203,10 @@ def test_add_alloc_pass_multiple_tiles():
         tile_width = 64
 
         # Create 4 tiles to test multiple allocs
-        tile_a = ib.let("tile_a", block.load(input_a, 0, 0, tile_height, tile_width))
+        tile_a = ib.let("tile_a", block.load(input_a, [0, 0], [tile_height, tile_width]))
         tile_b = ib.let("tile_b", block.add(tile_a, tile_a))
         tile_c = ib.let("tile_c", block.add(tile_b, tile_b))
-        result = ib.let("result", block.store(tile_c, 0, 0, tile_height, tile_width, output))
+        result = ib.let("result", block.store(tile_c, [0, 0], [tile_height, tile_width], output))
 
         ib.return_stmt(result)
 
@@ -255,8 +255,8 @@ def test_add_alloc_pass_multiple_tiles():
         assert actual_addr == expected_addr, f"{var_name}: expected addr={expected_addr}, got {actual_addr}"
 
 
-def test_add_alloc_pass_with_xplatform_strategy():
-    """Test AddAllocPass as part of XPlatform optimization strategy.
+def test_add_alloc_pass_with_ptoas_strategy():
+    """Test AddAllocPass as part of PTOAS optimization strategy.
 
     Verifies that:
     1. AddAllocPass runs after InitMemRefPass and BasicMemoryReusePass
@@ -264,7 +264,7 @@ def test_add_alloc_pass_with_xplatform_strategy():
     """
     ib = builder.IRBuilder()
 
-    with ib.function("test_xplatform") as f:
+    with ib.function("test_ptoas") as f:
         input_a = f.param("input_a", ir.TensorType([64, 64], DataType.FP32))
         output = f.param("output", ir.TensorType([64, 64], DataType.FP32))
         f.return_type(ir.TensorType([64, 64], DataType.FP32))
@@ -272,19 +272,19 @@ def test_add_alloc_pass_with_xplatform_strategy():
         tile_height = 64
         tile_width = 64
 
-        tile_a = ib.let("tile_a", block.load(input_a, 0, 0, tile_height, tile_width))
+        tile_a = ib.let("tile_a", block.load(input_a, [0, 0], [tile_height, tile_width]))
         tile_b = ib.let("tile_b", block.add(tile_a, tile_a))
-        result = ib.let("result", block.store(tile_b, 0, 0, tile_height, tile_width, output))
+        result = ib.let("result", block.store(tile_b, [0, 0], [tile_height, tile_width], output))
 
         ib.return_stmt(result)
 
     func = f.get_result()
 
     # Wrap function in Program for PassManager
-    program = ir.Program([func], "test_xplatform", ir.Span.unknown())
+    program = ir.Program([func], "test_ptoas", ir.Span.unknown())
 
-    # Run XPlatform strategy (which includes AddAllocPass)
-    pm = PassManager.get_strategy(OptimizationStrategy.XPlatform)
+    # Run PTOAS strategy (which includes AddAllocPass)
+    pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     optimized_result = pm.run_passes(program)
     assert isinstance(optimized_result, ir.Program), "Result should be a Program"
 
@@ -293,11 +293,11 @@ def test_add_alloc_pass_with_xplatform_strategy():
 
     # Verify alloc operations were added
     alloc_count = count_alloc_operations(optimized_func)
-    assert alloc_count > 0, "XPlatform strategy should include AddAllocPass which creates alloc operations"
+    assert alloc_count > 0, "PTOAS strategy should include AddAllocPass which creates alloc operations"
 
     # Verify the function is still valid
     assert optimized_func is not None
-    assert optimized_func.name == "test_xplatform"
+    assert optimized_func.name == "test_ptoas"
     assert isinstance(optimized_func.body, ir.SeqStmts)
 
 
@@ -319,10 +319,10 @@ def test_add_alloc_pass_with_memory_reuse():
         tile_width = 64
 
         # Sequential operations allow memory reuse
-        tile_a = ib.let("tile_a", block.load(input_a, 0, 0, tile_height, tile_width))
+        tile_a = ib.let("tile_a", block.load(input_a, [0, 0], [tile_height, tile_width]))
         tile_b = ib.let("tile_b", block.add(tile_a, tile_a))
         tile_c = ib.let("tile_c", block.add(tile_b, tile_b))
-        result = ib.let("result", block.store(tile_c, 0, 0, tile_height, tile_width, output))
+        result = ib.let("result", block.store(tile_c, [0, 0], [tile_height, tile_width], output))
 
         ib.return_stmt(result)
 
@@ -331,8 +331,8 @@ def test_add_alloc_pass_with_memory_reuse():
     # Wrap function in Program for PassManager
     program = ir.Program([func], "test_with_reuse", ir.Span.unknown())
 
-    # Run XPlatform strategy
-    pm = PassManager.get_strategy(OptimizationStrategy.XPlatform)
+    # Run PTOAS strategy
+    pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     optimized_result = pm.run_passes(program)
     assert isinstance(optimized_result, ir.Program), "Result should be a Program"
 
@@ -424,9 +424,9 @@ def test_add_alloc_pass_alloc_placement():
         output = f.param("output", ir.TensorType([64, 64], DataType.FP32))
         f.return_type(ir.TensorType([64, 64], DataType.FP32))
 
-        tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 64, 64))
+        tile_a = ib.let("tile_a", block.load(input_a, offsets=[0, 0], shapes=[64, 64]))
         tile_b = ib.let("tile_b", block.add(tile_a, tile_a))
-        result = ib.let("result", block.store(tile_b, 0, 0, 64, 64, output))
+        result = ib.let("result", block.store(tile_b, offsets=[0, 0], shapes=[64, 64], output_tensor=output))
 
         ib.return_stmt(result)
 
@@ -492,10 +492,10 @@ def test_add_alloc_pass_raw_pointer_uniqueness():
         f.return_type(ir.TensorType([64, 64], DataType.FP32))
 
         # Create 4 tiles with different MemRef objects
-        tile_a = ib.let("tile_a", block.load(input_a, 0, 0, 64, 64))
+        tile_a = ib.let("tile_a", block.load(input_a, offsets=[0, 0], shapes=[64, 64]))
         tile_b = ib.let("tile_b", block.add(tile_a, tile_a))
         tile_c = ib.let("tile_c", block.add(tile_b, tile_b))
-        result = ib.let("result", block.store(tile_c, 0, 0, 64, 64, output))
+        result = ib.let("result", block.store(tile_c, offsets=[0, 0], shapes=[64, 64], output_tensor=output))
 
         ib.return_stmt(result)
 

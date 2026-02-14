@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -21,6 +22,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/verification_error.h"
+#include "pypto/ir/transforms/verifier.h"
 
 namespace pypto {
 namespace ir {
@@ -39,6 +41,10 @@ std::string ErrorTypeToString(ErrorType type) {
       return "SHAPE_VALUE_MISMATCH";
     case ErrorType::SIZE_MISMATCH:
       return "SIZE_MISMATCH";
+    case ErrorType::IF_CONDITION_MUST_BE_SCALAR:
+      return "IF_CONDITION_MUST_BE_SCALAR";
+    case ErrorType::FOR_RANGE_MUST_BE_SCALAR:
+      return "FOR_RANGE_MUST_BE_SCALAR";
     default:
       return "UNKNOWN";
   }
@@ -53,15 +59,16 @@ namespace {
  */
 class TypeChecker : public IRVisitor {
  public:
-  explicit TypeChecker(std::vector<VerificationError>& errors) : errors_(errors) {}
+  explicit TypeChecker(std::vector<Diagnostic>& diagnostics) : diagnostics_(diagnostics) {}
 
   void VisitStmt_(const ForStmtPtr& op) override;
+  void VisitStmt_(const WhileStmtPtr& op) override;
   void VisitStmt_(const IfStmtPtr& op) override;
 
-  [[nodiscard]] const std::vector<VerificationError>& GetErrors() const { return errors_; }
+  [[nodiscard]] const std::vector<Diagnostic>& GetDiagnostics() const { return diagnostics_; }
 
  private:
-  std::vector<VerificationError>& errors_;
+  std::vector<Diagnostic>& diagnostics_;
 
   /**
    * @brief Record an error
@@ -82,13 +89,18 @@ class TypeChecker : public IRVisitor {
   /**
    * @brief Check if two ExprPtr represent the same constant value
    */
-  bool IsSameConstant(const ExprPtr& expr1, const ExprPtr& expr2) const;
+  [[nodiscard]] bool IsSameConstant(const ExprPtr& expr1, const ExprPtr& expr2) const;
+
+  /**
+   * @brief Check if expression type is ScalarType
+   */
+  void CheckIsScalarType(const ExprPtr& expr, const std::string& context, const Span& span);
 };
 
 // TypeChecker implementation
 
 void TypeChecker::RecordError(typecheck::ErrorType type, const std::string& message, const Span& span) {
-  errors_.push_back(VerificationError{static_cast<int>(type), message, span});
+  diagnostics_.emplace_back(DiagnosticSeverity::Error, "TypeCheck", static_cast<int>(type), message, span);
 }
 
 StmtPtr TypeChecker::GetLastStmt(const StmtPtr& stmt) {
@@ -195,8 +207,35 @@ bool TypeChecker::IsSameConstant(const ExprPtr& expr1, const ExprPtr& expr2) con
   return false;
 }
 
+void TypeChecker::CheckIsScalarType(const ExprPtr& expr, const std::string& context, const Span& span) {
+  if (!expr || !expr->GetType()) return;
+
+  if (!As<ScalarType>(expr->GetType())) {
+    std::ostringstream msg;
+    msg << context << " must be ScalarType, but got " << expr->GetType()->TypeName();
+
+    // Determine error type based on context
+    auto error_type = (context.find("condition") != std::string::npos)
+                          ? typecheck::ErrorType::IF_CONDITION_MUST_BE_SCALAR
+                          : typecheck::ErrorType::FOR_RANGE_MUST_BE_SCALAR;
+
+    RecordError(error_type, msg.str(), span);
+  }
+}
+
 void TypeChecker::VisitStmt_(const ForStmtPtr& op) {
   if (!op) return;
+
+  // Check start, stop, step must be ScalarType
+  if (op->start_ && op->start_->GetType()) {
+    CheckIsScalarType(op->start_, "ForStmt start", op->span_);
+  }
+  if (op->stop_ && op->stop_->GetType()) {
+    CheckIsScalarType(op->stop_, "ForStmt stop", op->span_);
+  }
+  if (op->step_ && op->step_->GetType()) {
+    CheckIsScalarType(op->step_, "ForStmt step", op->span_);
+  }
 
   // Check type consistency between iter_args initValue, yield values, and return_vars
   if (!op->iter_args_.empty()) {
@@ -250,8 +289,74 @@ void TypeChecker::VisitStmt_(const ForStmtPtr& op) {
   IRVisitor::VisitStmt_(op);
 }
 
+void TypeChecker::VisitStmt_(const WhileStmtPtr& op) {
+  if (!op) return;
+
+  // Check condition must be ScalarType (bool)
+  if (op->condition_ && op->condition_->GetType()) {
+    CheckIsScalarType(op->condition_, "WhileStmt condition", op->span_);
+  }
+
+  // Check type consistency between iter_args initValue, yield values, and return_vars
+  if (!op->iter_args_.empty()) {
+    StmtPtr last_stmt = GetLastStmt(op->body_);
+    auto yield_stmt = As<YieldStmt>(last_stmt);
+
+    if (yield_stmt) {
+      // Check that all three vectors have the same size
+      size_t num_iter_args = op->iter_args_.size();
+      size_t num_yield_values = yield_stmt->value_.size();
+      size_t num_return_vars = op->return_vars_.size();
+
+      if (num_iter_args != num_yield_values || num_iter_args != num_return_vars) {
+        std::ostringstream msg;
+        msg << "WhileStmt size mismatch: iter_args=" << num_iter_args << ", yield values=" << num_yield_values
+            << ", return_vars=" << num_return_vars;
+        RecordError(typecheck::ErrorType::SIZE_MISMATCH, msg.str(), op->span_);
+      } else {
+        // Check type consistency for each index
+        for (size_t i = 0; i < num_iter_args; ++i) {
+          const auto& iter_arg = op->iter_args_[i];
+          const auto& yield_value = yield_stmt->value_[i];
+          const auto& return_var = op->return_vars_[i];
+
+          if (!iter_arg || !iter_arg->initValue_ || !yield_value || !return_var) continue;
+
+          auto init_type = iter_arg->initValue_->GetType();
+          auto yield_type = yield_value->GetType();
+          auto return_type = return_var->GetType();
+
+          if (!init_type || !yield_type || !return_type) continue;
+
+          // Check initValue type == yield type
+          CheckTypeEquality(init_type, yield_type, "WhileStmt",
+                            "iter_arg[" + std::to_string(i) + "] initValue",
+                            "yield value[" + std::to_string(i) + "]", op->span_);
+
+          // Check yield type == return_var type
+          CheckTypeEquality(yield_type, return_type, "WhileStmt", "yield value[" + std::to_string(i) + "]",
+                            "return_var[" + std::to_string(i) + "]", op->span_);
+
+          // Check initValue type == return_var type (for completeness)
+          CheckTypeEquality(init_type, return_type, "WhileStmt",
+                            "iter_arg[" + std::to_string(i) + "] initValue",
+                            "return_var[" + std::to_string(i) + "]", op->span_);
+        }
+      }
+    }
+  }
+
+  // Continue with default traversal
+  IRVisitor::VisitStmt_(op);
+}
+
 void TypeChecker::VisitStmt_(const IfStmtPtr& op) {
   if (!op) return;
+
+  // Check condition must be ScalarType
+  if (op->condition_ && op->condition_->GetType()) {
+    CheckIsScalarType(op->condition_, "IfStmt condition", op->span_);
+  }
 
   // Check type consistency only if return_vars is not empty
   if (!op->return_vars_.empty() && op->else_body_.has_value()) {
@@ -297,33 +402,6 @@ void TypeChecker::VisitStmt_(const IfStmtPtr& op) {
 }
 
 /**
- * @brief Generate a formatted type checking report
- */
-std::string GenerateReport(const std::vector<VerificationError>& errors) {
-  std::ostringstream oss;
-  oss << "Type Check Report\n";
-  oss << "=================\n";
-  oss << "Total errors found: " << errors.size() << "\n\n";
-
-  if (errors.empty()) {
-    oss << "Status: PASSED\n";
-  } else {
-    for (size_t i = 0; i < errors.size(); ++i) {
-      const auto& error = errors[i];
-      oss << "[Error " << (i + 1) << "] "
-          << typecheck::ErrorTypeToString(static_cast<typecheck::ErrorType>(error.error_code)) << "\n";
-      oss << "  " << error.message << "\n";
-      const auto& span = error.span;
-      oss << "  Location: " << span.filename_ << ":" << span.begin_line_ << ":" << span.begin_column_ << "\n";
-      oss << "\n";
-    }
-    oss << "Status: FAILED (" << errors.size() << " errors)\n";
-  }
-
-  return oss.str();
-}
-
-/**
  * @brief Transform a function by checking type consistency
  *
  * This transformation checks type consistency in control flow constructs and logs any violations.
@@ -332,11 +410,9 @@ std::string GenerateReport(const std::vector<VerificationError>& errors) {
 FunctionPtr TransformTypeCheck(const FunctionPtr& func) {
   INTERNAL_CHECK(func) << "TypeCheck cannot run on null function";
 
-  // Collect errors during type checking
-  std::vector<VerificationError> errors;
-
-  // Create type checker and run checking
-  TypeChecker checker(errors);
+  // Collect diagnostics during type checking
+  std::vector<Diagnostic> diagnostics;
+  TypeChecker checker(diagnostics);
 
   // Visit function body
   if (func->body_) {
@@ -344,8 +420,8 @@ FunctionPtr TransformTypeCheck(const FunctionPtr& func) {
   }
 
   // If errors found, log the report
-  if (!errors.empty()) {
-    std::string report = GenerateReport(errors);
+  if (!diagnostics.empty()) {
+    std::string report = IRVerifier::GenerateReport(diagnostics);
     LOG_ERROR << "Type checking failed for function '" << func->name_ << "':\n" << report;
   }
 
@@ -354,6 +430,31 @@ FunctionPtr TransformTypeCheck(const FunctionPtr& func) {
 }
 
 }  // namespace
+
+/**
+ * @brief Type checking rule for use with IRVerifier
+ */
+class TypeCheckRule : public VerifyRule {
+ public:
+  [[nodiscard]] std::string GetName() const override { return "TypeCheck"; }
+
+  void Verify(const FunctionPtr& func, std::vector<Diagnostic>& diagnostics) override {
+    if (!func) {
+      return;
+    }
+
+    // Create type checker and run checking
+    TypeChecker checker(diagnostics);
+
+    // Visit function body
+    if (func->body_) {
+      checker.VisitStmt(func->body_);
+    }
+  }
+};
+
+// Factory function for creating TypeCheckRule (for use with IRVerifier)
+VerifyRulePtr CreateTypeCheckRule() { return std::make_shared<TypeCheckRule>(); }
 
 // Factory function
 namespace pass {

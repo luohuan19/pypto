@@ -9,62 +9,102 @@
 
 """Tensor operations for PyPTO IR."""
 
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Literal, Optional, Sequence, Union
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import Call, ConstInt, Expr, ScalarType, Span
 
-from ..utils import _normalize_expr
+from ..utils import _get_span_or_capture, _normalize_expr
 
 
-def create(shape: List[int], dtype: DataType) -> Call:
+def create(shape: Sequence[Union[int, Expr]], dtype: DataType, span: Optional[Span] = None) -> Call:
     """Create a new tensor with specified shape and dtype.
 
     Args:
-        shape: List of dimension sizes
+        shape: List of dimension sizes (int or Expr)
         dtype: Data type of tensor elements
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression creating a new tensor
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
 
-    # Convert shape to Expr list
-    args = [ConstInt(dim, DataType.INT32, span) for dim in shape]
+    # Convert shape to MakeTuple
+    shape_elements = [_normalize_expr(dim, actual_span, int_dtype=DataType.UINT64) for dim in shape]
+    shape_tuple = _ir_core.MakeTuple(shape_elements, actual_span)
 
-    kwargs: Dict[str, Any] = {"dtype": dtype}
+    args = [shape_tuple]
+    kwargs: dict[str, Any] = {"dtype": dtype}
 
-    return _ir_core.create_op_call("tensor.create", args, kwargs, span)
+    return _ir_core.create_op_call("tensor.create", args, kwargs, actual_span)
 
 
-def view(tensor: Expr, shape: List[Union[int, Expr]], offset: List[Union[int, Expr]]) -> Call:
+def read(tensor: Expr, indices: list[Union[int, Expr]], span: Optional[Span] = None) -> Call:
+    """Read a scalar value from a tensor at given indices.
+
+    Args:
+        tensor: Input tensor expression
+        indices: List of index expressions (one per tensor dimension)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression reading a scalar from the tensor
+    """
+    actual_span = _get_span_or_capture(span)
+
+    # Convert indices to MakeTuple
+    indices_elements = [_normalize_expr(idx, actual_span, int_dtype=DataType.INT64) for idx in indices]
+    indices_tuple = _ir_core.MakeTuple(indices_elements, actual_span)
+
+    args = [tensor, indices_tuple]
+    return _ir_core.create_op_call("tensor.read", args, {}, actual_span)
+
+
+def dim(tensor: Expr, axis: Union[int, Expr], span: Optional[Span] = None) -> Call:
+    """Extract a shape dimension from a tensor as a scalar value.
+
+    Args:
+        tensor: Input tensor expression
+        axis: Dimension index (supports negative indexing)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression returning the dimension size as ScalarType(INT64)
+    """
+    actual_span = _get_span_or_capture(span)
+    axis_expr = _normalize_expr(axis, actual_span, int_dtype=DataType.INT64)
+    args = [tensor, axis_expr]
+    return _ir_core.create_op_call("tensor.dim", args, {}, actual_span)
+
+
+def view(
+    tensor: Expr, shape: list[Union[int, Expr]], offset: list[Union[int, Expr]], span: Optional[Span] = None
+) -> Call:
     """Create a view/slice of a tensor with new shape and offset.
 
     Args:
         tensor: Input tensor expression
         shape: New shape dimensions
         offset: Offset dimensions for the view
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression creating a tensor view
     """
-    span = Span.unknown()
-    args = [tensor]
+    actual_span = _get_span_or_capture(span)
 
-    # Add the number of shape dimensions as a ConstInt
-    # This allows the C++ side to correctly split shape and offset arguments
-    args.append(ConstInt(len(shape), DataType.INT32, span))
+    # Convert shape to MakeTuple
+    shape_elements = [_normalize_expr(dim, actual_span, int_dtype=DataType.UINT64) for dim in shape]
+    shape_tuple = _ir_core.MakeTuple(shape_elements, actual_span)
 
-    # Add shape dimensions
-    for dim in shape:
-        args.append(_normalize_expr(dim, int_dtype=DataType.INT32))
+    # Convert offset to MakeTuple
+    offset_elements = [_normalize_expr(off, actual_span, int_dtype=DataType.UINT64) for off in offset]
+    offset_tuple = _ir_core.MakeTuple(offset_elements, actual_span)
 
-    # Add offset dimensions
-    for off in offset:
-        args.append(_normalize_expr(off, int_dtype=DataType.INT32))
-
-    return _ir_core.create_op_call("tensor.view", args, {}, span)
+    args = [tensor, shape_tuple, offset_tuple]
+    return _ir_core.create_op_call("tensor.view", args, {}, actual_span)
 
 
 def matmul(
@@ -74,6 +114,7 @@ def matmul(
     a_trans: bool = False,
     b_trans: bool = False,
     c_matrix_nz: bool = False,
+    span: Optional[Span] = None,
 ) -> Call:
     """Matrix multiplication with optional transpose.
 
@@ -84,27 +125,28 @@ def matmul(
         a_trans: Whether to transpose lhs
         b_trans: Whether to transpose rhs
         c_matrix_nz: C matrix non-zero flag
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for matrix multiplication
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
 
     # Only Expr arguments
     args = [lhs, rhs]
 
-    # Build kwargs dict
-    kwargs: Dict[str, Any] = {
-        "out_dtype": out_dtype,
+    kwargs: dict[str, Any] = {
         "a_trans": a_trans,
         "b_trans": b_trans,
         "c_matrix_nz": c_matrix_nz,
     }
+    if out_dtype is not None:
+        kwargs["out_dtype"] = out_dtype
 
-    return _ir_core.create_op_call("tensor.matmul", args, kwargs, span)
+    return _ir_core.create_op_call("tensor.matmul", args, kwargs, actual_span)
 
 
-def mul(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
+def mul(lhs: Expr, rhs: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
     """Element-wise multiplication of tensor and tensor or scalar.
 
     Automatically selects between tensor.mul (tensor x tensor) and
@@ -113,44 +155,46 @@ def mul(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Expr)
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise multiplication
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
-        return _ir_core.create_op_call("tensor.mul_scalar", [lhs, rhs_expr], {}, span)
+        return _ir_core.create_op_call("tensor.mul_scalar", [lhs, rhs_expr], {}, actual_span)
     else:
-        return _ir_core.create_op_call("tensor.mul", [lhs, rhs_expr], {}, span)
+        return _ir_core.create_op_call("tensor.mul", [lhs, rhs_expr], {}, actual_span)
 
 
-def mul_scalar(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
+def mul_scalar(lhs: Expr, rhs: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
     """Element-wise multiplication of tensor and scalar.
 
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side scalar (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise multiplication with scalar
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
-    return _ir_core.create_op_call("tensor.mul_scalar", [lhs, rhs_expr], {}, span)
+    return _ir_core.create_op_call("tensor.mul_scalar", [lhs, rhs_expr], {}, actual_span)
 
 
-def add(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
+def add(lhs: Expr, rhs: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
     """Element-wise addition of tensor and tensor or scalar.
 
     Automatically selects between tensor.add (tensor + tensor) and
@@ -159,44 +203,46 @@ def add(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Expr)
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise addition
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
-        return _ir_core.create_op_call("tensor.add_scalar", [lhs, rhs_expr], {}, span)
+        return _ir_core.create_op_call("tensor.add_scalar", [lhs, rhs_expr], {}, actual_span)
     else:
-        return _ir_core.create_op_call("tensor.add", [lhs, rhs_expr], {}, span)
+        return _ir_core.create_op_call("tensor.add", [lhs, rhs_expr], {}, actual_span)
 
 
-def add_scalar(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
+def add_scalar(lhs: Expr, rhs: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
     """Element-wise addition of tensor and scalar.
 
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side scalar (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise addition with scalar
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
-    return _ir_core.create_op_call("tensor.add_scalar", [lhs, rhs_expr], {}, span)
+    return _ir_core.create_op_call("tensor.add_scalar", [lhs, rhs_expr], {}, actual_span)
 
 
-def sub(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
+def sub(lhs: Expr, rhs: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
     """Element-wise subtraction of tensor and tensor or scalar.
 
     Automatically selects between tensor.sub (tensor - tensor) and
@@ -205,44 +251,46 @@ def sub(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Expr)
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise subtraction
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
-        return _ir_core.create_op_call("tensor.sub_scalar", [lhs, rhs_expr], {}, span)
+        return _ir_core.create_op_call("tensor.sub_scalar", [lhs, rhs_expr], {}, actual_span)
     else:
-        return _ir_core.create_op_call("tensor.sub", [lhs, rhs_expr], {}, span)
+        return _ir_core.create_op_call("tensor.sub", [lhs, rhs_expr], {}, actual_span)
 
 
-def sub_scalar(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
+def sub_scalar(lhs: Expr, rhs: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
     """Element-wise subtraction of tensor and scalar.
 
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side scalar (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise subtraction with scalar
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
-    return _ir_core.create_op_call("tensor.sub_scalar", [lhs, rhs_expr], {}, span)
+    return _ir_core.create_op_call("tensor.sub_scalar", [lhs, rhs_expr], {}, actual_span)
 
 
-def div(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
+def div(lhs: Expr, rhs: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
     """Element-wise division of tensor and tensor or scalar.
 
     Automatically selects between tensor.div (tensor / tensor) and
@@ -251,165 +299,196 @@ def div(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Expr)
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise division
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
-        return _ir_core.create_op_call("tensor.div_scalar", [lhs, rhs_expr], {}, span)
+        return _ir_core.create_op_call("tensor.div_scalar", [lhs, rhs_expr], {}, actual_span)
     else:
-        return _ir_core.create_op_call("tensor.div", [lhs, rhs_expr], {}, span)
+        return _ir_core.create_op_call("tensor.div", [lhs, rhs_expr], {}, actual_span)
 
 
-def div_scalar(lhs: Expr, rhs: Union[int, float, Expr]) -> Call:
+def div_scalar(lhs: Expr, rhs: Union[int, float, Expr], span: Optional[Span] = None) -> Call:
     """Element-wise division of tensor and scalar.
 
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side scalar (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise division with scalar
     """
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
-    return _ir_core.create_op_call("tensor.div_scalar", [lhs, rhs_expr], {}, span)
+    return _ir_core.create_op_call("tensor.div_scalar", [lhs, rhs_expr], {}, actual_span)
 
 
-def maximum(lhs: Expr, rhs: Expr) -> Call:
+def maximum(lhs: Expr, rhs: Expr, span: Optional[Span] = None) -> Call:
     """Element-wise maximum of two tensors.
 
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise maximum
     """
-    span = Span.unknown()
-    return _ir_core.create_op_call("tensor.maximum", [lhs, rhs], {}, span)
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.maximum", [lhs, rhs], {}, actual_span)
 
 
-def row_max(input: Expr, axis: int = -1, keep_dim: Union[int, bool] = 1) -> Call:
-    """Row-wise maximum reduction along specified axis.
+def row_max(input: Expr, span: Optional[Span] = None) -> Call:
+    """Row-wise max reduction (reduces along last axis, keeps dim).
 
     Args:
         input: Input tensor
-        axis: Reduction axis (default: -1, last axis)
-        keep_dim: Keep reduced dimension as 1
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for row-wise maximum reduction
+        Call expression for row-wise max reduction
     """
-    span = Span.unknown()
-
-    args = [input]
-    kwargs: Dict[str, Any] = {
-        "axis": axis,
-        "keep_dim": bool(keep_dim),
-    }
-
-    return _ir_core.create_op_call("tensor.row_max", args, kwargs, span)
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.row_max", [input], {}, actual_span)
 
 
-def row_sum(input: Expr, axis: int = -1, keep_dim: Union[int, bool] = 1) -> Call:
-    """Row-wise sum reduction along specified axis.
+def row_sum(input: Expr, span: Optional[Span] = None) -> Call:
+    """Row-wise sum reduction (reduces along last axis, keeps dim).
 
     Args:
         input: Input tensor
-        axis: Reduction axis (default: -1, last axis)
-        keep_dim: Keep reduced dimension as 1
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for row-wise sum reduction
     """
-    span = Span.unknown()
-
-    args = [input]
-    kwargs: Dict[str, Any] = {
-        "axis": axis,
-        "keep_dim": bool(keep_dim),
-    }
-
-    return _ir_core.create_op_call("tensor.row_sum", args, kwargs, span)
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.row_sum", [input], {}, actual_span)
 
 
-def exp(input: Expr) -> Call:
+def exp(input: Expr, span: Optional[Span] = None) -> Call:
     """Element-wise exponential operation.
 
     Args:
         input: Input tensor
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise exponential
     """
-    span = Span.unknown()
-    return _ir_core.create_op_call("tensor.exp", [input], {}, span)
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.exp", [input], {}, actual_span)
 
 
 def cast(
     input: Expr,
     target_type: Union[int, DataType],
-    mode: Literal["round", "floor", "ceil"] = "round",
+    mode: Literal["none", "rint", "round", "floor", "ceil", "trunc", "odd"] = "round",
+    span: Optional[Span] = None,
 ) -> Call:
     """Type casting operation.
 
     Args:
         input: Input tensor
         target_type: Target data type
-        mode: Rounding mode
+        mode: Rounding mode in None(0), RINT(1), ROUND(2), FLOOR(3), CEIL(4), TRUNC(5), ODD(6)
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for type casting
     """
-    modes = {
-        "round": 0,
-        "floor": 1,
-        "ceil": 2,
-    }
+    modes = {"none": 0, "rint": 1, "round": 2, "floor": 3, "ceil": 4, "trunc": 5, "odd": 6}
     mode_val = modes.get(mode)
     if mode_val is None:
         raise ValueError(f"Invalid rounding mode '{mode}'. Expected one of {list(modes.keys())}.")
 
-    span = Span.unknown()
+    actual_span = _get_span_or_capture(span)
 
     args = [input]
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "target_type": target_type,
         "mode": mode_val,
     }
 
-    return _ir_core.create_op_call("tensor.cast", args, kwargs, span)
+    return _ir_core.create_op_call("tensor.cast", args, kwargs, actual_span)
 
 
-def assemble(target: Expr, source: Expr, offset: List[Union[int, Expr]]) -> Call:
+def assemble(target: Expr, source: Expr, offset: list[Union[int, Expr]], span: Optional[Span] = None) -> Call:
     """Write/update tensor values at specified offset.
 
     Args:
         target: Target tensor to update
         source: Source tensor to write
         offset: Offset dimensions for where to write
+        span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for tensor assembly
     """
-    span = Span.unknown()
-    args = [target, source]
+    actual_span = _get_span_or_capture(span)
 
-    # Add offset dimensions
-    for off in offset:
-        args.append(_normalize_expr(off, int_dtype=DataType.INT32))
+    # Convert offset to MakeTuple
+    offset_elements = [_normalize_expr(off, actual_span, int_dtype=DataType.UINT64) for off in offset]
+    offset_tuple = _ir_core.MakeTuple(offset_elements, actual_span)
 
-    return _ir_core.create_op_call("tensor.assemble", args, {}, span)
+    args = [target, source, offset_tuple]
+    return _ir_core.create_op_call("tensor.assemble", args, {}, actual_span)
+
+
+def reshape(tensor: Expr, shape: list[Union[int, Expr]], span: Optional[Span] = None) -> Call:
+    """Reshape tensor to new shape.
+
+    Args:
+        tensor: Input tensor expression
+        shape: New shape dimensions
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for tensor reshape
+    """
+    actual_span = _get_span_or_capture(span)
+
+    # Convert shape to MakeTuple
+    shape_elements = [_normalize_expr(dim, actual_span, int_dtype=DataType.UINT64) for dim in shape]
+    shape_tuple = _ir_core.MakeTuple(shape_elements, actual_span)
+
+    args = [tensor, shape_tuple]
+    return _ir_core.create_op_call("tensor.reshape", args, {}, actual_span)
+
+
+def transpose(tensor: Expr, axis1: int, axis2: int, span: Optional[Span] = None) -> Call:
+    """Transpose tensor by swapping two axes.
+
+    Args:
+        tensor: Input tensor expression
+        axis1: First axis to swap (supports negative indexing)
+        axis2: Second axis to swap (supports negative indexing)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for tensor transpose
+    """
+    actual_span = _get_span_or_capture(span)
+
+    # Create ConstInt for axis indices
+    axis1_expr = ConstInt(axis1, DataType.INT32, actual_span)
+    axis2_expr = ConstInt(axis2, DataType.INT32, actual_span)
+
+    args = [tensor, axis1_expr, axis2_expr]
+
+    return _ir_core.create_op_call("tensor.transpose", args, {}, actual_span)

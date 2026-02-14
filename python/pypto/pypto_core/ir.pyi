@@ -308,8 +308,45 @@ class ShapedType(Type):
         """
         ...
 
+class TensorLayout(enum.Enum):
+    """Tensor layout type enumeration."""
+
+    ND = ...
+    """ND layout."""
+
+    DN = ...
+    """DN layout."""
+
+    NZ = ...
+    """NZ layout."""
+
+class TensorView:
+    """Tensor view representation with stride and layout."""
+
+    stride: Sequence[Expr]
+    """Stride for each dimension."""
+
+    layout: TensorLayout
+    """Tensor layout type."""
+
+    @overload
+    def __init__(self) -> None:
+        """Create an empty tensor view with default ND layout."""
+
+    @overload
+    def __init__(self, stride: Sequence[Expr], layout: TensorLayout) -> None:
+        """Create a tensor view with stride and layout.
+
+        Args:
+            stride: Stride for each dimension
+            layout: Tensor layout type (ND, DN, or NZ)
+        """
+
 class TensorType(ShapedType):
     """Tensor type representation."""
+
+    tensor_view: Final[Optional[TensorView]]
+    """Optional tensor view information."""
 
     @overload
     def __init__(self, shape: Sequence[Expr], dtype: DataType) -> None:
@@ -331,6 +368,23 @@ class TensorType(ShapedType):
         """
 
     @overload
+    def __init__(
+        self,
+        shape: Sequence[Expr],
+        dtype: DataType,
+        memref: Optional[MemRef],
+        tensor_view: Optional[TensorView],
+    ) -> None:
+        """Create a tensor type with memory reference and tensor view.
+
+        Args:
+            shape: Shape dimensions as Expr nodes
+            dtype: Element data type
+            memref: Optional memory reference
+            tensor_view: Optional tensor view information
+        """
+
+    @overload
     def __init__(self, shape: Sequence[int], dtype: DataType) -> None:
         """Create a tensor type without memory reference.
 
@@ -347,6 +401,23 @@ class TensorType(ShapedType):
             shape: Shape dimensions as integers (automatically converted to ConstInt)
             dtype: Element data type
             memref: Optional memory reference
+        """
+
+    @overload
+    def __init__(
+        self,
+        shape: Sequence[int],
+        dtype: DataType,
+        memref: Optional[MemRef],
+        tensor_view: Optional[TensorView],
+    ) -> None:
+        """Create a tensor type with memory reference and tensor view.
+
+        Args:
+            shape: Shape dimensions as integers (automatically converted to ConstInt)
+            dtype: Element data type
+            memref: Optional memory reference
+            tensor_view: Optional tensor view information
         """
 
 class TileView:
@@ -376,34 +447,28 @@ class TileView:
         """
 
 class TileType(ShapedType):
-    """Tile type representation (2D tensor with at most 2 dimensions)."""
+    """Tile type representation (multi-dimensional tensor)."""
 
     tile_view: Final[Optional[TileView]]
     """Optional tile view information."""
 
     @overload
     def __init__(self, shape: Sequence[Expr], dtype: DataType) -> None:
-        """Create a tile type without memory reference (validates shape has at most 2 dimensions).
+        """Create a tile type without memory reference.
 
         Args:
             shape: Shape dimensions as Expr nodes
             dtype: Element data type
-
-        Raises:
-            Exception: If shape has more than 2 dimensions
         """
 
     @overload
     def __init__(self, shape: Sequence[Expr], dtype: DataType, memref: Optional[MemRef]) -> None:
-        """Create a tile type with memory reference (validates shape has at most 2 dimensions).
+        """Create a tile type with memory reference.
 
         Args:
             shape: Shape dimensions as Expr nodes
             dtype: Element data type
             memref: Optional memory reference
-
-        Raises:
-            Exception: If shape has more than 2 dimensions
         """
 
     @overload
@@ -413,13 +478,13 @@ class TileType(ShapedType):
         """Create a tile type with memory reference and tile view.
 
         Args:
-            shape: Shape dimensions as Expr nodes
+            shape: Shape dimensions as Expr nodes (supports multi-dimensional tensors)
             dtype: Element data type
             memref: Optional memory reference
             tile_view: Optional tile view information
 
-        Raises:
-            Exception: If shape has more than 2 dimensions
+        Note:
+            Code generation currently only supports up to 2D tiles.
         """
 
     @overload
@@ -464,6 +529,38 @@ class CoreType(enum.IntEnum):
 
     VECTOR = ...
     CUBE = ...
+
+class FunctionType(enum.Enum):
+    """Function type classification.
+
+    Categorizes functions by their execution context and purpose:
+    - Opaque: Unspecified (default)
+    - Orchestration: Runs on host/AICPU for control flow and dependency analysis
+    - InCore: Sub-graph on specific AICore
+    """
+
+    Opaque = ...
+    """Unspecified function type (default)."""
+
+    Orchestration = ...
+    """Host/AICPU control and coordination."""
+
+    InCore = ...
+    """AICore sub-graph execution."""
+
+class ForKind(enum.Enum):
+    """For loop kind classification.
+
+    Distinguishes sequential vs parallel for loops:
+    - Sequential: Standard sequential for loop (default)
+    - Parallel: Parallel for loop
+    """
+
+    Sequential = ...
+    """Standard sequential for loop (default)."""
+
+    Parallel = ...
+    """Parallel for loop."""
 
 class MemorySpace(enum.Enum):
     """Memory space enumeration."""
@@ -672,6 +769,24 @@ class Call(Expr):
         op: Op,
         args: Sequence[Expr],
         kwargs: Mapping[str, Union[int, bool, str, float, DataType]],
+        span: Span,
+    ) -> None:
+        """Create a function call expression with kwargs.
+
+        Args:
+            op: Operation/function to call
+            args: List of argument expressions
+            kwargs: Keyword arguments (metadata)
+            span: Source location
+        """
+        ...
+
+    @overload
+    def __init__(
+        self,
+        op: Op,
+        args: Sequence[Expr],
+        kwargs: Mapping[str, Union[int, bool, str, float, DataType]],
         type: Type,
         span: Span,
     ) -> None:
@@ -691,6 +806,29 @@ class Call(Expr):
 
     def __repr__(self) -> str:
         """Detailed representation of the call expression."""
+
+class MakeTuple(Expr):
+    """Tuple construction expression."""
+
+    elements: Final[Sequence[Expr]]
+    """Elements of the tuple."""
+
+    def __init__(self, elements: Sequence[Expr], span: Span) -> None:
+        """Create a tuple construction expression.
+
+        Args:
+            elements: Expressions to be tuple elements
+            span: Source location
+
+        The result type is automatically set to TupleType containing
+        the types of all input expressions.
+        """
+
+    def __str__(self) -> str:
+        """String representation of the tuple construction expression."""
+
+    def __repr__(self) -> str:
+        """Detailed representation of the tuple construction expression."""
 
 class TupleGetItemExpr(Expr):
     """Tuple element access expression."""
@@ -1236,6 +1374,9 @@ class ForStmt(Stmt):
     return_vars: Final[list[Var]]
     """Return variables (can be empty)."""
 
+    kind: Final[ForKind]
+    """Loop kind (Sequential or Parallel)."""
+
     def __init__(
         self,
         loop_var: Var,
@@ -1246,6 +1387,7 @@ class ForStmt(Stmt):
         body: Stmt,
         return_vars: list[Var],
         span: Span,
+        kind: ForKind = ForKind.Sequential,
     ) -> None:
         """Create a for loop statement.
 
@@ -1254,8 +1396,67 @@ class ForStmt(Stmt):
             start: Start value expression
             stop: Stop value expression
             step: Step value expression
+            iter_args: Iteration arguments (can be empty)
             body: Loop body statements
             return_vars: Return variables (can be empty)
+            span: Source location
+            kind: Loop kind (default: Sequential)
+        """
+
+class WhileStmt(Stmt):
+    """While loop statement: while condition: body."""
+
+    condition: Final[Expr]
+    """Condition expression."""
+
+    iter_args: Final[list[IterArg]]
+    """Iteration arguments (can be empty)."""
+
+    body: Final[Stmt]
+    """Loop body statement."""
+
+    return_vars: Final[list[Var]]
+    """Return variables (can be empty)."""
+
+    def __init__(
+        self,
+        condition: Expr,
+        iter_args: list[IterArg],
+        body: Stmt,
+        return_vars: list[Var],
+        span: Span,
+    ) -> None:
+        """Create a while loop statement.
+
+        Args:
+            condition: Condition expression
+            iter_args: Iteration arguments (can be empty)
+            body: Loop body statement
+            return_vars: Return variables (can be empty)
+            span: Source location
+        """
+
+class ScopeKind(enum.Enum):
+    """Scope kind classification."""
+
+    InCore = 0
+    """InCore scope for AICore sub-graphs."""
+
+class ScopeStmt(Stmt):
+    """Scope statement: marks a region with specific execution context."""
+
+    scope_kind: Final[ScopeKind]
+    """The kind of scope."""
+
+    body: Final[Stmt]
+    """The nested statements."""
+
+    def __init__(self, scope_kind: ScopeKind, body: Stmt, span: Span) -> None:
+        """Create a scope statement.
+
+        Args:
+            scope_kind: The kind of scope (e.g., ScopeKind.InCore)
+            body: The nested statements
             span: Source location
         """
 
@@ -1288,16 +1489,16 @@ class SeqStmts(Stmt):
         """
 
 class OpStmts(Stmt):
-    """Operation statements: a sequence of assignment statements."""
+    """Operation statements: a sequence of assignment and/or evaluation statements."""
 
-    stmts: Final[list[AssignStmt]]
-    """List of assignment statements."""
+    stmts: Final[list[AssignStmt | EvalStmt]]
+    """List of assignment and/or evaluation statements."""
 
-    def __init__(self, stmts: list[AssignStmt], span: Span) -> None:
+    def __init__(self, stmts: list[AssignStmt | EvalStmt], span: Span) -> None:
         """Create an operation statements.
 
         Args:
-            stmts: List of assignment statements
+            stmts: List of assignment and/or evaluation statements
             span: Source location
         """
 
@@ -1329,11 +1530,34 @@ class EvalStmt(Stmt):
             span: Source location
         """
 
+class BreakStmt(Stmt):
+    """Break statement: break."""
+
+    def __init__(self, span: Span) -> None:
+        """Create a break statement.
+
+        Args:
+            span: Source location
+        """
+
+class ContinueStmt(Stmt):
+    """Continue statement: continue."""
+
+    def __init__(self, span: Span) -> None:
+        """Create a continue statement.
+
+        Args:
+            span: Source location
+        """
+
 class Function(IRNode):
     """Function definition with name, parameters, return types, and body."""
 
     name: Final[str]
     """Function name."""
+
+    func_type: Final[FunctionType]
+    """Function type (orchestration, incore, or opaque)."""
 
     params: Final[list[Var]]
     """Parameter variables."""
@@ -1347,10 +1571,11 @@ class Function(IRNode):
     def __init__(
         self,
         name: str,
-        params: list[Var],
-        return_types: list[Type],
+        params: Sequence[Var],
+        return_types: Sequence[Type],
         body: Stmt,
         span: Span,
+        type: FunctionType = FunctionType.Opaque,
     ) -> None:
         """Create a function definition.
 
@@ -1360,6 +1585,7 @@ class Function(IRNode):
             return_types: Return types
             body: Function body statement (use SeqStmts for multiple statements)
             span: Source location
+            type: Function type (default: Opaque)
         """
 
     def __str__(self) -> str:
@@ -1696,12 +1922,13 @@ class IRBuilder:
         """Create an IR builder."""
 
     # Function building
-    def begin_function(self, name: str, span: Span) -> None:
+    def begin_function(self, name: str, span: Span, type: FunctionType = FunctionType.Opaque) -> None:
         """Begin building a function.
 
         Args:
             name: Function name
             span: Source location for function definition
+            type: Function type (default: Opaque)
         """
 
     def func_arg(self, name: str, type: Type, span: Span) -> Var:
@@ -1734,7 +1961,15 @@ class IRBuilder:
         """
 
     # For loop building
-    def begin_for_loop(self, loop_var: Var, start: Expr, stop: Expr, step: Expr, span: Span) -> None:
+    def begin_for_loop(
+        self,
+        loop_var: Var,
+        start: Expr,
+        stop: Expr,
+        step: Expr,
+        span: Span,
+        kind: ForKind = ForKind.Sequential,
+    ) -> None:
         """Begin building a for loop.
 
         Args:
@@ -1743,6 +1978,7 @@ class IRBuilder:
             stop: Stop value expression
             step: Step value expression
             span: Source location for loop definition
+            kind: Loop kind (default: Sequential)
         """
 
     def add_iter_arg(self, iter_arg: IterArg) -> None:
@@ -1767,6 +2003,57 @@ class IRBuilder:
 
         Returns:
             The built for statement
+        """
+
+    # While loop building
+    def begin_while_loop(self, condition: Expr, span: Span) -> None:
+        """Begin building a while loop.
+
+        Creates a new while loop context. Must be closed with end_while_loop().
+
+        Args:
+            condition: Condition expression
+            span: Source location for loop definition
+        """
+
+    def add_while_iter_arg(self, iter_arg: IterArg) -> None:
+        """Add an iteration argument to the current while loop.
+
+        Iteration arguments are loop-carried values (SSA-style).
+
+        Args:
+            iter_arg: Iteration argument with initial value
+        """
+
+    def add_while_return_var(self, var: Var) -> None:
+        """Add a return variable to the current while loop.
+
+        Return variables capture the final values of iteration arguments.
+
+        Args:
+            var: Return variable
+        """
+
+    def set_while_loop_condition(self, condition: Expr) -> None:
+        """Set the condition for the current while loop.
+
+        Used to update the loop condition after setting up iter_args. This allows
+        the condition to reference iter_arg variables that are defined in the loop.
+
+        Args:
+            condition: New condition expression
+        """
+
+    def end_while_loop(self, end_span: Span) -> WhileStmt:
+        """End building a while loop.
+
+        Finalizes the loop and returns it.
+
+        Args:
+            end_span: Source location for end of loop
+
+        Returns:
+            The built while statement
         """
 
     # If statement building
@@ -1800,6 +2087,25 @@ class IRBuilder:
 
         Returns:
             The built if statement
+        """
+
+    # Scope building
+    def begin_scope(self, scope_kind: ScopeKind, span: Span) -> None:
+        """Begin building a scope statement.
+
+        Args:
+            scope_kind: The kind of scope (e.g., ScopeKind.InCore)
+            span: Source location for scope statement
+        """
+
+    def end_scope(self, end_span: Span) -> ScopeStmt:
+        """End building a scope statement.
+
+        Args:
+            end_span: Source location for end of scope
+
+        Returns:
+            The built scope statement
         """
 
     # Program building
@@ -2021,37 +2327,6 @@ def python_print_type(type: Type, prefix: str = "pl") -> str:
         String representation of the Type
     """
 
-# ========== PTO Code Generator ==========
-class PTOCodegen:
-    """Code generator that transforms PyPTO IR to PTO assembly (.pto format).
-
-    Generates PTO ISA instructions from PyPTO IR, supporting:
-    - Tile operations (binary, unary, scalar) -> PTO instructions (VADD, VMUL, etc.)
-    - Control flow (for loops, if statements) -> FOR/ENDFOR, IF/ENDIF
-    - SSA-style variable naming with % prefix
-    - Proper type annotations (!pto.tile<...>, !pto.memref<...>)
-    """
-
-    def __init__(self) -> None:
-        """Create a new PTO code generator."""
-
-    def generate(self, program: Program) -> str:
-        """Generate PTO assembly code from PyPTO IR Program.
-
-        Transforms the entire program into PTO assembly (.pto format).
-
-        Args:
-            program: Input PyPTO IR Program
-
-        Returns:
-            PTO assembly string (.pto format)
-
-        Example:
-            >>> codegen = ir.PTOCodegen()
-            >>> pto_code = codegen.generate(program)
-            >>> print(pto_code)
-        """
-
 def add(lhs: Expr, rhs: Expr, span: Span) -> Expr:
     """Addition operator (lhs + rhs)."""
 
@@ -2090,3 +2365,70 @@ def bit_shift_right(lhs: Expr, rhs: Expr, span: Span) -> Expr:
 
 def bit_not(operand: Expr, span: Span) -> Expr:
     """Bitwise not operator (~operand)."""
+
+class ParentStmtAnalysis:
+    """Utility class for analyzing parent-child relationships in statement trees.
+
+    This class builds a mapping from each statement to its parent statement within
+    a function's body. It is useful for passes that need to traverse upward in the
+    IR tree or understand the context of a statement.
+
+    Example usage:
+        analysis = ir.ParentStmtAnalysis()
+        analysis.build_map(function)
+        parent = analysis.get_parent(some_stmt)
+        if parent:
+            # Use parent statement
+
+    Note: The analysis becomes invalid after IR transformations. Call build_map again
+    if the IR tree is modified.
+    """
+
+    def __init__(self) -> None:
+        """Create a ParentStmtAnalysis instance."""
+
+    def build_map(self, func: Function) -> None:
+        """Build the parent mapping from a function's body.
+
+        Traverses the function's statement tree and records parent-child relationships.
+        This method clears any existing mapping before building the new one.
+
+        Args:
+            func: The function to analyze
+
+        Parent relationships established:
+        - For SeqStmts/OpStmts: Each child statement's parent is the SeqStmts/OpStmts
+        - For IfStmt: then_body and else_body (if present) have IfStmt as parent
+        - For ForStmt: body has ForStmt as parent
+        - Root statement (function.body) has no parent
+        """
+
+    def get_parent(self, stmt: Stmt) -> Stmt | None:
+        """Get the parent statement of a given statement.
+
+        Args:
+            stmt: The statement to query
+
+        Returns:
+            Parent statement, or None if:
+            - stmt is the root statement (function body)
+            - stmt is not found in the analyzed tree
+            - stmt is None
+        """
+
+    def has_parent(self, stmt: Stmt) -> bool:
+        """Check if a statement has a recorded parent.
+
+        Args:
+            stmt: The statement to check
+
+        Returns:
+            True if stmt has a parent in the map, False otherwise
+        """
+
+    def clear(self) -> None:
+        """Clear the parent mapping.
+
+        Removes all recorded parent-child relationships. Useful for reusing
+        the same ParentStmtAnalysis instance with different functions.
+        """

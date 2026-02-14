@@ -266,7 +266,7 @@ using VarPtr = std::shared_ptr<const Var>;
  * 4. Capture final value in ForStmt's return_vars
  *
  * @example
- * // for i, (sum,) in pl.range(0, n, 1, init_values=[0]):
+ * // for i, (sum,) in pl.range(0, n, 1, init_values=(0,)):
  * //     sum = pl.yield_(sum + i)
  * // sum_final = sum
  * auto sum_iter = std::make_shared<IterArg>("sum", type, init_val, span);
@@ -472,6 +472,40 @@ class Call : public Expr {
 };
 
 using CallPtr = std::shared_ptr<const Call>;
+
+/**
+ * @brief Expression to create a tuple from multiple expressions
+ *
+ * Takes a list of expressions and creates a tuple value.
+ * The result type is TupleType containing the types of all input expressions.
+ */
+class MakeTuple : public Expr {
+ public:
+  std::vector<ExprPtr> elements_;  // Elements of the tuple
+
+  /**
+   * @brief Create a tuple construction expression
+   *
+   * @param elements Expressions to be tuple elements
+   * @param span Source location
+   */
+  MakeTuple(std::vector<ExprPtr> elements, Span span);
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::MakeTuple; }
+  [[nodiscard]] std::string TypeName() const override { return "MakeTuple"; }
+
+  /**
+   * @brief Get field descriptors for reflection-based visitation
+   *
+   * @return Tuple of field descriptors
+   */
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Expr::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&MakeTuple::elements_, "elements")));
+  }
+};
+
+using MakeTuplePtr = std::shared_ptr<const MakeTuple>;
 
 /**
  * @brief Tuple element access expression

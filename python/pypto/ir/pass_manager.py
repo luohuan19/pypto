@@ -11,7 +11,7 @@
 
 import os
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Optional
 
 from pypto.pypto_core import ir as core_ir
 from pypto.pypto_core import passes
@@ -23,9 +23,7 @@ class OptimizationStrategy(Enum):
     """Enumeration of optimization strategies."""
 
     Default = "Default"  # No optimization
-    Custom1 = "Custom1"  # Custom optimization strategy 1
-    Custom2 = "Custom2"  # Custom optimization strategy 2
-    XPlatform = "XPlatform"  # Cross-platform optimization without scheduling and sync
+    PTOAS = "PTOAS"  # PTO assembly optimization without scheduling and sync
 
 
 class PassManager:
@@ -37,15 +35,15 @@ class PassManager:
 
     Usage:
         # Get a pre-configured strategy
-        pm = PassManager.get_strategy(OptimizationStrategy.Custom2)
+        pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
         result = pm.run_passes(program)  # For Program
 
         # Or use the shorthand
-        result = PassManager.get_strategy(OptimizationStrategy.Custom2).run_passes(program)
+        result = PassManager.get_strategy(OptimizationStrategy.PTOAS).run_passes(program)
     """
 
     # Static storage: strategy -> List of (pass_name, pass_factory) tuples
-    _strategy_passes: Dict[OptimizationStrategy, List[Tuple[str, Callable[[], passes.Pass]]]] = {}
+    _strategy_passes: dict[OptimizationStrategy, list[tuple[str, Callable[[], passes.Pass]]]] = {}
 
     @classmethod
     def _register_passes(cls):
@@ -57,18 +55,15 @@ class PassManager:
         """
         cls._strategy_passes = {
             OptimizationStrategy.Default: [
-                # No passes for Default (no optimization)
+                ("ConvertToSSA", lambda: passes.convert_to_ssa()),
+                ("FlattenCallExpr", lambda: passes.flatten_call_expr()),
+                ("RunVerifier", lambda: passes.run_verifier()),
+                ("InitMemRef", lambda: passes.init_mem_ref()),
+                ("MemoryReuse", lambda: passes.basic_memory_reuse()),
+                ("InsertSync", lambda: passes.insert_sync()),
+                ("AddAlloc", lambda: passes.add_alloc()),
             ],
-            OptimizationStrategy.Custom1: [
-                # Custom optimization strategy 1
-                ("IdentityPass_1", lambda: passes.identity()),
-            ],
-            OptimizationStrategy.Custom2: [
-                # Custom optimization strategy 2
-                ("IdentityPass_1", lambda: passes.identity()),
-                ("IdentityPass_2", lambda: passes.identity()),
-            ],
-            OptimizationStrategy.XPlatform: [
+            OptimizationStrategy.PTOAS: [
                 ("InitMemRef", lambda: passes.init_mem_ref()),
                 ("MemoryReuse", lambda: passes.basic_memory_reuse()),
                 ("AddAlloc", lambda: passes.add_alloc()),
@@ -76,7 +71,10 @@ class PassManager:
         }
 
     @classmethod
-    def get_strategy(cls, strategy: OptimizationStrategy = OptimizationStrategy.Default) -> "PassManager":
+    def get_strategy(
+        cls,
+        strategy: OptimizationStrategy = OptimizationStrategy.Default,
+    ) -> "PassManager":
         """Get a PassManager configured for the specified strategy.
 
         Args:
@@ -84,12 +82,6 @@ class PassManager:
 
         Returns:
             A PassManager instance configured with the appropriate passes
-
-        Example:
-            pm = PassManager.get_strategy(OptimizationStrategy.Custom2)
-            result = pm.run_passes(program)
-
-            pm_default = PassManager.get_strategy()  # Uses default strategy
         """
         if not cls._strategy_passes:
             cls._register_passes()
@@ -105,7 +97,6 @@ class PassManager:
         self.passes = []
         self.pass_names = []
 
-        # Instantiate all passes for this strategy
         for pass_name, pass_factory in self._strategy_passes[strategy]:
             self.passes.append(pass_factory())
             self.pass_names.append(pass_name)
@@ -169,7 +160,7 @@ class PassManager:
 
             return current_program
 
-    def get_pass_names(self) -> List[str]:
+    def get_pass_names(self) -> list[str]:
         """Get the names of all passes in this manager.
 
         Returns:

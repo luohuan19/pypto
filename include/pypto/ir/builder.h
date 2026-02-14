@@ -79,9 +79,10 @@ class IRBuilder {
    *
    * @param name Function name
    * @param span Source location for function definition
+   * @param type Function type (default: Opaque)
    * @throws RuntimeError if already inside a function (no nested functions allowed)
    */
-  void BeginFunction(const std::string& name, const Span& span);
+  void BeginFunction(const std::string& name, const Span& span, FunctionType type = FunctionType::Opaque);
 
   /**
    * @brief Add a function parameter
@@ -130,10 +131,11 @@ class IRBuilder {
    * @param stop Stop value expression
    * @param step Step value expression
    * @param span Source location for loop definition
+   * @param kind Loop kind (Sequential or Parallel, default: Sequential)
    * @throws RuntimeError if not inside a function or another loop
    */
   void BeginForLoop(const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop, const ExprPtr& step,
-                    const Span& span);
+                    const Span& span, ForKind kind = ForKind::Sequential);
 
   /**
    * @brief Add an iteration argument to the current for loop
@@ -167,6 +169,64 @@ class IRBuilder {
    * @throws RuntimeError if number of return variables doesn't match iteration arguments
    */
   StmtPtr EndForLoop(const Span& end_span);
+
+  // ========== While Loop Building ==========
+
+  /**
+   * @brief Begin building a while loop
+   *
+   * Creates a new while loop context and pushes it onto the context stack.
+   * Must be closed with EndWhileLoop().
+   *
+   * @param condition Condition expression
+   * @param span Source location for loop definition
+   * @throws RuntimeError if not inside a function or another loop
+   */
+  void BeginWhileLoop(const ExprPtr& condition, const Span& span);
+
+  /**
+   * @brief Add an iteration argument to the current while loop
+   *
+   * Iteration arguments are loop-carried values (SSA-style).
+   *
+   * @param iter_arg Iteration argument with initial value
+   * @throws RuntimeError if not inside a while loop context
+   */
+  void AddWhileIterArg(const IterArgPtr& iter_arg);
+
+  /**
+   * @brief Add a return variable to the current while loop
+   *
+   * Return variables capture the final values of iteration arguments.
+   * The number of return variables must match the number of iteration arguments.
+   *
+   * @param var Return variable
+   * @throws RuntimeError if not inside a while loop context
+   */
+  void AddWhileReturnVar(const VarPtr& var);
+
+  /**
+   * @brief Set the condition for the current while loop
+   *
+   * Used to update the loop condition after setting up iter_args. This allows
+   * the condition to reference iter_arg variables that are defined in the loop.
+   *
+   * @param condition New condition expression
+   * @throws RuntimeError if not inside a while loop context
+   */
+  void SetWhileLoopCondition(const ExprPtr& condition);
+
+  /**
+   * @brief End building a while loop
+   *
+   * Finalizes the loop and pops the loop context from the stack.
+   *
+   * @param end_span Source location for end of loop
+   * @return The built while statement
+   * @throws RuntimeError if not inside a while loop context
+   * @throws RuntimeError if number of return variables doesn't match iteration arguments
+   */
+  StmtPtr EndWhileLoop(const Span& end_span);
 
   // ========== If Statement Building ==========
 
@@ -213,6 +273,31 @@ class IRBuilder {
    * @throws RuntimeError if not inside an if context
    */
   StmtPtr EndIf(const Span& end_span);
+
+  // ========== Scope Building ==========
+
+  /**
+   * @brief Begin building a scope statement
+   *
+   * Creates a new scope context and pushes it onto the context stack.
+   * Must be closed with EndScope().
+   *
+   * @param scope_kind The kind of scope (e.g., InCore)
+   * @param span Source location for scope statement
+   * @throws RuntimeError if not inside a function or loop
+   */
+  void BeginScope(ScopeKind scope_kind, const Span& span);
+
+  /**
+   * @brief End building a scope statement
+   *
+   * Finalizes the scope statement and pops the context from the stack.
+   *
+   * @param end_span Source location for end of scope
+   * @return The built scope statement
+   * @throws RuntimeError if not inside a scope context
+   */
+  StmtPtr EndScope(const Span& end_span);
 
   // ========== Statement Recording ==========
 
@@ -304,6 +389,13 @@ class IRBuilder {
    */
   [[nodiscard]] bool InIf() const;
 
+  /**
+   * @brief Check if currently inside a while loop
+   *
+   * @return true if inside a while loop context
+   */
+  [[nodiscard]] bool InWhileLoop() const;
+
   // ========== Program Building ==========
 
   /**
@@ -391,6 +483,7 @@ class IRBuilder {
   void ValidateInFunction(const std::string& operation);
   void ValidateInLoop(const std::string& operation);
   void ValidateInIf(const std::string& operation);
+  void ValidateInWhileLoop(const std::string& operation);
   void ValidateInProgram(const std::string& operation);
 };
 
@@ -402,7 +495,7 @@ class IRBuilder {
  */
 class BuildContext {
  public:
-  enum class Type { FUNCTION, FOR_LOOP, IF_STMT, PROGRAM };
+  enum class Type { FUNCTION, FOR_LOOP, WHILE_LOOP, IF_STMT, SCOPE, PROGRAM };
 
   explicit BuildContext(Type type, Span span) : type_(type), begin_span_(std::move(span)) {}
   virtual ~BuildContext() = default;
@@ -425,8 +518,8 @@ class BuildContext {
  */
 class FunctionContext : public BuildContext {
  public:
-  FunctionContext(std::string name, Span span)
-      : BuildContext(Type::FUNCTION, std::move(span)), name_(std::move(name)) {}
+  FunctionContext(std::string name, Span span, FunctionType func_type = FunctionType::Opaque)
+      : BuildContext(Type::FUNCTION, std::move(span)), name_(std::move(name)), func_type_(func_type) {}
 
   void AddParam(const VarPtr& param) { params_.push_back(param); }
   void AddReturnType(const TypePtr& type) { return_types_.push_back(type); }
@@ -435,9 +528,11 @@ class FunctionContext : public BuildContext {
   [[nodiscard]] const std::string& GetName() const { return name_; }
   [[nodiscard]] const std::vector<VarPtr>& GetParams() const { return params_; }
   [[nodiscard]] const std::vector<TypePtr>& GetReturnTypes() const { return return_types_; }
+  [[nodiscard]] FunctionType GetFuncType() const { return func_type_; }
 
  private:
   std::string name_;
+  FunctionType func_type_;
   std::vector<VarPtr> params_;
   std::vector<TypePtr> return_types_;
 };
@@ -447,12 +542,14 @@ class FunctionContext : public BuildContext {
  */
 class ForLoopContext : public BuildContext {
  public:
-  ForLoopContext(VarPtr loop_var, ExprPtr start, ExprPtr stop, ExprPtr step, Span span)
+  ForLoopContext(VarPtr loop_var, ExprPtr start, ExprPtr stop, ExprPtr step, Span span,
+                 ForKind kind = ForKind::Sequential)
       : BuildContext(Type::FOR_LOOP, std::move(span)),
         loop_var_(std::move(loop_var)),
         start_(std::move(start)),
         stop_(std::move(stop)),
-        step_(std::move(step)) {}
+        step_(std::move(step)),
+        kind_(kind) {}
 
   void AddIterArg(const IterArgPtr& iter_arg) { iter_args_.push_back(iter_arg); }
   void AddReturnVar(const VarPtr& var) { return_vars_.push_back(var); }
@@ -464,12 +561,37 @@ class ForLoopContext : public BuildContext {
   [[nodiscard]] const ExprPtr& GetStep() const { return step_; }
   [[nodiscard]] const std::vector<IterArgPtr>& GetIterArgs() const { return iter_args_; }
   [[nodiscard]] const std::vector<VarPtr>& GetReturnVars() const { return return_vars_; }
+  [[nodiscard]] ForKind GetKind() const { return kind_; }
 
  private:
   VarPtr loop_var_;
   ExprPtr start_;
   ExprPtr stop_;
   ExprPtr step_;
+  ForKind kind_;
+  std::vector<IterArgPtr> iter_args_;
+  std::vector<VarPtr> return_vars_;
+};
+
+/**
+ * @brief Context for building a while loop
+ */
+class WhileLoopContext : public BuildContext {
+ public:
+  WhileLoopContext(ExprPtr condition, Span span)
+      : BuildContext(Type::WHILE_LOOP, std::move(span)), condition_(std::move(condition)) {}
+
+  void AddIterArg(const IterArgPtr& iter_arg) { iter_args_.push_back(iter_arg); }
+  void AddReturnVar(const VarPtr& var) { return_vars_.push_back(var); }
+  void SetCondition(const ExprPtr& condition) { condition_ = condition; }
+
+  void AddStmt(const StmtPtr& stmt) override { stmts_.push_back(stmt); }
+  [[nodiscard]] const ExprPtr& GetCondition() const { return condition_; }
+  [[nodiscard]] const std::vector<IterArgPtr>& GetIterArgs() const { return iter_args_; }
+  [[nodiscard]] const std::vector<VarPtr>& GetReturnVars() const { return return_vars_; }
+
+ private:
+  ExprPtr condition_;
   std::vector<IterArgPtr> iter_args_;
   std::vector<VarPtr> return_vars_;
 };
@@ -506,6 +628,24 @@ class IfStmtContext : public BuildContext {
   bool in_else_branch_ = false;
   std::vector<StmtPtr> else_stmts_;
   std::vector<VarPtr> return_vars_;
+};
+
+/**
+ * @brief Context for building a scope statement
+ */
+class ScopeContext : public BuildContext {
+ public:
+  ScopeContext(ScopeKind scope_kind, Span span)
+      : BuildContext(Type::SCOPE, std::move(span)), scope_kind_(scope_kind) {}
+
+  void AddStmt(const StmtPtr& stmt) override { stmts_.push_back(stmt); }
+
+  [[nodiscard]] ScopeKind GetScopeKind() const { return scope_kind_; }
+  [[nodiscard]] const std::vector<StmtPtr>& GetStmts() const { return stmts_; }
+
+ private:
+  ScopeKind scope_kind_;
+  std::vector<StmtPtr> stmts_;
 };
 
 /**

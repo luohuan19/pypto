@@ -15,7 +15,9 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "pypto/backend/common/backend.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/program.h"
 
@@ -63,7 +65,7 @@ class PassImpl {
  * Passes maintain immutability - they return new IR instances rather than modifying in place.
  *
  * The Pass class uses a pimpl pattern to hide implementation details.
- * Users should create passes using factory functions (CreateIdentity, CreateInitMemRef, etc.)
+ * Users should create passes using factory functions (CreateInitMemRef, etc.)
  * rather than instantiating Pass directly.
  */
 class Pass {
@@ -147,13 +149,6 @@ Pass CreateFunctionPass(std::function<FunctionPtr(const FunctionPtr&)> transform
 Pass CreateProgramPass(std::function<ProgramPtr(const ProgramPtr&)> transform, const std::string& name = "");
 
 /**
- * @brief Create an identity pass for testing
- *
- * Appends "_identity" to function names to verify pass execution.
- */
-Pass Identity();
-
-/**
  * @brief Create an init memref pass
  *
  * Initializes MemRef for all variables in functions.
@@ -174,6 +169,7 @@ Pass BasicMemoryReuse();
  *
  * Analyzes data dependencies and inserts synchronization operations
  * (sync_src, sync_dst, bar_v, bar_m) for correct execution across hardware pipes.
+ * Uses the globally configured backend to obtain pipe info.
  */
 Pass InsertSync();
 
@@ -226,6 +222,119 @@ Pass VerifySSA();
  * @return Pass that performs type checking
  */
 Pass TypeCheck();
+
+/**
+ * @brief Create an SSA conversion pass
+ *
+ * This pass converts non-SSA IR to SSA form by:
+ * 1. Renaming variables with version suffixes (x -> x_0, x_1, x_2)
+ * 2. Adding phi nodes (return_vars + YieldStmt) for IfStmt control flow divergence
+ * 3. Converting loop-modified variables to iter_args + return_vars pattern
+ *
+ * The pass handles:
+ * - Straight-line code: multiple assignments to the same variable
+ * - If statements: variables modified in one or both branches
+ * - For loops: variables modified inside the loop body
+ * - Mixed SSA/non-SSA: preserves existing SSA structure while converting non-SSA parts
+ *
+ * @return Pass that converts to SSA form
+ */
+Pass ConvertToSSA();
+
+/**
+ * @brief Outline InCore scopes into separate functions
+ *
+ * This pass transforms ScopeStmt(InCore) nodes into separate Function(InCore) definitions
+ * and replaces the scope with a Call to the outlined function.
+ *
+ * Requirements:
+ * - Input IR must be in SSA form (run ConvertToSSA first)
+ * - Only processes Opaque functions (InCore functions are left unchanged)
+ *
+ * Transformation:
+ * 1. For each ScopeStmt(InCore) in an Opaque function:
+ *    - Analyze body to determine external variable references (inputs)
+ *    - Analyze body to determine internal definitions used after scope (outputs)
+ *    - Extract body into new Function(InCore) with appropriate params/returns
+ *    - Replace scope with Call to the outlined function + output assignments
+ * 2. Add outlined functions to the program
+ *
+ * @return Pass that outlines InCore scopes
+ */
+Pass OutlineIncoreScopes();
+
+/**
+ * @brief Create a verifier pass with configurable rules
+ *
+ * This pass creates an IRVerifier with default rules (SSAVerify, TypeCheck)
+ * and allows disabling specific rules. The verifier collects all diagnostics
+ * and logs them without throwing exceptions (unless there are errors).
+ *
+ * @param disabled_rules Vector of rule names to disable (e.g., {"TypeCheck"})
+ * @return Pass that runs IR verification
+ */
+Pass RunVerifier(const std::vector<std::string>& disabled_rules = {});
+
+/**
+ * @brief Create a pass that flattens nested call expressions into three-address code
+ *
+ * This pass ensures that call expressions do not appear in nested contexts:
+ * 1. Call arguments cannot be calls
+ * 2. If conditions cannot be calls
+ * 3. For loop ranges (start/stop/step) cannot be calls
+ * 4. Binary/unary expression operands cannot be calls
+ *
+ * Nested calls are extracted into temporary variables (named _t0, _t1, etc.)
+ * and inserted as AssignStmt before the statement containing the nested call.
+ * For if/for statements, extracted statements are inserted into the last OpStmts
+ * before the if/for, or a new OpStmts is created if needed.
+ *
+ * Example transformation:
+ *   c = foo(bar(a))  =>  _t0 = bar(a); c = foo(_t0)
+ *
+ * @return Pass that flattens nested call expressions
+ */
+Pass FlattenCallExpr();
+
+/**
+ * @brief Create a pass that normalizes statement structure
+ *
+ * This pass ensures IR is in a normalized form:
+ * 1. Function/IfStmt/ForStmt body must be SeqStmts
+ * 2. Consecutive AssignStmt/EvalStmt in SeqStmts are wrapped in OpStmts
+ *
+ * Example transformations:
+ *   Function body = AssignStmt(x, 1)
+ *   => Function body = SeqStmts([OpStmts([AssignStmt(x, 1)])])
+ *
+ *   SeqStmts([AssignStmt(a, 1), AssignStmt(b, 2), IfStmt(...)])
+ *   => SeqStmts([OpStmts([AssignStmt(a, 1), AssignStmt(b, 2)]), IfStmt(...)])
+ *
+ * @return Pass that normalizes statement structure
+ */
+Pass NormalizeStmtStructure();
+
+/**
+ * @brief Create a pass that recursively flattens single-statement blocks
+ *
+ * This pass simplifies IR by removing unnecessary nesting:
+ * - SeqStmts with only one statement is replaced by that statement
+ * - OpStmts with only one statement is replaced by that statement
+ * - Process is applied recursively
+ *
+ * Example transformations:
+ *   SeqStmts([OpStmts([AssignStmt(x, 1)])])
+ *   => AssignStmt(x, 1)
+ *
+ *   SeqStmts([OpStmts([AssignStmt(x, 1), AssignStmt(y, 2)])])
+ *   => OpStmts([AssignStmt(x, 1), AssignStmt(y, 2)])
+ *
+ * Note: This pass does NOT enforce that Function/IfStmt/ForStmt body must be SeqStmts.
+ * It will flatten them if they contain only a single statement.
+ *
+ * @return Pass that flattens single-statement blocks
+ */
+Pass FlattenSingleStmt();
 
 }  // namespace pass
 }  // namespace ir

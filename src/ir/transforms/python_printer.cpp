@@ -141,6 +141,7 @@ class IRPythonPrinter : public IRVisitor {
   void VisitExpr_(const ConstFloatPtr& op) override;
   void VisitExpr_(const ConstBoolPtr& op) override;
   void VisitExpr_(const CallPtr& op) override;
+  void VisitExpr_(const MakeTuplePtr& op) override;
   void VisitExpr_(const TupleGetItemExprPtr& op) override;
 
   // Binary operations
@@ -181,9 +182,13 @@ class IRPythonPrinter : public IRVisitor {
   void VisitStmt_(const YieldStmtPtr& op) override;
   void VisitStmt_(const ReturnStmtPtr& op) override;
   void VisitStmt_(const ForStmtPtr& op) override;
+  void VisitStmt_(const WhileStmtPtr& op) override;
+  void VisitStmt_(const ScopeStmtPtr& op) override;
   void VisitStmt_(const SeqStmtsPtr& op) override;
   void VisitStmt_(const OpStmtsPtr& op) override;
   void VisitStmt_(const EvalStmtPtr& op) override;
+  void VisitStmt_(const BreakStmtPtr& op) override;
+  void VisitStmt_(const ContinueStmtPtr& op) override;
   void VisitStmt_(const StmtPtr& op) override;
 
   // Function and program visitors
@@ -203,6 +208,7 @@ class IRPythonPrinter : public IRVisitor {
 
   // Statement body visitor with SSA-style handling
   void VisitStmtBody(const StmtPtr& body, const std::vector<VarPtr>& return_vars = {});
+  void PrintYieldAssignmentVars(const std::vector<VarPtr>& return_vars);
 
   // Statement body visitor in program context (for self.method() call printing)
   void VisitStmtInProgramContext(const StmtPtr& stmt, const ProgramPtr& program);
@@ -216,6 +222,7 @@ class IRPythonPrinter : public IRVisitor {
   // MemRef and TileView printing helpers
   std::string PrintMemRef(const MemRef& memref);
   std::string PrintTileView(const TileView& tile_view);
+  std::string PrintTensorView(const TensorView& tensor_view);
 };
 
 // Helper function to format float literals with decimal point
@@ -248,7 +255,8 @@ std::string DataTypeToPythonString(DataType dtype, const std::string& prefix) {
   if (dtype == DataType::UINT32) return p + "UINT32";
   if (dtype == DataType::UINT64) return p + "UINT64";
   if (dtype == DataType::FP4) return p + "FP4";
-  if (dtype == DataType::FP8) return p + "FP8";
+  if (dtype == DataType::FP8E4M3FN) return p + "FP8E4M3FN";
+  if (dtype == DataType::FP8E5M2) return p + "FP8E5M2";
   if (dtype == DataType::FP16) return p + "FP16";
   if (dtype == DataType::FP32) return p + "FP32";
   if (dtype == DataType::BF16) return p + "BFLOAT16";
@@ -283,7 +291,8 @@ std::string IRPythonPrinter::Print(const IRNodePtr& node) {
 
 std::string IRPythonPrinter::Print(const TypePtr& type) {
   if (auto scalar_type = As<ScalarType>(type)) {
-    return DataTypeToPythonString(scalar_type->dtype_, prefix_);
+    // Print as pl.Scalar[pl.INT64] for proper round-trip support
+    return prefix_ + ".Scalar[" + DataTypeToPythonString(scalar_type->dtype_, prefix_) + "]";
   }
 
   if (auto tensor_type = As<TensorType>(type)) {
@@ -302,6 +311,12 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
     if (tensor_type->memref_.has_value()) {
       oss << ", memref=" << PrintMemRef(*tensor_type->memref_.value());
     }
+
+    // Add optional tensor_view parameter if present
+    if (tensor_type->tensor_view_.has_value()) {
+      oss << ", tensor_view=" << PrintTensorView(tensor_type->tensor_view_.value());
+    }
+
     oss << "]";
     return oss.str();
   }
@@ -396,7 +411,7 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
 
   // Format operation name for printing
   // Operations are stored with internal names like "tensor.add_scalar"
-  // but need to be printed in parseable format like "pl.op.tensor.add"
+  // but need to be printed in parseable format like "pl.tensor.add"
   std::string op_name = op->op_->name_;
 
   // Check if this is a registered operation (contains a dot)
@@ -409,8 +424,8 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       op_name = op_name.substr(0, scalar_pos);
     }
 
-    // Print with pl.op. prefix
-    stream_ << prefix_ << ".op." << op_name << "(";
+    // Print with pl. prefix
+    stream_ << prefix_ << "." << op_name << "(";
   } else {
     // Not a registered operation, print as-is
     stream_ << op_name << "(";
@@ -459,6 +474,15 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   }
 
   stream_ << ")";
+}
+
+void IRPythonPrinter::VisitExpr_(const MakeTuplePtr& op) {
+  stream_ << "[";
+  for (size_t i = 0; i < op->elements_.size(); ++i) {
+    if (i > 0) stream_ << ", ";
+    VisitExpr(op->elements_[i]);
+  }
+  stream_ << "]";
 }
 
 void IRPythonPrinter::VisitExpr_(const TupleGetItemExprPtr& op) {
@@ -647,8 +671,11 @@ void IRPythonPrinter::VisitStmt_(const ReturnStmtPtr& op) {
 }
 
 void IRPythonPrinter::VisitStmt_(const ForStmtPtr& op) {
-  // SSA-style for with pl.range() - no inline type annotations in unpacking
+  // SSA-style for with pl.range() or pl.parallel() - no inline type annotations in unpacking
   stream_ << "for " << op->loop_var_->name_;
+
+  // Determine range keyword based on kind
+  bool is_parallel = (op->kind_ == ForKind::Parallel);
 
   // If we have iter_args, add tuple unpacking without type annotations
   if (!op->iter_args_.empty()) {
@@ -657,10 +684,13 @@ void IRPythonPrinter::VisitStmt_(const ForStmtPtr& op) {
       if (i > 0) stream_ << ", ";
       stream_ << op->iter_args_[i]->name_;
     }
-    stream_ << ") in " << prefix_ << ".range(";
-  } else {
-    stream_ << " in range(";
+    // Add trailing comma for single-element tuples to distinguish from parenthesized expression
+    if (op->iter_args_.size() == 1) {
+      stream_ << ",";
+    }
+    stream_ << ")";
   }
+  stream_ << " in " << prefix_ << (is_parallel ? ".parallel(" : ".range(");
 
   VisitExpr(op->start_);
   stream_ << ", ";
@@ -670,18 +700,82 @@ void IRPythonPrinter::VisitStmt_(const ForStmtPtr& op) {
 
   // Add init_values for iter_args
   if (!op->iter_args_.empty()) {
-    stream_ << ", init_values=[";
+    stream_ << ", init_values=(";
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
       if (i > 0) stream_ << ", ";
       VisitExpr(op->iter_args_[i]->initValue_);
     }
-    stream_ << "]";
+    // Add trailing comma for single-element tuple
+    if (op->iter_args_.size() == 1) stream_ << ",";
+    stream_ << ")";
   }
 
   stream_ << "):\n";
 
   IncreaseIndent();
   VisitStmtBody(op->body_, op->return_vars_);
+  DecreaseIndent();
+}
+
+void IRPythonPrinter::VisitStmt_(const WhileStmtPtr& op) {
+  // Check if this is SSA-style (with iter_args) or natural style
+  if (op->iter_args_.empty()) {
+    // Natural while loop without iter_args
+    stream_ << "while ";
+    VisitExpr(op->condition_);
+    stream_ << ":\n";
+
+    IncreaseIndent();
+    VisitStmtBody(op->body_, op->return_vars_);
+    DecreaseIndent();
+  } else {
+    // SSA-style while with iter_args - print as explicit DSL syntax
+    stream_ << "for (";
+    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+      if (i > 0) stream_ << ", ";
+      stream_ << op->iter_args_[i]->name_;
+    }
+    // Add trailing comma for single-element tuples
+    if (op->iter_args_.size() == 1) {
+      stream_ << ",";
+    }
+    stream_ << ") in " << prefix_ << ".while_(init_values=(";
+
+    // Add init_values for iter_args
+    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+      if (i > 0) stream_ << ", ";
+      VisitExpr(op->iter_args_[i]->initValue_);
+    }
+    // Add trailing comma for single-element tuple
+    if (op->iter_args_.size() == 1) stream_ << ",";
+    stream_ << ")):\n";
+
+    IncreaseIndent();
+
+    // Print condition as pl.cond() call as first body statement
+    stream_ << GetIndent() << prefix_ << ".cond(";
+    VisitExpr(op->condition_);
+    stream_ << ")\n";
+
+    VisitStmtBody(op->body_, op->return_vars_);
+    DecreaseIndent();
+  }
+}
+
+void IRPythonPrinter::VisitStmt_(const ScopeStmtPtr& op) {
+  // Map ScopeKind to DSL function name for robustness
+  static const std::unordered_map<ScopeKind, std::string> scope_kind_to_dsl = {
+      {ScopeKind::InCore, "incore"},
+  };
+
+  auto it = scope_kind_to_dsl.find(op->scope_kind_);
+  INTERNAL_CHECK(it != scope_kind_to_dsl.end())
+      << "Internal error: Unknown ScopeKind in python_printer: " << ScopeKindToString(op->scope_kind_);
+
+  stream_ << "with " << prefix_ << "." << it->second << "():\n";
+
+  IncreaseIndent();
+  VisitStmt(op->body_);
   DecreaseIndent();
 }
 
@@ -710,19 +804,33 @@ void IRPythonPrinter::VisitStmt_(const EvalStmtPtr& op) {
   VisitExpr(op->expr_);
 }
 
+void IRPythonPrinter::VisitStmt_(const BreakStmtPtr& op) { stream_ << "break"; }
+
+void IRPythonPrinter::VisitStmt_(const ContinueStmtPtr& op) { stream_ << "continue"; }
+
 void IRPythonPrinter::VisitStmt_(const StmtPtr& op) { stream_ << op->TypeName(); }
+
+void IRPythonPrinter::PrintYieldAssignmentVars(const std::vector<VarPtr>& return_vars) {
+  // Helper to print left-hand side of yield assignment
+  // For single variable: print with type annotation (var: type)
+  // For multiple variables: print without type annotations (var1, var2)
+  if (return_vars.size() == 1) {
+    stream_ << return_vars[0]->name_ << ": " << Print(return_vars[0]->GetType());
+  } else {
+    for (size_t i = 0; i < return_vars.size(); ++i) {
+      if (i > 0) stream_ << ", ";
+      stream_ << return_vars[i]->name_;
+    }
+  }
+}
 
 void IRPythonPrinter::VisitStmtBody(const StmtPtr& body, const std::vector<VarPtr>& return_vars) {
   // Helper to visit statement body and wrap YieldStmt with assignment if needed
   if (auto yield_stmt = As<YieldStmt>(body)) {
-    // If parent has return_vars, wrap yield as assignment (no inline type annotations)
+    // If parent has return_vars, wrap yield as assignment
     if (!yield_stmt->value_.empty() && !return_vars.empty()) {
       stream_ << GetIndent();
-      // Print variable names without type annotations (not valid in tuple unpacking)
-      for (size_t i = 0; i < return_vars.size(); ++i) {
-        if (i > 0) stream_ << ", ";
-        stream_ << return_vars[i]->name_;
-      }
+      PrintYieldAssignmentVars(return_vars);
       stream_ << " = " << prefix_ << ".yield_(";
       for (size_t i = 0; i < yield_stmt->value_.size(); ++i) {
         if (i > 0) stream_ << ", ";
@@ -742,12 +850,9 @@ void IRPythonPrinter::VisitStmtBody(const StmtPtr& body, const std::vector<VarPt
       bool is_last = (i == seq_stmts->stmts_.size() - 1);
       if (auto yield_stmt = As<YieldStmt>(stmt)) {
         if (is_last && !yield_stmt->value_.empty() && !return_vars.empty()) {
-          // Wrap as assignment without inline type annotations
+          // Wrap as assignment
           stream_ << GetIndent();
-          for (size_t j = 0; j < return_vars.size(); ++j) {
-            if (j > 0) stream_ << ", ";
-            stream_ << return_vars[j]->name_;
-          }
+          PrintYieldAssignmentVars(return_vars);
           stream_ << " = " << prefix_ << ".yield_(";
           for (size_t j = 0; j < yield_stmt->value_.size(); ++j) {
             if (j > 0) stream_ << ", ";
@@ -774,7 +879,12 @@ void IRPythonPrinter::VisitStmtBody(const StmtPtr& body, const std::vector<VarPt
 }
 
 void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
-  stream_ << "@" << prefix_ << ".function\n";
+  // Print decorator with type parameter if not opaque
+  stream_ << "@" << prefix_ << ".function";
+  if (func->func_type_ != FunctionType::Opaque) {
+    stream_ << "(type=" << prefix_ << ".FunctionType." << FunctionTypeToString(func->func_type_) << ")";
+  }
+  stream_ << "\n";
   stream_ << "def " << func->name_ << "(";
 
   // Print parameters with type annotations
@@ -1076,6 +1186,36 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view) {
   // Print start_offset
   IRPythonPrinter temp_printer(prefix_);
   oss << temp_printer.Print(tile_view.start_offset);
+
+  oss << ")";
+  return oss.str();
+}
+
+std::string IRPythonPrinter::PrintTensorView(const TensorView& tensor_view) {
+  std::ostringstream oss;
+  oss << prefix_ << ".TensorView(stride=[";
+
+  // Print stride
+  for (size_t i = 0; i < tensor_view.stride.size(); ++i) {
+    if (i > 0) oss << ", ";
+    IRPythonPrinter temp_printer(prefix_);
+    oss << temp_printer.Print(tensor_view.stride[i]);
+  }
+
+  oss << "], layout=" << prefix_ << ".TensorLayout.";
+
+  // Print layout enum value
+  switch (tensor_view.layout) {
+    case TensorLayout::ND:
+      oss << "ND";
+      break;
+    case TensorLayout::DN:
+      oss << "DN";
+      break;
+    case TensorLayout::NZ:
+      oss << "NZ";
+      break;
+  }
 
   oss << ")";
   return oss.str();

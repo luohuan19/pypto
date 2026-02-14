@@ -46,11 +46,13 @@ void BindIRBuilder(nb::module_& m) {
 
       // Function building
       .def("begin_function", &IRBuilder::BeginFunction, nb::arg("name"), nb::arg("span"),
+           nb::arg("type") = FunctionType::Opaque,
            "Begin building a function.\n\n"
            "Creates a new function context. Must be closed with end_function().\n\n"
            "Args:\n"
            "    name: Function name\n"
-           "    span: Source location for function definition\n\n"
+           "    span: Source location for function definition\n"
+           "    type: Function type (default: Opaque)\n\n"
            "Raises:\n"
            "    RuntimeError: If already inside a function (nested functions not allowed)")
 
@@ -86,7 +88,7 @@ void BindIRBuilder(nb::module_& m) {
 
       // For loop building
       .def("begin_for_loop", &IRBuilder::BeginForLoop, nb::arg("loop_var"), nb::arg("start"), nb::arg("stop"),
-           nb::arg("step"), nb::arg("span"),
+           nb::arg("step"), nb::arg("span"), nb::arg("kind") = ForKind::Sequential,
            "Begin building a for loop.\n\n"
            "Creates a new for loop context. Must be closed with end_for_loop().\n\n"
            "Args:\n"
@@ -94,7 +96,8 @@ void BindIRBuilder(nb::module_& m) {
            "    start: Start value expression\n"
            "    stop: Stop value expression\n"
            "    step: Step value expression\n"
-           "    span: Source location for loop definition\n\n"
+           "    span: Source location for loop definition\n"
+           "    kind: Loop kind (Sequential or Parallel, default: Sequential)\n\n"
            "Raises:\n"
            "    RuntimeError: If not inside a valid context")
 
@@ -124,6 +127,52 @@ void BindIRBuilder(nb::module_& m) {
            "    ForStmt: The built for statement\n\n"
            "Raises:\n"
            "    RuntimeError: If not inside a for loop context\n"
+           "    RuntimeError: If number of return variables doesn't match iteration arguments")
+
+      // While loop building
+      .def("begin_while_loop", &IRBuilder::BeginWhileLoop, nb::arg("condition"), nb::arg("span"),
+           "Begin building a while loop.\n\n"
+           "Creates a new while loop context. Must be closed with end_while_loop().\n\n"
+           "Args:\n"
+           "    condition: Condition expression\n"
+           "    span: Source location for loop definition\n\n"
+           "Raises:\n"
+           "    RuntimeError: If not inside a valid context")
+
+      .def("add_while_iter_arg", &IRBuilder::AddWhileIterArg, nb::arg("iter_arg"),
+           "Add an iteration argument to the current while loop.\n\n"
+           "Iteration arguments are loop-carried values (SSA-style).\n\n"
+           "Args:\n"
+           "    iter_arg: Iteration argument with initial value\n\n"
+           "Raises:\n"
+           "    RuntimeError: If not inside a while loop context")
+
+      .def("add_while_return_var", &IRBuilder::AddWhileReturnVar, nb::arg("var"),
+           "Add a return variable to the current while loop.\n\n"
+           "Return variables capture the final values of iteration arguments.\n\n"
+           "Args:\n"
+           "    var: Return variable\n\n"
+           "Raises:\n"
+           "    RuntimeError: If not inside a while loop context")
+
+      .def("set_while_loop_condition", &IRBuilder::SetWhileLoopCondition, nb::arg("condition"),
+           "Set the condition for the current while loop.\n\n"
+           "Used to update the loop condition after setting up iter_args. This allows\n"
+           "the condition to reference iter_arg variables that are defined in the loop.\n\n"
+           "Args:\n"
+           "    condition: New condition expression\n\n"
+           "Raises:\n"
+           "    RuntimeError: If not inside a while loop context")
+
+      .def("end_while_loop", &IRBuilder::EndWhileLoop, nb::arg("end_span"),
+           "End building a while loop.\n\n"
+           "Finalizes the loop and returns it.\n\n"
+           "Args:\n"
+           "    end_span: Source location for end of loop\n\n"
+           "Returns:\n"
+           "    WhileStmt: The built while statement\n\n"
+           "Raises:\n"
+           "    RuntimeError: If not inside a while loop context\n"
            "    RuntimeError: If number of return variables doesn't match iteration arguments")
 
       // If statement building
@@ -162,6 +211,25 @@ void BindIRBuilder(nb::module_& m) {
            "    IfStmt: The built if statement\n\n"
            "Raises:\n"
            "    RuntimeError: If not inside an if context")
+
+      // Scope building
+      .def("begin_scope", &IRBuilder::BeginScope, nb::arg("scope_kind"), nb::arg("span"),
+           "Begin building a scope statement.\n\n"
+           "Creates a new scope context. Must be closed with end_scope().\n\n"
+           "Args:\n"
+           "    scope_kind: The kind of scope (e.g., ScopeKind.InCore)\n"
+           "    span: Source location for scope statement\n\n"
+           "Raises:\n"
+           "    RuntimeError: If not inside a function or loop")
+      .def("end_scope", &IRBuilder::EndScope, nb::arg("end_span"),
+           "End building a scope statement.\n\n"
+           "Finalizes the scope statement and returns it.\n\n"
+           "Args:\n"
+           "    end_span: Source location for end of scope\n\n"
+           "Returns:\n"
+           "    ScopeStmt: The built scope statement\n\n"
+           "Raises:\n"
+           "    RuntimeError: If not inside a scope context")
 
       // Statement recording
       .def("emit", &IRBuilder::Emit, nb::arg("stmt"),

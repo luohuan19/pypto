@@ -71,6 +71,14 @@ void IRVisitor::VisitExpr_(const CallPtr& op) {
   }
 }
 
+void IRVisitor::VisitExpr_(const MakeTuplePtr& op) {
+  // Visit all element expressions
+  for (size_t i = 0; i < op->elements_.size(); ++i) {
+    INTERNAL_CHECK(op->elements_[i]) << "MakeTuple has null element at index " << i;
+    VisitExpr(op->elements_[i]);
+  }
+}
+
 void IRVisitor::VisitExpr_(const TupleGetItemExprPtr& op) {
   // Visit the tuple expression
   INTERNAL_CHECK(op->tuple_) << "TupleGetItemExpr has null tuple";
@@ -187,6 +195,26 @@ void IRVisitor::VisitStmt_(const ForStmtPtr& op) {
   }
 }
 
+void IRVisitor::VisitStmt_(const WhileStmtPtr& op) {
+  INTERNAL_CHECK(op->condition_) << "WhileStmt has null condition";
+  VisitExpr(op->condition_);
+  for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+    INTERNAL_CHECK(op->iter_args_[i]) << "WhileStmt has null iter_args at index " << i;
+    VisitExpr(op->iter_args_[i]);
+  }
+  INTERNAL_CHECK(op->body_) << "WhileStmt has null body";
+  VisitStmt(op->body_);
+  for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+    INTERNAL_CHECK(op->return_vars_[i]) << "WhileStmt has null return_vars at index " << i;
+    VisitExpr(op->return_vars_[i]);
+  }
+}
+
+void IRVisitor::VisitStmt_(const ScopeStmtPtr& op) {
+  INTERNAL_CHECK(op->body_) << "ScopeStmt has null body";
+  VisitStmt(op->body_);
+}
+
 void IRVisitor::VisitStmt_(const SeqStmtsPtr& op) {
   for (size_t i = 0; i < op->stmts_.size(); ++i) {
     INTERNAL_CHECK(op->stmts_[i]) << "SeqStmts has null statement at index " << i;
@@ -196,7 +224,7 @@ void IRVisitor::VisitStmt_(const SeqStmtsPtr& op) {
 
 void IRVisitor::VisitStmt_(const OpStmtsPtr& op) {
   for (size_t i = 0; i < op->stmts_.size(); ++i) {
-    INTERNAL_CHECK(op->stmts_[i]) << "OpStmts has null assignment statement at index " << i;
+    INTERNAL_CHECK(op->stmts_[i]) << "OpStmts has null statement at index " << i;
     VisitStmt(op->stmts_[i]);
   }
 }
@@ -204,6 +232,14 @@ void IRVisitor::VisitStmt_(const OpStmtsPtr& op) {
 void IRVisitor::VisitStmt_(const EvalStmtPtr& op) {
   INTERNAL_CHECK(op->expr_) << "EvalStmt has null expr";
   VisitExpr(op->expr_);
+}
+
+void IRVisitor::VisitStmt_(const BreakStmtPtr& op) {
+  // Leaf node, no children to visit
+}
+
+void IRVisitor::VisitStmt_(const ContinueStmtPtr& op) {
+  // Leaf node, no children to visit
 }
 
 void IRVisitor::VisitStmt_(const StmtPtr& op) {
