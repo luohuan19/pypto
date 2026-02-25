@@ -49,7 +49,7 @@ Test Case Definition → Build IR → Generate Kernels → Compile → Execute �
 
 ## Running Tests
 
-**Important:** The `--forked` flag is required for running system tests.
+**Note:** The `--forked` flag is optional. Use it if you need process isolation between tests.
 
 ### Basic Test Execution
 
@@ -60,16 +60,16 @@ Navigate to the PyPTO project root and run tests:
 cd /path/to/pypto-github
 
 # Run all system tests (simulation mode by default)
-pytest tests/st/ -v --forked
+pytest tests/st/ -v
 
 # Run specific test file
-pytest tests/st/runtime/test_matmul.py -v --forked
+pytest tests/st/runtime/test_matmul.py -v
 
 # Run specific test class
-pytest tests/st/runtime/test_matmul.py::TestMatmulOperations -v --forked
+pytest tests/st/runtime/test_matmul.py::TestMatmulOperations -v
 
 # Run specific test method
-pytest tests/st/runtime/test_matmul.py::TestMatmulOperations::test_matmul_shapes -v --forked
+pytest tests/st/runtime/test_matmul.py::TestMatmulOperations::test_matmul_shapes -v
 ```
 
 ### Platform Selection
@@ -78,32 +78,55 @@ Tests can run on simulation or hardware platforms:
 
 ```bash
 # Run on simulator (default, no hardware required)
-pytest tests/st/ -v --forked --platform=a2a3sim
+pytest tests/st/ -v --platform=a2a3sim
 
 # Run on real hardware (requires NPU device)
-pytest tests/st/ -v --forked --platform=a2a3 --device=0
+pytest tests/st/ -v --platform=a2a3 --device=0
 
 # Specify different device ID
-pytest tests/st/ -v --forked --platform=a2a3 --device=1
+pytest tests/st/ -v --platform=a2a3 --device=1
 ```
 
 ### Verbose Output
 
-Control output verbosity for debugging:
+Control output verbosity and logging for debugging:
 
 ```bash
 # Standard verbose mode
-pytest tests/st/ -v --forked
+pytest tests/st/ -v
 
 # Extra verbose mode (shows test function docstrings)
-pytest tests/st/ -vv --forked
+pytest tests/st/ -vv
 
 # Show print statements and logging
-pytest tests/st/ -v -s --forked
+pytest tests/st/ -v -s
 
 # Show full diff for assertion failures
-pytest tests/st/ -vv --tb=long --forked
+pytest tests/st/ -vv --tb=long
 ```
+
+### Logging Level
+
+Control runtime logging for both Python and C++ sides:
+
+```bash
+# Debug level (most verbose - shows all debug information)
+pytest tests/st/ -v -s --pto-log-level=debug
+
+# Info level (default - shows main execution flow)
+pytest tests/st/ -v -s --pto-log-level=info
+
+# Warn level (only warnings and errors)
+pytest tests/st/ -v -s --pto-log-level=warn
+
+# Error level (only errors)
+pytest tests/st/ -v -s --pto-log-level=error
+
+# Combine with other options
+pytest tests/st/ -v -s --platform=a2a3 --device=1 --pto-log-level=debug
+```
+
+**Note:** Use `-s` flag with `--pto-log-level` to see the logging output (pytest captures stdout by default).
 
 ### Filtering Tests
 
@@ -111,16 +134,16 @@ Use pytest's built-in filtering capabilities:
 
 ```bash
 # Run tests matching keyword
-pytest tests/st/ -v --forked -k "matmul"
+pytest tests/st/ -v -k "matmul"
 
 # Run tests NOT matching keyword
-pytest tests/st/ -v --forked -k "not matmul"
+pytest tests/st/ -v -k "not matmul"
 
 # Run tests with specific marker
-pytest tests/st/ -v --forked -m "slow"
+pytest tests/st/ -v -m "slow"
 
 # Skip tests with specific marker
-pytest tests/st/ -v --forked -m "not hardware"
+pytest tests/st/ -v -m "not hardware"
 ```
 
 ## Test Configuration Options
@@ -134,6 +157,7 @@ The test framework provides extensive configuration through pytest command-line 
 | `--platform` | `a2a3sim` | Target platform: `a2a3sim` (simulator) or `a2a3` (hardware) |
 | `--device` | `0` | Device ID for hardware tests (0, 1, 2, ...) |
 | `--strategy` | `Default` | PyPTO optimization strategy: `Default` or `PTOAS` |
+| `--pto-log-level` | `info` | Log level for both Python and C++ runtime: `debug`, `info`, `warn`, `error` |
 | `--save-kernels` | `False` | Save generated kernels and artifacts to disk |
 | `--kernels-dir` | `build/tests/st/outputs/output_{timestamp}/` | Custom output directory for saved kernels |
 | `--dump-passes` | `False` | Dump intermediate IR after each compiler pass |
@@ -143,25 +167,28 @@ The test framework provides extensive configuration through pytest command-line 
 
 ```bash
 # Test with PTOAS optimization strategy
-pytest tests/st/ -v --forked --strategy=PTOAS
+pytest tests/st/ -v --strategy=PTOAS
 
 # Run hardware tests on device 1
-pytest tests/st/ -v --forked --platform=a2a3 --device=1
+pytest tests/st/ -v --platform=a2a3 --device=1
+
+# Run with debug logging (shows detailed execution info)
+pytest tests/st/ -v -s --pto-log-level=debug
 
 # Save generated kernels for inspection
-pytest tests/st/ -v --forked --save-kernels
+pytest tests/st/ -v --save-kernels
 
 # Save kernels to custom directory
-pytest tests/st/ -v --forked --save-kernels --kernels-dir ./my_test_outputs
+pytest tests/st/ -v --save-kernels --kernels-dir ./my_test_outputs
 
 # Enable compiler pass dumps for debugging
-pytest tests/st/ -v --forked --save-kernels --dump-passes
+pytest tests/st/ -v --save-kernels --dump-passes
 
 # Generate code without running (for code inspection)
-pytest tests/st/ -v --forked --codegen-only --save-kernels
+pytest tests/st/ -v --codegen-only --save-kernels
 
 # Combine multiple options
-pytest tests/st/ -v --forked --platform=a2a3sim --strategy=PTOAS --save-kernels --dump-passes
+pytest tests/st/ -v -s --platform=a2a3sim --strategy=PTOAS --save-kernels --dump-passes --pto-log-level=debug
 ```
 
 ## Advanced Usage
@@ -172,13 +199,13 @@ By default, generated kernels are stored in temporary directories and cleaned up
 
 ```bash
 # Save to default location: build/tests/st/outputs/output_{timestamp}/
-pytest tests/st/ -v --forked --save-kernels
+pytest tests/st/ -v --save-kernels
 
 # Save to custom directory
-pytest tests/st/ -v --forked --save-kernels --kernels-dir ./test_artifacts
+pytest tests/st/ -v --save-kernels --kernels-dir ./test_artifacts
 
 # Run single test and save outputs
-pytest tests/st/runtime/test_matmul.py::TestMatmulOperations::test_matmul_shapes -v --forked --save-kernels
+pytest tests/st/runtime/test_matmul.py::TestMatmulOperations::test_matmul_shapes -v --save-kernels
 ```
 
 **Output Structure:**
@@ -212,7 +239,7 @@ Dump intermediate IR representations after each compiler pass to debug transform
 
 ```bash
 # Enable IR pass dumps
-pytest tests/st/ -v --forked --save-kernels --dump-passes
+pytest tests/st/ -v --save-kernels --dump-passes
 
 # The pass_dump/ directory will contain IR snapshots at each optimization stage
 # Files are numbered sequentially: 001_initial.mlir, 002_after_pass_x.mlir, etc.
@@ -231,7 +258,7 @@ Generate code without executing on the runtime:
 
 ```bash
 # Generate kernels without running
-pytest tests/st/ -v --forked --codegen-only --save-kernels
+pytest tests/st/ -v --codegen-only --save-kernels
 
 # Useful for:
 # - Validating code generation without hardware/simulator
@@ -246,13 +273,13 @@ PyPTO supports different optimization strategies. Select at runtime:
 
 ```bash
 # Use Default optimization strategy (default)
-pytest tests/st/ -v --forked --strategy=Default
+pytest tests/st/ -v --strategy=Default
 
 # Use PTOAS (PTO Accelerator Strategy) optimization
-pytest tests/st/ -v --forked --strategy=PTOAS
+pytest tests/st/ -v --strategy=PTOAS
 
 # Combine with other options
-pytest tests/st/ -v --forked --strategy=PTOAS --save-kernels --dump-passes
+pytest tests/st/ -v --strategy=PTOAS --save-kernels --dump-passes
 ```
 
 You can also override the strategy in individual test cases by implementing the `get_strategy()` method:
@@ -274,10 +301,10 @@ Run tests with multiple configurations:
 # Tests using the tensor_shape fixture will run with: (64,64), (128,128), (256,256)
 
 # Run all shape variations
-pytest tests/st/ -v --forked
+pytest tests/st/ -v
 
 # Filter to specific parameter
-pytest tests/st/ -v --forked -k "64"
+pytest tests/st/ -v -k "64"
 ```
 
 ## Writing New Tests
@@ -438,14 +465,14 @@ Tests are organized by execution mode:
 
 ### Common Issues
 
-#### Tests Fail or Hang Without --forked
+#### Tests Interfering With Each Other
 
-**Problem:** Tests fail with unexpected errors, hang, or produce incorrect results when run without `--forked`.
+**Problem:** Tests fail when run together but pass individually.
 
-**Solution:**
+**Solution:** Use `--forked` to run each test in a separate process for isolation:
 
 ```bash
-# Always use --forked to run each test in a separate process
+# Run each test in a separate process
 pytest tests/st/ -v --forked
 
 # Install pytest-forked if not available
@@ -472,7 +499,7 @@ pip install -e .
 
 ```bash
 cd /path/to/pypto-github
-pytest tests/st/ -v --forked
+pytest tests/st/ -v
 ```
 
 The `conftest.py` automatically adds `tests/st/` to the Python path.
@@ -496,10 +523,10 @@ export SIMPLER_ROOT=/path/to/simpler
 ```bash
 # Run from project root directory
 cd /path/to/pypto-github
-pytest tests/st/ -v --forked
+pytest tests/st/ -v
 
 # Check pytest discovers conftest.py
-pytest tests/st/ -v --forked --collect-only
+pytest tests/st/ -v --collect-only
 ```
 
 #### Hardware Tests Skipped
@@ -510,7 +537,7 @@ pytest tests/st/ -v --forked --collect-only
 
 ```bash
 # Run hardware tests on device
-pytest tests/st/ -v --forked --platform=a2a3 --device=0
+pytest tests/st/ -v --platform=a2a3 --device=0
 ```
 
 ### Verification Checklist
@@ -518,7 +545,7 @@ pytest tests/st/ -v --forked --platform=a2a3 --device=0
 Before running tests, verify your setup:
 
 - [ ] PyPTO installed: `python -c "import pypto"`
-- [ ] pytest-forked installed: `pip install pytest-forked`
+- [ ] pytest-forked installed (optional): `pip install pytest-forked`
 - [ ] In correct directory: `pwd` shows PyPTO project root
 - [ ] conftest.py exists: `ls tests/st/conftest.py`
 - [ ] harness package exists: `ls tests/st/harness/`

@@ -18,6 +18,7 @@ Orchestrates the full test execution pipeline:
 5. Validate results
 """
 
+import os
 import shutil
 import tempfile
 import time
@@ -26,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from pypto import LogLevel, set_log_level
 from pypto.backend import BackendType, set_backend_type
 
 from harness.adapters.golden_generator import GoldenGenerator
@@ -41,6 +43,26 @@ _SESSION_OUTPUT_DIR = None
 
 # Counter for unique test numbering within a session
 _TEST_COUNTER = 0
+
+
+def _setup_logging(level_str: str) -> None:
+    """Setup logging for both Python and C++ sides.
+    Args:
+        level_str: Log level string ('error', 'warn', 'info', 'debug')
+    """
+    pypto_level_map = {
+        "error": LogLevel.ERROR,
+        "warn": LogLevel.WARN,
+        "info": LogLevel.INFO,
+        "debug": LogLevel.DEBUG,
+    }
+    level_key = level_str.lower()
+
+    # Setup PyPTO C++ logging
+    set_log_level(pypto_level_map.get(level_key, LogLevel.INFO))
+
+    # Set environment variable for Simpler C++ side
+    os.environ["SIMPLER_LOG_LEVEL"] = level_str
 
 
 def _get_next_test_number() -> int:
@@ -88,6 +110,9 @@ class TestRunner:
             config: Test configuration. If None, uses default config.
         """
         self.config = config or TestConfig()
+
+        # Setup logging for both Python and C++ sides based on config
+        _setup_logging(self.config.log_level)
 
     def run(self, test_case: PTOTestCase) -> TestResult:
         """Run a test case and return results.

@@ -102,6 +102,7 @@ class TestConfig:
                               └── metadata.json
         dump_passes: If True, dump intermediate IR after each pass.
         codegen_only: If True, only generate code without executing runtime.
+        log_level: Log level for both Python and C++ ("debug", "info", "warn", "error").
     """
 
     __test__ = False  # Not a pytest test class
@@ -116,10 +117,13 @@ class TestConfig:
     save_kernels_dir: str | None = None
     dump_passes: bool = False
     codegen_only: bool = False
+    log_level: str = "info"
 
     def __post_init__(self):
         if self.platform not in ("a2a3sim", "a2a3"):
             raise ValueError(f"Invalid platform: {self.platform}")
+        if self.log_level not in ("debug", "info", "warn", "error"):
+            raise ValueError(f"Invalid log_level: {self.log_level}")
 
 
 @dataclass

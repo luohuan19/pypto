@@ -119,6 +119,13 @@ def pytest_addoption(parser):
         default=False,
         help="Only generate code, skip runtime execution (default: False)",
     )
+    parser.addoption(
+        "--pto-log-level",
+        action="store",
+        default="info",
+        choices=["debug", "info", "warn", "error"],
+        help="Log level for both Python and C++ runtime (default: info)",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -143,6 +150,7 @@ def test_config(request) -> TestConfig:
         save_kernels_dir=save_kernels_dir,
         dump_passes=request.config.getoption("--dump-passes"),
         codegen_only=request.config.getoption("--codegen-only"),
+        log_level=request.config.getoption("--pto-log-level"),
     )
 
 
