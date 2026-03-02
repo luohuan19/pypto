@@ -382,6 +382,11 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
           result_buf = GetTileBufForMemRef(tile_type->memref_.value());
         }
         result_tile_type = tile_type;
+      } else if (As<ScalarType>(op->var_->GetType())) {
+        // Pre-allocate an SSA name for scalar-result backend ops (e.g., block.getval).
+        // Register it in var_to_mlir_ so subsequent expressions can resolve the variable.
+        result_buf = NewTemp();
+        var_to_mlir_[op->var_->name_] = result_buf;
       }
       current_result_buf_ = result_buf;
       current_result_tile_type_ = result_tile_type;

@@ -35,6 +35,8 @@ import pypto.language as pl
 import pytest
 import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
+from pypto.backend import BackendType
+from pypto.ir.pass_manager import OptimizationStrategy
 
 from examples.ir_parser.batch_paged_attention_example import BuildBatchPagedAttentionProgram
 
@@ -76,13 +78,19 @@ class BatchQKMatmulTestCase(PTOTestCase):
     def get_name(self) -> str:
         return f"batch_qk_matmul_{self.batch}b_{self.num_heads}h_{self.head_dim}d"
 
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.PTOAS
+
+    def get_backend_type(self) -> BackendType:
+        return BackendType.PTO
+
     def define_tensors(self) -> list[TensorSpec]:
         query_rows = self.batch * self.num_heads
         key_cache_rows = self.batch * self.block_num * self.block_size
         batch_q_tile = self.batch * self.q_tile
         bt_size = self.batch * self.block_num
 
-        block_table = torch.arange(bt_size, dtype=torch.int32)
+        block_table = torch.arange(bt_size, dtype=torch.int32).reshape(1, bt_size)
         config = torch.tensor(
             [self.batch, self.block_idx, self.q_offset, self.block_num, self.num_heads],
             dtype=torch.int64,
@@ -93,7 +101,7 @@ class BatchQKMatmulTestCase(PTOTestCase):
             TensorSpec(
                 "key_cache", [key_cache_rows, self.head_dim], DataType.FP16, init_value=torch.randn
             ),
-            TensorSpec("block_table", [bt_size], DataType.INT32, init_value=block_table),
+            TensorSpec("block_table", [1, bt_size], DataType.INT32, init_value=block_table),
             TensorSpec("config", [5], DataType.INT64, init_value=config),
             TensorSpec(
                 "sij_batch", [batch_q_tile, self.block_size], DataType.FP32, is_output=True
@@ -121,16 +129,20 @@ class BatchQKMatmulTestCase(PTOTestCase):
                 query: pl.Tensor[[query_rows, head_dim], pl.FP16],
                 key_cache: pl.Tensor[[key_cache_rows, head_dim], pl.FP16],
                 sij_batch: pl.Out[pl.Tensor[[batch_q_tile, block_size], pl.FP32]],
-                block_table: pl.Tensor[[block_table_flat_size], pl.INT32],
-                batch_count: pl.Scalar[pl.INT64],
-                block_idx: pl.Scalar[pl.INT64],
-                q_offset: pl.Scalar[pl.INT64],
-                block_num_p: pl.Scalar[pl.INT64],
-                num_heads_p: pl.Scalar[pl.INT64],
+                block_table: pl.Tensor[[1, block_table_flat_size], pl.INT32],
+                batch_count: pl.Scalar[pl.INDEX],
+                block_idx: pl.Scalar[pl.INDEX],
+                q_offset: pl.Scalar[pl.INDEX],
+                block_num_p: pl.Scalar[pl.INDEX],
+                num_heads_p: pl.Scalar[pl.INDEX],
             ) -> pl.Tensor[[batch_q_tile, block_size], pl.FP32]:
+                bt_tile = pl.load(
+                    block_table, [0, 0], [1, block_table_flat_size],
+                    target_memory=pl.MemorySpace.Vec,
+                )
                 for b in pl.range(batch_count):
                     qi_row = b * num_heads_p + q_offset
-                    phys_block = pl.tensor.read(block_table, [b * block_num_p + block_idx])
+                    phys_block = pl.block.getval(bt_tile, b * block_num_p + block_idx)
                     kj_row = phys_block * block_size
 
                     qi_l1 = pl.load(
@@ -144,17 +156,17 @@ class BatchQKMatmulTestCase(PTOTestCase):
                     qi_l0a = pl.move(qi_l1, target_memory=pl.MemorySpace.Left)
                     kj_l0b = pl.move(kj_l1, target_memory=pl.MemorySpace.Right, transpose=True)
                     sij_l0c = pl.matmul(qi_l0a, kj_l0b)
-                    sij_batch = pl.l0c_store(
+                    sij_batch_new = pl.l0c_store(
                         sij_l0c, [b * q_tile, 0], [q_tile, block_size], sij_batch
                     )
-                return sij_batch
+                return sij_batch_new
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def Orchestrator(
                 self,
                 query: pl.Tensor[[query_rows, head_dim], pl.FP16],
                 key_cache: pl.Tensor[[key_cache_rows, head_dim], pl.FP16],
-                block_table: pl.Tensor[[block_table_flat_size], pl.INT32],
+                block_table: pl.Tensor[[1, block_table_flat_size], pl.INT32],
                 config: pl.Tensor[[5], pl.INT64],
             ) -> pl.Tensor[[batch_q_tile, block_size], pl.FP32]:
                 batch_count: pl.Scalar[pl.INT64] = pl.tensor.read(config, [0])
@@ -191,7 +203,7 @@ class BatchQKMatmulTestCase(PTOTestCase):
 
         for b in range(batch_count):
             qi_row = b * num_heads + q_offset
-            phys_block = int(block_table[b * block_num + block_idx].item())
+            phys_block = int(block_table[0, b * block_num + block_idx].item())
             kj_row = phys_block * block_size
 
             qi = query[qi_row : qi_row + q_tile, :]
@@ -232,6 +244,12 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
 
     def get_name(self) -> str:
         return f"batch_softmax_prepare_{self.batch}b_{self.block_size}bs_bi{self.block_idx}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.PTOAS
+
+    def get_backend_type(self) -> BackendType:
+        return BackendType.PTO
 
     def define_tensors(self) -> list[TensorSpec]:
         batch_q_tile = self.batch * self.q_tile
@@ -416,6 +434,12 @@ class BatchPVMatmulTestCase(PTOTestCase):
     def get_name(self) -> str:
         return f"batch_pv_matmul_{self.batch}b_{self.num_heads}h_{self.head_dim}d"
 
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.PTOAS
+
+    def get_backend_type(self) -> BackendType:
+        return BackendType.PTO
+
     def define_tensors(self) -> list[TensorSpec]:
         key_cache_rows = self.batch * self.block_num * self.block_size
         batch_q_tile = self.batch * self.q_tile
@@ -481,10 +505,10 @@ class BatchPVMatmulTestCase(PTOTestCase):
                     pij_l0a = pl.move(pij_l1, target_memory=pl.MemorySpace.Left)
                     vj_l0b = pl.move(vj_l1, target_memory=pl.MemorySpace.Right)
                     oi_l0c = pl.matmul(pij_l0a, vj_l0b)
-                    oi_new_batch = pl.l0c_store(
+                    oi_out_batch = pl.l0c_store(
                         oi_l0c, [b * q_tile, 0], [q_tile, head_dim], oi_new_batch
                     )
-                return oi_new_batch
+                return oi_out_batch
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def Orchestrator(
@@ -571,6 +595,11 @@ class BatchOnlineUpdateTestCase(PTOTestCase):
             f"batch_online_update_{self.batch}b_{self.num_heads}h_{self.head_dim}d"
             f"_f{self.is_first}_l{self.is_last}"
         )
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.PTOAS
+
+    def get_backend_type(self) -> BackendType:
+        return BackendType.PTO
 
     def define_tensors(self) -> list[TensorSpec]:
         batch_q_tile = self.batch * self.q_tile
@@ -865,6 +894,11 @@ class BatchPagedAttentionTestCase(PTOTestCase):
             f"batch_paged_attention_{self.batch}bat_{self.num_heads}h"
             f"_{self.head_dim}d_{self.block_size}bs"
         )
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.PTOAS
+
+    def get_backend_type(self) -> BackendType:
+        return BackendType.PTO
 
     def define_tensors(self) -> list[TensorSpec]:
         b = self.batch

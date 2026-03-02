@@ -312,6 +312,25 @@ TypePtr DeduceBlockFullType(const std::vector<ExprPtr>& args,
   return std::make_shared<TileType>(tile_shape, dtype);
 }
 
+TypePtr DeduceBlockGetValType(const std::vector<ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs,
+                              const std::string& op_name) {
+  CHECK(args.size() == 2) << "The operator " << op_name
+                          << " requires 2 arguments (tile, offset), but got " << args.size();
+
+  auto tile_type = As<TileType>(args[0]->GetType());
+  CHECK(tile_type) << "The operator " << op_name
+                   << " requires first argument to be a TileType, but got "
+                   << args[0]->GetType()->TypeName();
+
+  auto offset_type = As<ScalarType>(args[1]->GetType());
+  CHECK(offset_type) << "The operator " << op_name
+                     << " requires second argument (offset) to be a ScalarType, but got "
+                     << args[1]->GetType()->TypeName();
+
+  return std::make_shared<ScalarType>(tile_type->dtype_);
+}
+
 // ============================================================================
 // Registration Function for Block Memory Operations
 // ============================================================================
@@ -413,6 +432,16 @@ REGISTER_OP("block.full")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceBlockFullType(args, kwargs, "block.full");
+    });
+
+REGISTER_OP("block.getval")
+    .set_op_category("BlockOp")
+    .set_description("Get a scalar value from a tile at a flat offset")
+    .add_argument("tile", "Source tile (TileType)")
+    .add_argument("offset", "Flat offset into the tile (ScalarType index)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceBlockGetValType(args, kwargs, "block.getval");
     });
 }  // namespace ir
 }  // namespace pypto

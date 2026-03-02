@@ -365,8 +365,8 @@ struct SimpleOpEntry {
 // clang-format off
 static const SimpleOpEntry kSimpleOps[] = {
     // Tile utility operations
-    {"block.getval",          "pto.tgetval",          2},
-    {"block.setval",          "pto.tsetval",          2},
+    {"block.getval",          "pto.tgetval",          2, PipeType::M},
+    {"block.setval",          "pto.tsetval",          2, PipeType::M},
     // Memory operations
     {"block.mgather",         "pto.tmgather",         2},
     {"block.mscatter",        "pto.tmscatter",        2},
