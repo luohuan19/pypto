@@ -35,12 +35,11 @@ Typical usage::
     print(result)  # PASS / FAIL: ...
 """
 
-import shutil
-import tempfile
 import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -196,13 +195,12 @@ def run(
         config = RunConfig()
 
     start_time = time.time()
-    if config.save_kernels and config.save_kernels_dir:
-        use_temp = False
+    if config.save_kernels_dir:
         work_dir = Path(config.save_kernels_dir).resolve()
-        work_dir.mkdir(parents=True, exist_ok=True)
     else:
-        use_temp = True
-        work_dir = Path(tempfile.mkdtemp(prefix="pypto_run_"))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        work_dir = Path("build_output") / f"{program.name}_{timestamp}"
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         # 1. Set backend for code generation
@@ -233,9 +231,6 @@ def run(
             error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
             execution_time=time.time() - start_time,
         )
-    finally:
-        if use_temp and work_dir.exists():
-            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
