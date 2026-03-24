@@ -93,6 +93,12 @@ class RunConfig:
             raise ValueError(
                 f"Invalid platform {self.platform!r}. Expected 'a2a3sim', 'a2a3', 'a5sim', or 'a5'."
             )
+        # Auto-correct platform to match backend_type so compilation and execution
+        # always target the same architecture.
+        expected_arch = "a5" if self.backend_type == BackendType.Ascend950 else "a2a3"
+        if not self.platform.startswith(expected_arch):
+            sim_suffix = "sim" if self.platform.endswith("sim") else ""
+            self.platform = f"{expected_arch}{sim_suffix}"
 
 
 @dataclass

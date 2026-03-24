@@ -101,7 +101,7 @@ class TileAssembleRightOffsetTestCase(PTOTestCase):
         tensors["y"][:, 16:] = src
 
 
-@pytest.mark.skip(reason="Pending adaptation for A5")
+@pytest.mark.a5
 class TestAssembleOperations:
     """Test suite for tile.assemble operations."""
 
@@ -174,7 +174,7 @@ class TileAssembleVecRightOffsetTestCase(PTOTestCase):
         tensors["y"][:, 16:] = tensors["src"]
 
 
-@pytest.mark.skip(reason="Pending adaptation for A5")
+@pytest.mark.a5
 class TestVecAssembleOperations:
     """Test suite for UB-to-UB (Vec→Vec) tile.assemble operations (TInsertMode::ND_VEC)."""
 

@@ -352,6 +352,9 @@ TypePtr DeduceTileAssembleType(const std::vector<ExprPtr>& args,
   CHECK(offset_tuple_type) << "tile.assemble requires offset to be TupleType, but got "
                            << args[2]->GetType()->TypeName();
 
+  CHECK(As<MakeTuple>(args[2])) << "tile.assemble offset must be a literal tuple (e.g., (row, col)), "
+                                << "not a variable or computed expression";
+
   ValidateIndexTupleElements(offset_tuple_type, "tile.assemble", "offset");
 
   CHECK(target_type->dtype_ == source_type->dtype_)
