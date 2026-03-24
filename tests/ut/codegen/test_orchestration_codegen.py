@@ -145,7 +145,7 @@ class TestOrchestration:
             }
 
             __attribute__((visibility("default")))
-            void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+            void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
                 (void)arg_count;
                 (void)orch_thread_num;
                 (void)orch_thread_index;
@@ -171,14 +171,14 @@ class TestOrchestration:
                 params_t0.add_input(ext_a);
                 params_t0.add_input(ext_b);
                 params_t0.add_output(c);
-                pto2_rt_submit_aiv_task(rt, 0, params_t0);
+                pto2_rt_submit_aiv_task(0, params_t0);
 
                 // Task 1: kernel_add
                 PTOParam params_t1;
                 params_t1.add_input(c);
                 params_t1.add_input(ext_b);
                 params_t1.add_output(ext_d);
-                pto2_rt_submit_aiv_task(rt, 0, params_t1);
+                pto2_rt_submit_aiv_task(0, params_t1);
             }
 
             }  // extern "C"
@@ -457,7 +457,7 @@ class TestOrchestration:
             }
 
             __attribute__((visibility("default")))
-            void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+            void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
                 (void)arg_count;
                 (void)orch_thread_num;
                 (void)orch_thread_index;
@@ -483,7 +483,7 @@ class TestOrchestration:
                 params_t0.add_input(ext_a);
                 params_t0.add_input(ext_b);
                 params_t0.add_output(c);
-                pto2_rt_submit_aiv_task(rt, 0, params_t0);
+                pto2_rt_submit_aiv_task(0, params_t0);
                 uint32_t d_shapes[2] = {16, 16};
                 Tensor d = make_tensor(d_shapes, 2, DataType::FLOAT32);
 
@@ -492,7 +492,7 @@ class TestOrchestration:
                 params_t1.add_input(c);
                 params_t1.add_output(d);
                 params_t1.add_scalar(float_to_u64(1.000000f));
-                pto2_rt_submit_aiv_task(rt, 1, params_t1);
+                pto2_rt_submit_aiv_task(1, params_t1);
                 uint32_t e_shapes[2] = {16, 16};
                 Tensor e = make_tensor(e_shapes, 2, DataType::FLOAT32);
 
@@ -501,7 +501,7 @@ class TestOrchestration:
                 params_t2.add_input(c);
                 params_t2.add_output(e);
                 params_t2.add_scalar(float_to_u64(2.000000f));
-                pto2_rt_submit_aiv_task(rt, 1, params_t2);
+                pto2_rt_submit_aiv_task(1, params_t2);
                 uint32_t g_shapes[2] = {16, 16};
                 Tensor g = make_tensor(g_shapes, 2, DataType::FLOAT32);
 
@@ -510,14 +510,14 @@ class TestOrchestration:
                 params_t3.add_input(d);
                 params_t3.add_input(e);
                 params_t3.add_output(g);
-                pto2_rt_submit_aiv_task(rt, 2, params_t3);
+                pto2_rt_submit_aiv_task(2, params_t3);
 
                 // Task 4: kernel_add
                 PTOParam params_t4;
                 params_t4.add_input(g);
                 params_t4.add_input(c);
                 params_t4.add_output(ext_f);
-                pto2_rt_submit_aiv_task(rt, 0, params_t4);
+                pto2_rt_submit_aiv_task(0, params_t4);
             }
 
             }  // extern "C"
@@ -903,7 +903,7 @@ class TestOrchestration:
             }
 
             __attribute__((visibility("default")))
-            void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+            void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
                 (void)arg_count;
                 (void)orch_thread_num;
                 (void)orch_thread_index;
@@ -943,7 +943,7 @@ class TestOrchestration:
                 params_t0.add_inout(ext_li);
                 params_t0.add_inout(ext_oi);
                 params_t0.add_output(ext_dst);
-                pto2_rt_submit_aiv_task(rt, 0, params_t0);
+                pto2_rt_submit_aiv_task(0, params_t0);
             }
 
             }  // extern "C"
@@ -1035,7 +1035,7 @@ class TestOrchestration:
         assert "for (int64_t i = 0; i < n_blocks; i += 1)" in code
 
         # PTO2_SCOPE wraps the for loop body
-        assert "PTO2_SCOPE(rt)" in code
+        assert "PTO2_SCOPE()" in code
 
         # tensor.slice generates array variables and runtime .view() call with dynamic offset
         assert "uint32_t chunk_shapes[2] = {16, 16};" in code
@@ -1114,7 +1114,7 @@ class TestOrchestration:
         assert "if ((i == 0))" in code
 
         # PTO2_SCOPE wraps for loop body and if/else bodies
-        assert "PTO2_SCOPE(rt)" in code
+        assert "PTO2_SCOPE()" in code
 
         # Scalar assignment in both branches
         assert "is_first = 1" in code
@@ -1294,7 +1294,7 @@ class TestOrchestration:
 
         # For loop exists with correct structure
         assert "for (int64_t i = 0; i < 4; i += 1)" in code
-        assert "PTO2_SCOPE(rt)" in code
+        assert "PTO2_SCOPE()" in code
 
         # Both tasks submitted
         assert "kernel_init" in code
