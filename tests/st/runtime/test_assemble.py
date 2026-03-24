@@ -27,36 +27,41 @@ Hardware semantics (PTO backend):
 from typing import Any
 
 import pytest
+import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy
 
 from examples.language.beginner.assemble import (
-    TileAddThenAssembleRightOffsetProgram,
-    TileAddThenAssembleZeroOffsetProgram,
-    TileAssembleRightOffsetProgram,
-    TileAssembleVecRightOffsetProgram,
-    TileAssembleVecZeroOffsetProgram,
-    TileAssembleZeroOffsetProgram,
+    TileAssembleAccMatProgram,
+    TileAssembleDoubleLoopBroadcastProgram,
+    TileAssembleDoubleLoopProgram,
+    TileAssembleLoopColBroadcastProgram,
+    TileAssembleRowByRowProgram,
+    TileAssembleVecProgram,
 )
 
+# ---------------------------------------------------------------------------
+# Acc→Mat (NZ mode): matmul result assembled into a Mat target
+# ---------------------------------------------------------------------------
 
-class TileAssembleZeroOffsetTestCase(PTOTestCase):
-    """Test case for tile.assemble at [0, 0]: matmul(a,b)[32x16] overwrites the left half of x[32x32]."""
+
+class TileAssembleAccMatTestCase(PTOTestCase):
+    """Acc→Mat: matmul(a[32,16], b[16,16]) assembled into the right half of x[32,32] at [0, 16]."""
 
     def get_name(self) -> str:
-        return "tile_assemble_zero_offset"
+        return "tile_assemble_acc_mat"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=1.0),
-            TensorSpec("a", [32, 16], DataType.FP32, init_value=1.0),
-            TensorSpec("b", [16, 16], DataType.FP32, init_value=1.0),
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("a", [32, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("b", [16, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
             TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
         ]
 
     def get_program(self) -> Any:
-        return TileAssembleZeroOffsetProgram
+        return TileAssembleAccMatProgram
 
     def get_strategy(self) -> OptimizationStrategy:
         return OptimizationStrategy.Default
@@ -65,74 +70,32 @@ class TileAssembleZeroOffsetTestCase(PTOTestCase):
         return BackendType.Ascend950
 
     def compute_expected(self, tensors, params=None):
-        # assemble at [0, 0]: matmul(a, b) overwrites columns 0..15; columns 16..31 remain x (1.0)
-        src = tensors["a"] @ tensors["b"]
-        tensors["y"][:] = tensors["x"]
-        tensors["y"][:, :16] = src
-
-
-class TileAssembleRightOffsetTestCase(PTOTestCase):
-    """Test case for tile.assemble at [0, 16]: matmul(a,b)[32x16] overwrites the right half of x[32x32]."""
-
-    def get_name(self) -> str:
-        return "tile_assemble_right_offset"
-
-    def define_tensors(self) -> list[TensorSpec]:
-        return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=1.0),
-            TensorSpec("a", [32, 16], DataType.FP32, init_value=1.0),
-            TensorSpec("b", [16, 16], DataType.FP32, init_value=1.0),
-            TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
-        ]
-
-    def get_program(self) -> Any:
-        return TileAssembleRightOffsetProgram
-
-    def get_strategy(self) -> OptimizationStrategy:
-        return OptimizationStrategy.Default
-
-    def get_backend_type(self) -> BackendType:
-        return BackendType.Ascend950
-
-    def compute_expected(self, tensors, params=None):
-        # assemble at [0, 16]: columns 0..15 remain x (1.0); matmul(a, b) overwrites columns 16..31
+        # matmul(a, b) overwrites the right half; left half (columns 0..15) remains x (1.0)
         src = tensors["a"] @ tensors["b"]
         tensors["y"][:] = tensors["x"]
         tensors["y"][:, 16:] = src
 
 
-@pytest.mark.a5
-class TestAssembleOperations:
-    """Test suite for tile.assemble operations."""
-
-    def test_tile_assemble_zero_offset(self, test_runner):
-        """Test tile.assemble: write matmul result into left half of target at offset [0, 0]."""
-        test_case = TileAssembleZeroOffsetTestCase()
-        result = test_runner.run(test_case)
-        assert result.passed, f"Test failed: {result.error}"
-
-    def test_tile_assemble_right_offset(self, test_runner):
-        """Test tile.assemble: write matmul result into right half of target at offset [0, 16]."""
-        test_case = TileAssembleRightOffsetTestCase()
-        result = test_runner.run(test_case)
-        assert result.passed, f"Test failed: {result.error}"
+# ---------------------------------------------------------------------------
+# Vec→Vec single-shot (ND_VEC mode)
+# ---------------------------------------------------------------------------
 
 
-class TileAssembleVecZeroOffsetTestCase(PTOTestCase):
-    """Test case for Vec-to-Vec tile.assemble at [0, 0]: src[32x16] overwrites the left half of x[32x32]."""
+class TileAssembleVecTestCase(PTOTestCase):
+    """Vec→Vec single-shot: src[32,16] assembled into the left half of x[32,32] at [0, 0]."""
 
     def get_name(self) -> str:
-        return "tile_assemble_vec_zero_offset"
+        return "tile_assemble_vec"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=1.0),
-            TensorSpec("src", [32, 16], DataType.FP32, init_value=2.0),
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("src", [32, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
             TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
         ]
 
     def get_program(self) -> Any:
-        return TileAssembleVecZeroOffsetProgram
+        return TileAssembleVecProgram
 
     def get_strategy(self) -> OptimizationStrategy:
         return OptimizationStrategy.Default
@@ -141,26 +104,34 @@ class TileAssembleVecZeroOffsetTestCase(PTOTestCase):
         return BackendType.Ascend950
 
     def compute_expected(self, tensors, params=None):
-        # assemble at [0, 0]: src overwrites columns 0..15; columns 16..31 remain x (1.0)
         tensors["y"][:] = tensors["x"]
         tensors["y"][:, :16] = tensors["src"]
 
 
-class TileAssembleVecRightOffsetTestCase(PTOTestCase):
-    """Test case for Vec-to-Vec tile.assemble at [0, 16]: src[32x16] overwrites the right half of x[32x32]."""
+# ---------------------------------------------------------------------------
+# Vec→Vec single loop + pl.slice: dynamic row gather
+# ---------------------------------------------------------------------------
+
+
+class TileAssembleRowByRowTestCase(PTOTestCase):
+    """Vec→Vec row-by-row: for each row i, pl.slice src[i,:] and assemble at [i, 0].
+
+    Semantically equivalent to TileAssembleVecTestCase but exercises the
+    loop + pl.slice + dynamic-offset assemble code path.
+    """
 
     def get_name(self) -> str:
-        return "tile_assemble_vec_right_offset"
+        return "tile_assemble_row_by_row"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=1.0),
-            TensorSpec("src", [32, 16], DataType.FP32, init_value=2.0),
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("src", [32, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
             TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
         ]
 
     def get_program(self) -> Any:
-        return TileAssembleVecRightOffsetProgram
+        return TileAssembleRowByRowProgram
 
     def get_strategy(self) -> OptimizationStrategy:
         return OptimizationStrategy.Default
@@ -169,106 +140,156 @@ class TileAssembleVecRightOffsetTestCase(PTOTestCase):
         return BackendType.Ascend950
 
     def compute_expected(self, tensors, params=None):
-        # assemble at [0, 16]: columns 0..15 remain x (1.0); src overwrites columns 16..31
         tensors["y"][:] = tensors["x"]
-        tensors["y"][:, 16:] = tensors["src"]
+        tensors["y"][:, :16] = tensors["src"]
+
+
+# ---------------------------------------------------------------------------
+# Vec→Vec nested loops + pl.slice: batch×head two-level index
+# ---------------------------------------------------------------------------
+
+
+class TileAssembleDoubleLoopTestCase(PTOTestCase):
+    """Vec→Vec nested loops: outer b in range(4), inner i in range(8).
+
+    Row index row = b*8+i; pl.slice src[row,:] assembled at [row, 0].
+    Models the batch×head two-level indexing pattern in real workloads.
+    """
+
+    def get_name(self) -> str:
+        return "tile_assemble_double_loop"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("src", [32, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return TileAssembleDoubleLoopProgram
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def get_backend_type(self) -> BackendType:
+        return BackendType.Ascend950
+
+    def compute_expected(self, tensors, params=None):
+        tensors["y"][:] = tensors["x"]
+        tensors["y"][:, :16] = tensors["src"]
+
+
+# ---------------------------------------------------------------------------
+# Vec→Vec single loop, no pl.slice: dynamic column broadcast
+# ---------------------------------------------------------------------------
+
+
+class TileAssembleLoopColBroadcastTestCase(PTOTestCase):
+    """Vec→Vec column broadcast: loop c in range(4), same src[32,8] assembled at [0, c*8].
+
+    No pl.slice — the entire source is loaded once and written to each column-block.
+    Result: all column-blocks of y equal src.
+    """
+
+    def get_name(self) -> str:
+        return "tile_assemble_loop_col_broadcast"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("src", [32, 8], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return TileAssembleLoopColBroadcastProgram
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def get_backend_type(self) -> BackendType:
+        return BackendType.Ascend950
+
+    def compute_expected(self, tensors, params=None):
+        for c in range(4):
+            tensors["y"][:, c * 8 : (c + 1) * 8] = tensors["src"]
+
+
+# ---------------------------------------------------------------------------
+# Vec→Vec nested loops, no pl.slice: 2-D position broadcast
+# ---------------------------------------------------------------------------
+
+
+class TileAssembleDoubleLoopBroadcastTestCase(PTOTestCase):
+    """Vec→Vec 2-D broadcast: nested b×c in range(2)×range(2), src[16,16] at [b*16, c*16].
+
+    No pl.slice — same source tile fills all four [16,16] quadrants of y.
+    Result: all quadrants of y equal src.
+    """
+
+    def get_name(self) -> str:
+        return "tile_assemble_double_loop_broadcast"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("src", [16, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return TileAssembleDoubleLoopBroadcastProgram
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def get_backend_type(self) -> BackendType:
+        return BackendType.Ascend950
+
+    def compute_expected(self, tensors, params=None):
+        for b in range(2):
+            for c in range(2):
+                tensors["y"][b * 16 : (b + 1) * 16, c * 16 : (c + 1) * 16] = tensors["src"]
+
+
+# ---------------------------------------------------------------------------
+# Test suites
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.a5
-class TestVecAssembleOperations:
-    """Test suite for UB-to-UB (Vec→Vec) tile.assemble operations (TInsertMode::ND_VEC)."""
+class TestAssembleOperations:
+    """Test suite for tile.assemble: one test per distinct pattern."""
 
-    def test_tile_assemble_vec_zero_offset(self, test_runner):
-        """Test Vec tile.assemble: write src into left half of target at offset [0, 0]."""
-        test_case = TileAssembleVecZeroOffsetTestCase()
-        result = test_runner.run(test_case)
+    def test_tile_assemble_acc_mat(self, test_runner):
+        """Acc→Mat (NZ mode): matmul result assembled into right half of Mat target."""
+        result = test_runner.run(TileAssembleAccMatTestCase())
         assert result.passed, f"Test failed: {result.error}"
 
-    def test_tile_assemble_vec_right_offset(self, test_runner):
-        """Test Vec tile.assemble: write src into right half of target at offset [0, 16]."""
-        test_case = TileAssembleVecRightOffsetTestCase()
-        result = test_runner.run(test_case)
+    def test_tile_assemble_vec(self, test_runner):
+        """Vec→Vec single-shot (ND_VEC mode): src assembled into left half of target."""
+        result = test_runner.run(TileAssembleVecTestCase())
         assert result.passed, f"Test failed: {result.error}"
 
-
-class TileAddThenAssembleZeroOffsetTestCase(PTOTestCase):
-    """Test case for add-then-assemble at [0, 0].
-
-    add(src, delta)[32x16] overwrites the left half of x[32x32].
-    """
-
-    def get_name(self) -> str:
-        return "tile_add_then_assemble_zero_offset"
-
-    def define_tensors(self) -> list[TensorSpec]:
-        return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=1.0),
-            TensorSpec("src", [32, 16], DataType.FP32, init_value=2.0),
-            TensorSpec("delta", [32, 16], DataType.FP32, init_value=3.0),
-            TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
-        ]
-
-    def get_program(self) -> Any:
-        return TileAddThenAssembleZeroOffsetProgram
-
-    def get_strategy(self) -> OptimizationStrategy:
-        return OptimizationStrategy.Default
-
-    def get_backend_type(self) -> BackendType:
-        return BackendType.Ascend950
-
-    def compute_expected(self, tensors, params=None):
-        # add then assemble at [0, 0]: (src + delta) overwrites columns 0..15; columns 16..31 remain x (1.0)
-        tensors["y"][:] = tensors["x"]
-        tensors["y"][:, :16] = tensors["src"] + tensors["delta"]
-
-
-class TileAddThenAssembleRightOffsetTestCase(PTOTestCase):
-    """Test case for add-then-assemble at [0, 16].
-
-    add(src, delta)[32x16] overwrites the right half of x[32x32].
-    """
-
-    def get_name(self) -> str:
-        return "tile_add_then_assemble_right_offset"
-
-    def define_tensors(self) -> list[TensorSpec]:
-        return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=1.0),
-            TensorSpec("src", [32, 16], DataType.FP32, init_value=2.0),
-            TensorSpec("delta", [32, 16], DataType.FP32, init_value=3.0),
-            TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
-        ]
-
-    def get_program(self) -> Any:
-        return TileAddThenAssembleRightOffsetProgram
-
-    def get_strategy(self) -> OptimizationStrategy:
-        return OptimizationStrategy.Default
-
-    def get_backend_type(self) -> BackendType:
-        return BackendType.Ascend950
-
-    def compute_expected(self, tensors, params=None):
-        # add then assemble at [0, 16]: columns 0..15 remain x (1.0); (src + delta) overwrites columns 16..31
-        tensors["y"][:] = tensors["x"]
-        tensors["y"][:, 16:] = tensors["src"] + tensors["delta"]
-
-
-@pytest.mark.skip(reason="Pending adaptation for A5")
-class TestAddThenAssembleOperations:
-    """Test suite for add-then-assemble: pl.add on source tile before Vec→Vec tile.assemble."""
-
-    def test_tile_add_then_assemble_zero_offset(self, test_runner):
-        """Test add-then-assemble: write add(src, delta) into left half of target at offset [0, 0]."""
-        test_case = TileAddThenAssembleZeroOffsetTestCase()
-        result = test_runner.run(test_case)
+    def test_tile_assemble_row_by_row(self, test_runner):
+        """Vec→Vec single loop + pl.slice: dynamic row gather into left half."""
+        result = test_runner.run(TileAssembleRowByRowTestCase())
         assert result.passed, f"Test failed: {result.error}"
 
-    def test_tile_add_then_assemble_right_offset(self, test_runner):
-        """Test add-then-assemble: write add(src, delta) into right half of target at offset [0, 16]."""
-        test_case = TileAddThenAssembleRightOffsetTestCase()
-        result = test_runner.run(test_case)
+    def test_tile_assemble_double_loop(self, test_runner):
+        """Vec→Vec nested loops + pl.slice: batch×head two-level index (b*8+i)."""
+        result = test_runner.run(TileAssembleDoubleLoopTestCase())
+        assert result.passed, f"Test failed: {result.error}"
+
+    def test_tile_assemble_loop_col_broadcast(self, test_runner):
+        """Vec→Vec single loop, no pl.slice: same src column-block at each c*8 offset."""
+        result = test_runner.run(TileAssembleLoopColBroadcastTestCase())
+        assert result.passed, f"Test failed: {result.error}"
+
+    def test_tile_assemble_double_loop_broadcast(self, test_runner):
+        """Vec→Vec nested loops, no pl.slice: same src[16,16] fills all four quadrants."""
+        result = test_runner.run(TileAssembleDoubleLoopBroadcastTestCase())
         assert result.passed, f"Test failed: {result.error}"
 
 
