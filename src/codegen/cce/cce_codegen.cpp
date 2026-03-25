@@ -91,12 +91,14 @@ std::map<std::string, std::string> CCECodegen::Generate(const ir::ProgramPtr& pr
     oss << KERNEL_HEADER << "\n";
 
     // Add compute_stride helper function
-    oss << "// Helper function to compute stride from raw_shapes\n";
+    oss << "// Helper function to compute stride, respecting is_raw_eq_shapes flag\n";
     oss << "__aicore__ __attribute__((always_inline)) inline int64_t compute_stride(\n";
     oss << "    __gm__ TensorData* tensor, int dim) {\n";
     oss << "  int64_t stride = 1;\n";
+    oss << "  const __gm__ uint32_t* rs =\n";
+    oss << "      tensor->is_raw_eq_shapes ? tensor->shapes : tensor->raw_shapes;\n";
     oss << "  for (int j = dim + 1; j < static_cast<int>(tensor->ndims); j++) {\n";
-    oss << "    stride *= static_cast<int64_t>(tensor->raw_shapes[j]);\n";
+    oss << "    stride *= static_cast<int64_t>(rs[j]);\n";
     oss << "  }\n";
     oss << "  return stride;\n";
     oss << "}\n\n";

@@ -85,10 +85,6 @@ class TestOrchestration:
 
             #include "pto_orchestration_api.h"
 
-            #define ARG_PTR_A 0
-            #define ARG_PTR_B 1
-            #define ARG_PTR_D 2
-
             // Helper to encode float as uint64_t for scalar params
             static uint64_t float_to_u64(float f) {
                 union {
@@ -103,9 +99,8 @@ class TestOrchestration:
             extern "C" {
 
             __attribute__((visibility("default")))
-            PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-                (void)args;
-                (void)arg_count;
+            PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+                (void)orch_args;
                 return PTO2OrchestrationConfig{
                     .expected_arg_count = 3,
                 };
@@ -145,40 +140,34 @@ class TestOrchestration:
             }
 
             __attribute__((visibility("default")))
-            void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+            void aicpu_orchestration_entry(OrchArg* orch, int arg_count, int orch_thread_num, int orch_thread_index) {
                 (void)arg_count;
                 (void)orch_thread_num;
                 (void)orch_thread_index;
 
-                // Extract device pointers
-                void* arg_a_ptr = reinterpret_cast<void*>(args[ARG_PTR_A]);
-                void* arg_b_ptr = reinterpret_cast<void*>(args[ARG_PTR_B]);
-                void* arg_d_ptr = reinterpret_cast<void*>(args[ARG_PTR_D]);
-
                 // External tensors
-                uint32_t a_shapes[2] = {16, 16};
-                Tensor ext_a = make_tensor_external(arg_a_ptr, a_shapes, 2, DataType::FLOAT32);
-                uint32_t b_shapes[2] = {16, 16};
-                Tensor ext_b = make_tensor_external(arg_b_ptr, b_shapes, 2, DataType::FLOAT32);
-                uint32_t d_shapes[2] = {16, 16};
-                Tensor ext_d = make_tensor_external(arg_d_ptr, d_shapes, 2, DataType::FLOAT32);
+                Tensor ext_a = orch[0].to_tensor();
+                Tensor ext_b = orch[1].to_tensor();
+                Tensor ext_d = orch[2].to_tensor();
 
-                uint32_t c_shapes[2] = {16, 16};
-                Tensor c = make_tensor(c_shapes, 2, DataType::FLOAT32);
+                PTO2_SCOPE() {
+                    uint32_t c_shapes[2] = {16, 16};
+                    Tensor c = make_tensor(c_shapes, 2, DataType::FLOAT32);
 
-                // Task 0: kernel_add
-                PTOParam params_t0;
-                params_t0.add_input(ext_a);
-                params_t0.add_input(ext_b);
-                params_t0.add_output(c);
-                pto2_rt_submit_aiv_task(0, params_t0);
+                    // Task 0: kernel_add
+                    PTOParam params_t0;
+                    params_t0.add_input(ext_a);
+                    params_t0.add_input(ext_b);
+                    params_t0.add_output(c);
+                    pto2_rt_submit_aiv_task(0, params_t0);
 
-                // Task 1: kernel_add
-                PTOParam params_t1;
-                params_t1.add_input(c);
-                params_t1.add_input(ext_b);
-                params_t1.add_output(ext_d);
-                pto2_rt_submit_aiv_task(0, params_t1);
+                    // Task 1: kernel_add
+                    PTOParam params_t1;
+                    params_t1.add_input(c);
+                    params_t1.add_input(ext_b);
+                    params_t1.add_output(ext_d);
+                    pto2_rt_submit_aiv_task(0, params_t1);
+                }
             }
 
             }  // extern "C"
@@ -186,7 +175,7 @@ class TestOrchestration:
         assert_code_equal(code, expected)
 
     def test_tensor_read(self):
-        """Test tensor.read uses arg_<name>_ptr."""
+        """Test tensor.read uses orch[].data<void>(), not host_t."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B_CCE)
 
@@ -221,9 +210,9 @@ class TestOrchestration:
         files = generator.generate(TensorReadProgram)
         code = files["orchestration/orch_read.cpp"]
 
-        # tensor.read uses arg_t_ptr, not host_t
+        # tensor.read uses orch[0].data<void>(), not host_t
         assert "idx_val" in code
-        assert "static_cast<float*>(arg_t_ptr)" in code
+        assert "static_cast<float*>(orch[0].data<void>())" in code
         assert "host_t" not in code
 
     def test_config_file(self):
@@ -303,13 +292,13 @@ class TestOrchestration:
         # Two return tensors: c and d are both external
         assert "ext_c" in code
         assert "ext_d" in code
-        assert "make_tensor_external" in code
+        assert "to_tensor()" in code
 
         # Two tasks submitted
         assert code.count("pto2_rt_submit_aiv_task") == 2
 
-        # No PTO2_SCOPE needed: all tasks use only external tensors
-        assert "PTO2_SCOPE" not in code
+        # PTO2_SCOPE wraps all task submissions
+        assert "PTO2_SCOPE" in code
 
     def test_vector_example_dag(self):
         """Test codegen matching vector_example DAG structure.
@@ -397,10 +386,6 @@ class TestOrchestration:
 
             #include "pto_orchestration_api.h"
 
-            #define ARG_PTR_A 0
-            #define ARG_PTR_B 1
-            #define ARG_PTR_F 2
-
             // Helper to encode float as uint64_t for scalar params
             static uint64_t float_to_u64(float f) {
                 union {
@@ -415,9 +400,8 @@ class TestOrchestration:
             extern "C" {
 
             __attribute__((visibility("default")))
-            PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-                (void)args;
-                (void)arg_count;
+            PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+                (void)orch_args;
                 return PTO2OrchestrationConfig{
                     .expected_arg_count = 3,
                 };
@@ -457,67 +441,61 @@ class TestOrchestration:
             }
 
             __attribute__((visibility("default")))
-            void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+            void aicpu_orchestration_entry(OrchArg* orch, int arg_count, int orch_thread_num, int orch_thread_index) {
                 (void)arg_count;
                 (void)orch_thread_num;
                 (void)orch_thread_index;
 
-                // Extract device pointers
-                void* arg_a_ptr = reinterpret_cast<void*>(args[ARG_PTR_A]);
-                void* arg_b_ptr = reinterpret_cast<void*>(args[ARG_PTR_B]);
-                void* arg_f_ptr = reinterpret_cast<void*>(args[ARG_PTR_F]);
-
                 // External tensors
-                uint32_t a_shapes[2] = {16, 16};
-                Tensor ext_a = make_tensor_external(arg_a_ptr, a_shapes, 2, DataType::FLOAT32);
-                uint32_t b_shapes[2] = {16, 16};
-                Tensor ext_b = make_tensor_external(arg_b_ptr, b_shapes, 2, DataType::FLOAT32);
-                uint32_t f_shapes[2] = {16, 16};
-                Tensor ext_f = make_tensor_external(arg_f_ptr, f_shapes, 2, DataType::FLOAT32);
+                Tensor ext_a = orch[0].to_tensor();
+                Tensor ext_b = orch[1].to_tensor();
+                Tensor ext_f = orch[2].to_tensor();
 
-                uint32_t c_shapes[2] = {16, 16};
-                Tensor c = make_tensor(c_shapes, 2, DataType::FLOAT32);
+                PTO2_SCOPE() {
+                    uint32_t c_shapes[2] = {16, 16};
+                    Tensor c = make_tensor(c_shapes, 2, DataType::FLOAT32);
 
-                // Task 0: kernel_add
-                PTOParam params_t0;
-                params_t0.add_input(ext_a);
-                params_t0.add_input(ext_b);
-                params_t0.add_output(c);
-                pto2_rt_submit_aiv_task(0, params_t0);
-                uint32_t d_shapes[2] = {16, 16};
-                Tensor d = make_tensor(d_shapes, 2, DataType::FLOAT32);
+                    // Task 0: kernel_add
+                    PTOParam params_t0;
+                    params_t0.add_input(ext_a);
+                    params_t0.add_input(ext_b);
+                    params_t0.add_output(c);
+                    pto2_rt_submit_aiv_task(0, params_t0);
+                    uint32_t d_shapes[2] = {16, 16};
+                    Tensor d = make_tensor(d_shapes, 2, DataType::FLOAT32);
 
-                // Task 1: kernel_add_scalar
-                PTOParam params_t1;
-                params_t1.add_input(c);
-                params_t1.add_output(d);
-                params_t1.add_scalar(float_to_u64(1.000000f));
-                pto2_rt_submit_aiv_task(1, params_t1);
-                uint32_t e_shapes[2] = {16, 16};
-                Tensor e = make_tensor(e_shapes, 2, DataType::FLOAT32);
+                    // Task 1: kernel_add_scalar
+                    PTOParam params_t1;
+                    params_t1.add_input(c);
+                    params_t1.add_output(d);
+                    params_t1.add_scalar(float_to_u64(1.000000f));
+                    pto2_rt_submit_aiv_task(1, params_t1);
+                    uint32_t e_shapes[2] = {16, 16};
+                    Tensor e = make_tensor(e_shapes, 2, DataType::FLOAT32);
 
-                // Task 2: kernel_add_scalar
-                PTOParam params_t2;
-                params_t2.add_input(c);
-                params_t2.add_output(e);
-                params_t2.add_scalar(float_to_u64(2.000000f));
-                pto2_rt_submit_aiv_task(1, params_t2);
-                uint32_t g_shapes[2] = {16, 16};
-                Tensor g = make_tensor(g_shapes, 2, DataType::FLOAT32);
+                    // Task 2: kernel_add_scalar
+                    PTOParam params_t2;
+                    params_t2.add_input(c);
+                    params_t2.add_output(e);
+                    params_t2.add_scalar(float_to_u64(2.000000f));
+                    pto2_rt_submit_aiv_task(1, params_t2);
+                    uint32_t g_shapes[2] = {16, 16};
+                    Tensor g = make_tensor(g_shapes, 2, DataType::FLOAT32);
 
-                // Task 3: kernel_mul
-                PTOParam params_t3;
-                params_t3.add_input(d);
-                params_t3.add_input(e);
-                params_t3.add_output(g);
-                pto2_rt_submit_aiv_task(2, params_t3);
+                    // Task 3: kernel_mul
+                    PTOParam params_t3;
+                    params_t3.add_input(d);
+                    params_t3.add_input(e);
+                    params_t3.add_output(g);
+                    pto2_rt_submit_aiv_task(2, params_t3);
 
-                // Task 4: kernel_add
-                PTOParam params_t4;
-                params_t4.add_input(g);
-                params_t4.add_input(c);
-                params_t4.add_output(ext_f);
-                pto2_rt_submit_aiv_task(0, params_t4);
+                    // Task 4: kernel_add
+                    PTOParam params_t4;
+                    params_t4.add_input(g);
+                    params_t4.add_input(c);
+                    params_t4.add_output(ext_f);
+                    pto2_rt_submit_aiv_task(0, params_t4);
+                }
             }
 
             }  // extern "C"
@@ -583,13 +561,13 @@ class TestOrchestration:
         assert "DataType::FLOAT32" in code
 
         # Return tensor result is external
-        assert "make_tensor_external(arg_result_ptr" in code
+        assert "orch[2].to_tensor()" in code
 
         # Two tasks: kernel_pair + kernel_add
         assert code.count("pto2_rt_submit_aiv_task") == 2
 
-        # No PTO2_SCOPE: no control flow
-        assert "PTO2_SCOPE" not in code
+        # PTO2_SCOPE wraps all task submissions
+        assert "PTO2_SCOPE" in code
 
     def test_tuple_output(self):
         """Test tuple return as final output: all elements are external tensors."""
@@ -629,17 +607,17 @@ class TestOrchestration:
         files = generator.generate(TupleOutputProgram)
         code = files["orchestration/orch_tuple_out.cpp"]
 
-        # Both x and y are return tensors: make_tensor_external
+        # Both x and y are return tensors: orch[].to_tensor()
         assert "ext_x" in code
         assert "ext_y" in code
-        assert "make_tensor_external(arg_x_ptr" in code
-        assert "make_tensor_external(arg_y_ptr" in code
+        assert "orch[2].to_tensor()" in code
+        assert "orch[3].to_tensor()" in code
 
         # Only one task: kernel_pair
         assert code.count("pto2_rt_submit_aiv_task") == 1
 
-        # No PTO2_SCOPE needed: single task, all external
-        assert "PTO2_SCOPE" not in code
+        # PTO2_SCOPE wraps all task submissions
+        assert "PTO2_SCOPE" in code
 
     def test_four_element_tuple(self):
         """Test 4-element tuple unpacking with mixed shapes as intermediate."""
@@ -710,12 +688,12 @@ class TestOrchestration:
         code = files["orchestration/orch_four_tuple.cpp"]
 
         # All orch params are external tensors
-        assert "make_tensor_external(arg_mi_in_ptr" in code
-        assert "make_tensor_external(arg_oi_in_ptr" in code
-        assert "make_tensor_external(arg_dst_in_ptr" in code
+        assert "orch[3].to_tensor()" in code  # mi_in
+        assert "orch[4].to_tensor()" in code  # oi_in
+        assert "orch[5].to_tensor()" in code  # dst_in
 
         # Final return tensor is external
-        assert "make_tensor_external(arg_final_ptr" in code
+        assert "orch[6].to_tensor()" in code  # final
 
         # Two tasks: online_update + kernel_add
         assert code.count("pto2_rt_submit_aiv_task") == 2
@@ -729,8 +707,8 @@ class TestOrchestration:
         assert "params_t1.add_input(ext_oi_in)" in code
         assert "params_t1.add_output(ext_final)" in code
 
-        # No PTO2_SCOPE: no control flow
-        assert "PTO2_SCOPE" not in code
+        # PTO2_SCOPE wraps all task submissions
+        assert "PTO2_SCOPE" in code
 
     def test_tensor_create(self):
         """Test tensor.create generates make_tensor with correct size."""
@@ -839,14 +817,6 @@ class TestOrchestration:
 
             #include "pto_orchestration_api.h"
 
-            #define ARG_PTR_MIJ 0
-            #define ARG_PTR_LIJ 1
-            #define ARG_PTR_OI_NEW 2
-            #define ARG_PTR_MI 3
-            #define ARG_PTR_LI 4
-            #define ARG_PTR_OI 5
-            #define ARG_PTR_DST 6
-
             // Helper to encode float as uint64_t for scalar params
             static uint64_t float_to_u64(float f) {
                 union {
@@ -861,9 +831,8 @@ class TestOrchestration:
             extern "C" {
 
             __attribute__((visibility("default")))
-            PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-                (void)args;
-                (void)arg_count;
+            PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+                (void)orch_args;
                 return PTO2OrchestrationConfig{
                     .expected_arg_count = 7,
                 };
@@ -903,47 +872,33 @@ class TestOrchestration:
             }
 
             __attribute__((visibility("default")))
-            void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+            void aicpu_orchestration_entry(OrchArg* orch, int arg_count, int orch_thread_num, int orch_thread_index) {
                 (void)arg_count;
                 (void)orch_thread_num;
                 (void)orch_thread_index;
 
-                // Extract device pointers
-                void* arg_mij_ptr = reinterpret_cast<void*>(args[ARG_PTR_MIJ]);
-                void* arg_lij_ptr = reinterpret_cast<void*>(args[ARG_PTR_LIJ]);
-                void* arg_oi_new_ptr = reinterpret_cast<void*>(args[ARG_PTR_OI_NEW]);
-                void* arg_mi_ptr = reinterpret_cast<void*>(args[ARG_PTR_MI]);
-                void* arg_li_ptr = reinterpret_cast<void*>(args[ARG_PTR_LI]);
-                void* arg_oi_ptr = reinterpret_cast<void*>(args[ARG_PTR_OI]);
-                void* arg_dst_ptr = reinterpret_cast<void*>(args[ARG_PTR_DST]);
-
                 // External tensors
-                uint32_t mij_shapes[2] = {16, 1};
-                Tensor ext_mij = make_tensor_external(arg_mij_ptr, mij_shapes, 2, DataType::FLOAT32);
-                uint32_t lij_shapes[2] = {16, 1};
-                Tensor ext_lij = make_tensor_external(arg_lij_ptr, lij_shapes, 2, DataType::FLOAT32);
-                uint32_t oi_new_shapes[2] = {16, 16};
-                Tensor ext_oi_new = make_tensor_external(arg_oi_new_ptr, oi_new_shapes, 2, DataType::FLOAT32);
-                uint32_t mi_shapes[2] = {16, 1};
-                Tensor ext_mi = make_tensor_external(arg_mi_ptr, mi_shapes, 2, DataType::FLOAT32);
-                uint32_t li_shapes[2] = {16, 1};
-                Tensor ext_li = make_tensor_external(arg_li_ptr, li_shapes, 2, DataType::FLOAT32);
-                uint32_t oi_shapes[2] = {16, 16};
-                Tensor ext_oi = make_tensor_external(arg_oi_ptr, oi_shapes, 2, DataType::FLOAT32);
-                uint32_t dst_shapes[2] = {16, 16};
-                Tensor ext_dst = make_tensor_external(arg_dst_ptr, dst_shapes, 2, DataType::FLOAT32);
+                Tensor ext_mij = orch[0].to_tensor();
+                Tensor ext_lij = orch[1].to_tensor();
+                Tensor ext_oi_new = orch[2].to_tensor();
+                Tensor ext_mi = orch[3].to_tensor();
+                Tensor ext_li = orch[4].to_tensor();
+                Tensor ext_oi = orch[5].to_tensor();
+                Tensor ext_dst = orch[6].to_tensor();
 
+                PTO2_SCOPE() {
 
-                // Task 0: online_update
-                PTOParam params_t0;
-                params_t0.add_input(ext_mij);
-                params_t0.add_input(ext_lij);
-                params_t0.add_input(ext_oi_new);
-                params_t0.add_inout(ext_mi);
-                params_t0.add_inout(ext_li);
-                params_t0.add_inout(ext_oi);
-                params_t0.add_output(ext_dst);
-                pto2_rt_submit_aiv_task(0, params_t0);
+                    // Task 0: online_update
+                    PTOParam params_t0;
+                    params_t0.add_input(ext_mij);
+                    params_t0.add_input(ext_lij);
+                    params_t0.add_input(ext_oi_new);
+                    params_t0.add_inout(ext_mi);
+                    params_t0.add_inout(ext_li);
+                    params_t0.add_inout(ext_oi);
+                    params_t0.add_output(ext_dst);
+                    pto2_rt_submit_aiv_task(0, params_t0);
+                }
             }
 
             }  // extern "C"
@@ -1043,7 +998,7 @@ class TestOrchestration:
         assert "Tensor chunk = ext_data.view(chunk_shapes, chunk_offsets);" in code
 
         # tensor.read generates host pointer access
-        assert "static_cast<int64_t*>(arg_config_ptr)" in code
+        assert "static_cast<int64_t*>(orch[2].data<void>())" in code
 
         # kernel_add task submitted inside loop
         assert "pto2_rt_submit_aiv_task" in code
@@ -1288,8 +1243,8 @@ class TestOrchestration:
         assert "b_acc = b_acc;" not in code
 
         # make_tensor declarations exist (exactly once each)
-        # a_acc is a return value → external (make_tensor_external)
-        assert code.count("Tensor ext_a_acc = make_tensor_external(") == 1
+        # a_acc is a return value → external (orch[].to_tensor())
+        assert code.count("Tensor ext_a_acc = orch[1].to_tensor()") == 1
         assert code.count("Tensor b_acc = make_tensor(") == 1
 
         # For loop exists with correct structure
@@ -1337,13 +1292,13 @@ class TestOrchestration:
         code = files["orchestration/add_one.cpp"]
 
         # Inplace detection: output_tensor return var should match the param,
-        # so only 2 ARG slots (input_tensor + output_tensor), not 3
+        # so only 2 orch arg slots (input_tensor + output_tensor), not 3
         assert "expected_arg_count = 2" in code
-        assert "#define ARG_PTR_INPUT_TENSOR 0" in code
-        assert "#define ARG_PTR_OUTPUT_TENSOR 1" in code
+        assert "orch[0].to_tensor()" in code  # input_tensor
+        assert "orch[1].to_tensor()" in code  # output_tensor
 
-        # No third ARG define for the compound-named return var
-        assert "ARG_PTR_OUTPUT_TENSOR_ITER" not in code
+        # No third orch entry for the compound-named return var
+        assert "orch[2]" not in code
 
         # Task params should use ext_output_tensor (the inplace param), not a separate buffer
         assert "ext_output_tensor)" in code
@@ -1432,7 +1387,7 @@ class TestOrchestration:
         files = generator.generate(transformed)
         code = files["orchestration/orch_duplicate_assemble.cpp"]
 
-        assert "Tensor row = make_tensor_nd(row_shapes, 2, DataType::FLOAT32);" in code
+        assert "Tensor row = make_tensor(row_shapes, 2, DataType::FLOAT32);" in code
         assert "Tensor row = ext_out.view(row_shapes, row_offsets);" not in code
 
     def test_tensor_assemble_slice_source_does_not_require_view_fast_path(self):
@@ -1506,13 +1461,13 @@ class TestOrchestration:
         files = generator.generate(NumericSuffixProgram)
         code = files["orchestration/orch_numeric.cpp"]
 
-        # Each param must get a distinct ARG_PTR define
-        assert "#define ARG_PTR_X 0" in code
-        assert "#define ARG_PTR_OUT_0 1" in code
-        assert "#define ARG_PTR_OUT_1 2" in code
+        # Each param must get a distinct orch index
+        assert "orch[0].to_tensor()" in code  # x
+        assert "orch[1].to_tensor()" in code  # out_0
+        assert "orch[2].to_tensor()" in code  # out_1
 
-        # No collapsed "ARG_PTR_OUT" without suffix
-        assert "#define ARG_PTR_OUT " not in code
+        # No collapsed names
+        assert "ARG_PTR" not in code
 
         # Each param gets its own make_tensor_external
         assert "ext_out_0" in code
@@ -1558,8 +1513,8 @@ class TestOrchestration:
         files = generator.generate(transformed)
         code = files["orchestration/orch_repeat.cpp"]
 
-        assert code.count("Tensor ret0__out = make_tensor_nd(") == 1
-        assert code.count("Tensor ret0__out_1 = make_tensor_nd(") == 1
+        assert code.count("Tensor ret0__out = make_tensor(") == 1
+        assert code.count("Tensor ret0__out_1 = make_tensor(") == 1
         assert "params_t0.add_output(ret0__out)" in code
         assert "params_t1.add_output(ret0__out_1)" in code
         assert "Tensor& first = ret0__out;" in code
@@ -1585,7 +1540,7 @@ class TestTensorReadWriteOffsetCodegen:
         generator = codegen.CCECodegen()
         files = generator.generate(Prog)
         code = files["orchestration/orch.cpp"]
-        assert "static_cast<float*>(arg_t_ptr)[3]" in code
+        assert "static_cast<float*>(orch[0].data<void>())[3]" in code
 
     def test_tensor_read_constant_2d(self):
         """2D tensor [4, 8], read(t, [1, 3]) -> flat offset 1*8+3=11 (computed correctly)."""
@@ -1603,8 +1558,8 @@ class TestTensorReadWriteOffsetCodegen:
         files = generator.generate(Prog)
         code = files["orchestration/orch.cpp"]
         # The flat offset expression 1*8+3=11 is generated (either inlined or via idx_val)
-        assert ("arg_t_ptr)[11]" in code) or ("1 * 8 + 3" in code)
-        assert "arg_t_ptr)" in code
+        assert ("orch[0].data<void>())[11]" in code) or ("1 * 8 + 3" in code)
+        assert "orch[0].data<void>())" in code
 
     def test_tensor_read_constant_3d(self):
         """3D tensor [2, 4, 8], read(t, [1, 2, 3]) -> flat offset 1*32+2*8+3=51."""
@@ -1622,8 +1577,8 @@ class TestTensorReadWriteOffsetCodegen:
         files = generator.generate(Prog)
         code = files["orchestration/orch.cpp"]
         # The flat offset expression is generated (either inlined as 51 or as computed expression)
-        assert ("arg_t_ptr)[51]" in code) or ("1 * 4 * 8" in code and "2 * 8" in code)
-        assert "arg_t_ptr)" in code
+        assert ("orch[0].data<void>())[51]" in code) or ("1 * 4 * 8" in code and "2 * 8" in code)
+        assert "orch[0].data<void>())" in code
 
     def test_tensor_read_variable_index(self):
         """2D tensor [4, 8], read(t, [i, j]) -> generates idx_val = i * 8 + j."""
@@ -1666,8 +1621,8 @@ class TestTensorReadWriteOffsetCodegen:
         files = generator.generate(Prog)
         code = files["orchestration/orch.cpp"]
         # Write generates flat offset 11 or the expression 1*8+3
-        assert ("arg_t_ptr)[11]" in code) or ("1 * 8 + 3" in code)
-        assert "arg_t_ptr)" in code
+        assert ("orch[0].data<void>())[11]" in code) or ("1 * 8 + 3" in code)
+        assert "orch[0].data<void>())" in code
 
     def test_infer_output_param_from_loop_carried_store(self):
         """Loop-carried store to a default-In tensor should emit output params."""
