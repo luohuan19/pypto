@@ -14,10 +14,14 @@ This configuration sets up the testing environment using the internal
 harness package (migrated from pto-testing-framework).
 """
 
+import inspect
 import os
 import random
+import re
 import sys
+import tempfile
 from pathlib import Path
+from typing import Any
 
 # Add harness to path (internal package in tests/st/)
 _ST_DIR = Path(__file__).parent
@@ -36,6 +40,7 @@ from harness.core.environment import (  # noqa: E402
     get_simpler_scripts_path,
 )
 from harness.core.test_runner import TestRunner  # noqa: E402
+from pypto import LogLevel, set_log_level  # noqa: E402
 from pypto.runtime.runner import RunConfig  # noqa: E402
 
 
@@ -123,6 +128,20 @@ def pytest_addoption(parser):
         default=False,
         help="Only generate code, skip runtime execution (default: False)",
     )
+    parser.addoption(
+        "--precompile-workers",
+        action="store",
+        default=None,
+        type=int,
+        help="Number of parallel threads for pre-compilation phase (default: min(32, cpu_count+4))",
+    )
+    parser.addoption(
+        "--pypto-log-level",
+        action="store",
+        default="ERROR",
+        choices=["DEBUG", "INFO", "WARN", "ERROR", "FATAL", "EVENT", "NONE"],
+        help="PyPTO C++ log level threshold (default: ERROR)",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -198,11 +217,19 @@ def tensor_shape(request):
 
 # Skip markers
 def pytest_configure(config):
-    """Register custom markers."""
+    """Register custom markers and apply early global settings."""
     config.addinivalue_line("markers", "hardware: mark test as requiring hardware (--platform=a2a3)")
     config.addinivalue_line("markers", "a5: mark test as requiring Ascend 950 (--platform=a5 or a5sim)")
     config.addinivalue_line("markers", "slow: mark test as slow")
     config.addinivalue_line("markers", "fuzz: mark test as fuzz test")
+
+    # Set C++ log level as early as possible so it applies to collection too.
+    # Forked child processes inherit this setting via os.fork().
+    try:
+        level_name: str = config.getoption("--pypto-log-level")
+        set_log_level(LogLevel[level_name])
+    except (ValueError, KeyError):
+        pass  # option not yet registered (e.g. during --co --help)
 
 
 def pytest_collection_modifyitems(config, items):
@@ -217,3 +244,131 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_hardware)
         if "a5" in item.keywords and not platform.startswith("a5"):
             item.add_marker(skip_a5)
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Phase 1: discover and pre-compile all test cases in parallel after collection.
+
+    After pytest finishes collecting tests, this hook inspects each test item to
+    find which PTOTestCase subclass it uses, instantiates those cases, and
+    compiles them all concurrently via a thread pool.
+
+    Discovery strategy (best-effort, no test file changes required):
+    - Find PTOTestCase subclasses in each collected item's module.
+    - Scan the test function source for ``ClassName(`` to identify which class
+      is used in that test.
+    - For parametrised tests, match ``callspec.params`` to ``__init__`` kwargs.
+    - Cases that cannot be discovered fall back to the original
+      compile-on-demand path inside ``TestRunner.run()``.
+    """
+    from harness.core.harness import PTOTestCase
+    from harness.core.test_runner import _precompile_cache, precompile_test_cases, pregenerate_golden_inputs, prebuild_binaries
+
+    if not session.items:
+        return
+
+    # ── discover PTOTestCase instances ───────────────────────────────────────
+    seen: dict[str, PTOTestCase] = {}  # test_name → instance (deduped)
+
+    for item in session.items:
+        # Skip items already marked as skip (e.g. hardware / a5 markers).
+        if any(m.name == "skip" for m in item.iter_markers()):
+            continue
+
+        module = item.module
+
+        # Collect PTOTestCase subclasses visible in this module.
+        testcase_classes: dict[str, type] = {}
+        for attr in dir(module):
+            obj = getattr(module, attr, None)
+            if (
+                obj is not None
+                and isinstance(obj, type)
+                and issubclass(obj, PTOTestCase)
+                and obj is not PTOTestCase
+            ):
+                testcase_classes[attr] = obj
+
+        if not testcase_classes:
+            continue
+
+        # callspec params for @pytest.mark.parametrize (empty dict if none).
+        callspec = getattr(item, "callspec", None)
+        call_params: dict[str, Any] = callspec.params if callspec else {}
+
+        # Scan test function source to find which class name is referenced.
+        try:
+            source = inspect.getsource(item.function)
+        except (OSError, TypeError):
+            continue
+
+        for cls_name, cls in testcase_classes.items():
+            if not re.search(r"\b" + re.escape(cls_name) + r"\s*\(", source):
+                continue
+            # Filter callspec params to those accepted by __init__.
+            try:
+                sig = inspect.signature(cls.__init__)
+                valid = {k: v for k, v in call_params.items() if k in sig.parameters}
+                instance = cls(**valid)
+            except Exception:
+                continue  # constructor mismatch — skip
+            name = instance.get_name()
+            if name not in seen:
+                seen[name] = instance
+
+    if not seen:
+        return
+
+    dump_passes: bool = session.config.getoption("--dump-passes")
+    max_workers: int | None = session.config.getoption("--precompile-workers")
+
+    # Without --precompile-workers the pre-compilation/cache phases are skipped
+    # entirely; each test compiles on demand inside TestRunner.run().
+    if max_workers is None:
+        return
+
+    # ── determine cache directory ─────────────────────────────────────────────
+    save_kernels: bool = session.config.getoption("--save-kernels")
+    kernels_dir: str | None = session.config.getoption("--kernels-dir")
+    if save_kernels:
+        if kernels_dir:
+            cache_dir = Path(kernels_dir)
+        else:
+            from datetime import datetime
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            cache_dir = _PROJECT_ROOT / "build_output" / f"precompile_{timestamp}"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        cache_dir = Path(tempfile.mkdtemp(prefix="pypto_precompile_"))
+
+    # ── compile in parallel ───────────────────────────────────────────────────
+    test_cases = list(seen.values())
+    workers_str = str(max_workers) if max_workers is not None else "auto"
+    print(f"\n[PyPTO] Pre-compiling {len(test_cases)} test case(s) in parallel (workers={workers_str})…")
+    precompile_test_cases(test_cases, cache_dir, dump_passes=dump_passes, max_workers=max_workers)
+
+    n_ok = sum(1 for _, err in _precompile_cache.values() if err is None)
+    n_fail = len(_precompile_cache) - n_ok
+    print(f"[PyPTO] Pre-compilation done — {n_ok} ok, {n_fail} failed\n")
+
+    # ── Phase 0: pre-generate golden inputs ──────────────────────────────────
+    # Only makes sense when there are successful pre-compilations (golden.py
+    # files must exist before we can load and call generate_inputs).
+    if n_ok > 0:
+        ok_cases = [tc for tc in test_cases if tc.get_name() in _precompile_cache
+                    and _precompile_cache[tc.get_name()][1] is None]
+        print(f"[PyPTO] Pre-generating golden inputs for {len(ok_cases)} test case(s) in parallel (workers={workers_str})…")
+        n_gen = pregenerate_golden_inputs(ok_cases, cache_dir, max_workers=max_workers)
+        print(f"[PyPTO] Golden inputs pre-generated — {n_gen} case(s) cached\n")
+
+        # ── Phase 2: pre-build binary artifacts ──────────────────────────────
+        # Compile incore kernels, orchestration .so, and runtime binaries in parallel.
+        # Results are saved to work_dir/cache/ and the global binary_cache/runtimes/
+        # directory. _execute_on_device installs a write-through patch so subsequent
+        # CodeRunner calls serve from disk without recompiling.
+        if not session.config.getoption("--codegen-only"):
+            platform: str = session.config.getoption("--platform")
+            print(f"[PyPTO] Pre-building binary artifacts for {len(ok_cases)} test case(s) in parallel (workers={workers_str})…")
+            n_built = prebuild_binaries(ok_cases, cache_dir, platform, max_workers=max_workers)
+            print(f"[PyPTO] Binary pre-build done — {n_built} case(s) compiled\n")

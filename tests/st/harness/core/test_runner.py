@@ -18,15 +18,17 @@ Orchestrates the full test execution pipeline:
 5. Validate results
 """
 
+import concurrent.futures
 import shutil
 import tempfile
+import threading
 import time
 import traceback
 from datetime import datetime
 from pathlib import Path
 
 import pytest
-from pypto.backend import BackendType, set_backend_type
+from pypto.backend import BackendType, reset_for_testing, set_backend_type
 from pypto.runtime import compile_program
 from pypto.runtime.golden_writer import _extract_compute_golden, generate_golden_source
 from pypto.runtime.runner import RunConfig, RunResult, _execute_on_device
@@ -37,6 +39,23 @@ from harness.core.harness import PTOTestCase
 # tests/st/harness/core/test_runner.py -> tests/st/ -> project root
 _ST_DIR = Path(__file__).parent.parent.parent
 _PROJECT_ROOT = _ST_DIR.parent.parent
+
+# ---------------------------------------------------------------------------
+# Pre-compilation cache (Phase 1 / Phase 2 split)
+# ---------------------------------------------------------------------------
+
+# Maps test_name → (work_dir, error_str | None).
+# Populated by precompile_test_cases() in the parent process during
+# pytest_collection_finish, before any test forks.  Forked children inherit
+# the populated dict via os.fork() copy-on-write and find their pre-compiled
+# artefacts on the filesystem under work_dir.
+_precompile_cache: dict[str, tuple[Path, str | None]] = {}
+
+# set_backend_type is called once per backend-type group before the thread pool
+# starts.  Only get_program() needs serialisation because the @pl.program
+# decorator is not thread-safe; compile_program() writes to isolated dirs and
+# runs concurrently.
+_get_program_lock = threading.Lock()
 
 # Map BackendType to the architecture prefix used by the platform string.
 # "a2a3" covers Ascend 910B; "a5" covers Ascend 950.
@@ -113,6 +132,356 @@ def _write_golden_for_test_case(test_case: PTOTestCase, output_path: Path) -> No
     output_path.write_text(write_golden_src, encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Pre-compilation helpers
+# ---------------------------------------------------------------------------
+
+
+def _compile_for_cache(test_case: "PTOTestCase", work_dir: Path, dump_passes: bool) -> None:
+    """Compile one test case into *work_dir* (called from thread pool).
+
+    The backend type MUST already be set by the caller before entering the pool.
+    Only ``get_program`` is serialised (via ``_get_program_lock``) because the
+    ``@pl.program`` decorator is not thread-safe; ``compile_program`` writes to
+    an isolated directory and runs concurrently.
+    """
+    backend_type = test_case.get_backend_type()
+    with _get_program_lock:
+        program = test_case.get_program()
+    if program is None:
+        raise ValueError(
+            f"Test case {test_case.get_name()} must implement get_program() "
+            "to return a @pl.program class or ir.Program"
+        )
+    compile_program(
+        program,
+        work_dir,
+        strategy=test_case.get_strategy(),
+        backend_type=backend_type,
+        dump_passes=dump_passes,
+    )
+    if not list((work_dir / "kernels").rglob("*.cpp")):
+        raise ValueError(f"No kernels generated for {test_case.get_name()}")
+    if not list((work_dir / "orchestration").glob("*.cpp")):
+        raise ValueError(
+            f"No orchestration generated for {test_case.get_name()}. "
+            "Ensure your @pl.program includes an orchestration function "
+            "(decorated with @pl.function(type=pl.FunctionType.Orchestration))."
+        )
+    _write_golden_for_test_case(test_case, work_dir / "golden.py")
+
+
+def precompile_test_cases(
+    test_cases: "list[PTOTestCase]",
+    cache_dir: Path,
+    *,
+    dump_passes: bool = False,
+    max_workers: int | None = None,
+) -> None:
+    """Compile all *test_cases* in parallel and populate :data:`_precompile_cache`.
+
+    This is **Phase 1** of the two-phase execution model.  Call this once in
+    the parent process (e.g. from a ``pytest_collection_finish`` hook) before
+    any test forks.  Forked child processes inherit the populated cache and the
+    pre-compiled artefacts on the filesystem.
+
+    Because ``set_backend_type`` is a one-time global setter (calling it again
+    with a *different* value raises ``ValueError``), test cases are grouped by
+    backend type.  Each group is compiled sequentially with the backend set once;
+    ``get_program()`` is serialised within the group (via ``_get_program_lock``)
+    while ``compile_program()`` runs in parallel.  The backend is reset between
+    groups via ``reset_for_testing()``.
+
+    Args:
+        test_cases: Instances to compile (should be deduplicated by ``get_name``
+            before calling).
+        cache_dir: Root output directory; each test case is compiled into
+            ``cache_dir / <test_name>``.
+        dump_passes: If ``True``, dump intermediate IR after each pass.
+        max_workers: Thread-pool size per backend group.  Defaults to
+            ``os.cpu_count()``.
+    """
+    # Group by backend type so set_backend_type is called once per group.
+    groups: dict[BackendType, list["PTOTestCase"]] = {}
+    for tc in test_cases:
+        groups.setdefault(tc.get_backend_type(), []).append(tc)
+
+    def _compile_one(tc: "PTOTestCase") -> tuple[str, Path, str | None]:
+        name = tc.get_name()
+        work_dir = cache_dir / name
+        work_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _compile_for_cache(tc, work_dir, dump_passes)
+            return name, work_dir, None
+        except Exception as exc:
+            return name, work_dir, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+
+    for backend_type, group in groups.items():
+        # Set the backend type once for the whole group (idempotent if already
+        # set to the same value; reset_for_testing() between groups handles reuse).
+        set_backend_type(backend_type)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_compile_one, tc): tc for tc in group}
+                for fut in concurrent.futures.as_completed(futures):
+                    name, work_dir, error = fut.result()
+                    _precompile_cache[name] = (work_dir, error)
+        finally:
+            # Reset so the next group can set a different backend type.
+            reset_for_testing()
+
+
+def pregenerate_golden_inputs(
+    test_cases: "list[PTOTestCase]",
+    cache_dir: Path,
+    *,
+    max_workers: int | None = None,
+) -> int:
+    """Phase 0: pre-generate golden inputs for all test cases in parallel.
+
+    Must be called AFTER :func:`precompile_test_cases` so that golden.py files
+    have been written to ``cache_dir / <test_name> / golden.py``.
+
+    For each test case the golden module is loaded with importlib (no simpler
+    dependency needed — generated golden.py only imports torch/ctypes) and
+    ``generate_inputs(params)`` is called for every entry in ``ALL_CASES``.
+    Results are stored in :data:`pypto.runtime.runner._golden_inputs_cache`
+    keyed by ``(resolved_golden_path_str, case_name)``.  Forked worker
+    processes inherit the populated cache via copy-on-write and the
+    :func:`pypto.runtime.runner._install_golden_inputs_patch` monkey-patch
+    makes each ``CodeRunner`` instance serve inputs from the cache, skipping
+    the (potentially expensive) ``generate_inputs`` call at test execution time.
+
+    Args:
+        test_cases: Test case instances (should be deduplicated by ``get_name``).
+        cache_dir: Root output directory used during precompilation.
+        max_workers: Thread-pool size. Defaults to ``min(32, cpu_count + 4)``.
+
+    Returns:
+        Number of (test_case, case_name) pairs successfully pre-generated.
+    """
+    import importlib.util
+
+    from pypto.runtime.runner import (
+        _golden_cache_file,
+        _inputs_cache_file,
+        _load_golden,
+        _load_inputs,
+        _save_golden,
+        _save_inputs,
+    )
+
+    def _load_module(path: Path, name: str):
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    # ── Collect work items (main thread) ─────────────────────────────────────
+    # Each item is (module, golden_path, case_name, params) for cases whose
+    # .pt file does not yet exist.  Module loading happens here (single thread)
+    # to avoid importlib races.
+    work_items: list[tuple] = []
+    already_cached = 0
+
+    for tc in test_cases:
+        work_dir = cache_dir / tc.get_name()
+        golden_path = work_dir / "golden.py"
+        if not golden_path.exists():
+            continue
+        try:
+            module = _load_module(golden_path, f"_pregolden_{tc.get_name()}")
+        except Exception:
+            continue
+        if module is None:
+            continue
+
+        all_cases = getattr(module, "ALL_CASES", {"Default": {}})
+        for case_name, case_params in all_cases.items():
+            inputs_file = _inputs_cache_file(golden_path, case_name)
+            golden_file = _golden_cache_file(golden_path, case_name)
+            if inputs_file.exists() and golden_file.exists():
+                already_cached += 1
+                continue
+            params = {"name": case_name, **case_params}
+            work_items.append((module, golden_path, case_name, params))
+
+    # ── Generate in parallel (one task per (test_case, case_name) pair) ──────
+    def _gen_case(module, golden_path: Path, case_name: str, params: dict) -> bool:
+        import torch
+
+        inputs_file = _inputs_cache_file(golden_path, case_name)
+        golden_file = _golden_cache_file(golden_path, case_name)
+        try:
+            result = module.generate_inputs(params)
+            _save_inputs(result, inputs_file)
+
+            # Compute golden: replicate the logic in CodeRunner.run()
+            output_names = set(getattr(module, "__outputs__", []))
+            tensors = {name: val for name, val in result if isinstance(val, torch.Tensor)}
+            golden = {name: tensors[name].clone() for name in output_names if name in tensors}
+            golden_with_inputs = {**{k: v for k, v in tensors.items() if k not in output_names}, **golden}
+            module.compute_golden(golden_with_inputs, params)
+            _save_golden(golden, golden_file)
+            return True
+        except Exception:
+            return False  # fallback: live generation at test time
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = [pool.submit(_gen_case, *item) for item in work_items]
+        n_generated = sum(f.result() for f in concurrent.futures.as_completed(futs))
+
+    return already_cached + n_generated
+
+
+def prebuild_binaries(
+    test_cases: "list[PTOTestCase]",
+    cache_dir: Path,
+    platform: str,
+    *,
+    max_workers: int | None = None,
+) -> int:
+    """Phase 2: pre-compile binary artifacts for all test cases in parallel.
+
+    Must be called AFTER :func:`precompile_test_cases` so kernel/orchestration
+    C++ sources exist under ``work_dir``. Imports KernelCompiler/RuntimeBuilder
+    from Simpler and compiles incore kernels, the orchestration ``.so``, and
+    runtime binaries, saving results via the write-through binary cache patch
+    in :mod:`pypto.runtime.runner`.
+
+    Args:
+        test_cases: Test case instances (deduplicated by ``get_name``).
+        cache_dir: Root output directory used during precompilation.
+        platform: Session platform string (e.g. ``"a2a3"``).
+        max_workers: Thread-pool size. Defaults to ``min(32, cpu_count + 4)``.
+
+    Returns:
+        Number of test cases whose kernels and orchestration were successfully
+        pre-built.
+    """
+    import importlib.util
+    import os
+    import sys
+
+    simpler_root = os.environ.get("SIMPLER_ROOT", "")
+    if not simpler_root:
+        return 0
+    for sub in ("examples/scripts", "python"):
+        p = str(Path(simpler_root) / sub)
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+    try:
+        from kernel_compiler import KernelCompiler  # type: ignore[import]
+        from runtime_builder import RuntimeBuilder  # type: ignore[import]
+        from code_runner import _ensure_pto_isa_root  # type: ignore[import]
+        from pypto.runtime.runner import (
+            _BINARY_RUNTIME_CACHE,
+            _get_simpler_stamp,
+            _install_binary_cache_patch,
+        )
+    except ImportError:
+        return 0
+
+    _install_binary_cache_patch(KernelCompiler, RuntimeBuilder)
+
+    pto_isa_root = _ensure_pto_isa_root(verbose=False, clone_protocol="https")
+    if pto_isa_root is None:
+        return 0
+
+    def _load_kc(work_dir: Path):
+        config_path = work_dir / "kernel_config.py"
+        if not config_path.exists():
+            return None
+        spec = importlib.util.spec_from_file_location(f"_prebin_{work_dir.name}", str(config_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    # ── Collect configs for all valid test cases ──────────────────────────────
+    # Load each kernel_config.py once in the main thread (not thread-safe to do
+    # it concurrently via importlib).
+    case_configs: list[tuple] = []  # (tc, compiler, runtime_name, kernels, orch_source)
+    seen_runtimes: set[tuple[str, str]] = set()
+
+    for tc in test_cases:
+        name = tc.get_name()
+        if name not in _precompile_cache or _precompile_cache[name][1] is not None:
+            continue
+        work_dir = _precompile_cache[name][0]
+        mod = _load_kc(work_dir)
+        if mod is None:
+            continue
+        tc_platform = _resolve_platform(platform, tc.get_backend_type())
+        runtime_name = getattr(mod, "RUNTIME_CONFIG", {}).get("runtime", "host_build_graph")
+        seen_runtimes.add((tc_platform, runtime_name))
+        compiler = KernelCompiler(platform=tc_platform)
+        case_configs.append((tc, compiler, runtime_name, mod.KERNELS, mod.ORCHESTRATION["source"]))
+
+    if not case_configs:
+        return 0
+
+    # ── Submit ALL tasks to a single flat pool ────────────────────────────────
+    # - One task per incore kernel (kernels across all test cases run in parallel)
+    # - One task per orchestration .so
+    # - One task per unique (platform, runtime_name) build
+    # This way runtime compilation overlaps with kernel/orch compilation, and
+    # with a single test case (common case) all kernels still run in parallel.
+    def _compile_incore_task(compiler, kernel, runtime_includes):
+        compiler.compile_incore(
+            kernel["source"],
+            core_type=kernel["core_type"],
+            pto_isa_root=pto_isa_root,
+            extra_include_dirs=runtime_includes,
+        )
+
+    def _compile_orch_task(compiler, runtime_name, orch_source):
+        compiler.compile_orchestration(runtime_name, orch_source)
+
+    def _build_runtime_task(tc_platform, runtime_name):
+        host_file = _BINARY_RUNTIME_CACHE / _get_simpler_stamp() / f"{runtime_name}_{tc_platform}_host.bin"
+        if not host_file.exists():
+            RuntimeBuilder(platform=tc_platform).build(runtime_name)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        all_futs: list = []
+
+        # Runtime builds (independent of test-case kernels)
+        for tc_platform, runtime_name in seen_runtimes:
+            all_futs.append(pool.submit(_build_runtime_task, tc_platform, runtime_name))
+
+        # Per-test-case: each kernel and orchestration as independent tasks
+        tc_kernel_futs: list[tuple[list, concurrent.futures.Future]] = []
+        for tc, compiler, runtime_name, kernels, orch_source in case_configs:
+            runtime_includes = compiler.get_orchestration_include_dirs(runtime_name)[:2]
+            kfuts = [
+                pool.submit(_compile_incore_task, compiler, k, runtime_includes)
+                for k in kernels
+            ]
+            ofut = pool.submit(_compile_orch_task, compiler, runtime_name, orch_source)
+            tc_kernel_futs.append((kfuts, ofut))
+            all_futs.extend(kfuts)
+            all_futs.append(ofut)
+
+        # Wait for everything; swallow individual failures (write-through patch
+        # simply won't cache on failure, test will fall back to live compilation)
+        for fut in concurrent.futures.as_completed(all_futs):
+            try:
+                fut.result()
+            except Exception:
+                pass
+
+    # Count test cases where all kernels AND orchestration succeeded
+    n_ok = sum(
+        1
+        for kfuts, ofut in tc_kernel_futs
+        if all(f.exception() is None for f in kfuts) and ofut.exception() is None
+    )
+    return n_ok
+
+
 class TestRunner:
     """Executes PTO test cases via simpler's CodeRunner.
 
@@ -148,6 +517,51 @@ class TestRunner:
         """
         start_time = time.time()
         test_name = test_case.get_name()
+
+        # --- Phase 2: pre-compiled artifacts available — skip compilation ---
+        if test_name in _precompile_cache:
+            cached_dir, cached_error = _precompile_cache[test_name]
+            if cached_error is not None:
+                return RunResult(
+                    passed=False,
+                    test_name=test_name,
+                    error=f"Pre-compilation failed: {cached_error}",
+                    execution_time=time.time() - start_time,
+                )
+            if self.config.codegen_only:
+                return RunResult(
+                    passed=True,
+                    test_name=test_name,
+                    execution_time=time.time() - start_time,
+                )
+            try:
+                backend_type = test_case.get_backend_type()
+                platform = _resolve_platform(self.config.platform, backend_type)
+                # Re-write golden.py with the actual test case's tolerances.
+                # The pre-compiled golden.py may have been written with default
+                # tolerances (1e-5) because pytest_collection_finish instantiates
+                # test cases without their RunConfig constructor args.
+                _write_golden_for_test_case(test_case, cached_dir / "golden.py")
+                _execute_on_device(
+                    cached_dir,
+                    cached_dir / "golden.py",
+                    platform,
+                    self.config.device_id,
+                )
+                return RunResult(
+                    passed=True,
+                    test_name=test_name,
+                    execution_time=time.time() - start_time,
+                )
+            except Exception as e:
+                return RunResult(
+                    passed=False,
+                    test_name=test_name,
+                    error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+                    execution_time=time.time() - start_time,
+                )
+
+        # --- Original path: no cache, compile + execute in one step ---
 
         # Determine work directory based on save_kernels configuration
         if self.config.save_kernels:

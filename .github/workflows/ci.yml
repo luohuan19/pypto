@@ -130,7 +130,7 @@ jobs:
           pip install -v .
 
       - name: Test system tests
-        run: pytest tests/st -v --device=$DEVICE_ID --forked
+        run: pytest tests/st -v --device=$DEVICE_ID --forked --precompile-workers=256
 
   fuzz-tests-sim:
     runs-on: ubuntu-latest

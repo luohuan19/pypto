@@ -53,6 +53,176 @@ from pypto.ir.pass_manager import OptimizationStrategy
 from .golden_writer import write_golden
 from .tensor_spec import TensorSpec
 
+# ---------------------------------------------------------------------------
+# Golden inputs pre-generation cache
+# ---------------------------------------------------------------------------
+# .pt files written by pregenerate_golden_inputs() (see test_runner.py) are
+# the persistent cache.  This flag just prevents re-patching CodeRunner in
+# the same process.
+_code_runner_patched: bool = False
+_binary_cache_patched: bool = False
+_simpler_stamp_value: str | None = None
+
+
+def _get_simpler_stamp() -> str:
+    """Return Simpler's current git commit (short hash) as a cache-key stamp.
+
+    The stamp is used to namespace the global runtime binary cache so that
+    stale binaries from an older Simpler version are never reused after an
+    update.  Falls back to ``"unknown"`` when git is unavailable or
+    ``SIMPLER_ROOT`` is not set.
+
+    The value is computed once and cached in-process.
+    """
+    global _simpler_stamp_value
+    if _simpler_stamp_value is not None:
+        return _simpler_stamp_value
+    try:
+        import subprocess
+        simpler_root = os.environ.get("SIMPLER_ROOT", "")
+        if not simpler_root:
+            _simpler_stamp_value = "unknown"
+            return _simpler_stamp_value
+        r = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=simpler_root, timeout=5,
+        )
+        _simpler_stamp_value = r.stdout.strip() if r.returncode == 0 else "unknown"
+    except Exception:
+        _simpler_stamp_value = "unknown"
+    return _simpler_stamp_value
+
+
+# ---------------------------------------------------------------------------
+# Cache file helpers
+# ---------------------------------------------------------------------------
+
+
+def _cache_dir(golden_path: Path) -> Path:
+    """Return the ``cache/`` subdirectory co-located with ``golden.py``."""
+    return golden_path.parent / "cache"
+
+
+def _inputs_cache_file(golden_path: Path, case_name: str) -> Path:
+    """Return the path for the pre-generated inputs ``.pt`` file.
+
+    All cache artefacts live under ``work_dir/cache/`` alongside the other
+    test-case outputs::
+
+        work_dir/
+          cache/
+            Default_inputs.pt
+            Default_golden.pt
+            Case1_inputs.pt
+            Case1_golden.pt
+          golden.py
+          kernels/
+          orchestration/
+    """
+    safe = case_name.replace("/", "_").replace(" ", "_")
+    return _cache_dir(golden_path) / f"{safe}_inputs.pt"
+
+
+def _golden_cache_file(golden_path: Path, case_name: str) -> Path:
+    """Return the path for the pre-computed golden outputs ``.pt`` file."""
+    safe = case_name.replace("/", "_").replace(" ", "_")
+    return _cache_dir(golden_path) / f"{safe}_golden.pt"
+
+
+def _save_inputs(result: list, path: Path) -> None:
+    """Serialise ``generate_inputs()`` result to *path* via ``torch.save``.
+
+    Each item in *result* is wrapped in a small dict so that ctypes scalars
+    can be reconstructed faithfully on load::
+
+        {"kind": "tensor", "name": "a",    "data": <torch.Tensor>}
+        {"kind": "ctypes", "name": "size", "ctype": "c_int64", "value": 1024}
+    """
+    import ctypes
+    import torch
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialisable = []
+    for name, val in result:
+        if isinstance(val, torch.Tensor):
+            serialisable.append({"kind": "tensor", "name": name, "data": val})
+        elif isinstance(val, ctypes._SimpleCData):
+            serialisable.append({
+                "kind": "ctypes",
+                "name": name,
+                "ctype": type(val).__name__,
+                "value": val.value,
+            })
+        else:
+            raise TypeError(
+                f"Cannot serialise arg {name!r}: unsupported type {type(val)}"
+            )
+    torch.save(serialisable, path)
+
+
+def _load_inputs(path: Path) -> list | None:
+    """Load and reconstruct a ``generate_inputs()`` result from *path*.
+
+    Returns ``None`` if the file does not exist or cannot be read.
+    """
+    import ctypes
+    import torch
+
+    if not path.exists():
+        return None
+    try:
+        items = torch.load(path, weights_only=False)
+        result = []
+        for item in items:
+            name = item["name"]
+            if item["kind"] == "tensor":
+                result.append((name, item["data"]))
+            elif item["kind"] == "ctypes":
+                ctype_cls = getattr(ctypes, item["ctype"])
+                result.append((name, ctype_cls(item["value"])))
+        return result
+    except Exception:
+        return None
+
+
+def _save_golden(golden: dict, path: Path) -> None:
+    """Serialise pre-computed golden output tensors to *path*."""
+    import torch
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(golden, path)
+
+
+def _load_golden(path: Path) -> dict | None:
+    """Load pre-computed golden output tensors from *path*.
+
+    Returns ``None`` if the file does not exist or cannot be read.
+    """
+    import torch
+
+    if not path.exists():
+        return None
+    try:
+        return torch.load(path, weights_only=False)
+    except Exception:
+        return None
+
+
+def _save_binary(data: bytes, path: Path) -> None:
+    """Save compiled binary bytes to *path*."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def _load_binary(path: Path) -> bytes | None:
+    """Load compiled binary bytes from *path*. Returns ``None`` on miss."""
+    if not path.exists():
+        return None
+    try:
+        return path.read_bytes()
+    except Exception:
+        return None
+
 
 @dataclass
 class RunConfig:
@@ -248,6 +418,150 @@ def run(
 # ---------------------------------------------------------------------------
 
 
+def _install_golden_inputs_patch(CodeRunner) -> None:
+    """Monkey-patch CodeRunner.__init__ to serve generate_inputs and compute_golden from disk cache.
+
+    Idempotent — safe to call multiple times.  For each new CodeRunner instance:
+
+    - ``generate_inputs``: loads ``cache/{case}_inputs.pt`` when available,
+      falls through to the original on a cache miss.
+    - ``compute_golden``: copies cached output tensors from
+      ``cache/{case}_golden.pt`` into the tensors dict when available,
+      falls through to the original on a cache miss.
+
+    Each ``torch.load`` produces fresh tensors, so no cloning is needed.
+    """
+    global _code_runner_patched
+    if _code_runner_patched:
+        return
+
+    orig_init = CodeRunner.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        golden_path = self.golden_path  # Path, already resolved
+
+        # --- patch generate_inputs -------------------------------------------
+        orig_gen = self._golden_module.generate_inputs
+
+        def _cached_gen(params):
+            case_name = params.get("name", "Default")
+            result = _load_inputs(_inputs_cache_file(golden_path, case_name))
+            return result if result is not None else orig_gen(params)
+
+        self._golden_module.generate_inputs = _cached_gen
+
+        # --- patch compute_golden --------------------------------------------
+        orig_compute = self._golden_module.compute_golden
+
+        def _cached_compute(tensors, params):
+            case_name = params.get("name", "Default")
+            cached = _load_golden(_golden_cache_file(golden_path, case_name))
+            if cached is not None:
+                for name, val in cached.items():
+                    if name in tensors:
+                        tensors[name].copy_(val)
+                return
+            orig_compute(tensors, params)
+
+        self._golden_module.compute_golden = _cached_compute
+
+    CodeRunner.__init__ = _patched_init
+    _code_runner_patched = True
+
+
+# Persistent runtime binary cache — shared across test cases and sessions.
+# Root directory for persistent runtime binary cache.  Actual files live under
+# a Simpler-version subdirectory (see _get_simpler_stamp()) so that stale
+# binaries are automatically bypassed after a Simpler update.
+_BINARY_RUNTIME_CACHE = (
+    Path(__file__).parent.parent.parent.parent / "build_output" / "binary_cache" / "runtimes"
+)
+
+
+def _install_binary_cache_patch(KernelCompiler, RuntimeBuilder) -> None:
+    """Monkey-patch KernelCompiler and RuntimeBuilder to serve compiled binaries from disk.
+
+    Patches three methods with write-through caches:
+
+    - ``KernelCompiler.compile_incore``: caches at
+      ``work_dir/cache/incore_{core_type}_{stem}.bin``
+      (derived from the kernel source path structure
+      ``work_dir/kernels/{core_type}/{name}.cpp``).
+    - ``KernelCompiler.compile_orchestration``: caches at
+      ``work_dir/cache/orch_{stem}.bin``
+      (derived from ``work_dir/orchestration/{name}.cpp``).
+    - ``RuntimeBuilder.build``: caches at
+      ``build_output/binary_cache/runtimes/{name}_{platform}_{target}.bin``
+      (global, shared across all test cases).
+
+    Idempotent — safe to call multiple times. Cache miss triggers compilation
+    and saves the result; subsequent calls serve from disk.
+    """
+    global _binary_cache_patched
+    if _binary_cache_patched:
+        return
+
+    # --- KernelCompiler.compile_incore ---
+    orig_incore = KernelCompiler.compile_incore
+
+    def _patched_incore(self, source_path, core_type="aiv", pto_isa_root=None,
+                        extra_include_dirs=None, build_dir=None):
+        source = Path(source_path)
+        # Only cache for the expected structure: work_dir/kernels/{core_type}/{name}.cpp
+        if source.parent.parent.name == "kernels":
+            cache_file = source.parent.parent.parent / "cache" / f"incore_{core_type}_{source.stem}.bin"
+            cached = _load_binary(cache_file)
+            if cached is not None:
+                return cached
+            result = orig_incore(self, source_path, core_type, pto_isa_root, extra_include_dirs, build_dir)
+            _save_binary(result, cache_file)
+            return result
+        return orig_incore(self, source_path, core_type, pto_isa_root, extra_include_dirs, build_dir)
+
+    KernelCompiler.compile_incore = _patched_incore
+
+    # --- KernelCompiler.compile_orchestration ---
+    orig_orch = KernelCompiler.compile_orchestration
+
+    def _patched_orch(self, runtime_name, source_path, extra_include_dirs=None, build_dir=None):
+        source = Path(source_path)
+        # Only cache for the expected structure: work_dir/orchestration/{name}.cpp
+        if source.parent.name == "orchestration":
+            cache_file = source.parent.parent / "cache" / f"orch_{source.stem}.bin"
+            cached = _load_binary(cache_file)
+            if cached is not None:
+                return cached
+            result = orig_orch(self, runtime_name, source_path, extra_include_dirs, build_dir)
+            _save_binary(result, cache_file)
+            return result
+        return orig_orch(self, runtime_name, source_path, extra_include_dirs, build_dir)
+
+    KernelCompiler.compile_orchestration = _patched_orch
+
+    # --- RuntimeBuilder.build ---
+    orig_build = RuntimeBuilder.build
+
+    def _patched_build(self, name, build_dir=None):
+        cache_dir = _BINARY_RUNTIME_CACHE / _get_simpler_stamp()
+        host_file = cache_dir / f"{name}_{self.platform}_host.bin"
+        aicpu_file = cache_dir / f"{name}_{self.platform}_aicpu.bin"
+        aicore_file = cache_dir / f"{name}_{self.platform}_aicore.bin"
+        host = _load_binary(host_file)
+        aicpu = _load_binary(aicpu_file)
+        aicore = _load_binary(aicore_file)
+        if host is not None and aicpu is not None and aicore is not None:
+            return (host, aicpu, aicore)
+        result = orig_build(self, name, build_dir)
+        _save_binary(result[0], host_file)
+        _save_binary(result[1], aicpu_file)
+        _save_binary(result[2], aicore_file)
+        return result
+
+    RuntimeBuilder.build = _patched_build
+    _binary_cache_patched = True
+
+
 def _execute_on_device(work_dir: Path, golden_path: Path, platform: str, device_id: int) -> None:
     """Invoke Simpler's CodeRunner to compile, load, execute, and validate.
 
@@ -270,6 +584,13 @@ def _execute_on_device(work_dir: Path, golden_path: Path, platform: str, device_
                 sys.path.insert(0, p)
 
     code_runner_cls = importlib.import_module("code_runner").CodeRunner
+    
+    from code_runner import CodeRunner  # type: ignore[import]  # noqa: PLC0415,I001 — available after sys.path setup
+    from kernel_compiler import KernelCompiler  # type: ignore[import]  # noqa: PLC0415
+    from runtime_builder import RuntimeBuilder  # type: ignore[import]  # noqa: PLC0415
+
+    _install_golden_inputs_patch(CodeRunner)
+    _install_binary_cache_patch(KernelCompiler, RuntimeBuilder)
 
     code_runner_cls(
         kernels_dir=str(work_dir),
