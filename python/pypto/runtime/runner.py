@@ -79,13 +79,18 @@ def _get_simpler_stamp() -> str:
         return _simpler_stamp_value
     try:
         import subprocess
+
         simpler_root = os.environ.get("SIMPLER_ROOT", "")
         if not simpler_root:
             _simpler_stamp_value = "unknown"
             return _simpler_stamp_value
         r = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, cwd=simpler_root, timeout=5,
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=simpler_root,
+            timeout=5,
         )
         _simpler_stamp_value = r.stdout.strip() if r.returncode == 0 else "unknown"
     except Exception:
@@ -139,6 +144,7 @@ def _save_inputs(result: list, path: Path) -> None:
         {"kind": "ctypes", "name": "size", "ctype": "c_int64", "value": 1024}
     """
     import ctypes
+
     import torch
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,16 +153,16 @@ def _save_inputs(result: list, path: Path) -> None:
         if isinstance(val, torch.Tensor):
             serialisable.append({"kind": "tensor", "name": name, "data": val})
         elif isinstance(val, ctypes._SimpleCData):
-            serialisable.append({
-                "kind": "ctypes",
-                "name": name,
-                "ctype": type(val).__name__,
-                "value": val.value,
-            })
-        else:
-            raise TypeError(
-                f"Cannot serialise arg {name!r}: unsupported type {type(val)}"
+            serialisable.append(
+                {
+                    "kind": "ctypes",
+                    "name": name,
+                    "ctype": type(val).__name__,
+                    "value": val.value,
+                }
             )
+        else:
+            raise TypeError(f"Cannot serialise arg {name!r}: unsupported type {type(val)}")
     torch.save(serialisable, path)
 
 
@@ -166,6 +172,7 @@ def _load_inputs(path: Path) -> list | None:
     Returns ``None`` if the file does not exist or cannot be read.
     """
     import ctypes
+
     import torch
 
     if not path.exists():
@@ -505,8 +512,9 @@ def _install_binary_cache_patch(KernelCompiler, RuntimeBuilder) -> None:
     # --- KernelCompiler.compile_incore ---
     orig_incore = KernelCompiler.compile_incore
 
-    def _patched_incore(self, source_path, core_type="aiv", pto_isa_root=None,
-                        extra_include_dirs=None, build_dir=None):
+    def _patched_incore(
+        self, source_path, core_type="aiv", pto_isa_root=None, extra_include_dirs=None, build_dir=None
+    ):
         source = Path(source_path)
         # Only cache for the expected structure: work_dir/kernels/{core_type}/{name}.cpp
         if source.parent.parent.name == "kernels":
@@ -584,10 +592,10 @@ def _execute_on_device(work_dir: Path, golden_path: Path, platform: str, device_
                 sys.path.insert(0, p)
 
     code_runner_cls = importlib.import_module("code_runner").CodeRunner
-    
-    from code_runner import CodeRunner  # type: ignore[import]  # noqa: PLC0415,I001 — available after sys.path setup
-    from kernel_compiler import KernelCompiler  # type: ignore[import]  # noqa: PLC0415
-    from runtime_builder import RuntimeBuilder  # type: ignore[import]  # noqa: PLC0415
+
+    from code_runner import CodeRunner
+    from kernel_compiler import KernelCompiler
+    from runtime_builder import RuntimeBuilder
 
     _install_golden_inputs_patch(CodeRunner)
     _install_binary_cache_patch(KernelCompiler, RuntimeBuilder)

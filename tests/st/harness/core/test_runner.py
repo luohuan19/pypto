@@ -202,7 +202,7 @@ def precompile_test_cases(
             ``os.cpu_count()``.
     """
     # Group by backend type so set_backend_type is called once per group.
-    groups: dict[BackendType, list["PTOTestCase"]] = {}
+    groups: dict[BackendType, list[PTOTestCase]] = {}
     for tc in test_cases:
         groups.setdefault(tc.get_backend_type(), []).append(tc)
 
@@ -265,8 +265,6 @@ def pregenerate_golden_inputs(
     from pypto.runtime.runner import (
         _golden_cache_file,
         _inputs_cache_file,
-        _load_golden,
-        _load_inputs,
         _save_golden,
         _save_inputs,
     )
@@ -321,9 +319,13 @@ def pregenerate_golden_inputs(
             # Compute golden: replicate the logic in CodeRunner.run()
             output_names = set(getattr(module, "__outputs__", []))
             tensors = {name: val for name, val in result if isinstance(val, torch.Tensor)}
-            golden = {name: tensors[name].clone() for name in output_names if name in tensors}
-            golden_with_inputs = {**{k: v for k, v in tensors.items() if k not in output_names}, **golden}
+            # Clone output tensors so compute_golden modifies the clones (not the originals)
+            golden_with_inputs = {
+                name: val.clone() if name in output_names else val for name, val in tensors.items()
+            }
             module.compute_golden(golden_with_inputs, params)
+            # Save only the output tensors (which now contain the computed values)
+            golden = {name: golden_with_inputs[name] for name in output_names if name in golden_with_inputs}
             _save_golden(golden, golden_file)
             return True
         except Exception:
@@ -374,14 +376,14 @@ def prebuild_binaries(
             sys.path.insert(0, p)
 
     try:
-        from kernel_compiler import KernelCompiler  # type: ignore[import]
-        from runtime_builder import RuntimeBuilder  # type: ignore[import]
         from code_runner import _ensure_pto_isa_root  # type: ignore[import]
+        from kernel_compiler import KernelCompiler  # type: ignore[import]
         from pypto.runtime.runner import (
             _BINARY_RUNTIME_CACHE,
             _get_simpler_stamp,
             _install_binary_cache_patch,
         )
+        from runtime_builder import RuntimeBuilder  # type: ignore[import]
     except ImportError:
         return 0
 
@@ -456,10 +458,7 @@ def prebuild_binaries(
         tc_kernel_futs: list[tuple[list, concurrent.futures.Future]] = []
         for tc, compiler, runtime_name, kernels, orch_source in case_configs:
             runtime_includes = compiler.get_orchestration_include_dirs(runtime_name)[:2]
-            kfuts = [
-                pool.submit(_compile_incore_task, compiler, k, runtime_includes)
-                for k in kernels
-            ]
+            kfuts = [pool.submit(_compile_incore_task, compiler, k, runtime_includes) for k in kernels]
             ofut = pool.submit(_compile_orch_task, compiler, runtime_name, orch_source)
             tc_kernel_futs.append((kfuts, ofut))
             all_futs.extend(kfuts)

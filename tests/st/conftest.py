@@ -18,6 +18,7 @@ import inspect
 import os
 import random
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -42,6 +43,10 @@ from harness.core.environment import (  # noqa: E402
 from harness.core.test_runner import TestRunner  # noqa: E402
 from pypto import LogLevel, set_log_level  # noqa: E402
 from pypto.runtime.runner import RunConfig  # noqa: E402
+
+# Temp directories created for pre-compilation (when --save-kernels is not set).
+# Cleaned up in pytest_sessionfinish.
+_temp_precompile_dirs: list[Path] = []
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -262,7 +267,12 @@ def pytest_collection_finish(session: pytest.Session) -> None:
       compile-on-demand path inside ``TestRunner.run()``.
     """
     from harness.core.harness import PTOTestCase
-    from harness.core.test_runner import _precompile_cache, precompile_test_cases, pregenerate_golden_inputs, prebuild_binaries
+    from harness.core.test_runner import (
+        _precompile_cache,
+        prebuild_binaries,
+        precompile_test_cases,
+        pregenerate_golden_inputs,
+    )
 
     if not session.items:
         return
@@ -341,6 +351,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     else:
         cache_dir = Path(tempfile.mkdtemp(prefix="pypto_precompile_"))
+        _temp_precompile_dirs.append(cache_dir)
 
     # ── compile in parallel ───────────────────────────────────────────────────
     test_cases = list(seen.values())
@@ -356,9 +367,14 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     # Only makes sense when there are successful pre-compilations (golden.py
     # files must exist before we can load and call generate_inputs).
     if n_ok > 0:
-        ok_cases = [tc for tc in test_cases if tc.get_name() in _precompile_cache
-                    and _precompile_cache[tc.get_name()][1] is None]
-        print(f"[PyPTO] Pre-generating golden inputs for {len(ok_cases)} test case(s) in parallel (workers={workers_str})…")
+        ok_cases = [
+            tc
+            for tc in test_cases
+            if tc.get_name() in _precompile_cache and _precompile_cache[tc.get_name()][1] is None
+        ]
+        print(
+            f"[PyPTO] Pre-generating golden inputs for {len(ok_cases)} test case(s) in parallel (workers={workers_str})…"
+        )
         n_gen = pregenerate_golden_inputs(ok_cases, cache_dir, max_workers=max_workers)
         print(f"[PyPTO] Golden inputs pre-generated — {n_gen} case(s) cached\n")
 
@@ -369,6 +385,14 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         # CodeRunner calls serve from disk without recompiling.
         if not session.config.getoption("--codegen-only"):
             platform: str = session.config.getoption("--platform")
-            print(f"[PyPTO] Pre-building binary artifacts for {len(ok_cases)} test case(s) in parallel (workers={workers_str})…")
+            print(
+                f"[PyPTO] Pre-building binary artifacts for {len(ok_cases)} test case(s) in parallel (workers={workers_str})…"
+            )
             n_built = prebuild_binaries(ok_cases, cache_dir, platform, max_workers=max_workers)
             print(f"[PyPTO] Binary pre-build done — {n_built} case(s) compiled\n")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # noqa: ARG001
+    """Clean up temporary pre-compilation directories created during the session."""
+    for d in _temp_precompile_dirs:
+        shutil.rmtree(d, ignore_errors=True)
