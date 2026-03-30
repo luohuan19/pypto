@@ -351,6 +351,7 @@ def prebuild_binaries(
     platform: str,
     *,
     max_workers: int | None = None,
+    pto_isa_commit: str | None = None,
 ) -> int:
     """Phase 2: pre-compile binary artifacts for all test cases in parallel.
 
@@ -365,6 +366,8 @@ def prebuild_binaries(
         cache_dir: Root output directory used during precompilation.
         platform: Session platform string (e.g. ``"a2a3"``).
         max_workers: Thread-pool size. Defaults to ``min(32, cpu_count + 4)``.
+        pto_isa_commit: If set, pin the pto-isa clone to this specific git
+            commit (hash or tag).  ``None`` means use latest remote HEAD.
 
     Returns:
         Number of test cases whose kernels and orchestration were successfully
@@ -391,7 +394,7 @@ def prebuild_binaries(
 
     _install_binary_cache_patch(KernelCompiler, RuntimeBuilder)
 
-    pto_isa_root = _ensure_pto_isa_root(verbose=False, clone_protocol="https")
+    pto_isa_root = _ensure_pto_isa_root(verbose=False, clone_protocol="https", commit=pto_isa_commit)
     if pto_isa_root is None:
         return 0
 
@@ -549,6 +552,7 @@ class TestRunner:
                     cached_dir / "golden.py",
                     platform,
                     self.config.device_id,
+                    self.config.pto_isa_commit,
                 )
                 return RunResult(
                     passed=True,
@@ -623,7 +627,7 @@ class TestRunner:
                 )
 
             platform = _resolve_platform(self.config.platform, backend_type)
-            _execute_on_device(work_dir, golden_path, platform, self.config.device_id)
+            _execute_on_device(work_dir, golden_path, platform, self.config.device_id, self.config.pto_isa_commit)
 
             return RunResult(
                 passed=True,

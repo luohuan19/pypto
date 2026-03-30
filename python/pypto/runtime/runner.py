@@ -239,6 +239,8 @@ class RunConfig:
             ``build_output/<program_name>_<timestamp>``.
         codegen_only: If ``True``, stop after code generation without executing
             on device.  Useful for validating compilation output.
+        pto_isa_commit: If set, pin the pto-isa clone to this specific git
+            commit (hash or tag).  ``None`` means use the latest remote HEAD.
     """
 
     __test__ = False  # Not a pytest test class
@@ -253,6 +255,7 @@ class RunConfig:
     save_kernels: bool = False
     save_kernels_dir: str | None = None
     codegen_only: bool = False
+    pto_isa_commit: str | None = None
 
     def __post_init__(self) -> None:
         if self.platform not in ("a2a3sim", "a2a3", "a5sim", "a5"):
@@ -396,7 +399,7 @@ def run(
         write_golden(tensor_specs, golden, golden_path, rtol=config.rtol, atol=config.atol)
 
         # 4. Execute via Simpler's CodeRunner
-        _execute_on_device(work_dir, golden_path, config.platform, config.device_id)
+        _execute_on_device(work_dir, golden_path, config.platform, config.device_id, config.pto_isa_commit)
 
         return RunResult(passed=True, execution_time=time.time() - start_time)
 
@@ -555,7 +558,13 @@ def _install_binary_cache_patch(KernelCompiler, RuntimeBuilder) -> None:
     _binary_cache_patched[0] = True
 
 
-def _execute_on_device(work_dir: Path, golden_path: Path, platform: str, device_id: int) -> None:
+def _execute_on_device(
+    work_dir: Path,
+    golden_path: Path,
+    platform: str,
+    device_id: int,
+    pto_isa_commit: str | None = None,
+) -> None:
     """Invoke Simpler's CodeRunner to compile, load, execute, and validate.
 
     Automatically adds SIMPLER_ROOT sub-paths to ``sys.path`` when the
@@ -568,6 +577,8 @@ def _execute_on_device(work_dir: Path, golden_path: Path, platform: str, device_
         platform: Target execution platform (``"a2a3sim"``, ``"a2a3"``,
             ``"a5sim"``, or ``"a5"``).
         device_id: Hardware device index.
+        pto_isa_commit: If set, pin the pto-isa clone to this specific git
+            commit (hash or tag).
     """
     simpler_root = os.environ.get("SIMPLER_ROOT")
     if simpler_root:
@@ -589,6 +600,7 @@ def _execute_on_device(work_dir: Path, golden_path: Path, platform: str, device_
         platform=platform,
         device_id=device_id,
         clone_protocol="https",
+        pto_isa_commit=pto_isa_commit,
     ).run()
 
 

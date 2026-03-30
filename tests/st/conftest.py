@@ -170,6 +170,12 @@ def pytest_addoption(parser):
         choices=["DEBUG", "INFO", "WARN", "ERROR", "FATAL", "EVENT", "NONE"],
         help="PyPTO C++ log level threshold (default: ERROR)",
     )
+    parser.addoption(
+        "--pto-isa-commit",
+        action="store",
+        default=None,
+        help="Pin the pto-isa clone to a specific git commit (hash or tag). Default: use latest remote HEAD.",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -193,6 +199,7 @@ def test_config(request) -> RunConfig:
         save_kernels_dir=save_kernels_dir,
         dump_passes=request.config.getoption("--dump-passes"),
         codegen_only=request.config.getoption("--codegen-only"),
+        pto_isa_commit=request.config.getoption("--pto-isa-commit"),
     )
 
 
@@ -403,6 +410,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         # CodeRunner calls serve from disk without recompiling.
         if not session.config.getoption("--codegen-only"):
             platform: str = session.config.getoption("--platform")
+            pto_isa_commit: str | None = session.config.getoption("--pto-isa-commit")
             # Ensure SIMPLER_ROOT is available before prebuild_binaries checks it.
             # This hook runs before session fixtures, so setup_simpler_dependency
             # may not have set it yet.
@@ -411,7 +419,9 @@ def pytest_collection_finish(session: pytest.Session) -> None:
                 f"[PyPTO] Pre-building binary artifacts for {len(ok_cases)} test case(s)"
                 f" in parallel (workers={workers_str})…"
             )
-            n_built = prebuild_binaries(ok_cases, cache_dir, platform, max_workers=max_workers)
+            n_built = prebuild_binaries(
+                ok_cases, cache_dir, platform, max_workers=max_workers, pto_isa_commit=pto_isa_commit
+            )
             print(f"[PyPTO] Binary pre-build done — {n_built} case(s) compiled\n")
 
 
