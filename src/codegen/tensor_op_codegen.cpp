@@ -78,8 +78,8 @@ REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
   oss << "};\n";
 
   std::string dtype_str = codegen.GetRuntimeDataTypeString(result_type->dtype_);
-  oss << "TensorCreateInfo " << result_var << "_ci(" << result_var << "_ci_shapes, " << ndim << ", " << dtype_str
-      << ");\n";
+  oss << "TensorCreateInfo " << result_var << "_ci(" << result_var << "_ci_shapes, " << ndim << ", "
+      << dtype_str << ");\n";
 
   // Also declare a null-addr Tensor for input uses and as target for copy-assignment after output submit.
   bool is_dn = result_type->tensor_view_.has_value() && result_type->tensor_view_->layout == TensorLayout::DN;
@@ -88,8 +88,8 @@ REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
     oss << "Tensor " << result_var << " = make_tensor_2d_dn(" << result_var << "_ci_shapes, " << ndim << ", "
         << dtype_str << ");";
   } else {
-    oss << "Tensor " << result_var << " = make_tensor_external(nullptr, " << result_var << "_ci_shapes, " << ndim
-        << ", " << dtype_str << ");";
+    oss << "Tensor " << result_var << " = make_tensor_external(nullptr, " << result_var << "_ci_shapes, "
+        << ndim << ", " << dtype_str << ");";
   }
   return oss.str();
 }

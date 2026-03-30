@@ -1536,7 +1536,9 @@ class TestTensorReadWriteOffsetCodegen:
 
         code = _generate_orch_code(Prog)
         # The flat offset expression is generated (either inlined as 51 or as computed expression)
-        assert ("orch_args.tensor(0).data_as<void>())[51]" in code) or ("1 * 4 * 8" in code and "2 * 8" in code)
+        assert ("orch_args.tensor(0).data_as<void>())[51]" in code) or (
+            "1 * 4 * 8" in code and "2 * 8" in code
+        )
         assert "orch_args.tensor(0).data_as<void>())" in code
 
     def test_tensor_read_variable_index(self):

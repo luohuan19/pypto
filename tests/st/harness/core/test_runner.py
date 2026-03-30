@@ -627,7 +627,9 @@ class TestRunner:
                 )
 
             platform = _resolve_platform(self.config.platform, backend_type)
-            _execute_on_device(work_dir, golden_path, platform, self.config.device_id, self.config.pto_isa_commit)
+            _execute_on_device(
+                work_dir, golden_path, platform, self.config.device_id, self.config.pto_isa_commit
+            )
 
             return RunResult(
                 passed=True,

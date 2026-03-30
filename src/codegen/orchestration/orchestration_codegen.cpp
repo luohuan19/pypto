@@ -560,8 +560,8 @@ std::string GenerateMakeTensorExternal(const std::string& var_name, int orch_ind
         << "orch_args.tensor(" << orch_index << ").shapes[1], "
         << "orch_args.tensor(" << orch_index << ").shapes[0]};\n";
     oss << "    Tensor ext_" << var_name << " = make_tensor_external_2d_dn("
-        << "orch_args.tensor(" << orch_index << ").data_as<void>(), " << var_name << "_shapes, " << ndim << ", "
-        << codegen.GetRuntimeDataTypeString(tensor_type->dtype_) << ");\n";
+        << "orch_args.tensor(" << orch_index << ").data_as<void>(), " << var_name << "_shapes, " << ndim
+        << ", " << codegen.GetRuntimeDataTypeString(tensor_type->dtype_) << ");\n";
   } else {
     // ND layout: use from_tensor_arg() to convert ContinuousTensor to Tensor
     oss << "    Tensor ext_" << var_name << " = from_tensor_arg(orch_args.tensor(" << orch_index << "));\n";
@@ -658,7 +658,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
   [[nodiscard]] std::string GetTensorShapeDim(const std::string& name, int64_t axis) const override {
     auto it = param_name_to_orch_index_.find(name);
     if (it != param_name_to_orch_index_.end()) {
-      return "(int64_t)orch_args.tensor(" + std::to_string(it->second) + ").shapes[" + std::to_string(axis) + "]";
+      return "(int64_t)orch_args.tensor(" + std::to_string(it->second) + ").shapes[" + std::to_string(axis) +
+             "]";
     }
     // Fallback for non-parameter tensors (views, aliases, internal tensors):
     // read the shape from the runtime Tensor object directly.
@@ -1010,7 +1011,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
     }
 
-    std::string submit_expr = CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
+    std::string submit_expr =
+        CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
     if (internal_out_vars.empty()) {
       code_ << ind << submit_expr << ";\n";
     } else {
@@ -1272,8 +1274,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::unordered_map<const Var*, std::string> emit_name_map_;
   std::set<std::string> declared_var_names_;  // Tracks all emitted names to prevent collisions
   std::unordered_map<const Var*, const Var*> var_to_param_;
-  std::set<std::string> param_name_set_;                 // For string-only contexts (op codegen callbacks)
-  std::map<std::string, int> param_name_to_orch_index_;  // emit_name → orch_args.tensor() index (tensors only)
+  std::set<std::string> param_name_set_;  // For string-only contexts (op codegen callbacks)
+  std::map<std::string, int>
+      param_name_to_orch_index_;  // emit_name → orch_args.tensor() index (tensors only)
   std::unordered_map<const Var*, const Var*> buffer_root_map_;
   std::unordered_map<const Var*, AssembleViewInfo> assemble_view_infos_;
   std::unordered_set<const Var*> non_optimizable_assemble_roots_;
@@ -1341,8 +1344,9 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
     }
   }
 
-  // Scalar params are handled separately via GenerateScalarUnpack (0-indexed in ChipStorageTaskArgs.scalars_).
-  // They are NOT inserted into param_name_to_orch_index since that map is for tensor slots only.
+  // Scalar params are handled separately via GenerateScalarUnpack (0-indexed in
+  // ChipStorageTaskArgs.scalars_). They are NOT inserted into param_name_to_orch_index since that map is for
+  // tensor slots only.
 
   // Step 4c: Lineage alias — map iter_args/return_vars to their param's emit name
   for (const auto& [body_var, param_var] : lineage.var_to_param) {
@@ -1401,7 +1405,8 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   if (!scalar_params.empty()) {
     oss << "\n    // Scalar params\n";
     for (size_t i = 0; i < scalar_params.size(); ++i) {
-      oss << GenerateScalarUnpack(scalar_params[i].emit_name, static_cast<int>(i), scalar_params[i].scalar_type);
+      oss << GenerateScalarUnpack(scalar_params[i].emit_name, static_cast<int>(i),
+                                  scalar_params[i].scalar_type);
     }
   }
 
