@@ -123,14 +123,18 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
 
-      - name: Clone and install simpler repository (stable)
+      - name: Add Ascend tools to PATH
+        run: echo "/usr/local/Ascend/cann-8.5.0/bin" >> $GITHUB_PATH
+
+      - name: Clone and install simpler repository (pinned)
         run: |
-          git clone --branch stable --depth 1 https://github.com/hw-native-sys/simpler $GITHUB_WORKSPACE/simpler
+          git clone --branch main https://github.com/hw-native-sys/simpler $GITHUB_WORKSPACE/simpler
           cd $GITHUB_WORKSPACE/simpler
+          git checkout b55714c595cf52113f1aead522735ca266102851
           pip install -v .
 
       - name: Test system tests
-        run: pytest tests/st -v --device=$DEVICE_ID --forked --precompile-workers=256
+        run: pytest tests/st -v --device=$DEVICE_ID --forked --precompile-workers=256 --pto-isa-commit=012a8c22fd0121c59ec2462da2146c260266f63b
 
   fuzz-tests-sim:
     runs-on: ubuntu-latest
@@ -147,10 +151,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -v .[dev]
 
-      - name: Clone and install simpler repository (stable)
+      - name: Clone and install simpler repository (pinned)
         run: |
-          git clone --branch stable --depth 1 https://github.com/hw-native-sys/simpler $GITHUB_WORKSPACE/simpler
+          git clone --branch main https://github.com/hw-native-sys/simpler $GITHUB_WORKSPACE/simpler
           cd $GITHUB_WORKSPACE/simpler
+          git checkout b55714c595cf52113f1aead522735ca266102851
           pip install -v .
 
       - name: Run fuzz tests (sim mode)
