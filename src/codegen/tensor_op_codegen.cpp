@@ -59,7 +59,11 @@ static std::string CalculateTensorSizeExpr(const TensorTypePtr& tensor_type, Cod
 }
 
 REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
-  // tensor.create -> uint32_t var_shapes[N] = {...}; Tensor var = make_tensor(var_shapes, N, DataType::XX);
+  // tensor.create emits TensorCreateInfo for runtime memory allocation via add_output().
+  // For non-DN tensors, the Tensor binding is emitted at the task submission site:
+  //   const Tensor& var = outs_tN.get_ref(i);
+  // For DN tensors, a null-addr placeholder with view transformation is pre-declared here,
+  // and copy-assigned at the submission site (unchanged behavior).
   auto result_type = As<TensorType>(op->GetType());
   CHECK(result_type) << "tensor.create must return TensorType";
 
@@ -67,21 +71,25 @@ REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
   size_t ndim = result_type->shape_.size();
 
   std::ostringstream oss;
-  oss << "uint32_t " << result_var << "_shapes[" << ndim << "] = {";
+  oss << "uint32_t " << result_var << "_ci_shapes[" << ndim << "] = {";
   for (size_t i = 0; i < ndim; ++i) {
     if (i > 0) oss << ", ";
     oss << codegen.GenerateExprString(result_type->shape_[i]);
   }
   oss << "};\n";
 
-  // check layout DN
-  std::string runtime_func = "make_tensor";
-  if (result_type->tensor_view_.has_value() && result_type->tensor_view_->layout == TensorLayout::DN) {
+  std::string dtype_str = codegen.GetRuntimeDataTypeString(result_type->dtype_);
+  oss << "TensorCreateInfo " << result_var << "_ci(" << result_var << "_ci_shapes, " << ndim << ", "
+      << dtype_str << ");";
+
+  // DN layout: pre-declare null Tensor with logical view (copy-assigned after submit).
+  bool is_dn = result_type->tensor_view_.has_value() && result_type->tensor_view_->layout == TensorLayout::DN;
+  if (is_dn) {
     CHECK(ndim == 2) << "only support 2D tensor for DN layout now";
-    runtime_func = "make_tensor_2d_dn";
+    oss << "\nTensor " << result_var << " = make_tensor_2d_dn(" << result_var << "_ci_shapes, " << ndim
+        << ", " << dtype_str << ");";
   }
-  oss << "Tensor " << result_var << " = " << runtime_func << "(" << result_var << "_shapes, " << ndim << ", "
-      << codegen.GetRuntimeDataTypeString(result_type->dtype_) << ");";
+  // Non-DN: no placeholder; const Tensor& var declared at submit site via outs_tN.get_ref(i).
   return oss.str();
 }
 
