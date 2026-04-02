@@ -170,8 +170,7 @@ class TestCallableInitValue:
         src = generate_golden_source(specs, _dummy_golden, 1e-5, 1e-5)
 
         assert "def _make_arange_tensor():" in src
-        assert "a = _make_arange_tensor()" in src
-        # Preamble must appear before generate_inputs
+        assert "a = torch.as_tensor(_make_arange_tensor(), dtype=torch.float32)" in src
         assert src.index("def _make_arange_tensor") < src.index("def generate_inputs")
 
     def test_named_function_golden_executes(self):
@@ -205,7 +204,7 @@ class TestCallableInitValue:
     def test_extract_callable_expr_rejects_lambda(self):
         """_extract_callable_expr returns None for lambdas (invalid __name__)."""
         fn = lambda: torch.zeros(4)  # noqa: E731
-        preambles: list[str] = []
+        preambles: dict[str, str] = {}
         result = _extract_callable_expr(fn, preambles)
 
         assert result is None
@@ -213,12 +212,12 @@ class TestCallableInitValue:
 
     def test_extract_callable_expr_accepts_named_function(self):
         """_extract_callable_expr succeeds for named functions."""
-        preambles: list[str] = []
+        preambles: dict[str, str] = {}
         result = _extract_callable_expr(_make_arange_tensor, preambles)
 
         assert result == "_make_arange_tensor()"
         assert len(preambles) == 1
-        assert "def _make_arange_tensor" in preambles[0]
+        assert "def _make_arange_tensor" in preambles["_make_arange_tensor"]
 
     def test_large_tensor_literal_raises(self):
         """Tensor init_value with >100 elements raises ValueError."""
@@ -254,8 +253,8 @@ class TestCallableInitValue:
 
         assert "def _make_arange_tensor" in src
         assert "def make_ones" in src
-        assert "a = _make_arange_tensor()" in src
-        assert "b = make_ones()" in src
+        assert "a = torch.as_tensor(_make_arange_tensor(), dtype=torch.float32)" in src
+        assert "b = torch.as_tensor(make_ones(), dtype=torch.float32)" in src
 
 
 class TestExtractClosureConstants:

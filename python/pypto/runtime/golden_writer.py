@@ -133,7 +133,7 @@ def generate_golden_source(
 
     # Pre-compute init expressions so that helper function preambles (e.g. for
     # callable init_values) are collected before we start building the output.
-    preambles: list[str] = []
+    preambles: dict[str, str] = {}
     init_exprs = [_init_expr(spec, preambles) for spec in tensor_specs]
 
     lines: list[str] = [
@@ -152,7 +152,7 @@ def generate_golden_source(
 
     # Helper functions referenced by init expressions (e.g. copied from
     # callable init_values).
-    for preamble in preambles:
+    for preamble in preambles.values():
         lines.append("")
         lines.append("")
         lines.extend(preamble.splitlines())
@@ -200,7 +200,7 @@ def _compute_golden_imports(compute_golden_src: str) -> list[str]:
     ]
 
 
-def _init_expr(spec: TensorSpec, preambles: list[str]) -> str:
+def _init_expr(spec: TensorSpec, preambles: dict[str, str]) -> str:
     """Return the Python expression (string) used to initialise this tensor in golden.py.
 
     For callable init_values that are not built-in factories, the function
@@ -226,7 +226,7 @@ def _init_expr(spec: TensorSpec, preambles: list[str]) -> str:
         # Try to extract source (works for named functions with valid identifiers).
         expr = _extract_callable_expr(iv, preambles)
         if expr is not None:
-            return expr
+            return f"torch.as_tensor({expr}, dtype={dtype_str})"
         # Fallback for C builtins (torch.randn etc.) whose source is not
         # available via inspect.
         factory_name = _KNOWN_FACTORIES.get(iv)
@@ -234,8 +234,8 @@ def _init_expr(spec: TensorSpec, preambles: list[str]) -> str:
             return f"{factory_name}({shape_str}, dtype={dtype_str})"
         raise ValueError(
             f"Callable init_value {iv!r} for tensor {spec.name!r} is not supported by "
-            "golden_writer. Use a scalar, a torch.Tensor, a callable (lambda or named "
-            "function), or one of: torch.randn, torch.rand, torch.zeros, torch.ones."
+            "golden_writer. Use a scalar, a torch.Tensor, a named function, "
+            "or one of: torch.randn, torch.rand, torch.zeros, torch.ones."
         )
 
     raise TypeError(f"Unsupported init_value type {type(iv)!r} for tensor {spec.name!r}")
@@ -273,24 +273,36 @@ def _tensor_literal_expr(tensor: torch.Tensor, shape_str: str, dtype_str: str) -
     )
 
 
-def _extract_callable_expr(fn: Callable, preambles: list[str]) -> str | None:
+def _extract_callable_expr(fn: Callable, preambles: dict[str, str]) -> str | None:
     """Extract source from a callable and return an expression for golden.py.
 
-    Copies the full function definition into *preambles* and returns
-    ``fn_name()`` as the call expression.  Returns ``None`` if source
-    extraction fails (e.g. C builtins) or if the callable name is not a
-    valid Python identifier (e.g. lambdas whose ``__name__`` is ``<lambda>``).
+    Copies the full function definition (with any closure constants) into
+    *preambles* and returns ``fn_name()`` as the call expression.  Returns
+    ``None`` if source extraction fails (e.g. C builtins) or if the callable
+    name is not a valid Python identifier (e.g. lambdas whose ``__name__``
+    is ``<lambda>``).
     """
-    if not fn.__name__.isidentifier():
+    name = getattr(fn, "__name__", None)
+    if name is None or not name.isidentifier():
         return None
+
+    # Already extracted (e.g. multiple tensors share the same init function).
+    if name in preambles:
+        return f"{name}()"
 
     try:
         source = inspect.getsource(fn)
     except (TypeError, OSError):
         return None
 
-    preambles.append(textwrap.dedent(source))
-    return f"{fn.__name__}()"
+    # Include closure constants so the function body can reference captured variables.
+    closure_lines = _extract_closure_constants(fn)
+    parts: list[str] = []
+    if closure_lines:
+        parts.append("\n".join(closure_lines))
+    parts.append(textwrap.dedent(source))
+    preambles[name] = "\n\n".join(parts)
+    return f"{name}()"
 
 
 def _torch_dtype_str(dtype: torch.dtype) -> str:
