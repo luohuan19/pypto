@@ -1670,7 +1670,7 @@ class TestTileMoveAccNoopElision:
                 w0 = pl.load(w, [0, 0], [512, 64], target_memory=pl.MemorySpace.Mat)
                 x0_left = pl.move(x0, target_memory=pl.MemorySpace.Left)
                 w0_right = pl.move(w0, target_memory=pl.MemorySpace.Right)
-                acc: pl.Tile[[16, 64], pl.FP32] = pl.matmul(x0_left, w0_right, out_dtype=pl.FP32)
+                acc: pl.Tile[[16, 64], pl.FP32] = pl.matmul(x0_left, w0_right)
                 # Second block: matmul_acc accumulating into the same Acc tile
                 x1 = pl.load(x, [0, 512], [16, 512], target_memory=pl.MemorySpace.Mat)
                 w1 = pl.load(w, [512, 0], [512, 64], target_memory=pl.MemorySpace.Mat)

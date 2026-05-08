@@ -2128,6 +2128,10 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
           auto src_offset = As<ir::ConstInt>((*src_tile->memref_)->byte_offset_);
           auto dst_offset = As<ir::ConstInt>((*dst_tile->memref_)->byte_offset_);
           if (src_offset && dst_offset && src_offset->value_ == dst_offset->value_) {
+            // Alias the destination to the source SSA value so downstream
+            // references use the source's defined buffer, not the destination's
+            // alloc_tile (which would be unwritten after eliding the tmov).
+            codegen.SetCurrentResultBuf(codegen.GetExprAsCode(op->args_[0]));
             return std::string("");  // no-op: same space, same address
           }
         }
