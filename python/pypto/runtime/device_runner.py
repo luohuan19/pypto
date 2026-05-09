@@ -33,6 +33,7 @@ import ctypes
 import importlib.util
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -94,8 +95,12 @@ def _load_binary(path: Path) -> bytes | None:
 # PTO-ISA management
 # ---------------------------------------------------------------------------
 
-_PTO_ISA_HTTPS = "https://gitcode.com/luohuan40/pto-isa.git"
-_PTO_ISA_SSH = "git@gitcode.com:luohuan40/pto-isa.git"
+_PTO_ISA_HTTPS = "https://github.com/hw-native-sys/pto-isa.git"
+_PTO_ISA_SSH = "git@github.com:hw-native-sys/pto-isa.git"
+_PTO_ISA_HTTPS_FALLBACK = "https://gitcode.com/luohuan40/pto-isa.git"
+_PTO_ISA_SSH_FALLBACK = "git@gitcode.com:luohuan40/pto-isa.git"
+_PTO_ISA_PRIMARY_CLONE_TIMEOUT = 60
+_PTO_ISA_FALLBACK_CLONE_TIMEOUT = 300
 
 
 def _get_pto_isa_clone_path() -> Path:
@@ -123,22 +128,51 @@ def ensure_pto_isa_root(commit: str | None = None, clone_protocol: str = "https"
     include_dir = clone_path / "include"
 
     if not (clone_path.exists() and include_dir.exists() and include_dir.is_dir()):
-        # Need to clone
-        repo_url = _PTO_ISA_HTTPS if clone_protocol == "https" else _PTO_ISA_SSH
+        # Need to clone — try primary URL with a short timeout, fall back on failure.
+        if clone_protocol == "https":
+            primary_url, fallback_url = _PTO_ISA_HTTPS, _PTO_ISA_HTTPS_FALLBACK
+        else:
+            primary_url, fallback_url = _PTO_ISA_SSH, _PTO_ISA_SSH_FALLBACK
         clone_path.parent.mkdir(parents=True, exist_ok=True)
+        primary_failed = True
         try:
             result = subprocess.run(
-                ["git", "clone", repo_url, str(clone_path)],
+                ["git", "clone", primary_url, str(clone_path)],
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=_PTO_ISA_PRIMARY_CLONE_TIMEOUT,
             )
-            if result.returncode != 0:
-                # Another process may have succeeded
-                if not include_dir.exists():
+            primary_failed = result.returncode != 0
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"Cloning pto-isa from {primary_url} timed out after "
+                f"{_PTO_ISA_PRIMARY_CLONE_TIMEOUT}s; falling back to {fallback_url}"
+            )
+        except Exception as e:
+            logger.warning(f"Cloning pto-isa from {primary_url} failed: {e}; falling back to {fallback_url}")
+
+        if primary_failed and not include_dir.exists():
+            # Clean up any partial clone before retrying with the fallback.
+            if clone_path.exists():
+                shutil.rmtree(clone_path, ignore_errors=True)
+            try:
+                result = subprocess.run(
+                    ["git", "clone", fallback_url, str(clone_path)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=_PTO_ISA_FALLBACK_CLONE_TIMEOUT,
+                )
+                if result.returncode != 0 and not include_dir.exists():
                     logger.warning(f"Failed to clone pto-isa:\n{result.stderr}")
                     return None
+            except Exception as e:
+                if not include_dir.exists():
+                    logger.warning(f"Failed to clone pto-isa: {e}")
+                    return None
+
+        try:
             if commit:
                 result = subprocess.run(
                     ["git", "checkout", commit],
