@@ -19,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "pypto/core/dtype.h"
@@ -295,6 +296,9 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
   // function call unpacking.  Resolve each element to its actual Out/InOut
   // parameter tensor recorded in tuple_element_tensors_ during EmitCallToWorker.
   if (auto tge = std::dynamic_pointer_cast<const ir::TupleGetItemExpr>(op->value_)) {
+    INTERNAL_CHECK_SPAN(ir::AsVarLike(tge->tuple_) != nullptr, op->span_)
+        << "Internal error: TupleGetItemExpr tuple_ must be a Var-like expression "
+        << "for distributed codegen tuple-return unpacking";
     VisitExpr(tge->tuple_);
     std::string tuple_var = current_expr_value_;
     current_expr_value_ = "";
@@ -566,8 +570,8 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
   // parameter tensor.  In simpler's runtime model, the callee writes in-place
   // to the OUT parameter, so the return value is the same tensor.
   if (!target.empty() && !callee->return_types_.empty()) {
-    bool is_tuple_return = std::dynamic_pointer_cast<const ir::TupleType>(
-                               callee->return_types_.front()) != nullptr;
+    bool is_tuple_return =
+        std::dynamic_pointer_cast<const ir::TupleType>(callee->return_types_.front()) != nullptr;
     if (is_tuple_return) {
       // Tuple return: populate tuple_element_tensors_ so that downstream
       // TupleGetItemExpr AssignStmts resolve each element to its Out param.
