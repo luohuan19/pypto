@@ -570,8 +570,13 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
   // parameter tensor.  In simpler's runtime model, the callee writes in-place
   // to the OUT parameter, so the return value is the same tensor.
   if (!target.empty() && !callee->return_types_.empty()) {
+    // Tuple return is expressed in two ways in the IR:
+    //   1. pl.Tuple[T1, T2] → return_types_ = [TupleType(T1, T2)]  (single entry)
+    //   2. tuple[T1, T2]    → return_types_ = [T1, T2]             (flat entries)
+    // Both produce TupleGetItemExpr for unpacking, so handle both.
     bool is_tuple_return =
-        std::dynamic_pointer_cast<const ir::TupleType>(callee->return_types_.front()) != nullptr;
+        std::dynamic_pointer_cast<const ir::TupleType>(callee->return_types_.front()) != nullptr ||
+        callee->return_types_.size() > 1;
     if (is_tuple_return) {
       // Tuple return: populate tuple_element_tensors_ so that downstream
       // TupleGetItemExpr AssignStmts resolve each element to its Out param.
