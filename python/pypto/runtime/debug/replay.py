@@ -85,6 +85,7 @@ def replay(
     *tensors: torch.Tensor | DeviceTensor | _SimpleCData,
     config: RunConfig | None = None,
     recompile: bool = True,
+    validate: bool = False,
 ) -> None:
     """Re-execute an existing ``build_output/<jit_dir>/`` with new tensors.
 
@@ -102,9 +103,22 @@ def replay(
             orchestration binaries via :func:`invalidate_binary_cache` so
             hand-edited cpps are picked up. Set to ``False`` to reuse
             cached binaries (faster re-runs when no cpp has been modified).
+        validate: When ``True``, after execution compare each output tensor
+            (identified via ``golden.py::__outputs__``) against the value
+            produced by ``golden.py::compute_golden`` using ``torch.allclose``
+            with the tolerances declared in ``golden.py``. The number of
+            ``*tensors`` must match the length of
+            ``golden.py::generate_inputs`` so positional names line up.
+            Raises ``AssertionError`` on mismatch, ``FileNotFoundError`` if
+            the directory has no ``golden.py``.
 
     Raises:
-        FileNotFoundError: If *work_dir* does not contain ``kernel_config.py``.
+        FileNotFoundError: If *work_dir* does not contain ``kernel_config.py``,
+            or ``golden.py`` is missing when ``validate=True``.
+        ValueError: If ``validate=True`` and the number of *tensors* does not
+            match the orchestration parameter count from ``golden.py``.
+        AssertionError: If ``validate=True`` and any output tensor disagrees
+            with the golden reference within the declared tolerances.
     """
     config = config or RunConfig()
     work_dir = Path(work_dir)
@@ -113,6 +127,18 @@ def replay(
             f"replay(): {work_dir} is not a build_output directory "
             f"(missing kernel_config.py)"
         )
+
+    named_tensors: list[tuple[str, torch.Tensor]] | None = None
+    if validate:
+        named_defaults = _load_named_inputs_from_golden(work_dir)
+        if len(tensors) != len(named_defaults):
+            raise ValueError(
+                f"replay(validate=True): expected {len(named_defaults)} tensors "
+                f"(orchestration parameter count from {work_dir}/golden.py), "
+                f"got {len(tensors)}"
+            )
+        named_tensors = [(n, t) for (n, _), t in zip(named_defaults, tensors, strict=True)]
+
     if recompile:
         invalidate_binary_cache(work_dir)
     execute_compiled(
@@ -124,28 +150,72 @@ def replay(
         dfx=_DfxOpts.from_run_config(config),
     )
 
+    if named_tensors is not None:
+        _validate_against_golden(work_dir, named_tensors)
 
-def _load_inputs_from_golden(work_dir: Path) -> list[torch.Tensor]:
-    """Load ordered input tensors from ``<work_dir>/golden.py``.
 
-    ``generate_inputs`` returns ``list[tuple[str, value]]`` (see
-    :func:`pypto.runtime.device_runner.build_orch_args_from_inputs`). The
-    order matches the orchestration entry parameter order, so the values
-    can be passed positionally to :func:`replay`. Output tensors are
-    included — orchestration writes back into them in place.
+def _load_named_inputs_from_golden(
+    work_dir: Path,
+) -> list[tuple[str, torch.Tensor]]:
+    """Load ``[(name, value), ...]`` from ``<work_dir>/golden.py``.
+
+    The list order matches the orchestration entry parameter order. Both
+    inputs and outputs are present — outputs are zero-initialised tensors
+    that orchestration writes back into in place.
     """
     golden_path = work_dir / "golden.py"
     if not golden_path.exists():
         raise FileNotFoundError(
-            f"replay CLI requires {golden_path} to load inputs; "
-            f"call replay() from Python directly to pass tensors yourself."
+            f"{golden_path} not found; cannot derive named inputs / outputs."
         )
     spec = importlib.util.spec_from_file_location("_replay_golden", str(golden_path))
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    result = module.generate_inputs({"name": "Default"})
-    return [value for _, value in result]
+    return list(module.generate_inputs({"name": "Default"}))
+
+
+def _validate_against_golden(
+    work_dir: Path,
+    named_tensors: list[tuple[str, torch.Tensor]],
+) -> None:
+    """Compute expected outputs via ``golden.py`` and compare against actuals.
+
+    Actual outputs (already written in place by orchestration) are matched
+    by name against the ``__outputs__`` list. Expected outputs are produced
+    by cloning the actual output tensors (so dtype/shape match) and letting
+    ``compute_golden`` populate them from the user inputs. Comparison uses
+    :func:`torch.testing.assert_close` with the tolerances declared on the
+    ``golden.py`` module (``RTOL`` / ``ATOL``, defaulting to ``1e-5``).
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_replay_golden_validate", str(work_dir / "golden.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    output_names = set(getattr(module, "__outputs__", []))
+    if not output_names:
+        return  # nothing declared as output — skip silently
+
+    inputs = {n: v for n, v in named_tensors if n not in output_names}
+    actual_outputs = {n: v for n, v in named_tensors if n in output_names}
+    expected = {n: v.clone() for n, v in actual_outputs.items()}
+    module.compute_golden({**inputs, **expected}, {})
+
+    rtol = getattr(module, "RTOL", 1e-5)
+    atol = getattr(module, "ATOL", 1e-5)
+    for name, actual in actual_outputs.items():
+        try:
+            torch.testing.assert_close(
+                actual.cpu(), expected[name].cpu(), rtol=rtol, atol=atol
+            )
+        except AssertionError as e:
+            raise AssertionError(
+                f"Output '{name}' does not match golden "
+                f"(rtol={rtol}, atol={atol}):\n{e}"
+            ) from e
 
 
 def _main(argv: list[str] | None = None) -> int:
@@ -183,6 +253,15 @@ def _main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="When used with --log-level, mirror the level onto PyPTO's C++ logger.",
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help=(
+            "After execution, compare outputs against golden.py::compute_golden "
+            "using torch.allclose with the tolerances declared in golden.py. "
+            "Raises AssertionError on mismatch."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.log_level is not None:
@@ -197,9 +276,18 @@ def _main(argv: list[str] | None = None) -> int:
         enable_dump_tensor=args.dump_tensor,
         enable_dep_gen=args.dep_gen,
     )
-    tensors = _load_inputs_from_golden(args.work_dir)
-    replay(args.work_dir, *tensors, config=config, recompile=not args.no_recompile)
+    named_inputs = _load_named_inputs_from_golden(args.work_dir)
+    tensors = [v for _, v in named_inputs]
+    replay(
+        args.work_dir,
+        *tensors,
+        config=config,
+        recompile=not args.no_recompile,
+        validate=args.validate,
+    )
     print(f"Replay finished. DFX artefacts (if any) under {args.work_dir / 'dfx_outputs'}")
+    if args.validate:
+        print("Golden validation: PASSED")
     return 0
 
 

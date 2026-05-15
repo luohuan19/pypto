@@ -27,7 +27,7 @@ from pypto.runtime import RunConfig
 # which shadows the ``replay`` submodule on attribute lookup. Resolve the
 # module via importlib so ``patch.object(replay_module, "...")`` works.
 replay_module = importlib.import_module("pypto.runtime.debug.replay")
-_load_inputs_from_golden = replay_module._load_inputs_from_golden
+_load_named_inputs_from_golden = replay_module._load_named_inputs_from_golden
 _main = replay_module._main
 invalidate_binary_cache = replay_module.invalidate_binary_cache
 replay = replay_module.replay
@@ -151,11 +151,73 @@ def test_replay_uses_default_run_config_when_none(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _load_inputs_from_golden
+# validate=True path
 # ---------------------------------------------------------------------------
 
 
-def test_load_inputs_from_golden_returns_values_in_order(tmp_path: Path) -> None:
+def _write_add_golden(work_dir: Path) -> None:
+    """Write a minimal golden.py: outputs[0] = inputs[0] + inputs[1]."""
+    (work_dir / "golden.py").write_text(
+        "import torch\n"
+        "__outputs__ = ['c']\n"
+        "RTOL = 1e-5\n"
+        "ATOL = 1e-5\n"
+        "def generate_inputs(params):\n"
+        "    return [('a', torch.zeros(4)), ('b', torch.zeros(4)), ('c', torch.zeros(4))]\n"
+        "def compute_golden(tensors, params=None):\n"
+        "    tensors['c'].copy_(tensors['a'] + tensors['b'])\n"
+    )
+
+
+def test_replay_validate_passes_when_outputs_match(tmp_path: Path) -> None:
+    work_dir = _make_build_output(tmp_path)
+    _write_add_golden(work_dir)
+    a = torch.full((4,), 2.0)
+    b = torch.full((4,), 3.0)
+    c = torch.full((4,), 5.0)  # already correct: a+b
+
+    with patch.object(replay_module, "execute_compiled"):
+        replay(work_dir, a, b, c, validate=True)  # must not raise
+
+
+def test_replay_validate_fails_when_outputs_mismatch(tmp_path: Path) -> None:
+    work_dir = _make_build_output(tmp_path)
+    _write_add_golden(work_dir)
+    a = torch.full((4,), 2.0)
+    b = torch.full((4,), 3.0)
+    c = torch.zeros(4)  # wrong: should be 5.0
+
+    with patch.object(replay_module, "execute_compiled"):
+        with pytest.raises(AssertionError, match="does not match golden"):
+            replay(work_dir, a, b, c, validate=True)
+
+
+def test_replay_validate_missing_golden_raises(tmp_path: Path) -> None:
+    work_dir = _make_build_output(tmp_path)
+    with pytest.raises(FileNotFoundError, match="golden.py"):
+        replay(work_dir, torch.zeros(1), validate=True)
+
+
+def test_replay_validate_tensor_count_mismatch_raises(tmp_path: Path) -> None:
+    work_dir = _make_build_output(tmp_path)
+    _write_add_golden(work_dir)
+    with pytest.raises(ValueError, match="expected 3 tensors"):
+        replay(work_dir, torch.zeros(4), torch.zeros(4), validate=True)
+
+
+def test_replay_validate_false_does_not_open_golden(tmp_path: Path) -> None:
+    work_dir = _make_build_output(tmp_path)
+    # No golden.py exists; validate=False must not care.
+    with patch.object(replay_module, "execute_compiled"):
+        replay(work_dir, torch.zeros(4), validate=False)
+
+
+# ---------------------------------------------------------------------------
+# _load_named_inputs_from_golden
+# ---------------------------------------------------------------------------
+
+
+def test_load_inputs_from_golden_returns_named_tuples_in_order(tmp_path: Path) -> None:
     (tmp_path / "golden.py").write_text(
         "import torch\n"
         "def generate_inputs(params):\n"
@@ -165,17 +227,17 @@ def test_load_inputs_from_golden_returns_values_in_order(tmp_path: Path) -> None
         "        ('z', torch.full((4,), 7.0)),\n"
         "    ]\n"
     )
-    tensors = _load_inputs_from_golden(tmp_path)
-    assert len(tensors) == 3
-    assert tensors[0].shape == (2,)
-    assert tensors[1].shape == (3,)
-    assert tensors[2].shape == (4,)
-    assert tensors[2][0].item() == 7.0
+    named = _load_named_inputs_from_golden(tmp_path)
+    assert [n for n, _ in named] == ["x", "y", "z"]
+    assert named[0][1].shape == (2,)
+    assert named[1][1].shape == (3,)
+    assert named[2][1].shape == (4,)
+    assert named[2][1][0].item() == 7.0
 
 
 def test_load_inputs_from_golden_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="golden.py"):
-        _load_inputs_from_golden(tmp_path)
+        _load_named_inputs_from_golden(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -187,20 +249,22 @@ def test_cli_invokes_replay_with_dfx_flags(tmp_path: Path) -> None:
     work_dir = _make_build_output(tmp_path)
     captured: dict = {}
 
-    def fake_replay(wd, *tensors, config, recompile):
+    def fake_replay(wd, *tensors, config, recompile, validate):
         captured["work_dir"] = wd
         captured["tensors"] = tensors
         captured["config"] = config
         captured["recompile"] = recompile
+        captured["validate"] = validate
 
     with (
         patch.object(replay_module, "replay", side_effect=fake_replay),
-        patch.object(replay_module, "_load_inputs_from_golden", return_value=[torch.zeros(1)]),
+        patch.object(replay_module, "_load_named_inputs_from_golden", return_value=[("a", torch.zeros(1))]),
     ):
         rc = _main([str(work_dir), "--pmu", "2", "--swimlane", "--device-id", "5"])
     assert rc == 0
     assert captured["work_dir"] == work_dir
     assert captured["recompile"] is True
+    assert captured["validate"] is False
     cfg = captured["config"]
     assert cfg.enable_pmu == 2
     assert cfg.enable_l2_swimlane is True
@@ -211,15 +275,30 @@ def test_cli_no_recompile_flag(tmp_path: Path) -> None:
     work_dir = _make_build_output(tmp_path)
     captured: dict = {}
 
-    def fake_replay(wd, *tensors, config, recompile):
+    def fake_replay(wd, *tensors, config, recompile, validate):
         captured["recompile"] = recompile
 
     with (
         patch.object(replay_module, "replay", side_effect=fake_replay),
-        patch.object(replay_module, "_load_inputs_from_golden", return_value=[]),
+        patch.object(replay_module, "_load_named_inputs_from_golden", return_value=[]),
     ):
         _main([str(work_dir), "--no-recompile"])
     assert captured["recompile"] is False
+
+
+def test_cli_validate_flag(tmp_path: Path) -> None:
+    work_dir = _make_build_output(tmp_path)
+    captured: dict = {}
+
+    def fake_replay(wd, *tensors, config, recompile, validate):
+        captured["validate"] = validate
+
+    with (
+        patch.object(replay_module, "replay", side_effect=fake_replay),
+        patch.object(replay_module, "_load_named_inputs_from_golden", return_value=[]),
+    ):
+        _main([str(work_dir), "--validate"])
+    assert captured["validate"] is True
 
 
 def test_cli_log_level_calls_configure_log(tmp_path: Path) -> None:
@@ -232,7 +311,7 @@ def test_cli_log_level_calls_configure_log(tmp_path: Path) -> None:
 
     with (
         patch.object(replay_module, "replay"),
-        patch.object(replay_module, "_load_inputs_from_golden", return_value=[]),
+        patch.object(replay_module, "_load_named_inputs_from_golden", return_value=[]),
         patch("pypto.runtime.log_config.configure_log", side_effect=fake_configure_log),
     ):
         _main([str(work_dir), "--log-level", "debug", "--log-sync-pypto"])
@@ -249,7 +328,7 @@ def test_cli_no_log_level_skips_configure_log(tmp_path: Path) -> None:
 
     with (
         patch.object(replay_module, "replay"),
-        patch.object(replay_module, "_load_inputs_from_golden", return_value=[]),
+        patch.object(replay_module, "_load_named_inputs_from_golden", return_value=[]),
         patch("pypto.runtime.log_config.configure_log", side_effect=fake_configure_log),
     ):
         _main([str(work_dir)])

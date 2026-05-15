@@ -103,6 +103,11 @@ python -m pypto.runtime.debug.replay build_output/_jit_xxx/ \
 `error`、`null`）;加上 `--log-sync-pypto` 可以把同一档位推到
 PyPTO 的 C++ logger。
 
+传 `validate=True`（或 `--validate`）会在执行结束后,用
+`golden.py::compute_golden` 计算参考输出,并按 `golden.py` 里声明的
+`RTOL` / `ATOL` 公差逐 output 比对;不一致会抛 `AssertionError`。
+该开关需要目录里存在 `golden.py`（`ir.compile` 默认会产出）。
+
 
 ## 相关文档
 

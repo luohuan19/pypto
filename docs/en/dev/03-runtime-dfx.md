@@ -106,6 +106,12 @@ hand-edited cpps are picked up. Pass `recompile=False` (or
 (`debug`, `v0..v9`, `info`, `warn`, `error`, `null`); add
 `--log-sync-pypto` to also push the band to PyPTO's C++ logger.
 
+Pass `validate=True` (or `--validate`) to compare each output tensor
+against the reference produced by `golden.py::compute_golden` using the
+`RTOL`/`ATOL` tolerances declared in `golden.py`. Raises
+`AssertionError` on mismatch. Requires the directory to contain a
+`golden.py` (the default for `ir.compile`-produced artefacts).
+
 
 ## Related
 
