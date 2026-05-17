@@ -454,3 +454,9 @@ class CompiledProgram:
                 input_idx += 1
 
         return all_tensors
+
+
+# Public re-exports for callers (e.g. ir.compile()) that need orchestration
+# parameter metadata without instantiating a full CompiledProgram.
+ParamInfo = _ParamInfo
+extract_param_infos = _extract_param_infos

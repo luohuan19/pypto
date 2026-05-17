@@ -13,6 +13,8 @@ Verifies that ``@pl.jit``-decorated functions compile on first call,
 serve from cache on subsequent calls, and execute correctly on device.
 """
 
+import ast
+
 import pypto.language as pl
 import pytest
 import torch
@@ -91,6 +93,34 @@ class TestJITExecution:
         assert torch.allclose(c2, expected, rtol=1e-5, atol=1e-5), (
             f"Recompiled execution failed: max diff = {(c2 - expected).abs().max().item()}"
         )
+
+    def test_emits_debug_run_script(self, test_config):
+        """JIT compile must emit a self-contained ``debug/run.py`` re-runner.
+
+        This is the JIT-side guarantee for the unified debug-replay workflow:
+        any ``build_output/<jit_dir>/`` ships with a runnable script so the
+        user does not have to choose between the replay CLI and hand-written
+        Python — see ``pypto.runtime.debug.run_script_writer``.
+        """
+        add_kernel._cache.clear()
+
+        a = torch.full((128, 128), 1.0, dtype=torch.float32)
+        b = torch.full((128, 128), 2.0, dtype=torch.float32)
+        c = torch.zeros((128, 128), dtype=torch.float32)
+        add_kernel(a, b, c, config=test_config)
+
+        (compiled,) = add_kernel._cache.values()
+        run_script = compiled.output_dir / "debug" / "run.py"
+        assert run_script.exists(), f"Missing auto-emitted debug runner at {run_script}"
+
+        text = run_script.read_text()
+        # Syntactic validity — a broken file would surprise the user on first try.
+        ast.parse(text)
+        # JIT has no golden.py, so inline inputs must be present.
+        assert "_inline_inputs" in text
+        # Shape / dtype derived from the kernel signature.
+        assert "torch.randn((128, 128)" in text
+        assert "torch.zeros((128, 128)" in text
 
 
 if __name__ == "__main__":
