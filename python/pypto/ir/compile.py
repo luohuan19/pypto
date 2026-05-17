@@ -197,20 +197,6 @@ def compile(  # noqa: PLR0913
             raise
         _write_files(files, output_dir)
 
-        # Emit a self-contained debug runner at ``<output_dir>/debug/run.py``
-        # so re-executing the kernel is always ``python .../debug/run.py``,
-        # regardless of whether a ``golden.py`` is also present.
-        from .compiled_program import extract_param_infos  # noqa: PLC0415
-        from pypto.runtime.debug.run_script_writer import write_run_script  # noqa: PLC0415
-        try:
-            param_infos, _, _ = extract_param_infos(transformed_program)
-            write_run_script(output_dir, param_infos, platform=platform)
-        except (ValueError, TypeError):
-            # Distributed / unusual programs may lack a clean orchestration
-            # entry — debug-runner emission is best-effort and must not
-            # block compile(). The user can still use the replay CLI directly.
-            pass
-
         # Emit the comm-group manifest alongside generated host_orch.py so the
         # runner can re-enter the output directory without holding the live
         # Program. No-op when the program declares no CommGroup.

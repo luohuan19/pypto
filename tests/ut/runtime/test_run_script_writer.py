@@ -112,6 +112,43 @@ def test_scalar_param_emits_placeholder(tmp_path: Path) -> None:
     assert "TODO" in text and "scalar" in text
 
 
+def test_user_compare_hook_uses_param_names(tmp_path: Path) -> None:
+    """JIT path has no golden.py — users edit ``_user_compare`` to write their
+    own assertions. The hook must expose the IR's parameter names directly so
+    the body can reference ``a``, ``b``, ``c`` without indexing into a list."""
+    out = write_run_script(
+        tmp_path,
+        [
+            _info("a", ParamDirection.In, [64]),
+            _info("b", ParamDirection.In, [64]),
+            _info("c", ParamDirection.Out, [64]),
+        ],
+    )
+    text = out.read_text()
+    assert "def _user_compare(a, b, c):" in text
+
+
+def test_user_compare_invoked_only_on_jit_path(tmp_path: Path) -> None:
+    """When golden validation runs, ``_user_compare`` must NOT be called —
+    otherwise a hand-written assertion on inline shapes would fire against
+    golden-supplied tensors. The call belongs in the ``else`` branch only."""
+    out = write_run_script(tmp_path, [_info("a", ParamDirection.In, [4])])
+    text = out.read_text()
+    assert "_user_compare(*tensors)" in text
+    validate_idx = text.index('print("Golden validation: PASSED")')
+    compare_idx = text.index("_user_compare(*tensors)")
+    assert compare_idx > validate_idx, "_user_compare must follow the validate branch"
+
+
+def test_user_compare_with_no_params(tmp_path: Path) -> None:
+    """Edge case: a kernel with zero IR params still produces a syntactically
+    valid ``_user_compare()`` definition."""
+    out = write_run_script(tmp_path, [])
+    text = out.read_text()
+    ast.parse(text)
+    assert "def _user_compare():" in text
+
+
 def test_log_level_flags_present(tmp_path: Path) -> None:
     """The emitted CLI must expose --log-level / --log-sync-pypto so users can
     control runtime verbosity without re-editing the script — mirrors the

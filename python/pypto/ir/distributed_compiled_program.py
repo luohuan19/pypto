@@ -16,6 +16,7 @@ through simpler's distributed runtime (Worker level=3)::
     compiled(a, b, c)   # executes via simpler Worker(level=3)
 """
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -107,6 +108,28 @@ class DistributedCompiledProgram:
         self._param_infos = None
         self._output_indices = None
         self._return_types = None
+
+        self._emit_debug_runner()
+
+    def _emit_debug_runner(self) -> None:
+        """Write ``<output_dir>/debug/run.py`` for replaying this program.
+
+        Best-effort: distributed programs without a clean orchestration entry
+        will skip emission (the replay CLI is still usable directly).
+
+        Disable globally by setting ``PYPTO_EMIT_DEBUG_RUNNER=0`` (also accepts
+        ``false`` / ``no``).
+        """
+        if os.environ.get("PYPTO_EMIT_DEBUG_RUNNER", "").strip().lower() in ("0", "false", "no"):
+            return
+
+        from pypto.runtime.debug.run_script_writer import write_run_script  # noqa: PLC0415
+
+        try:
+            param_infos, _, _ = self._get_metadata()
+        except (ValueError, TypeError):
+            return
+        write_run_script(self._output_dir, param_infos, platform=self._platform)
 
     @property
     def output_dir(self) -> Path:

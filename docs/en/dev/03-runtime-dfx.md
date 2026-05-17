@@ -68,6 +68,15 @@ pytest tests/st/runtime/ \
 | pytest entry | [tests/st/conftest.py](../../../tests/st/conftest.py) | `pytest_addoption` |
 | Harness pipeline ctx | [tests/st/harness/core/test_runner.py](../../../tests/st/harness/core/test_runner.py) | `start_pipeline(..., enable_*)` |
 
+## Deprecated aliases
+
+`RunConfig.runtime_profiling` and the pytest flag `--runtime-profiling`
+were the original way to opt into L2 swimlane capture before the four
+DFX features became independently controllable. They are kept as
+aliases for `enable_l2_swimlane` / `--enable-l2-swimlane` so existing
+scripts keep working; both paths emit a `DeprecationWarning` and will
+be removed in a future release. Migrate to the new names.
+
 ## Replaying an existing build_output
 
 To re-run a previously compiled `build_output/<jit_dir>/` after editing
@@ -112,6 +121,35 @@ against the reference produced by `golden.py::compute_golden` using the
 `AssertionError` on mismatch. Requires the directory to contain a
 `golden.py` (the default for `ir.compile`-produced artefacts).
 
+### Auto-emitted `debug/run.py`
+
+`ir.compile()` writes a self-contained re-runner at
+`<output_dir>/debug/run.py` so the user only ever needs to remember one
+command:
+
+```bash
+python build_output/<jit_dir>/debug/run.py
+```
+
+The script wraps the `replay` flow above:
+
+- When a sibling `golden.py` is present, inputs come from
+  `golden.generate_inputs()` and the run is validated against
+  `compute_golden`.
+- Otherwise (JIT path), inputs are materialised from the shape / dtype
+  metadata embedded in the script. Edit them freely to experiment. The
+  script also exposes a `_user_compare(<param_names>)` hook that runs
+  after `replay` returns — write your own `assert torch.allclose(...)`
+  there to validate kernel output against a hand-rolled reference.
+
+Emission is **best-effort** — programs without a clean orchestration
+entry skip the file silently and the rest of compilation succeeds.
+
+Disable globally by setting `PYPTO_EMIT_DEBUG_RUNNER=0` (also accepts
+`false` / `no`, case-insensitive). Useful for large test suites or
+benchmark pipelines that compile many programs and don't need the
+runner. When disabled, the underlying `pypto.runtime.debug.replay`
+module / CLI is still usable directly against the output directory.
 
 ## Related
 

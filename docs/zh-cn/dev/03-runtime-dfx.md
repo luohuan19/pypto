@@ -66,6 +66,14 @@ pytest tests/st/runtime/ \
 | pytest 入口 | [tests/st/conftest.py](../../../tests/st/conftest.py) | `pytest_addoption` |
 | Harness 流水线上下文 | [tests/st/harness/core/test_runner.py](../../../tests/st/harness/core/test_runner.py) | `start_pipeline(..., enable_*)` |
 
+## 已弃用别名
+
+`RunConfig.runtime_profiling` 与 pytest flag `--runtime-profiling` 是
+四项 DFX 独立化之前唯一启用 L2 swimlane 采集的入口，现作为
+`enable_l2_swimlane` / `--enable-l2-swimlane` 的别名暂时保留，以兼容
+仍在使用它们的外部脚本。两条路径都会发出 `DeprecationWarning`，并将
+在未来版本中移除，请尽快迁移到新名称。
+
 ## 重放已有的 build_output
 
 需要在改完 kernel cpp 之后重新跑一遍编译产物（典型场景：手调 kernel
@@ -108,6 +116,32 @@ PyPTO 的 C++ logger。
 `RTOL` / `ATOL` 公差逐 output 比对;不一致会抛 `AssertionError`。
 该开关需要目录里存在 `golden.py`（`ir.compile` 默认会产出）。
 
+### 自动生成的 `debug/run.py`
+
+`ir.compile()` 会在 `<output_dir>/debug/run.py` 写一个自包含的
+重跑脚本，用户只需要记住一条命令：
+
+```bash
+python build_output/<jit_dir>/debug/run.py
+```
+
+脚本是对上面 `replay` 流程的封装：
+
+- 如果同目录有 `golden.py`，输入来自
+  `golden.generate_inputs()`，并用 `compute_golden` 做数值校验。
+- 否则（JIT 路径），输入由脚本内嵌的 shape / dtype 元数据构造，
+  用户可自由修改用于实验。脚本还预留了一个
+  `_user_compare(<参数名>)` 钩子，会在 `replay` 返回后自动调用 ——
+  在里面手写 `assert torch.allclose(...)` 即可对 kernel 输出做
+  自定义比对。
+
+生成过程是 **best-effort** —— 没有干净 orchestration 入口的程序
+会静默跳过这一步，编译流程本身不受影响。
+
+设置环境变量 `PYPTO_EMIT_DEBUG_RUNNER=0`（也接受 `false` / `no`，
+大小写不敏感）可全局关闭。适合大型测试套件或 benchmark 流水线
+（编译量大、不需要 runner）。关闭后底层的
+`pypto.runtime.debug.replay` 模块 / CLI 仍可直接对 output 目录使用。
 
 ## 相关文档
 

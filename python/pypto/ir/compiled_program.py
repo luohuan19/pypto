@@ -219,6 +219,31 @@ class CompiledProgram:
         self._output_indices: list[int] | None = None
         self._return_types: list[Any] | None = None
 
+        self._emit_debug_runner()
+
+    def _emit_debug_runner(self) -> None:
+        """Write ``<output_dir>/debug/run.py`` so the kernel can be replayed via
+        ``python .../debug/run.py``.
+
+        Best-effort: programs that lack a clean orchestration entry (unusual
+        shapes, edge-case codegen) cannot have their param signature extracted
+        here. In that case the file is skipped — the replay CLI is still usable
+        directly against the output directory.
+
+        Disable globally by setting ``PYPTO_EMIT_DEBUG_RUNNER=0`` (also accepts
+        ``false`` / ``no``).
+        """
+        if os.environ.get("PYPTO_EMIT_DEBUG_RUNNER", "").strip().lower() in ("0", "false", "no"):
+            return
+
+        from pypto.runtime.debug.run_script_writer import write_run_script  # noqa: PLC0415
+
+        try:
+            param_infos, _, _ = self._get_metadata()
+        except (ValueError, TypeError):
+            return
+        write_run_script(self._output_dir, param_infos, platform=self._platform)
+
     # --- Properties -----------------------------------------------------------
 
     @property
