@@ -267,9 +267,7 @@ def test_per_pto_independence(tmp_path: Path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_prints_stage_status_when_splice_happens(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_prints_stage_status_when_splice_happens(tmp_path: Path, monkeypatch, capsys) -> None:
     work_dir = _setup_build_output(tmp_path, {"foo": [("aiv", "foo")]})
     later = time.time() + 10
     os.utime(work_dir / "ptoas" / "foo.pto", (later, later))
@@ -284,9 +282,7 @@ def test_prints_stage_status_when_splice_happens(
     assert "[pto->cpp] updated 1 kernel cpp(s)" in out
 
 
-def test_prints_no_changes_when_all_pto_fresh(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_prints_no_changes_when_all_pto_fresh(tmp_path: Path, monkeypatch, capsys) -> None:
     work_dir = _setup_build_output(tmp_path, {"foo": [("aiv", "foo")]})
     out_cpp = work_dir / "ptoas" / "foo.cpp"
     out_cpp.write_text("")
@@ -309,9 +305,7 @@ def test_prints_status_when_env_disables(tmp_path: Path, monkeypatch, capsys) ->
     assert "[pto->cpp] skipped (PYPTO_REBUILD_FROM_PTO=0)" in out
 
 
-def test_prints_status_when_ptoas_binary_missing(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_prints_status_when_ptoas_binary_missing(tmp_path: Path, monkeypatch, capsys) -> None:
     work_dir = _setup_build_output(tmp_path, {"foo": [("aiv", "foo")]})
     monkeypatch.setattr(pto_rebuild, "_ptoas_binary", lambda: None)
     rebuild_kernel_cpp_from_pto(work_dir)

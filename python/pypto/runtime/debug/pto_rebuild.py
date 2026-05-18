@@ -91,9 +91,7 @@ def _run_ptoas(ptoas_bin: str, pto_path: Path, out_cpp: Path) -> None:
         timeout=60,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            f"ptoas rebuild failed for {pto_path.name}: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"ptoas rebuild failed for {pto_path.name}: {result.stderr.strip()}")
 
 
 def _preprocess_ptoas_body(content: str) -> str:

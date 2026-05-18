@@ -66,8 +66,7 @@ def test_preprocess_matches_pto_backend() -> None:
     expected = pto_backend._preprocess_ptoas_output(_PTOAS_SAMPLE)
     actual = pto_rebuild._preprocess_ptoas_body(_PTOAS_SAMPLE)
     assert actual == expected, (
-        "pto_rebuild._preprocess_ptoas_body drifted from "
-        "pto_backend._preprocess_ptoas_output."
+        "pto_rebuild._preprocess_ptoas_body drifted from pto_backend._preprocess_ptoas_output."
     )
 
 
@@ -80,8 +79,7 @@ def test_base_ptoas_flags_subset_of_backend_flags() -> None:
     src = inspect.getsource(pto_backend._get_ptoas_flags)
     missing = [f for f in pto_rebuild._ptoas_flags() if repr(f) not in src and f not in src]
     assert not missing, (
-        f"pto_rebuild base flags {missing!r} no longer found in "
-        "pto_backend._get_ptoas_flags source."
+        f"pto_rebuild base flags {missing!r} no longer found in pto_backend._get_ptoas_flags source."
     )
 
 

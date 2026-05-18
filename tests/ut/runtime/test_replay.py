@@ -79,9 +79,7 @@ def test_invalidate_binary_cache_noop_on_empty_dir(tmp_path: Path) -> None:
     invalidate_binary_cache(tmp_path)  # must not raise
 
 
-def test_invalidate_binary_cache_prints_status_when_files_removed(
-    tmp_path: Path, capsys
-) -> None:
+def test_invalidate_binary_cache_prints_status_when_files_removed(tmp_path: Path, capsys) -> None:
     _touch(tmp_path / "cache" / "foo.bin")
     _touch(tmp_path / "kernels" / "aiv" / "bar.so")
     invalidate_binary_cache(tmp_path)
@@ -89,9 +87,7 @@ def test_invalidate_binary_cache_prints_status_when_files_removed(
     assert "[cpp->.so] invalidated 2 cached binary file(s)" in out
 
 
-def test_invalidate_binary_cache_prints_status_when_nothing_to_do(
-    tmp_path: Path, capsys
-) -> None:
+def test_invalidate_binary_cache_prints_status_when_nothing_to_do(tmp_path: Path, capsys) -> None:
     invalidate_binary_cache(tmp_path)
     out = capsys.readouterr().out
     assert "[cpp->.so] no cached binaries to invalidate" in out
