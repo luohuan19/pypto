@@ -164,5 +164,15 @@ def test_log_level_flags_present(tmp_path: Path) -> None:
     assert "configure_log(args.log_level, sync_pypto=args.log_sync_pypto)" in text
 
 
+def test_no_rebuild_from_pto_flag_present(tmp_path: Path) -> None:
+    """The emitted CLI must expose --no-rebuild-from-pto and forward it to
+    replay's ``rebuild_from_pto`` kwarg — otherwise users can't opt out of the
+    .pto rebuild step from the auto-emitted runner."""
+    out = write_run_script(tmp_path, [_info("a", ParamDirection.In, [4])])
+    text = out.read_text()
+    assert '"--no-rebuild-from-pto"' in text
+    assert "rebuild_from_pto=not args.no_rebuild_from_pto" in text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

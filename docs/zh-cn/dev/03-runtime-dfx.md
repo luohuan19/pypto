@@ -116,6 +116,26 @@ PyPTO 的 C++ logger。
 `RTOL` / `ATOL` 公差逐 output 比对;不一致会抛 `AssertionError`。
 该开关需要目录里存在 `golden.py`（`ir.compile` 默认会产出）。
 
+### 改 `.pto` 而不是 cpp
+
+`replay`（以及自动生成的 `debug/run.py`）在清理 cpp 二进制之前会先
+按 mtime 扫描 `ptoas/*.pto`：任何比同名 `ptoas/<unit>.cpp` 新的
+`.pto` 都会触发一次 `ptoas` 重跑，新生成的 body 会 splice 到所有命中
+的 `kernels/<core>/<func>.cpp` —— 也就是在两条 sentinel
+`// --- ptoas-generated code ---` 与 `// --- Kernel entry point ---`
+之间替换。随后照常走 cpp → `.so` 重编译。
+
+| 改了哪些文件 | 实际触发的路径 |
+| ------------ | -------------- |
+| 只改 `kernels/<core>/<func>.cpp` | `cpp → .so`（保持原有行为） |
+| 只改 `ptoas/<unit>.pto` | `pto → cpp → .so`（新增 —— splice + 重编译） |
+| 两者都改 | `.pto` 决定 body 段；用户在 cpp wrapper / header 上的改动保留 |
+
+需要 `ptoas` 可被发现（`PTOAS_ROOT` 或 `PATH`）；找不到时静默跳过。
+关闭方式：`--no-rebuild-from-pto` 或 `PYPTO_REBUILD_FROM_PTO=0`。
+若 `.pto` 编辑会改变 kernel 函数签名，**不在本特性范围**：保存的
+wrapper 模板对不上,必须重新 `ir.compile()`。
+
 ### 自动生成的 `debug/run.py`
 
 `ir.compile()` 会在 `<output_dir>/debug/run.py` 写一个自包含的
@@ -134,6 +154,9 @@ python build_output/<jit_dir>/debug/run.py
   `_user_compare(<参数名>)` 钩子，会在 `replay` 返回后自动调用 ——
   在里面手写 `assert torch.allclose(...)` 即可对 kernel 输出做
   自定义比对。
+- 上面 "改 `.pto` 而不是 cpp" 一节描述的 `.pto` 重建流程在生成的
+  脚本里同样生效：改一份 `ptoas/*.pto` 再跑一次,splice 自动发生。
+  加 `--no-rebuild-from-pto` 可跳过。
 
 生成过程是 **best-effort** —— 没有干净 orchestration 入口的程序
 会静默跳过这一步，编译流程本身不受影响。

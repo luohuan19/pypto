@@ -159,6 +159,11 @@ def main(argv=None) -> int:
         help="Reuse cached binaries (faster, but ignores cpp edits)",
     )
     parser.add_argument(
+        "--no-rebuild-from-pto",
+        action="store_true",
+        help="Skip .pto -> cpp rebuild even when ptoas/*.pto is newer than cpp",
+    )
+    parser.add_argument(
         "--no-validate",
         action="store_true",
         help="Skip golden validation even when golden.py is present.",
@@ -204,6 +209,7 @@ def main(argv=None) -> int:
         *tensors,
         config=config,
         recompile=not args.no_recompile,
+        rebuild_from_pto=not args.no_rebuild_from_pto,
         validate=validate,
     )
     print(f"Replay finished. DFX artefacts (if any) under {{_WORK_DIR / 'dfx_outputs'}}")

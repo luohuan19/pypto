@@ -79,6 +79,24 @@ def test_invalidate_binary_cache_noop_on_empty_dir(tmp_path: Path) -> None:
     invalidate_binary_cache(tmp_path)  # must not raise
 
 
+def test_invalidate_binary_cache_prints_status_when_files_removed(
+    tmp_path: Path, capsys
+) -> None:
+    _touch(tmp_path / "cache" / "foo.bin")
+    _touch(tmp_path / "kernels" / "aiv" / "bar.so")
+    invalidate_binary_cache(tmp_path)
+    out = capsys.readouterr().out
+    assert "[cpp->.so] invalidated 2 cached binary file(s)" in out
+
+
+def test_invalidate_binary_cache_prints_status_when_nothing_to_do(
+    tmp_path: Path, capsys
+) -> None:
+    invalidate_binary_cache(tmp_path)
+    out = capsys.readouterr().out
+    assert "[cpp->.so] no cached binaries to invalidate" in out
+
+
 # ---------------------------------------------------------------------------
 # replay
 # ---------------------------------------------------------------------------
@@ -134,6 +152,47 @@ def test_replay_skips_invalidation_when_recompile_false(tmp_path: Path) -> None:
         replay(work_dir, recompile=False)
     assert bin_file.exists()
     assert so_file.exists()
+
+
+def test_replay_calls_rebuild_before_invalidate(tmp_path: Path) -> None:
+    """rebuild_from_pto must run *before* invalidate_binary_cache so the
+    freshly-spliced cpp is the one that drives the subsequent cpp -> .so
+    rebuild step."""
+    work_dir = _make_build_output(tmp_path)
+    call_order: list[str] = []
+
+    def _record_rebuild(*_a, **_kw):
+        call_order.append("rebuild")
+        return []
+
+    def _record_invalidate(*_a, **_kw):
+        call_order.append("invalidate")
+
+    with (
+        patch.object(replay_module, "execute_compiled"),
+        patch.object(replay_module, "rebuild_kernel_cpp_from_pto", side_effect=_record_rebuild),
+        patch.object(replay_module, "invalidate_binary_cache", side_effect=_record_invalidate),
+    ):
+        replay(work_dir)
+    assert call_order == ["rebuild", "invalidate"]
+
+
+def test_replay_skips_rebuild_from_pto_when_disabled(tmp_path: Path) -> None:
+    work_dir = _make_build_output(tmp_path)
+    with (
+        patch.object(replay_module, "execute_compiled"),
+        patch.object(replay_module, "rebuild_kernel_cpp_from_pto") as rb,
+    ):
+        replay(work_dir, rebuild_from_pto=False)
+    rb.assert_not_called()
+
+
+def test_replay_prints_execute_banner(tmp_path: Path, capsys) -> None:
+    work_dir = _make_build_output(tmp_path)
+    with patch.object(replay_module, "execute_compiled"):
+        replay(work_dir, rebuild_from_pto=False, recompile=False)
+    out = capsys.readouterr().out
+    assert "[execute] running on device..." in out
 
 
 def test_replay_missing_kernel_config_raises(tmp_path: Path) -> None:
@@ -249,7 +308,7 @@ def test_cli_invokes_replay_with_dfx_flags(tmp_path: Path) -> None:
     work_dir = _make_build_output(tmp_path)
     captured: dict = {}
 
-    def fake_replay(wd, *tensors, config, recompile, validate):
+    def fake_replay(wd, *tensors, config, recompile, rebuild_from_pto, validate):
         captured["work_dir"] = wd
         captured["tensors"] = tensors
         captured["config"] = config
@@ -275,7 +334,7 @@ def test_cli_no_recompile_flag(tmp_path: Path) -> None:
     work_dir = _make_build_output(tmp_path)
     captured: dict = {}
 
-    def fake_replay(wd, *tensors, config, recompile, validate):
+    def fake_replay(wd, *tensors, config, recompile, rebuild_from_pto, validate):
         captured["recompile"] = recompile
 
     with (
@@ -290,7 +349,7 @@ def test_cli_validate_flag(tmp_path: Path) -> None:
     work_dir = _make_build_output(tmp_path)
     captured: dict = {}
 
-    def fake_replay(wd, *tensors, config, recompile, validate):
+    def fake_replay(wd, *tensors, config, recompile, rebuild_from_pto, validate):
         captured["validate"] = validate
 
     with (

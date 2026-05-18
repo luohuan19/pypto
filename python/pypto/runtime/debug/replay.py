@@ -50,6 +50,7 @@ from types import ModuleType
 
 import torch
 
+from pypto.runtime.debug.pto_rebuild import rebuild_kernel_cpp_from_pto
 from pypto.runtime.device_tensor import DeviceTensor
 from pypto.runtime.runner import RunConfig, _DfxOpts, execute_compiled
 
@@ -66,12 +67,17 @@ def invalidate_binary_cache(work_dir: Path | str) -> None:
 
     Safe to call when nothing is cached — silently no-ops on missing
     files / directories.
+
+    Prints the number of files removed so users running ``debug/run.py``
+    can see the ``cpp -> .o`` rebuild path was taken.
     """
     work_dir = Path(work_dir)
+    removed = 0
     cache_dir = work_dir / "cache"
     if cache_dir.is_dir():
         for f in cache_dir.glob("*.bin"):
             f.unlink()
+            removed += 1
     for sub in ("kernels", "orchestration"):
         root = work_dir / sub
         if not root.is_dir():
@@ -79,6 +85,11 @@ def invalidate_binary_cache(work_dir: Path | str) -> None:
         for ext in ("*.so", "*.o"):
             for f in root.rglob(ext):
                 f.unlink()
+                removed += 1
+    if removed:
+        print(f"[cpp->.so] invalidated {removed} cached binary file(s); cpp will rebuild")
+    else:
+        print("[cpp->.so] no cached binaries to invalidate")
 
 
 def replay(
@@ -86,6 +97,7 @@ def replay(
     *tensors: torch.Tensor | DeviceTensor | _SimpleCData,
     config: RunConfig | None = None,
     recompile: bool = True,
+    rebuild_from_pto: bool = True,
     validate: bool = False,
 ) -> None:
     """Re-execute an existing ``build_output/<jit_dir>/`` with new tensors.
@@ -104,6 +116,13 @@ def replay(
             orchestration binaries via :func:`invalidate_binary_cache` so
             hand-edited cpps are picked up. Set to ``False`` to reuse
             cached binaries (faster re-runs when no cpp has been modified).
+        rebuild_from_pto: When ``True`` (default), before cache
+            invalidation, scan ``ptoas/*.pto`` and rerun ``ptoas`` for any
+            file newer than its sibling ``ptoas/<unit>.cpp``; the new body
+            is spliced into the matching ``kernels/<core>/<func>.cpp``. Set
+            to ``False`` to ignore ``.pto`` edits entirely. Independent of
+            ``recompile``: the cpp itself is still picked up by the cpp →
+            ``.so`` path even when ``rebuild_from_pto`` is off.
         validate: When ``True``, after execution compare each output tensor
             (identified via ``golden.py::__outputs__``) against the value
             produced by ``golden.py::compute_golden`` using ``torch.allclose``
@@ -148,8 +167,17 @@ def replay(
                 )
             named_tensors.append((name, t))
 
+    if rebuild_from_pto:
+        rebuild_kernel_cpp_from_pto(work_dir)
+    else:
+        print("[pto->cpp] skipped (rebuild_from_pto=False)")
+
     if recompile:
         invalidate_binary_cache(work_dir)
+    else:
+        print("[cpp->.so] reusing cached binaries (recompile=False)")
+
+    print("[execute] running on device...")
     execute_compiled(
         work_dir,
         list(tensors),
@@ -248,6 +276,11 @@ def _main(argv: list[str] | None = None) -> int:
         help="Reuse cached binaries (faster, but ignores cpp edits)",
     )
     parser.add_argument(
+        "--no-rebuild-from-pto",
+        action="store_true",
+        help="Skip .pto -> cpp rebuild even when ptoas/*.pto is newer than cpp",
+    )
+    parser.add_argument(
         "--log-level",
         default=None,
         metavar="LEVEL",
@@ -293,6 +326,7 @@ def _main(argv: list[str] | None = None) -> int:
         *tensors,
         config=config,
         recompile=not args.no_recompile,
+        rebuild_from_pto=not args.no_rebuild_from_pto,
         validate=args.validate,
     )
     print(f"Replay finished. DFX artefacts (if any) under {args.work_dir / 'dfx_outputs'}")

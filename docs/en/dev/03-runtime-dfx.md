@@ -121,6 +121,28 @@ against the reference produced by `golden.py::compute_golden` using the
 `AssertionError` on mismatch. Requires the directory to contain a
 `golden.py` (the default for `ir.compile`-produced artefacts).
 
+### Editing `.pto` instead of cpp
+
+`replay` (and the auto-emitted `debug/run.py`) checks `ptoas/*.pto`
+mtimes before invalidating cpp binaries: any `.pto` newer than its
+sibling `ptoas/<unit>.cpp` triggers a fresh `ptoas` run, and the new
+preprocessed body is spliced between the `// --- ptoas-generated code
+---` and `// --- Kernel entry point ---` sentinels in every matching
+`kernels/<core>/<func>.cpp`. The cpp → `.so` rebuild then runs as
+normal.
+
+| You edited | What runs |
+| ---------- | --------- |
+| only `kernels/<core>/<func>.cpp` | `cpp → .so` (existing behaviour) |
+| only `ptoas/<unit>.pto` | `pto → cpp → .so` (new — splice + recompile) |
+| both | `pto` wins for the body region; your wrapper / header edits in the cpp are preserved |
+
+Requires the `ptoas` binary on `PTOAS_ROOT` or `PATH`; silently no-ops
+otherwise. Disable with `--no-rebuild-from-pto` or
+`PYPTO_REBUILD_FROM_PTO=0`. Editing a `.pto` that changes the kernel
+function signature is **out of scope** — the saved wrapper boilerplate
+will not match, and a fresh `ir.compile()` is required.
+
 ### Auto-emitted `debug/run.py`
 
 `ir.compile()` writes a self-contained re-runner at
@@ -141,6 +163,9 @@ The script wraps the `replay` flow above:
   script also exposes a `_user_compare(<param_names>)` hook that runs
   after `replay` returns — write your own `assert torch.allclose(...)`
   there to validate kernel output against a hand-rolled reference.
+- The same `.pto` rebuild flow described above applies: edit a `.pto`
+  under `ptoas/`, rerun the script, and the splice happens
+  transparently. Pass `--no-rebuild-from-pto` to skip.
 
 Emission is **best-effort** — programs without a clean orchestration
 entry skip the file silently and the rest of compilation succeeds.

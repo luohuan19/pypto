@@ -13,7 +13,13 @@ Not for production use. Modules under ``pypto.runtime.debug`` are intended
 for offline debugging of compiled artefacts (re-execution, tracing, etc.).
 """
 
+from .pto_rebuild import rebuild_kernel_cpp_from_pto
 from .replay import invalidate_binary_cache, replay
 from .run_script_writer import write_run_script
 
-__all__ = ["invalidate_binary_cache", "replay", "write_run_script"]
+__all__ = [
+    "invalidate_binary_cache",
+    "rebuild_kernel_cpp_from_pto",
+    "replay",
+    "write_run_script",
+]
