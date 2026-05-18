@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+from collections.abc import Callable
 from ctypes import _SimpleCData
 from pathlib import Path
 from types import ModuleType
@@ -255,7 +256,30 @@ def _validate_against_golden_module(
             ) from e
 
 
-def _main(argv: list[str] | None = None) -> int:
+def _main(
+    argv: list[str] | None = None,
+    *,
+    inline_inputs: Callable[[], list] | None = None,
+    user_compare: Callable[..., None] | None = None,
+    default_platform: str = "a2a3sim",
+) -> int:
+    """Shared CLI entry for both ``python -m pypto.runtime.debug.replay`` and
+    the auto-generated ``debug/run.py`` shim.
+
+    Args:
+        argv: Argument vector (positional ``work_dir`` first).
+        inline_inputs: Auto-runner hook. When provided, signals that the
+            caller is the JIT-emitted ``debug/run.py`` and supplies tensors
+            for the no-golden / ``--no-validate`` paths. Switches the
+            ``--validate`` default from False (standalone, opt-in) to True
+            (auto-runner, opt-out).
+        user_compare: Auto-runner hook called with ``*tensors`` after a
+            non-validating replay finishes — the JIT path's hand-edited
+            comparison stub.
+        default_platform: Default for ``--platform``. The auto-runner bakes
+            the compile-time platform here so users get the right target
+            without re-typing it.
+    """
     parser = argparse.ArgumentParser(
         prog="python -m pypto.runtime.debug.replay",
         description=(
@@ -264,7 +288,7 @@ def _main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("work_dir", type=Path, help="Path to build_output/<jit_dir>/")
-    parser.add_argument("--platform", default="a2a3sim", help="Target execution platform")
+    parser.add_argument("--platform", default=default_platform, help="Target execution platform")
     parser.add_argument("--device-id", type=int, default=0, help="Hardware device index")
     parser.add_argument("--pmu", type=int, default=0, metavar="LEVEL", help="PMU level")
     parser.add_argument("--swimlane", action="store_true", help="Enable L2 swimlane capture")
@@ -297,11 +321,13 @@ def _main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--validate",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=inline_inputs is not None,
         help=(
-            "After execution, compare outputs against golden.py::compute_golden "
-            "using torch.allclose with the tolerances declared in golden.py. "
-            "Raises AssertionError on mismatch."
+            "Compare outputs against golden.py::compute_golden using "
+            "torch.allclose. Defaults to off for the standalone CLI "
+            "(opt-in) and on for the auto-emitted debug/run.py "
+            "(opt-out with --no-validate)."
         ),
     )
     args = parser.parse_args(argv)
@@ -311,6 +337,14 @@ def _main(argv: list[str] | None = None) -> int:
 
         configure_log(args.log_level, sync_pypto=args.log_sync_pypto)
 
+    golden_exists = (args.work_dir / "golden.py").exists()
+    if inline_inputs is not None and not (args.validate and golden_exists):
+        tensors = list(inline_inputs())
+        do_validate = False
+    else:
+        tensors = [v for _, v in _load_named_inputs_from_golden(args.work_dir)]
+        do_validate = args.validate
+
     config = RunConfig(
         platform=args.platform,
         device_id=args.device_id,
@@ -319,19 +353,19 @@ def _main(argv: list[str] | None = None) -> int:
         enable_dump_tensor=args.dump_tensor,
         enable_dep_gen=args.dep_gen,
     )
-    named_inputs = _load_named_inputs_from_golden(args.work_dir)
-    tensors = [v for _, v in named_inputs]
     replay(
         args.work_dir,
         *tensors,
         config=config,
         recompile=not args.no_recompile,
         rebuild_from_pto=not args.no_rebuild_from_pto,
-        validate=args.validate,
+        validate=do_validate,
     )
     print(f"Replay finished. DFX artefacts (if any) under {args.work_dir / 'dfx_outputs'}")
-    if args.validate:
+    if do_validate:
         print("Golden validation: PASSED")
+    elif user_compare is not None:
+        user_compare(*tensors)
     return 0
 
 

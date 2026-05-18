@@ -94,14 +94,14 @@ def test_dynamic_dim_filled_with_one_and_commented(tmp_path: Path) -> None:
     assert "dynamic dim" in text
 
 
-def test_platform_baked_into_cli_default(tmp_path: Path) -> None:
+def test_platform_baked_into_runner_kwarg(tmp_path: Path) -> None:
     out = write_run_script(tmp_path, [_info("a", ParamDirection.In, [4])], platform="a5sim")
-    assert 'parser.add_argument("--platform", default="a5sim")' in out.read_text()
+    assert 'default_platform="a5sim"' in out.read_text()
 
 
 def test_platform_defaults_to_a2a3sim(tmp_path: Path) -> None:
     out = write_run_script(tmp_path, [_info("a", ParamDirection.In, [4])])
-    assert 'parser.add_argument("--platform", default="a2a3sim")' in out.read_text()
+    assert 'default_platform="a2a3sim"' in out.read_text()
 
 
 def test_scalar_param_emits_placeholder(tmp_path: Path) -> None:
@@ -129,18 +129,6 @@ def test_user_compare_hook_uses_param_names(tmp_path: Path) -> None:
     assert "def _user_compare(a, b, c):" in text
 
 
-def test_user_compare_invoked_only_on_jit_path(tmp_path: Path) -> None:
-    """When golden validation runs, ``_user_compare`` must NOT be called —
-    otherwise a hand-written assertion on inline shapes would fire against
-    golden-supplied tensors. The call belongs in the ``else`` branch only."""
-    out = write_run_script(tmp_path, [_info("a", ParamDirection.In, [4])])
-    text = out.read_text()
-    assert "_user_compare(*tensors)" in text
-    validate_idx = text.index('print("Golden validation: PASSED")')
-    compare_idx = text.index("_user_compare(*tensors)")
-    assert compare_idx > validate_idx, "_user_compare must follow the validate branch"
-
-
 def test_user_compare_with_no_params(tmp_path: Path) -> None:
     """Edge case: a kernel with zero IR params still produces a syntactically
     valid ``_user_compare()`` definition."""
@@ -150,28 +138,59 @@ def test_user_compare_with_no_params(tmp_path: Path) -> None:
     assert "def _user_compare():" in text
 
 
-def test_log_level_flags_present(tmp_path: Path) -> None:
-    """The emitted CLI must expose --log-level / --log-sync-pypto so users can
-    control runtime verbosity without re-editing the script — mirrors the
-    pypto.runtime.debug.replay CLI surface."""
+def test_delegates_cli_to_replay_main(tmp_path: Path) -> None:
+    """The generated script must not re-implement the replay CLI — it just
+    forwards work_dir + sys.argv into ``replay._main`` with its two hooks.
+    Re-running the full argparse block would mean every new flag added to
+    replay needs a parallel edit in run_script_writer."""
     out = write_run_script(tmp_path, [_info("a", ParamDirection.In, [4])])
     text = out.read_text()
-    assert '"--log-level"' in text
-    assert '"--log-sync-pypto"' in text
-    # configure_log must actually be invoked when --log-level is set, not just
-    # parsed; otherwise the flag is decorative.
-    assert "from pypto.runtime.log_config import configure_log" in text
-    assert "configure_log(args.log_level, sync_pypto=args.log_sync_pypto)" in text
+    assert "from pypto.runtime.debug.replay import _main" in text
+    assert "inline_inputs=_inline_inputs" in text
+    assert "user_compare=_user_compare" in text
+    # No CLI flags should be DEFINED locally — they all live in replay._main.
+    # (Docstring mentions of flag names are fine; the regression we guard
+    # against is a re-declared argparse block.)
+    assert "argparse" not in text
+    assert "parser.add_argument" not in text
+    assert "configure_log" not in text
+    assert "RunConfig(" not in text
 
 
-def test_no_rebuild_from_pto_flag_present(tmp_path: Path) -> None:
-    """The emitted CLI must expose --no-rebuild-from-pto and forward it to
-    replay's ``rebuild_from_pto`` kwarg — otherwise users can't opt out of the
-    .pto rebuild step from the auto-emitted runner."""
+def test_generated_script_stays_compact(tmp_path: Path) -> None:
+    """Guard against the duplication regressing — the shim should be well
+    under the line count of the original copy-paste version (~150 lines).
+    Account for the in-file CLI flag listing (~25 docstring lines)."""
+    out = write_run_script(tmp_path, [_info("a", ParamDirection.In, [4])])
+    lines = out.read_text().splitlines()
+    assert len(lines) < 110, f"generated script ballooned to {len(lines)} lines"
+
+
+def test_docstring_lists_common_cli_flags(tmp_path: Path) -> None:
+    """The whole point of the auto-runner is to give users a one-command
+    debug entry. After moving the CLI to ``replay._main``, the flags aren't
+    visible in the file anymore — so the docstring must enumerate them.
+    Otherwise users have to ``--help`` or open replay.py to discover
+    ``--pmu`` / ``--swimlane`` / ``--log-level`` / ``--no-validate``."""
     out = write_run_script(tmp_path, [_info("a", ParamDirection.In, [4])])
     text = out.read_text()
-    assert '"--no-rebuild-from-pto"' in text
-    assert "rebuild_from_pto=not args.no_rebuild_from_pto" in text
+    for flag in (
+        "--platform",
+        "--pmu",
+        "--swimlane",
+        "--dump-tensor",
+        "--dep-gen",
+        "--no-recompile",
+        "--no-rebuild-from-pto",
+        "--log-level",
+        "--log-sync-pypto",
+        "--validate",
+        "--no-validate",
+    ):
+        assert flag in text, f"docstring missing flag {flag}"
+    # And the baked-in platform must show up in the listing so users know
+    # what default they're running against.
+    assert "default: a2a3sim" in text
 
 
 if __name__ == "__main__":

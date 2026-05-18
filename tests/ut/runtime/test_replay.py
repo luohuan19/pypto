@@ -394,5 +394,144 @@ def test_cli_no_log_level_skips_configure_log(tmp_path: Path) -> None:
     assert called["count"] == 0
 
 
+# ---------------------------------------------------------------------------
+# CLI: auto-runner kwargs (inline_inputs / user_compare / default_platform)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_inline_inputs_fallback_when_golden_missing(tmp_path: Path) -> None:
+    """When the auto-runner passes ``inline_inputs`` and ``golden.py`` is
+    absent, ``_main`` must use the inline tensors and skip validation —
+    instead of raising FileNotFoundError as the standalone path does."""
+    work_dir = _make_build_output(tmp_path)
+    inline_tensors = [torch.zeros(2), torch.ones(3)]
+    captured: dict = {}
+
+    def fake_replay(wd, *tensors, config, recompile, rebuild_from_pto, validate):
+        captured["tensors"] = tensors
+        captured["validate"] = validate
+
+    with patch.object(replay_module, "replay", side_effect=fake_replay):
+        rc = _main([str(work_dir)], inline_inputs=lambda: inline_tensors)
+    assert rc == 0
+    assert list(captured["tensors"]) == inline_tensors
+    assert captured["validate"] is False
+
+
+def test_cli_inline_inputs_default_validates_when_golden_exists(tmp_path: Path) -> None:
+    """Auto-runner default is validate=on; when golden.py exists, use golden
+    tensors and propagate validate=True to ``replay`` so ``compute_golden``
+    actually runs."""
+    work_dir = _make_build_output(tmp_path)
+    _write_add_golden(work_dir)
+    captured: dict = {}
+
+    def fake_replay(wd, *tensors, config, recompile, rebuild_from_pto, validate):
+        captured["validate"] = validate
+        captured["tensor_count"] = len(tensors)
+
+    with patch.object(replay_module, "replay", side_effect=fake_replay):
+        _main([str(work_dir)], inline_inputs=lambda: [torch.zeros(99)])
+    assert captured["validate"] is True
+    assert captured["tensor_count"] == 3  # came from golden, not inline
+
+
+def test_cli_no_validate_uses_inline_even_with_golden(tmp_path: Path) -> None:
+    """``--no-validate`` from the auto-runner must short-circuit golden
+    loading entirely and use the inline tensors. Otherwise a JIT user
+    skipping validation would still pay the golden import cost."""
+    work_dir = _make_build_output(tmp_path)
+    _write_add_golden(work_dir)
+    inline_marker = [torch.full((4,), 42.0)]
+    captured: dict = {}
+
+    def fake_replay(wd, *tensors, config, recompile, rebuild_from_pto, validate):
+        captured["tensors"] = tensors
+        captured["validate"] = validate
+
+    with patch.object(replay_module, "replay", side_effect=fake_replay):
+        _main([str(work_dir), "--no-validate"], inline_inputs=lambda: inline_marker)
+    assert captured["validate"] is False
+    assert captured["tensors"][0][0].item() == 42.0
+
+
+def test_cli_user_compare_invoked_when_validation_skipped(tmp_path: Path) -> None:
+    """``user_compare`` is the JIT comparison hook — it must run after
+    replay when validation did NOT happen, with the same tensors that
+    replay saw, so hand-written asserts can read in-place outputs."""
+    work_dir = _make_build_output(tmp_path)
+    inline_tensors = [torch.zeros(4), torch.ones(4)]
+    seen: dict = {}
+
+    def fake_compare(*tensors):
+        seen["tensors"] = tensors
+
+    with patch.object(replay_module, "replay"):
+        _main([str(work_dir)], inline_inputs=lambda: inline_tensors, user_compare=fake_compare)
+    assert seen["tensors"] == tuple(inline_tensors)
+
+
+def test_cli_user_compare_not_invoked_when_validation_runs(tmp_path: Path) -> None:
+    """Validation success and the user-compare hook are mutually exclusive
+    — running both would make a hand-edited inline assertion fire against
+    golden tensors and break the JIT user's mental model."""
+    work_dir = _make_build_output(tmp_path)
+    _write_add_golden(work_dir)
+    seen: dict = {"called": False}
+
+    def fake_compare(*tensors):
+        seen["called"] = True
+
+    with patch.object(replay_module, "replay"):
+        _main(
+            [str(work_dir)],
+            inline_inputs=lambda: [torch.zeros(1)],
+            user_compare=fake_compare,
+        )
+    assert seen["called"] is False
+
+
+def test_cli_default_platform_kwarg_used_when_flag_omitted(tmp_path: Path) -> None:
+    """The auto-runner bakes the compile-time platform into the
+    ``default_platform`` kwarg so ``python debug/run.py`` (no flags) picks
+    the right target. ``--platform`` on the CLI must still override."""
+    work_dir = _make_build_output(tmp_path)
+    captured: dict = {}
+
+    def fake_replay(wd, *tensors, config, recompile, rebuild_from_pto, validate):
+        captured["platform"] = config.platform
+
+    with (
+        patch.object(replay_module, "replay", side_effect=fake_replay),
+        patch.object(replay_module, "_load_named_inputs_from_golden", return_value=[]),
+    ):
+        _main([str(work_dir)], default_platform="a5sim")
+    assert captured["platform"] == "a5sim"
+
+
+def test_cli_default_platform_overridden_by_explicit_flag(tmp_path: Path) -> None:
+    work_dir = _make_build_output(tmp_path)
+    captured: dict = {}
+
+    def fake_replay(wd, *tensors, config, recompile, rebuild_from_pto, validate):
+        captured["platform"] = config.platform
+
+    with (
+        patch.object(replay_module, "replay", side_effect=fake_replay),
+        patch.object(replay_module, "_load_named_inputs_from_golden", return_value=[]),
+    ):
+        _main([str(work_dir), "--platform", "a2a3sim"], default_platform="a5sim")
+    assert captured["platform"] == "a2a3sim"
+
+
+def test_cli_standalone_missing_golden_still_raises(tmp_path: Path) -> None:
+    """Back-compat: when ``inline_inputs`` is not provided (standalone CLI),
+    a missing ``golden.py`` must still raise — otherwise the standalone
+    invocation would silently run with no tensors."""
+    work_dir = _make_build_output(tmp_path)
+    with pytest.raises(FileNotFoundError, match=r"golden\.py"):
+        _main([str(work_dir)])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
