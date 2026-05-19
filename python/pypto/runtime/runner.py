@@ -83,8 +83,12 @@ class RunConfig:
         pto_isa_commit: If set, pin the pto-isa clone to this specific git
             commit (hash or tag).  ``None`` means use the latest remote HEAD.
         enable_l2_swimlane: Capture per-task L2 perf records into
-            ``<work_dir>/dfx_outputs/l2_perf_records.json``. After the run
-            ``swimlane_converter`` produces ``merged_swimlane_*.json``.
+            ``<work_dir>/dfx_outputs/l2_perf_records.json``. On onboard
+            platforms, ``swimlane_converter`` then produces
+            ``merged_swimlane_*.json`` alongside it. Simulator platforms
+            (``*sim``) only emit ``l2_perf_records.json`` — the merged
+            swimlane file is intentionally skipped because the simulator
+            does not yet ship the task metadata the converter needs.
             Mirrors runtime's ``--enable-l2-swimlane`` flag.
         enable_dump_tensor: Dump per-task tensor I/O into
             ``<work_dir>/dfx_outputs/tensor_dump/``. Inspect with
@@ -470,6 +474,11 @@ def _collect_dfx_artifacts(
                 dfx_dir.parent,
                 dfx_dir,
                 dfx_dir / "l2_perf_records.json",
+            )
+        else:
+            print(
+                "Skipping swimlane conversion on simulator: "
+                "merged_swimlane_*.json is only generated for onboard runs."
             )
 
     if dfx.enable_dep_gen and (dfx_dir / "deps.json").exists():
