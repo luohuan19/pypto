@@ -46,7 +46,9 @@ def make_tensor_arg(arg: Any) -> Any:
         ContinuousTensor,  # pyright: ignore[reportAttributeAccessIssue]
         device_tensor_to_continuous,
     )
-    from .task_interface import make_tensor_arg as _impl  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+    from .task_interface import (  # noqa: PLC0415
+        make_tensor_arg as _impl,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 
     if isinstance(arg, ContinuousTensor):
         return arg

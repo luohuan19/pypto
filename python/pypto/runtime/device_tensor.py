@@ -123,9 +123,19 @@ def alloc_device_tensor(
     Returns:
         A :class:`DeviceTensor` referencing the allocated buffer.
     """
-    shape_t = tuple(int(d) for d in shape)
-    if any(d < 0 for d in shape_t):
-        raise ValueError(f"shape must contain only non-negative dimensions, got {shape_t}")
+    # Validate the shape up front (before malloc) and without coercion, mirroring
+    # DeviceTensor's constructor contract: bool is an int subclass, so reject it
+    # explicitly; only positive int dimensions are allowed. This avoids allocating
+    # for a wrong logical shape (e.g. an empty shape would make n_elems == 1) and
+    # gives the same error the resulting DeviceTensor would raise — just earlier.
+    shape_t = tuple(shape)
+    if not shape_t:
+        raise ValueError("shape must be non-empty")
+    for d in shape_t:
+        if isinstance(d, bool) or not isinstance(d, int):
+            raise TypeError(f"shape must contain ints, got {shape_t!r}")
+    if any(d <= 0 for d in shape_t):
+        raise ValueError(f"shape must contain only positive dimensions, got {shape_t}")
     n_elems = 1
     for d in shape_t:
         n_elems *= d

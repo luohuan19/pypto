@@ -249,6 +249,9 @@ with Worker(config=RunConfig(platform="a2a3sim")) as w:
 参数跳过 H2D/D2H。这是在 generate 循环的多次 dispatch 之间保持大块静态权重常驻的推荐做法。
 
 ```python
+import torch
+from pypto.runtime import DeviceTensor
+
 compiled = ir.compile(MyDistributedProgram)   # 返回 DistributedCompiledProgram
 weight = DeviceTensor(dev_ptr, (1024, 4096), torch.float16)   # 调用方自管 buffer
 compiled(x, weight, out)                       # weight：无 H2D/D2H 拷贝

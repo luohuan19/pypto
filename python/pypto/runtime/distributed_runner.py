@@ -471,14 +471,18 @@ def execute_distributed(
     chip_bootstrap_configs, rootinfo_path = _build_chip_bootstrap(output_dir, dc)
 
     num_sub = max(dc.num_sub_workers, len(sub_worker_fns))
-    w = _construct_worker(dc, compiled.platform, runtime_name, chip_bootstrap_configs, num_sub)
-    sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
-    w.init()
 
+    # Construct/register/init inside the try so a failure in any setup step still
+    # closes the worker and unlinks the rootinfo temp file — none of these leak.
+    w = None
     try:
+        w = _construct_worker(dc, compiled.platform, runtime_name, chip_bootstrap_configs, num_sub)
+        sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
+        w.init()
         _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, _make_call_config(dc))
     finally:
-        w.close()
+        if w is not None:
+            w.close()
         if rootinfo_path is not None:
             try:
                 os.unlink(rootinfo_path)
@@ -540,34 +544,56 @@ class DistributedRuntime(DeviceMemoryHandle):
     ) -> None:
         del config  # reserved for future per-runtime overrides
         dc = compiled._distributed_config
-        self._chip_callables, runtime_name = _assemble_chip_callables(compiled)
-        self._entry_fn, alloc_fn = _load_orch_entry(compiled.output_dir)
-        sub_worker_fns = _load_sub_worker_fns(compiled.output_dir)
-        sub_worker_fns = _merge_sub_worker_overrides(sub_worker_fns, sub_worker_overrides)
-        chip_bootstrap_configs, self._rootinfo_path = _build_chip_bootstrap(compiled.output_dir, dc)
 
-        num_sub = max(dc.num_sub_workers, len(sub_worker_fns))
-        self._w = _construct_worker(dc, compiled.platform, runtime_name, chip_bootstrap_configs, num_sub)
-        self._sub_ids, self._chip_cids = _register_callables(self._w, sub_worker_fns, self._chip_callables)
+        # Wrap setup so a failure at any step still releases the worker and the
+        # comm rootinfo temp file. ``self.close()`` can't be used here — it reads
+        # ``self._closed``, which isn't set until setup completes — so cleanup is
+        # inlined and guarded against the partially-constructed state.
+        self._w: Any = None
+        self._rootinfo_path: str | None = None
+        try:
+            self._chip_callables, runtime_name = _assemble_chip_callables(compiled)
+            self._entry_fn, alloc_fn = _load_orch_entry(compiled.output_dir)
+            sub_worker_fns = _load_sub_worker_fns(compiled.output_dir)
+            sub_worker_fns = _merge_sub_worker_overrides(sub_worker_fns, sub_worker_overrides)
+            chip_bootstrap_configs, self._rootinfo_path = _build_chip_bootstrap(compiled.output_dir, dc)
 
-        # Allocate HOST-level intermediate scratch tensors ONCE, before init()
-        # forks. They are reused (by name) across every dispatch; per-call
-        # inputs are merged on top in __call__.
-        self._base_tensors: dict[str, Any] = {}
-        if alloc_fn is not None:
-            alloc_fn(self._base_tensors)
+            num_sub = max(dc.num_sub_workers, len(sub_worker_fns))
+            self._w = _construct_worker(dc, compiled.platform, runtime_name, chip_bootstrap_configs, num_sub)
+            self._sub_ids, self._chip_cids = _register_callables(
+                self._w, sub_worker_fns, self._chip_callables
+            )
 
-        self._w.init()
+            # Allocate HOST-level intermediate scratch tensors ONCE, before init()
+            # forks. They are reused (by name) across every dispatch; per-call
+            # inputs are merged on top in __call__.
+            self._base_tensors: dict[str, Any] = {}
+            if alloc_fn is not None:
+                alloc_fn(self._base_tensors)
 
-        # Fork the chip/sub workers now (rather than lazily on the first
-        # ``run()``) so the device-memory API — ``malloc`` / ``copy_to`` /
-        # ``alloc_tensor`` — is usable before the first dispatch: those route
-        # through the orchestrator, which only exists after the hierarchy is
-        # started. ``_start_hierarchical`` is idempotent and is the same fork
-        # the first ``run()`` would trigger; the comm path already runs it from
-        # ``init()``. Intermediates are allocated above (pre-fork) so forked
-        # children inherit their shared-memory mappings.
-        self._w._start_hierarchical()
+            self._w.init()
+
+            # Fork the chip/sub workers now (rather than lazily on the first
+            # ``run()``) so the device-memory API — ``malloc`` / ``copy_to`` /
+            # ``alloc_tensor`` — is usable before the first dispatch: those route
+            # through the orchestrator, which only exists after the hierarchy is
+            # started. ``_start_hierarchical`` is idempotent and is the same fork
+            # the first ``run()`` would trigger; the comm path already runs it from
+            # ``init()``. Intermediates are allocated above (pre-fork) so forked
+            # children inherit their shared-memory mappings.
+            self._w._start_hierarchical()
+        except Exception:
+            if self._w is not None:
+                try:
+                    self._w.close()
+                except Exception:
+                    pass
+            if self._rootinfo_path is not None:
+                try:
+                    os.unlink(self._rootinfo_path)
+                except FileNotFoundError:
+                    pass
+            raise
 
         self._call_config = _make_call_config(dc)
         # Cache param metadata once: the dispatch contract is "setup once, run

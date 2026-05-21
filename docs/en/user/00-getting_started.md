@@ -255,6 +255,9 @@ for that argument. This is the recommended way to keep large static weights
 resident across the many dispatches of a generate loop.
 
 ```python
+import torch
+from pypto.runtime import DeviceTensor
+
 compiled = ir.compile(MyDistributedProgram)   # returns DistributedCompiledProgram
 weight = DeviceTensor(dev_ptr, (1024, 4096), torch.float16)   # caller-managed buffer
 compiled(x, weight, out)                       # weight: no H2D/D2H copy
