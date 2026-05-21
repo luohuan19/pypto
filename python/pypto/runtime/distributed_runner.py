@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -207,37 +208,22 @@ def _build_chip_bootstrap_configs_from_manifest(
     return cfgs
 
 
-def execute_distributed(  # noqa: PLR0912
-    compiled: DistributedCompiledProgram,
-    coerced_args: list[torch.Tensor | DeviceTensor],
-    config: Any = None,
-) -> None:
-    """Execute a distributed compiled program via simpler Worker(level=3).
+# ---------------------------------------------------------------------------
+# Setup steps shared by the one-shot ``execute_distributed`` path and the
+# reusable ``DistributedRuntime`` handle. Keeping them as free functions lets
+# both paths run identical, expensive setup (compile_and_assemble, module load,
+# Worker construction + registration) without duplicating it.
+# ---------------------------------------------------------------------------
 
-    Args:
-        compiled: The DistributedCompiledProgram instance.
-        coerced_args: Coerced arguments — host ``torch.Tensor`` or
-            worker-resident :class:`~pypto.runtime.DeviceTensor`.
-        config: Optional run configuration (unused for now).
-    """
-    from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-        CallConfig,
-    )
-    from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-        Worker,
-    )
 
-    from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
-
-    dc = compiled._distributed_config
-    output_dir = compiled.output_dir
-
-    # 1. Build ChipCallable for each chip-level task (under next_levels/{name}/)
+def _assemble_chip_callables(compiled: DistributedCompiledProgram) -> tuple[dict[str, Any], str]:
+    """Build a ChipCallable for each chip-level task under ``next_levels/{name}/``."""
     from pypto.pypto_core.ir import FunctionType  # noqa: PLC0415
+    from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
     chip_callables: dict[str, Any] = {}
     runtime_name = "tensormap_and_ringbuffer"
-    next_levels_dir = output_dir / "next_levels"
+    next_levels_dir = compiled.output_dir / "next_levels"
     for func in compiled._program.functions.values():
         if func.func_type == FunctionType.Orchestration:
             chip_dir = next_levels_dir / func.name
@@ -247,8 +233,15 @@ def execute_distributed(  # noqa: PLR0912
 
     if not chip_callables:
         raise RuntimeError(f"No chip-level tasks found in {next_levels_dir}")
+    return chip_callables, runtime_name
 
-    # 2. Load the generated Python orchestration module
+
+def _load_orch_entry(output_dir: Path) -> tuple[Any, Any]:
+    """Load the generated ``host_orch.py`` and return ``(entry_fn, alloc_fn)``.
+
+    ``alloc_fn`` is the optional ``_alloc_intermediates(tensors)`` that
+    pre-allocates HOST-level scratch tensors (``None`` when absent).
+    """
     orch_path = output_dir / "orchestration" / "host_orch.py"
     if not orch_path.exists():
         raise FileNotFoundError(
@@ -256,7 +249,6 @@ def execute_distributed(  # noqa: PLR0912
         )
     orch_module = _load_generated_module(orch_path)
 
-    # Find the entry function in the generated module
     entry_fn = None
     for attr_name in ("entry", "host_orch"):
         entry_fn = getattr(orch_module, attr_name, None)
@@ -271,29 +263,12 @@ def execute_distributed(  # noqa: PLR0912
     if entry_fn is None:
         raise RuntimeError(f"No entry function found in {orch_path}")
 
-    # 3. Build tensor mapping from parameter names
-    param_infos, _, _ = compiled._get_metadata()
-    tensors: dict[str, torch.Tensor | DeviceTensor] = {}
-    for info, arg in zip(param_infos, coerced_args, strict=True):
-        if isinstance(arg, DeviceTensor):
-            # Worker-resident buffer: already on device, no pre-fork shared
-            # memory needed. The generated host_orch converts it to a
-            # ContinuousTensor(child_memory=True) via make_tensor_arg.
-            tensors[info.name] = arg
-            continue
-        if not arg.is_shared():
-            arg.share_memory_()
-        tensors[info.name] = arg
-
-    # 3b. Pre-fork: allocate HOST-level intermediate tensors so the POSIX
-    # shared-memory mappings exist before w.init() forks subworker /
-    # chip-worker child processes. Mappings created after fork are not
-    # visible to inherited children.
     alloc_fn = getattr(orch_module, "_alloc_intermediates", None)
-    if alloc_fn is not None:
-        alloc_fn(tensors)
+    return entry_fn, alloc_fn
 
-    # 4. Load SubWorker callables from sub_workers/*.py files
+
+def _load_sub_worker_fns(output_dir: Path) -> dict[str, Any]:
+    """Load SubWorker callables from ``sub_workers/*.py`` (keyed by file stem)."""
     sub_worker_fns: dict[str, Any] = {}
     sub_workers_dir = output_dir / "sub_workers"
     if sub_workers_dir.exists():
@@ -303,58 +278,108 @@ def execute_distributed(  # noqa: PLR0912
             fn = getattr(mod, fn_name, None)
             if fn is not None:
                 sub_worker_fns[fn_name] = fn
+    return sub_worker_fns
 
-    # 5. Build per-chip bootstrap configs from the AOT comm manifest emitted at
-    #    compile time (output_dir/orchestration/comm_manifest.json). Comm-less
-    #    programs (no CommGroup declared) skip the manifest entirely and the
-    #    runner stays on the existing comm-less Worker path.
+
+def _build_chip_bootstrap(
+    output_dir: Path, dc: DistributedConfig
+) -> tuple[list[Any] | None, str | None]:
+    """Build per-chip comm bootstrap configs from the AOT comm manifest.
+
+    Comm-less programs (no CommGroup declared) have no manifest and return
+    ``(None, None)``; the runner stays on the comm-less Worker path.
+    """
     manifest_path = output_dir / "orchestration" / COMM_MANIFEST_FILENAME
     manifest: dict[str, Any] | None = None
     try:
         with manifest_path.open("r", encoding="utf-8") as fh:
             manifest = json.load(fh)
     except FileNotFoundError:
-        pass
+        return None, None
 
-    chip_bootstrap_configs: list[Any] | None = None
-    rootinfo_path: str | None = None
-    if manifest is not None:
-        # ``mkstemp`` returns a unique, unpredictable path and atomically creates
-        # the file (mode 0o600) — safer than a PID-derived name, which is racy
-        # under PID recycling. The fd is closed immediately because HCCL only
-        # needs the path: comm bring-up overwrites the file on rank-0 and
-        # reads it on the other ranks.
-        rootinfo_fd, rootinfo_path = tempfile.mkstemp(prefix="pypto_distributed_rootinfo_", suffix=".bin")
-        os.close(rootinfo_fd)
-        chip_bootstrap_configs = _build_chip_bootstrap_configs_from_manifest(manifest, dc, rootinfo_path)
+    # ``mkstemp`` returns a unique, unpredictable path and atomically creates
+    # the file (mode 0o600) — safer than a PID-derived name, which is racy under
+    # PID recycling. The fd is closed immediately because HCCL only needs the
+    # path: comm bring-up overwrites the file on rank-0 and reads it elsewhere.
+    rootinfo_fd, rootinfo_path = tempfile.mkstemp(prefix="pypto_distributed_rootinfo_", suffix=".bin")
+    os.close(rootinfo_fd)
+    chip_bootstrap_configs = _build_chip_bootstrap_configs_from_manifest(manifest, dc, rootinfo_path)
+    return chip_bootstrap_configs, rootinfo_path
 
-    num_sub = max(dc.num_sub_workers, len(sub_worker_fns))
-    w = Worker(
+
+def _construct_worker(
+    dc: DistributedConfig,
+    platform: str,
+    runtime_name: str,
+    chip_bootstrap_configs: list[Any] | None,
+    num_sub: int,
+) -> Any:
+    """Construct a simpler ``Worker(level=3)`` from the distributed config."""
+    from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        Worker,
+    )
+
+    return Worker(
         level=3,
         device_ids=dc.device_ids,
         num_sub_workers=num_sub,
-        platform=compiled.platform,
+        platform=platform,
         runtime=runtime_name,
         chip_bootstrap_configs=chip_bootstrap_configs,
     )
 
-    # 6. Register SubWorker callables and ChipCallables. Both must happen
-    # before w.init() so the L3 fork inherits the registry via COW (see
-    # runtime PR #710); the emitted host_orch.py then dispatches via cids
-    # — `orch.submit_sub(sub_ids[name], …)` and
-    # `orch.submit_next_level(callables[name], …)` — both indexing into
-    # name→cid dicts.
-    sub_ids: dict[str, int] = {}
-    for name, fn in sub_worker_fns.items():
-        sub_ids[name] = w.register(fn)
 
-    chip_cids: dict[str, int] = {}
-    for name, chip_callable in chip_callables.items():
-        chip_cids[name] = w.register(chip_callable)
+def _register_callables(
+    w: Any, sub_worker_fns: dict[str, Any], chip_callables: dict[str, Any]
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Register SubWorker + Chip callables before ``w.init()``.
 
-    w.init()
+    Both must happen before ``w.init()`` so the L3 fork inherits the registry
+    via COW (runtime PR #710); the emitted host_orch then dispatches via cids —
+    ``orch.submit_sub(sub_ids[name], …)`` / ``orch.submit_next_level(callables[name], …)``.
+    """
+    sub_ids: dict[str, int] = {name: w.register(fn) for name, fn in sub_worker_fns.items()}
+    chip_cids: dict[str, int] = {name: w.register(cc) for name, cc in chip_callables.items()}
+    return sub_ids, chip_cids
 
-    # 7. Build the orchestration closure and execute
+
+def _make_call_config(dc: DistributedConfig) -> Any:
+    """Build a simpler ``CallConfig`` from the distributed config."""
+    from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        CallConfig,
+    )
+
+    call_config = CallConfig()
+    call_config.block_dim = dc.block_dim
+    call_config.aicpu_thread_num = dc.aicpu_thread_num
+    return call_config
+
+
+def _is_continuous_tensor(arg: Any) -> bool:
+    """True if *arg* is a simpler ``ContinuousTensor``.
+
+    Returns ``False`` (rather than raising) when simpler is unavailable, so the
+    DeviceTensor-only path stays importable without the runtime package.
+    """
+    try:
+        from .task_interface import (  # noqa: PLC0415
+            ContinuousTensor,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+    except ImportError:
+        return False
+    return isinstance(arg, ContinuousTensor)
+
+
+def _dispatch(
+    w: Any,
+    entry_fn: Any,
+    tensors: dict[str, Any],
+    chip_cids: dict[str, int],
+    sub_ids: dict[str, int],
+    call_config: Any,
+) -> None:
+    """Build the orchestration closure and run it once on ``w``."""
+    # Fresh _keep per dispatch: it pins per-call TaskArgs alive for the run.
     _keep: list[Any] = []
 
     # Codegen always emits ``contexts`` in the entry signature; comm-less programs
@@ -377,12 +402,61 @@ def execute_distributed(  # noqa: PLR0912
             contexts=contexts,
         )
 
-    call_config = CallConfig()
-    call_config.block_dim = dc.block_dim
-    call_config.aicpu_thread_num = dc.aicpu_thread_num
+    w.run(orch_fn)
+
+
+def execute_distributed(
+    compiled: DistributedCompiledProgram,
+    coerced_args: list[torch.Tensor | DeviceTensor],
+    config: Any = None,
+) -> None:
+    """Execute a distributed compiled program once via simpler Worker(level=3).
+
+    One-shot path: runs the full setup, dispatches once, then tears the Worker
+    down. Supports host ``torch.Tensor`` inputs (placed in shared memory before
+    the fork). For repeated dispatch with device-resident inputs, prefer
+    :meth:`DistributedCompiledProgram.prepare` → :class:`DistributedRuntime`.
+
+    Args:
+        compiled: The DistributedCompiledProgram instance.
+        coerced_args: Coerced arguments — host ``torch.Tensor`` or
+            worker-resident :class:`~pypto.runtime.DeviceTensor`.
+        config: Optional run configuration (unused for now).
+    """
+    dc = compiled._distributed_config
+    output_dir = compiled.output_dir
+
+    chip_callables, runtime_name = _assemble_chip_callables(compiled)
+    entry_fn, alloc_fn = _load_orch_entry(output_dir)
+
+    # Build tensor mapping from parameter names. Host torch.Tensor inputs must
+    # be in shared memory before the fork; DeviceTensor inputs are device
+    # pointers forwarded at submit time and need no pre-fork shared memory.
+    param_infos, _, _ = compiled._get_metadata()
+    tensors: dict[str, torch.Tensor | DeviceTensor] = {}
+    for info, arg in zip(param_infos, coerced_args, strict=True):
+        if isinstance(arg, DeviceTensor):
+            tensors[info.name] = arg
+            continue
+        if not arg.is_shared():
+            arg.share_memory_()
+        tensors[info.name] = arg
+
+    # Pre-fork: allocate HOST-level intermediate tensors so the POSIX
+    # shared-memory mappings exist before w.init() forks child processes.
+    if alloc_fn is not None:
+        alloc_fn(tensors)
+
+    sub_worker_fns = _load_sub_worker_fns(output_dir)
+    chip_bootstrap_configs, rootinfo_path = _build_chip_bootstrap(output_dir, dc)
+
+    num_sub = max(dc.num_sub_workers, len(sub_worker_fns))
+    w = _construct_worker(dc, compiled.platform, runtime_name, chip_bootstrap_configs, num_sub)
+    sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
+    w.init()
 
     try:
-        w.run(orch_fn)
+        _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, _make_call_config(dc))
     finally:
         w.close()
         if rootinfo_path is not None:
@@ -390,3 +464,268 @@ def execute_distributed(  # noqa: PLR0912
                 os.unlink(rootinfo_path)
             except FileNotFoundError:
                 pass
+
+
+class DistributedRuntime:
+    """Reusable L3 execution handle: prepare once, dispatch many.
+
+    Holds an initialized simpler ``Worker(level=3)`` plus all setup artifacts
+    (chip callables, host_orch entry, sub-worker fns, comm bootstrap) so the
+    expensive setup — ``compile_and_assemble``, generated-module loading, Worker
+    construction + registration + ``init()`` (fork) — happens exactly once.
+
+    Mirrors the L2 ``with Worker(...)`` reuse block: it exposes device-memory
+    helpers (:meth:`malloc`, :meth:`copy_to`, :meth:`copy_from`, :meth:`free`,
+    :meth:`alloc_tensor`) so callers can build worker-resident
+    :class:`~pypto.runtime.DeviceTensor` buffers that survive across dispatches,
+    then call ``rt(*device_args)`` repeatedly.
+
+    Per-call IO buffers (inputs **and** outputs) are shared-memory host
+    ``torch.Tensor`` objects allocated **before** :meth:`prepare` and reused in
+    place across dispatches — the forked chip worker reads/writes them through
+    the inherited shared mapping, and outputs are read straight back from the
+    tensor (no ``copy_from``). Large static weights are uploaded once to a
+    worker-resident :class:`~pypto.runtime.DeviceTensor` via :meth:`alloc_tensor`
+    (its ``init`` source must likewise be a pre-``prepare`` shared tensor) and
+    mixed in. This mirrors the runtime's ``child_memory`` example.
+
+    Obtain via :meth:`DistributedCompiledProgram.prepare`. Use as a context
+    manager (recommended) or call :meth:`close` when done::
+
+        host_x = torch.zeros(seq, 4096, dtype=torch.float16).share_memory_()
+        host_out = torch.zeros(seq, 4096, dtype=torch.float16).share_memory_()
+        host_w = load_weight().share_memory_()      # before prepare()
+        with compiled.prepare() as rt:
+            weight = rt.alloc_tensor(host_w.shape, host_w.dtype, init=host_w)
+            for step in steps:
+                host_x.copy_(next_input(step))      # update in place
+                rt(host_x, weight, host_out)        # host shm IO + resident weight
+                consume(host_out)                   # read directly
+            rt.free_tensor(weight)
+    """
+
+    __test__ = False
+
+    def __init__(self, compiled: DistributedCompiledProgram, config: Any = None) -> None:
+        del config  # reserved for future per-runtime overrides
+        dc = compiled._distributed_config
+        self._chip_callables, runtime_name = _assemble_chip_callables(compiled)
+        self._entry_fn, alloc_fn = _load_orch_entry(compiled.output_dir)
+        sub_worker_fns = _load_sub_worker_fns(compiled.output_dir)
+        chip_bootstrap_configs, self._rootinfo_path = _build_chip_bootstrap(compiled.output_dir, dc)
+
+        num_sub = max(dc.num_sub_workers, len(sub_worker_fns))
+        self._w = _construct_worker(dc, compiled.platform, runtime_name, chip_bootstrap_configs, num_sub)
+        self._sub_ids, self._chip_cids = _register_callables(self._w, sub_worker_fns, self._chip_callables)
+
+        # Allocate HOST-level intermediate scratch tensors ONCE, before init()
+        # forks. They are reused (by name) across every dispatch; per-call
+        # inputs are merged on top in __call__.
+        self._base_tensors: dict[str, Any] = {}
+        if alloc_fn is not None:
+            alloc_fn(self._base_tensors)
+
+        self._w.init()
+
+        # Fork the chip/sub workers now (rather than lazily on the first
+        # ``run()``) so the device-memory API — ``malloc`` / ``copy_to`` /
+        # ``alloc_tensor`` — is usable before the first dispatch: those route
+        # through the orchestrator, which only exists after the hierarchy is
+        # started. ``_start_hierarchical`` is idempotent and is the same fork
+        # the first ``run()`` would trigger; the comm path already runs it from
+        # ``init()``. Intermediates are allocated above (pre-fork) so forked
+        # children inherit their shared-memory mappings.
+        self._w._start_hierarchical()
+
+        self._call_config = _make_call_config(dc)
+        # Cache param metadata once: the dispatch contract is "setup once, run
+        # many", so re-extracting it on every __call__ would be wasted work.
+        self._param_infos, _, _ = compiled._get_metadata()
+        self._closed = False
+
+    # ------------------------------------------------------------------
+    # Device memory primitives
+    #
+    # Routed through the simpler Orchestrator facade (``Worker._orch``) rather
+    # than ``Worker.malloc`` etc.: the level>=3 branch of those wrappers calls
+    # ``self._orch._impl.<op>(...)``, but the orchestrator's C++ handle lives on
+    # ``_o`` (no ``_impl``), so ``Worker.malloc`` raises ``AttributeError``. The
+    # facade methods (``malloc(worker_id, size)`` etc.) are the working path the
+    # generated host_orch and runtime examples use. ``_orch`` exists because
+    # __init__ starts the hierarchy eagerly.
+    # ------------------------------------------------------------------
+
+    def _orch(self) -> Any:
+        orch = getattr(self._w, "_orch", None)
+        if orch is None:
+            raise RuntimeError(
+                "DistributedRuntime worker has no active orchestrator; the chip "
+                "hierarchy was not started."
+            )
+        return orch
+
+    def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
+        """Allocate ``nbytes`` on chip *worker_id*; returns a device pointer."""
+        self._require_open("malloc")
+        return int(self._orch().malloc(worker_id, nbytes))
+
+    def free(self, ptr: int, *, worker_id: int = 0) -> None:
+        """Release a pointer previously returned by :meth:`malloc`."""
+        self._require_open("free")
+        self._orch().free(worker_id, ptr)
+
+    def copy_to(self, dst_dev_ptr: int, src_host_ptr: int, nbytes: int, *, worker_id: int = 0) -> None:
+        """H2D copy: ``nbytes`` from host *src_host_ptr* to device *dst_dev_ptr*."""
+        self._require_open("copy_to")
+        self._orch().copy_to(worker_id, dst_dev_ptr, src_host_ptr, nbytes)
+
+    def copy_from(self, dst_host_ptr: int, src_dev_ptr: int, nbytes: int, *, worker_id: int = 0) -> None:
+        """D2H copy: ``nbytes`` from device *src_dev_ptr* back to host *dst_host_ptr*."""
+        self._require_open("copy_from")
+        self._orch().copy_from(worker_id, dst_host_ptr, src_dev_ptr, nbytes)
+
+    def alloc_tensor(
+        self,
+        shape: Sequence[int],
+        dtype: torch.dtype,
+        *,
+        init: torch.Tensor | None = None,
+        worker_id: int = 0,
+    ) -> DeviceTensor:
+        """Allocate a worker-resident buffer and (optionally) upload host data.
+
+        Returns a :class:`~pypto.runtime.DeviceTensor` valid for this runtime's
+        Worker until :meth:`free_tensor` or :meth:`close`.
+
+        The upload (``copy_to``) runs **inside the forked chip worker**, so when
+        *init* is given it must be a CPU, contiguous, shared-memory tensor
+        allocated **before** :meth:`DistributedCompiledProgram.prepare` (call
+        ``.share_memory_()``) — only then does the chip child inherit the host
+        mapping and read the right bytes. Unlike the L2 ``Worker.alloc_tensor``
+        we cannot make a defensive ``.cpu().contiguous()`` copy here: that copy
+        would live only in the parent and be invisible to the child.
+        """
+        self._require_open("alloc_tensor")
+        if worker_id != 0:
+            raise ValueError(
+                "DistributedRuntime.alloc_tensor currently only supports worker_id=0. "
+                "Use malloc/copy_to directly if you need a different chip worker."
+            )
+        shape_t = tuple(int(d) for d in shape)
+        if any(d < 0 for d in shape_t):
+            raise ValueError(f"shape must contain only non-negative dimensions, got {shape_t}")
+        n_elems = 1
+        for d in shape_t:
+            n_elems *= d
+        nbytes = n_elems * torch.tensor([], dtype=dtype).element_size()
+        ptr = self.malloc(nbytes, worker_id=worker_id)
+        try:
+            if init is not None:
+                if init.dtype != dtype or tuple(init.shape) != shape_t:
+                    raise ValueError(
+                        f"init must have shape={shape_t} dtype={dtype}, "
+                        f"got shape={tuple(init.shape)} dtype={init.dtype}"
+                    )
+                if not (init.is_shared() and init.is_contiguous() and init.device.type == "cpu"):
+                    raise ValueError(
+                        "DistributedRuntime.alloc_tensor(init=...) requires a CPU, contiguous, "
+                        "shared-memory tensor allocated BEFORE prepare() (call .share_memory_()). "
+                        "The upload runs in the forked chip worker, which can only read host "
+                        "memory it inherited at fork."
+                    )
+                self.copy_to(ptr, init.data_ptr(), nbytes, worker_id=worker_id)
+            return DeviceTensor(ptr, shape_t, dtype)
+        except Exception:
+            self.free(ptr, worker_id=worker_id)
+            raise
+
+    def free_tensor(self, t: DeviceTensor, *, worker_id: int = 0) -> None:
+        """Release a buffer previously returned by :meth:`alloc_tensor`."""
+        if worker_id != 0:
+            raise ValueError(
+                "DistributedRuntime.free_tensor currently only supports worker_id=0. "
+                "Use free directly if you need a different chip worker."
+            )
+        self.free(t.data_ptr, worker_id=worker_id)
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    def __call__(self, *args: Any, config: Any = None) -> None:
+        """Dispatch one run on the held Worker, reusing all setup.
+
+        Pass one argument per program parameter (in-place). Each argument is
+        either:
+
+        - a **shared-memory** host ``torch.Tensor`` (call ``.share_memory_()``
+          and allocate it **before** :meth:`prepare`, then reuse the same buffer
+          across dispatches, updating its contents in place). The forked chip
+          worker reads/writes it through the inherited shared mapping; read
+          outputs back directly from the tensor — no ``copy_from`` needed.
+        - a worker-resident :class:`~pypto.runtime.DeviceTensor` (e.g. a static
+          weight from :meth:`alloc_tensor`) or a simpler ``ContinuousTensor``.
+
+        A non-shared ``torch.Tensor`` is rejected: a buffer allocated after the
+        fork is invisible to the chip worker.
+        """
+        del config  # reserved for future per-call overrides
+        self._require_open("__call__")
+        from pypto.ir.compiled_program import _validate_device_tensor  # noqa: PLC0415
+
+        param_infos = self._param_infos
+        n_params = len(param_infos)
+        if len(args) != n_params:
+            raise TypeError(
+                f"DistributedRuntime expects {n_params} arguments (in-place, one per parameter), "
+                f"got {len(args)}. Parameters: {[p.name for p in param_infos]}"
+            )
+
+        tensors: dict[str, Any] = dict(self._base_tensors)
+        for info, arg in zip(param_infos, args, strict=True):
+            if isinstance(arg, DeviceTensor):
+                _validate_device_tensor(arg, info)
+            elif isinstance(arg, torch.Tensor):
+                if not arg.is_shared():
+                    raise TypeError(
+                        f"Parameter {info.name!r}: a host torch.Tensor passed to a DistributedRuntime "
+                        f"must be shared memory allocated BEFORE prepare() (call .share_memory_() and "
+                        f"reuse the same buffer across dispatches), so the forked chip worker can see "
+                        f"it. Got a non-shared tensor."
+                    )
+            elif not _is_continuous_tensor(arg):
+                raise TypeError(
+                    f"DistributedRuntime parameter {info.name!r} got {type(arg).__name__}; expected a "
+                    f"shared-memory torch.Tensor, a worker-resident DeviceTensor, or a ContinuousTensor."
+                )
+            tensors[info.name] = arg
+
+        _dispatch(self._w, self._entry_fn, tensors, self._chip_cids, self._sub_ids, self._call_config)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def _require_open(self, op: str) -> None:
+        if self._closed:
+            raise RuntimeError(f"DistributedRuntime.{op}() called after close()")
+
+    def close(self) -> None:
+        """Release the Worker and comm rootinfo file. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._w.close()
+        finally:
+            if self._rootinfo_path is not None:
+                try:
+                    os.unlink(self._rootinfo_path)
+                except FileNotFoundError:
+                    pass
+
+    def __enter__(self) -> DistributedRuntime:
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()

@@ -28,7 +28,7 @@ read the data back must do so explicitly via
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -78,3 +78,59 @@ class DeviceTensor:
 
     def __repr__(self) -> str:
         return f"DeviceTensor(data_ptr=0x{self.data_ptr:x}, shape={self.shape}, dtype={self.dtype})"
+
+
+def alloc_device_tensor(
+    *,
+    malloc: Callable[[int], int],
+    copy_to: Callable[[int, int, int], None],
+    free: Callable[[int], None],
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    init: torch.Tensor | None = None,
+) -> DeviceTensor:
+    """Allocate a device buffer and (optionally) upload host data.
+
+    Shared by :meth:`pypto.runtime.Worker.alloc_tensor` (L2) and
+    :meth:`pypto.runtime.distributed_runner.DistributedRuntime.alloc_tensor`
+    (L3). The ``malloc`` / ``copy_to`` / ``free`` callables are injected with
+    any ``worker_id`` already bound, so this helper stays free of worker scope.
+
+    When *init* is provided its dtype and shape must match exactly; the tensor
+    is moved to CPU and made contiguous before upload. If any step after
+    ``malloc`` raises, the allocation is rolled back via ``free`` before the
+    exception propagates so callers never observe a leaked pointer.
+
+    Args:
+        malloc: ``malloc(nbytes) -> device_ptr``.
+        copy_to: ``copy_to(dst_dev_ptr, src_host_ptr, nbytes) -> None`` (H2D).
+        free: ``free(device_ptr) -> None`` (rollback on failure).
+        shape: Logical tensor shape (all dimensions positive).
+        dtype: Element ``torch.dtype``.
+        init: Optional host tensor to upload into the buffer.
+
+    Returns:
+        A :class:`DeviceTensor` referencing the allocated buffer.
+    """
+    shape_t = tuple(int(d) for d in shape)
+    if any(d < 0 for d in shape_t):
+        raise ValueError(f"shape must contain only non-negative dimensions, got {shape_t}")
+    n_elems = 1
+    for d in shape_t:
+        n_elems *= d
+    elem = torch.tensor([], dtype=dtype).element_size()
+    nbytes = n_elems * elem
+    ptr = malloc(nbytes)
+    try:
+        if init is not None:
+            if init.dtype != dtype or tuple(init.shape) != shape_t:
+                raise ValueError(
+                    f"init must have shape={shape_t} dtype={dtype}, "
+                    f"got shape={tuple(init.shape)} dtype={init.dtype}"
+                )
+            host = init.contiguous().cpu()
+            copy_to(ptr, host.data_ptr(), nbytes)
+        return DeviceTensor(ptr, shape_t, dtype)
+    except Exception:
+        free(ptr)
+        raise

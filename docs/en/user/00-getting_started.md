@@ -260,6 +260,40 @@ weight = DeviceTensor(dev_ptr, (1024, 4096), torch.float16)   # caller-managed b
 compiled(x, weight, out)                       # weight: no H2D/D2H copy
 ```
 
+#### Reusing setup across dispatches (`prepare()`)
+
+`compiled(*args)` runs the full distributed setup (per-chip assembly, Worker
+construction + fork) on every call. For a resident service that dispatches the
+same program many times (e.g. a generate loop), call `compiled.prepare()` once
+to get a `DistributedRuntime` handle that runs setup once and dispatches many
+times on the same Worker.
+
+Per-call IO buffers (inputs **and** outputs) are **shared-memory host tensors
+allocated before `prepare()`** and reused in place — the forked chip worker
+reads/writes them through the inherited mapping, so you read the output straight
+back from the tensor. Large static weights are uploaded once to a worker-resident
+`DeviceTensor` via `rt.alloc_tensor` (its `init` source must also be a pre-`prepare`
+shared tensor) and mixed in. A non-shared host tensor (or one allocated after
+`prepare()`) is rejected — the chip worker would not see it.
+
+```python
+compiled = ir.compile(MyDistributedProgram)
+
+# shared-memory host buffers — allocated BEFORE prepare()
+host_x = torch.zeros((seq, 4096), dtype=torch.float16).share_memory_()
+host_out = torch.zeros((seq, 4096), dtype=torch.float16).share_memory_()
+host_weight = load_weight().share_memory_()
+
+with compiled.prepare() as rt:                  # setup runs once
+    weight = rt.alloc_tensor(host_weight.shape, host_weight.dtype, init=host_weight)
+    for step in generate_steps:
+        host_x.copy_(next_input(step))          # refresh input in place
+        rt(host_x, weight, host_out)            # host shm IO + resident weight
+        consume(host_out)                       # read output directly
+    rt.free_tensor(weight)
+# rt.close() runs on exit
+```
+
 ## What's Next
 
 - **[Language Guide](01-language_guide.md)** — complete reference for types, operations, control flow, memory, and compilation

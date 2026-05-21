@@ -42,11 +42,8 @@ def make_tensor_arg(arg: Any) -> Any:
     # Imports are lazy: simpler is only available in the runtime environment,
     # and pypto must remain importable without it.
     from .device_tensor import DeviceTensor  # noqa: PLC0415
-    from .task_interface import (  # noqa: PLC0415
-        ContinuousTensor,
-        device_tensor_to_continuous,
-        make_tensor_arg as _impl,
-    )
+    from .task_interface import ContinuousTensor, device_tensor_to_continuous  # noqa: PLC0415
+    from .task_interface import make_tensor_arg as _impl  # noqa: PLC0415
 
     if isinstance(arg, ContinuousTensor):
         return arg

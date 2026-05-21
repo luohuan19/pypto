@@ -32,7 +32,7 @@ from typing import Any
 
 import torch
 
-from .device_tensor import DeviceTensor
+from .device_tensor import DeviceTensor, alloc_device_tensor
 from .runner import RunConfig
 
 # ``simpler`` is loaded lazily on first ``Worker(...)`` instantiation, matching
@@ -252,28 +252,14 @@ class Worker:
                 "Worker.alloc_tensor currently only supports worker_id=0. "
                 "Use malloc/copy_to directly if you need a different worker."
             )
-        shape_t = tuple(int(d) for d in shape)
-        if any(d < 0 for d in shape_t):
-            raise ValueError(f"shape must contain only non-negative dimensions, got {shape_t}")
-        n_elems = 1
-        for d in shape_t:
-            n_elems *= d
-        elem = torch.tensor([], dtype=dtype).element_size()
-        nbytes = n_elems * elem
-        ptr = self.malloc(nbytes, worker_id=worker_id)
-        try:
-            if init is not None:
-                if init.dtype != dtype or tuple(init.shape) != shape_t:
-                    raise ValueError(
-                        f"init must have shape={shape_t} dtype={dtype}, "
-                        f"got shape={tuple(init.shape)} dtype={init.dtype}"
-                    )
-                host = init.contiguous().cpu()
-                self.copy_to(ptr, host.data_ptr(), nbytes, worker_id=worker_id)
-            return DeviceTensor(ptr, shape_t, dtype)
-        except Exception:
-            self.free(ptr, worker_id=worker_id)
-            raise
+        return alloc_device_tensor(
+            malloc=lambda nbytes: self.malloc(nbytes, worker_id=worker_id),
+            copy_to=lambda dst, src, nbytes: self.copy_to(dst, src, nbytes, worker_id=worker_id),
+            free=lambda ptr: self.free(ptr, worker_id=worker_id),
+            shape=shape,
+            dtype=dtype,
+            init=init,
+        )
 
     def free_tensor(self, t: DeviceTensor, *, worker_id: int = 0) -> None:
         """Release a buffer previously returned by :meth:`alloc_tensor`."""

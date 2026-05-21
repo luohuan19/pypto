@@ -254,6 +254,36 @@ weight = DeviceTensor(dev_ptr, (1024, 4096), torch.float16)   # 调用方自管 
 compiled(x, weight, out)                       # weight：无 H2D/D2H 拷贝
 ```
 
+#### 跨多次 dispatch 复用 setup（`prepare()`）
+
+`compiled(*args)` 每次调用都会跑完整的分布式 setup（逐 chip 装配、构造 Worker 并 fork）。
+对反复 dispatch 同一程序的常驻服务（如 generate 循环），可调用一次 `compiled.prepare()` 得到
+一个 `DistributedRuntime` 句柄：setup 只做一次，多次 dispatch 复用同一个 Worker。
+
+per-call 的 IO buffer（输入**和**输出）是**在 `prepare()` 之前分配的共享内存 host 张量**，
+原地复用 —— fork 出的 chip worker 通过继承的映射读写它们，所以输出直接从该张量读回。大块静态
+权重则用 `rt.alloc_tensor` 一次性上传到 worker 常驻的 `DeviceTensor`（其 `init` 源同样必须是
+`prepare()` 之前共享的张量），混合传入。非共享的 host 张量（或 `prepare()` 之后才分配的）会被拒绝
+—— chip worker 看不到它。
+
+```python
+compiled = ir.compile(MyDistributedProgram)
+
+# 共享内存 host buffer —— 必须在 prepare() 之前分配
+host_x = torch.zeros((seq, 4096), dtype=torch.float16).share_memory_()
+host_out = torch.zeros((seq, 4096), dtype=torch.float16).share_memory_()
+host_weight = load_weight().share_memory_()
+
+with compiled.prepare() as rt:                  # setup 只跑一次
+    weight = rt.alloc_tensor(host_weight.shape, host_weight.dtype, init=host_weight)
+    for step in generate_steps:
+        host_x.copy_(next_input(step))          # 原地刷新输入
+        rt(host_x, weight, host_out)            # host shm IO + 常驻权重
+        consume(host_out)                       # 直接读输出
+    rt.free_tensor(weight)
+# 退出时自动 rt.close()
+```
+
 ## 下一步
 
 - **[语言指南](01-language_guide.md)** —— 类型、操作、控制流、内存和编译的完整参考
