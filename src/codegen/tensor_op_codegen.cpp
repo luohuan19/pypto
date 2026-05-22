@@ -229,19 +229,28 @@ REGISTER_ORCHESTRATION_OP(tensor_slice, ("tensor.slice")) {
   size_t ndim = shape_tuple->elements_.size();
   std::ostringstream oss;
 
-  // Generate shape array
-  oss << "uint32_t " << result_var << "_shapes[" << ndim << "] = {";
-  for (size_t i = 0; i < ndim; ++i) {
-    if (i > 0) oss << ", ";
-    oss << EmitAsUint32(shape_tuple->elements_[i], codegen);
-  }
-  oss << "};\n";
-
-  // Generate offset array
+  // Generate offset array (emitted first so the shape clamp below can read it).
   oss << "uint32_t " << result_var << "_offsets[" << ndim << "] = {";
   for (size_t i = 0; i < ndim; ++i) {
     if (i > 0) oss << ", ";
     oss << EmitAsUint32(offset_tuple->elements_[i], codegen);
+  }
+  oss << "};\n";
+
+  // Generate shape array, clamped to stay within the source tensor's extent.
+  // The #808 strided-Tensor runtime enforces ``offset[i] + shape[i] <= parent
+  // shapes[i]`` in ``Tensor::view`` and derives the dependency/extent footprint
+  // from start_offset + strides; an over-extent view corrupts host-side
+  // dependency tracking (scheduler timeout / device fault) rather than being a
+  // benign no-op as it was under the old (raw_shapes, offsets) model. The clamp
+  // is a no-op for in-bounds slices and only trims declared over-extent (e.g.
+  // a fixed unroll-width block_table slice near the buffer end); the trimmed
+  // tail is never the addressed region.
+  oss << "uint32_t " << result_var << "_shapes[" << ndim << "] = {";
+  for (size_t i = 0; i < ndim; ++i) {
+    if (i > 0) oss << ", ";
+    oss << "std::min<uint32_t>(" << EmitAsUint32(shape_tuple->elements_[i], codegen) << ", "
+        << ext_input_name << ".shapes[" << i << "] - " << result_var << "_offsets[" << i << "])";
   }
   oss << "};\n";
 
