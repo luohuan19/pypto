@@ -120,6 +120,24 @@ class GatherRank2LastDimProgram:
 
 
 @pl.program
+class GatherRank2LastDimTopLevelProgram:
+    """Same as ``GatherRank2LastDimProgram`` but uses the promoted top-level
+    ``pl.gather`` alias instead of ``pl.tensor.gather``."""
+
+    @pl.function(type=pl.FunctionType.Opaque)
+    def main(
+        self,
+        inp: pl.Tensor[[4, 16], pl.FP32],
+        idx: pl.Tensor[[4, 8], pl.INT32],
+        output: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
+    ) -> pl.Tensor[[4, 8], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            out = pl.gather(inp, dim=-1, index=idx)
+            output = pl.assemble(output, out, [0, 0])
+        return output
+
+
+@pl.program
 class GatherRank2SmallerLeadingProgram:
     """Rank-2 + dim=-1 with ``index.shape[0] (=2) < input.shape[0] (=4)``."""
 
@@ -214,6 +232,23 @@ class GatherMaskP0101Program:
     ) -> pl.Tensor[[8, 8], pl.FP32]:
         with pl.at(level=pl.Level.CORE_GROUP):
             out = pl.tensor.gather(inp, mask_pattern=pl.tile.MaskPattern.P0101)
+            output = pl.assemble(output, out, [0, 0])
+        return output
+
+
+@pl.program
+class GatherMaskP0101TopLevelProgram:
+    """Same as ``GatherMaskP0101Program`` but uses the promoted top-level
+    ``pl.gather`` alias (mask form) instead of ``pl.tensor.gather``."""
+
+    @pl.function(type=pl.FunctionType.Opaque)
+    def main(
+        self,
+        inp: pl.Tensor[[8, 16], pl.FP32],
+        output: pl.Out[pl.Tensor[[8, 8], pl.FP32]],
+    ) -> pl.Tensor[[8, 8], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            out = pl.gather(inp, mask_pattern=pl.tile.MaskPattern.P0101)
             output = pl.assemble(output, out, [0, 0])
         return output
 
@@ -330,6 +365,32 @@ class GatherRank2LastDimTestCase(_GatherBaseTestCase):
 
     def get_program(self) -> Any:
         return GatherRank2LastDimProgram
+
+    def compute_expected(self, tensors, params=None):
+        # torch.gather semantics: out[b, k] = inp[b, idx[b, k]]
+        inp = tensors["inp"]
+        idx = tensors["idx"].to(torch.int64)
+        tensors["output"][:] = torch.gather(inp, dim=-1, index=idx)
+
+
+class GatherRank2LastDimTopLevelTestCase(_GatherBaseTestCase):
+    def get_name(self) -> str:
+        return "gather_rank2_last_dim_toplevel"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("inp", [4, 16], DataType.FP32, init_value=torch.randn),
+            TensorSpec(
+                "idx",
+                [4, 8],
+                DataType.INT32,
+                init_value=lambda: _rand_indices(0, 16, (4, 8)),
+            ),
+            TensorSpec("output", [4, 8], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return GatherRank2LastDimTopLevelProgram
 
     def compute_expected(self, tensors, params=None):
         # torch.gather semantics: out[b, k] = inp[b, idx[b, k]]
@@ -459,6 +520,24 @@ class GatherMaskP0101TestCase(_GatherBaseTestCase):
         tensors["output"][:] = tensors["inp"][:, 0::2]
 
 
+class GatherMaskP0101TopLevelTestCase(_GatherBaseTestCase):
+    def get_name(self) -> str:
+        return "gather_mask_p0101_toplevel"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("inp", [8, 16], DataType.FP32, init_value=_make_gather_mask_src_8x16),
+            TensorSpec("output", [8, 8], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return GatherMaskP0101TopLevelProgram
+
+    def compute_expected(self, tensors, params=None):
+        # P0101 selects positions 0, 2, 4, ..., 14 of each row.
+        tensors["output"][:] = tensors["inp"][:, 0::2]
+
+
 class GatherMaskOutputDtypeTestCase(_GatherBaseTestCase):
     def get_name(self) -> str:
         return "gather_mask_output_dtype_uint32"
@@ -547,6 +626,12 @@ class TestGatherIndex:
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_gather_rank2_last_dim_toplevel(self, test_runner, platform):
+        """Top-level pl.gather alias (index form) matches pl.tensor.gather."""
+        result = test_runner.run(GatherRank2LastDimTopLevelTestCase(platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
     def test_gather_rank2_smaller_leading(self, test_runner, platform):
         result = test_runner.run(GatherRank2SmallerLeadingTestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
@@ -573,6 +658,12 @@ class TestGatherMask:
     @pytest.mark.parametrize("platform", PLATFORMS)
     def test_gather_mask_p0101(self, test_runner, platform):
         result = test_runner.run(GatherMaskP0101TestCase(platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_gather_mask_p0101_toplevel(self, test_runner, platform):
+        """Top-level pl.gather alias (mask form) matches pl.tensor.gather."""
+        result = test_runner.run(GatherMaskP0101TopLevelTestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)
