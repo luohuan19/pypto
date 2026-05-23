@@ -103,6 +103,13 @@ REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
 
 REGISTER_ORCHESTRATION_OP(tensor_read, ("tensor.read")) {
   // tensor.read(tensor, indices_tuple) -> scalar value
+  //
+  // Emit a call to the runtime's get_tensor_data<T>(tensor, ndims, indices).
+  // The runtime spin-waits on the producer task in TensorMap (for
+  // internally-allocated tensors) before reading, and reads immediately for
+  // external tensors with no producer entry. Using the API uniformly avoids
+  // both the missing producer-sync bug and the type-unsafe raw deref via
+  // buffer.addr that a direct static_cast<T*>(ptr)[idx] would imply.
   CHECK(op->args_.size() == 2) << "tensor.read requires 2 arguments";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
@@ -116,41 +123,29 @@ REGISTER_ORCHESTRATION_OP(tensor_read, ("tensor.read")) {
   std::string cpp_type = result_type->dtype_.ToCTypeString();
 
   std::string result_var = codegen.GetCurrentResultTarget();
-  std::string ptr_expr = codegen.GetTensorDataPtr(input_name);
+  std::string tensor_ref = codegen.GetExternalTensorName(input_name);
 
   // Extract indices from MakeTuple
   auto indices_tuple = As<MakeTuple>(op->args_[1]);
   CHECK(indices_tuple) << "tensor.read indices must be MakeTuple";
-
-  // Compute linear index
   const auto& indices = indices_tuple->elements_;
-  const auto& shape = input_type->shape_;
-
-  // Build linear index expression
-  std::ostringstream idx_oss;
-  for (size_t i = 0; i < indices.size(); ++i) {
-    if (i > 0) idx_oss << " + ";
-    idx_oss << codegen.GenerateExprString(indices[i]);
-    for (size_t j = i + 1; j < shape.size(); ++j) {
-      idx_oss << " * " << codegen.GenerateExprString(shape[j]);
-    }
-  }
-  // Default to "0" for rank-0 tensors (scalar tensor with empty shape/indices)
-  std::string idx_expr = idx_oss.str().empty() ? "0" : idx_oss.str();
-
-  // Check if the index expression is a simple constant (all digits)
-  bool is_simple = std::all_of(idx_expr.begin(), idx_expr.end(), ::isdigit);
+  size_t ndims = indices.size();
 
   std::ostringstream oss;
-  if (is_simple) {
-    // Inline constant index directly
-    oss << cpp_type << " " << result_var << " = static_cast<" << cpp_type << "*>(" << ptr_expr << ")["
-        << idx_expr << "];";
+  if (ndims == 0) {
+    // Rank-0 tensor: pass ndims=0 and a null index pointer.
+    oss << cpp_type << " " << result_var << " = get_tensor_data<" << cpp_type << ">(" << tensor_ref
+        << ", 0, nullptr);";
   } else {
-    // Use intermediate variable for complex index expressions
-    oss << "size_t idx_" << result_var << " = " << idx_expr << ";\n";
-    oss << cpp_type << " " << result_var << " = static_cast<" << cpp_type << "*>(" << ptr_expr << ")[idx_"
-        << result_var << "];";
+    std::string indices_var = "indices_" + result_var;
+    oss << "uint32_t " << indices_var << "[" << ndims << "] = {";
+    for (size_t i = 0; i < ndims; ++i) {
+      if (i > 0) oss << ", ";
+      oss << EmitAsUint32(indices[i], codegen);
+    }
+    oss << "};\n";
+    oss << cpp_type << " " << result_var << " = get_tensor_data<" << cpp_type << ">(" << tensor_ref << ", "
+        << ndims << ", " << indices_var << ");";
   }
 
   return oss.str();
@@ -158,6 +153,13 @@ REGISTER_ORCHESTRATION_OP(tensor_read, ("tensor.read")) {
 
 REGISTER_ORCHESTRATION_OP(tensor_write, ("tensor.write")) {
   // tensor.write(tensor, indices_tuple, value) -> write scalar value to tensor at indices
+  //
+  // Emit a call to the runtime's set_tensor_data<T>(tensor, ndims, indices, value).
+  // The runtime spin-waits on the producer task in TensorMap (and any
+  // tracked INOUT consumers) before writing, so cross-thread WAW/WAR
+  // hazards stay contained — same rationale as tensor.read using
+  // get_tensor_data<T>(). For external tensors with no TensorMap entry
+  // the write happens immediately (matches the previous raw store).
   CHECK(op->args_.size() == 3) << "tensor.write requires 3 arguments";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
@@ -166,7 +168,7 @@ REGISTER_ORCHESTRATION_OP(tensor_write, ("tensor.write")) {
   auto input_type = As<TensorType>(op->args_[0]->GetType());
   CHECK(input_type) << "tensor.write input must be TensorType";
 
-  std::string ptr_expr = codegen.GetTensorDataPtr(input_name);
+  std::string tensor_ref = codegen.GetExternalTensorName(input_name);
 
   auto indices_tuple = As<MakeTuple>(op->args_[1]);
   CHECK(indices_tuple) << "tensor.write indices must be MakeTuple";
@@ -176,31 +178,27 @@ REGISTER_ORCHESTRATION_OP(tensor_write, ("tensor.write")) {
   CHECK(value_type) << "tensor.write value must be ScalarType";
   std::string cpp_type = value_type->dtype_.ToCTypeString();
 
-  // Compute linear index
   const auto& indices = indices_tuple->elements_;
-  const auto& shape = input_type->shape_;
-
-  std::ostringstream idx_oss;
-  for (size_t i = 0; i < indices.size(); ++i) {
-    if (i > 0) idx_oss << " + ";
-    idx_oss << codegen.GenerateExprString(indices[i]);
-    for (size_t j = i + 1; j < shape.size(); ++j) {
-      idx_oss << " * " << codegen.GenerateExprString(shape[j]);
-    }
-  }
-  // Default to "0" for rank-0 tensors (scalar tensor with empty shape/indices)
-  std::string idx_expr = idx_oss.str().empty() ? "0" : idx_oss.str();
-
-  bool is_simple = std::all_of(idx_expr.begin(), idx_expr.end(), ::isdigit);
+  size_t ndims = indices.size();
 
   std::ostringstream oss;
-  if (is_simple) {
-    oss << "static_cast<" << cpp_type << "*>(" << ptr_expr << ")[" << idx_expr << "] = " << value_expr << ";";
+  if (ndims == 0) {
+    // Rank-0 tensor: pass ndims=0 and a null index pointer.
+    oss << "set_tensor_data<" << cpp_type << ">(" << tensor_ref << ", 0, nullptr, " << value_expr << ");";
   } else {
-    std::string result_var = codegen.GetCurrentResultTarget();
-    oss << "size_t idx_" << result_var << " = " << idx_expr << ";\n";
-    oss << "static_cast<" << cpp_type << "*>(" << ptr_expr << ")[idx_" << result_var << "] = " << value_expr
-        << ";";
+    // Wrap in a local block so the indices_<name>[N] temp lives in its own
+    // scope — multiple writes to the same tensor in the same outer scope
+    // (or across loop iterations) won't collide on the array name.
+    oss << "{\n";
+    oss << "  uint32_t indices_" << input_name << "[" << ndims << "] = {";
+    for (size_t i = 0; i < ndims; ++i) {
+      if (i > 0) oss << ", ";
+      oss << EmitAsUint32(indices[i], codegen);
+    }
+    oss << "};\n";
+    oss << "  set_tensor_data<" << cpp_type << ">(" << tensor_ref << ", " << ndims << ", indices_"
+        << input_name << ", " << value_expr << ");\n";
+    oss << "}";
   }
 
   return oss.str();
