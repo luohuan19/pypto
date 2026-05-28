@@ -2177,6 +2177,55 @@ class TestOrchestration:
             if ".dump(" in line:
                 assert "ext_b" not in line, f"Untagged ext_b should not be dumped: {line!r}"
 
+    def test_dump_per_call_emits_toggle_and_dump(self):
+        """``pl.dump(arg)`` (Layer 1, per-call) marks one arg slot of one task.
+
+        Demonstrates per-call granularity the per-tensor ``pl.dump_tag`` cannot
+        express: ``a`` is dumped on the first call only, never on the second,
+        and ``b`` is never dumped. Matched by Var identity, not name.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class DumpPerCallProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                b_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(b, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, b_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_per_call(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                c: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                c = self.kernel_add(pl.dump(a), b, c)  # dump a on task 0 only
+                d = self.kernel_add(a, b, d)  # task 1 dumps nothing
+                return d
+
+        code = _generate_orch_code(DumpPerCallProgram)
+
+        # Toggle emitted exactly once at orch entry.
+        assert code.count("enable_dump_tensor_selective();") == 1
+
+        # Only task 0 dumps, and only ext_a.
+        assert code.count("params_t0.dump(ext_a);") == 1
+        assert "params_t1.dump(" not in code
+        for line in code.split("\n"):
+            if ".dump(" in line:
+                assert "ext_b" not in line, f"Untagged ext_b should not be dumped: {line!r}"
+
     def test_no_dump_tag_emits_no_toggle_or_dump(self):
         """Without any ``pl.dump_tag`` the legacy full-dump path is preserved:
         no selective-mode toggle, no ``.dump(...)`` calls. The runtime's
@@ -2262,9 +2311,10 @@ class TestOrchestration:
 
     def test_dump_tag_inside_inline_function_propagates_to_caller(self):
         """``pl.dump_tag(<inline param>)`` written inside ``@pl.function(type=Inline)``
-        propagates to the caller orchestration after ``InlineFunctions``
-        merges callee attrs. Codegen then emits the toggle + per-task dump
-        for the matched inline parameter at the inlined call site.
+        desugars to ``dump_vars`` on the inline body's kernel calls; after
+        ``InlineFunctions`` splices the body in, the mutator substitutes the
+        caller's arg for the inline param, so the dump rides through to the
+        inlined call site. Codegen then emits the toggle + per-task dump.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -2317,10 +2367,10 @@ class TestOrchestration:
 
     def test_dump_tag_on_inline_body_local_var_after_freshname_rename(self):
         """``pl.create_tensor`` inside an inline function is alpha-renamed by
-        the inline pass (``FreshName`` appends ``_inline<N>``). The
-        ``GetCompatibleBaseName`` helper strips this suffix so the
-        ``dump_tag`` name match still succeeds against the user's chosen
-        base name after inlining.
+        the inline pass (``FreshName`` appends ``_inline<N>``) and versioned by
+        SSA. Because the dump target rides on the call's ``dump_vars`` (a Var
+        ref, not a name), it follows the rename / versioning automatically and
+        the dump is still emitted for the right slot after inlining.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -2368,11 +2418,10 @@ class TestOrchestration:
         code = _generate_orch_code(transformed)
 
         assert "enable_dump_tensor_selective();" in code
-        # The dump call references the FreshName-renamed local (e.g. ``tmp_inline0``);
-        # ``GetCompatibleBaseName`` strips the ``_inline<N>`` suffix back to ``tmp``
-        # for the allowlist match. Both kernel calls consume the renamed local
-        # (once as output, once as input), so at least one ``.dump(tmp...);`` line
-        # must appear.
+        # The dump rides on the call's ``dump_vars`` Var ref, which follows the
+        # FreshName rename (e.g. ``tmp_inline0``) and SSA versioning, so the
+        # emitted dump references the renamed local — at least one
+        # ``.dump(tmp...);`` line must appear.
         dump_lines = [line for line in code.split("\n") if ".dump(" in line]
         assert dump_lines, f"expected at least one dump call, got code:\n{code}"
         assert any("tmp" in line for line in dump_lines), (
@@ -2384,10 +2433,9 @@ class TestOrchestration:
         function survives several layers of inlining. Each ``InlineFunctions``
         pass iteration appends a fresh ``_inline<N>`` suffix to the Var name,
         so a Var that starts as ``tmp`` can land in the orch body as
-        ``tmp_inlineA_inlineB_inlineC``. ``GetCompatibleBaseName`` must loop
-        the strip until no more ``_inline<digits>`` tail remains; otherwise
-        the dump_tag allowlist would miss the match and the per-task dump
-        wouldn't emit.
+        ``tmp_inlineA_inlineB_inlineC``. Because the dump target is a Var ref on
+        the call's ``dump_vars`` (not a name), it follows every rename and the
+        per-task dump still emits for the right slot.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -2457,21 +2505,21 @@ class TestOrchestration:
         # The Var that started as ``tmp`` in ``inner`` is renamed at every
         # outer inlining step. Confirm we see at least one ``_inline``-
         # suffixed emit name in the generated code (sanity that the multi-
-        # level stack happened at all), then assert the dump emit picks it
-        # up via the looped suffix strip.
+        # level stack happened at all), then assert the dump emit picks it up
+        # via the Var ref riding through the renames.
         assert "_inline" in code, "expected at least one inline-renamed Var in the code"
         assert code.count("enable_dump_tensor_selective();") == 1
         dump_lines = [line for line in code.split("\n") if ".dump(" in line]
         assert dump_lines, f"expected dump calls after multi-level inline, got code:\n{code}"
         assert any("tmp" in line for line in dump_lines), (
-            f"stacked inline rename should still match base name 'tmp'; got: {dump_lines}"
+            f"stacked inline rename should still be dumped; got: {dump_lines}"
         )
 
     def test_dump_tag_two_level_inline_propagates(self):
-        """Two-level inlining (orch → middle → inner) merges
-        ``kAttrDumpTaggedNames`` up the chain via the InlineFunctions pass
-        fixpoint. The marker written inside the innermost inline takes
-        effect at the orchestration entry.
+        """Two-level inlining (orch → middle → inner): the ``dump_vars`` set
+        written inside the innermost inline rides on the spliced kernel calls
+        through each ``InlineFunctions`` fixpoint iteration, so the per-task
+        dump still emits at the orchestration entry.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)

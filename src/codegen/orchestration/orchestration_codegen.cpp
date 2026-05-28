@@ -271,8 +271,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
                                     int* next_id,
                                     std::unordered_map<const Var*, std::string> param_to_emit_name,
                                     std::set<std::string> param_name_set,
-                                    std::map<std::string, int> param_name_to_orch_index,
-                                    std::set<std::string> dump_tagged_names)
+                                    std::map<std::string, int> param_name_to_orch_index)
       : program_(prog),
         func_name_to_id_(func_ids),
         func_name_to_core_type_(core_types),
@@ -280,8 +279,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         next_func_id_(next_id),
         emit_name_map_(std::move(param_to_emit_name)),
         param_name_set_(std::move(param_name_set)),
-        param_name_to_orch_index_(std::move(param_name_to_orch_index)),
-        dump_tagged_names_(std::move(dump_tagged_names)) {
+        param_name_to_orch_index_(std::move(param_name_to_orch_index)) {
     declared_var_names_ = param_name_set_;
   }
 
@@ -334,15 +332,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
       return GetVarName(var);
     }
     return CodegenBase::TryGetVarName(expr);
-  }
-  /// Return the IR Var ``name_hint`` (stripped of SSA suffixes) for ``expr``,
-  /// or empty when ``expr`` is not Var-like. Distinct from ``TryGetVarName``,
-  /// which may route through ``emit_name_map_`` and return the ``ext_<n>``
-  /// emit-side prefix — ``pl.dump_tag(<name>)`` matches against the base
-  /// ``name_hint``, so dump filtering needs the un-prefixed form.
-  [[nodiscard]] std::string GetIrBaseName(const ir::ExprPtr& expr) const {
-    if (auto v = AsVarLike(expr)) return auto_name::GetCompatibleBaseName(v->name_hint_);
-    return "";
   }
   [[nodiscard]] std::string GetTensorShapeDim(const std::string& name, int64_t axis) const override {
     auto it = param_name_to_orch_index_.find(name);
@@ -1260,13 +1249,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
   struct ParamEntry {
     ArgDirection direction;
     std::string value;
-    /// IR Var base name (after ``GetSSABaseName``) when this entry originated
-    /// from a bound Var argument; empty for constants and runtime-synthesised
-    /// outputs. Used by the selective-dump filter to match orchestration-scope
-    /// names against ``pl.dump_tag(...)``-marked Vars — distinct from
-    /// ``value``, which may carry the ``ext_<name>`` prefix or a scalar
-    /// literal expression.
-    std::string var_name;
+    /// True when this arg's Var is listed in the Call's ``kAttrDumpVars`` set
+    /// (per-call ``pl.dump(arg)`` / ``pl.dump_tag`` selective dump). Set by
+    /// VarPtr identity in the param builders — no name comparison.
+    bool dump = false;
   };
 
   /// Build one ParamEntry from the call-site arg at `arg_idx`. Centralises the
@@ -1278,26 +1264,25 @@ class OrchestrationStmtCodegen : public CodegenBase {
     const auto& arg = call->args_[arg_idx];
     std::string var_name = TryGetVarName(arg);
     if (!var_name.empty()) {
-      std::string ir_base_name = GetIrBaseName(arg);
       if (auto scalar_type = As<ScalarType>(arg->GetType())) {
         std::string cpp_type = scalar_type->dtype_.ToCTypeString();
-        return {ArgDirection::Scalar, EncodeScalarVar(var_name, cpp_type), ir_base_name};
+        return {ArgDirection::Scalar, EncodeScalarVar(var_name, cpp_type)};
       }
       std::string ext_name = GetExternalTensorName(var_name);
-      return {call_arg_directions[arg_idx], ext_name, ir_base_name};
+      return {call_arg_directions[arg_idx], ext_name};
     }
     if (auto const_int = As<ConstInt>(arg)) {
       std::string cpp_type = const_int->dtype().ToCTypeString();
       std::string value = FormatConstIntValue(const_int, cpp_type);
-      return {ArgDirection::Scalar, "(uint64_t)" + value, ""};
+      return {ArgDirection::Scalar, "(uint64_t)" + value};
     }
     if (auto const_float = As<ConstFloat>(arg)) {
       std::string cpp_type = const_float->dtype().ToCTypeString();
       std::string value = FormatConstFloatValue(const_float, cpp_type);
-      return {ArgDirection::Scalar, EncodeScalarConst(value, cpp_type), ""};
+      return {ArgDirection::Scalar, EncodeScalarConst(value, cpp_type)};
     }
     if (auto const_bool = As<ConstBool>(arg)) {
-      return {ArgDirection::Scalar, const_bool->value_ ? "(uint64_t)1" : "(uint64_t)0", ""};
+      return {ArgDirection::Scalar, const_bool->value_ ? "(uint64_t)1" : "(uint64_t)0"};
     }
     INTERNAL_CHECK_SPAN(false, call->span_) << "Call to '" << callee_name << "' arg " << arg_idx
                                             << " is neither a variable nor a recognized constant literal "
@@ -1305,31 +1290,45 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return {};  // unreachable
   }
 
-  /// Filter a per-task ``params`` vector against ``dump_tagged_names_`` and
-  /// return the ``ParamEntry::value`` strings that should be passed to
-  /// ``Arg::dump(...)``. Scalar entries are never dumpable (the runtime
-  /// rejects them in ``Arg::dump``'s static_assert) and unbound / synthesised
-  /// entries (empty ``var_name``) have no Var to match — both are skipped.
+  /// Collect the set of arg Var pointers a Call marks for selective dump via
+  /// its ``kAttrDumpVars`` attr (``pl.dump(arg)`` / ``pl.dump_tag`` desugar).
+  /// Matched by VarPtr identity in ``BuildTaskParams`` — never by name.
+  std::set<const Var*> CollectDumpVarSet(const CallPtr& call) {
+    std::set<const Var*> out;
+    for (const auto& [k, v] : call->attrs_) {
+      if (k != kAttrDumpVars) continue;
+      if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&v)) {
+        for (const auto& var : *vars) {
+          if (var) out.insert(var.get());
+        }
+      }
+    }
+    return out;
+  }
+
+  /// Return the ``ParamEntry::value`` strings to pass to ``Arg::dump(...)``.
+  /// An entry is selected when its arg's Var was marked via ``kAttrDumpVars``
+  /// (``p.dump``, set by VarPtr identity in the param builders). Scalar entries
+  /// are never dumpable (the runtime rejects them in ``Arg::dump``'s
+  /// static_assert) and are skipped.
   ///
   /// Each match sets ``selective_dump_emitted_``, which the caller (top of
   /// ``GenerateOrchestration``) reads to decide whether to emit the global
   /// ``enable_dump_tensor_selective();`` toggle.
   std::vector<std::string> CollectSelectiveDumpValues(const std::vector<ParamEntry>& params) {
     std::vector<std::string> out;
-    if (dump_tagged_names_.empty()) return out;
     for (const auto& p : params) {
       if (p.direction == ArgDirection::Scalar) continue;
-      if (p.var_name.empty()) continue;
-      if (dump_tagged_names_.count(p.var_name) == 0) continue;
+      if (!p.dump) continue;
       out.push_back(p.value);
       selective_dump_emitted_ = true;
     }
     return out;
   }
 
-  /// Emit ``<task_var>.dump(v1, v2, ...);`` when any entries in ``params``
-  /// match ``dump_tagged_names_``. No-op when the set is empty (legacy
-  /// full-dump path) or none of the params are tagged.
+  /// Emit ``<task_var>.dump(v1, v2, ...);`` for the ``params`` entries marked
+  /// for selective dump (``kAttrDumpVars``). No-op when no param is marked
+  /// (legacy full-dump path is preserved).
   void EmitSelectiveDumpCall(const std::string& ind, const std::string& task_var,
                              const std::vector<ParamEntry>& params) {
     auto dump_vals = CollectSelectiveDumpValues(params);
@@ -1376,7 +1375,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     code_ << ind << "TensorCreateInfo " << ci_var << "(" << ci_var << "_shapes, " << ndim << ", "
           << GetRuntimeDataTypeString(tensor_ty->dtype_) << ");\n";
 
-    return {ArgDirection::Output, ci_var, ""};
+    return {ArgDirection::Output, ci_var};
   }
 
   // Map an IR ArgDirection to the runtime ArgDirection enum name used by the
@@ -1446,9 +1445,19 @@ class OrchestrationStmtCodegen : public CodegenBase {
     //     appends them at the tail of the callee signature, so we synth an
     //     add_output(TensorCreateInfo) entry for each. See
     //     `.claude/rules/pass-submit-awareness.md` §5.
+    // Per-call selective dump (``pl.dump(arg)`` / ``pl.dump_tag`` desugar):
+    // ``kAttrDumpVars`` lists the arg Vars to mark via ``Arg::dump``. Match by
+    // VarPtr identity against each arg — never by name.
+    std::set<const Var*> dump_var_set = CollectDumpVarSet(call);
+
     params.reserve(callee_func->params_.size());
     for (size_t arg_idx = 0; arg_idx < call->args_.size(); ++arg_idx) {
       params.push_back(BuildOneArgParam(call, callee_name, call_arg_directions, arg_idx));
+      if (!dump_var_set.empty()) {
+        if (auto v = AsVarLike(call->args_[arg_idx])) {
+          params.back().dump = dump_var_set.count(v.get()) > 0;
+        }
+      }
     }
     if (IsSubmitCall(call)) {
       INTERNAL_CHECK_SPAN(call->args_.size() <= callee_func->params_.size(), call->span_)
@@ -1565,6 +1574,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
         << outer_arg_directions.size() << " but args size " << outer_call->args_.size()
         << ". DeriveCallDirections must run before orchestration codegen.";
 
+    // Per-call selective dump rides on the outer Call's ``kAttrDumpVars``.
+    std::set<const Var*> dump_var_set = CollectDumpVarSet(outer_call);
+
     std::vector<ParamEntry> params;
     for (size_t inner_idx = 0; inner_idx < inner_call->args_.size(); ++inner_idx) {
       const auto& inner_arg = inner_call->args_[inner_idx];
@@ -1575,13 +1587,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
         if (auto const_int = As<ConstInt>(inner_arg)) {
           std::string cpp_type = const_int->dtype().ToCTypeString();
           std::string value = FormatConstIntValue(const_int, cpp_type);
-          params.push_back({ArgDirection::Scalar, "(uint64_t)" + value, ""});
+          params.push_back({ArgDirection::Scalar, "(uint64_t)" + value});
         } else if (auto const_float = As<ConstFloat>(inner_arg)) {
           std::string cpp_type = const_float->dtype().ToCTypeString();
           std::string value = FormatConstFloatValue(const_float, cpp_type);
-          params.push_back({ArgDirection::Scalar, EncodeScalarConst(value, cpp_type), ""});
+          params.push_back({ArgDirection::Scalar, EncodeScalarConst(value, cpp_type)});
         } else if (auto const_bool = As<ConstBool>(inner_arg)) {
-          params.push_back({ArgDirection::Scalar, const_bool->value_ ? "(uint64_t)1" : "(uint64_t)0", ""});
+          params.push_back({ArgDirection::Scalar, const_bool->value_ ? "(uint64_t)1" : "(uint64_t)0"});
         } else {
           INTERNAL_CHECK_SPAN(false, inner_call->span_) << "Internal error: inner call arg " << inner_idx
                                                         << " is neither a variable nor a recognized constant";
@@ -1604,27 +1616,30 @@ class OrchestrationStmtCodegen : public CodegenBase {
       size_t outer_idx = it->second;
       const auto& outer_arg = outer_call->args_[outer_idx];
       std::string var_name = TryGetVarName(outer_arg);
-      std::string ir_base_name = GetIrBaseName(outer_arg);
 
       if (!var_name.empty()) {
         if (auto scalar_type = As<ScalarType>(outer_arg->GetType())) {
           std::string cpp_type = scalar_type->dtype_.ToCTypeString();
-          params.push_back({ArgDirection::Scalar, EncodeScalarVar(var_name, cpp_type), ir_base_name});
+          params.push_back({ArgDirection::Scalar, EncodeScalarVar(var_name, cpp_type)});
           continue;
         }
 
         std::string ext_name = GetExternalTensorName(var_name);
-        params.push_back({outer_arg_directions[outer_idx], ext_name, ir_base_name});
+        bool is_dump = false;
+        if (!dump_var_set.empty()) {
+          if (auto v = AsVarLike(outer_arg)) is_dump = dump_var_set.count(v.get()) > 0;
+        }
+        params.push_back({outer_arg_directions[outer_idx], ext_name, is_dump});
       } else if (auto const_int = As<ConstInt>(outer_arg)) {
         std::string cpp_type = const_int->dtype().ToCTypeString();
         std::string value = FormatConstIntValue(const_int, cpp_type);
-        params.push_back({ArgDirection::Scalar, "(uint64_t)" + value, ""});
+        params.push_back({ArgDirection::Scalar, "(uint64_t)" + value});
       } else if (auto const_float = As<ConstFloat>(outer_arg)) {
         std::string cpp_type = const_float->dtype().ToCTypeString();
         std::string value = FormatConstFloatValue(const_float, cpp_type);
-        params.push_back({ArgDirection::Scalar, EncodeScalarConst(value, cpp_type), ""});
+        params.push_back({ArgDirection::Scalar, EncodeScalarConst(value, cpp_type)});
       } else if (auto const_bool = As<ConstBool>(outer_arg)) {
-        params.push_back({ArgDirection::Scalar, const_bool->value_ ? "(uint64_t)1" : "(uint64_t)0", ""});
+        params.push_back({ArgDirection::Scalar, const_bool->value_ ? "(uint64_t)1" : "(uint64_t)0"});
       } else {
         INTERNAL_CHECK_SPAN(false, outer_call->span_)
             << "Outer call to wrapper '" << wrapper_func->name_ << "' arg " << outer_idx
@@ -2768,12 +2783,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::set<std::string> declared_var_names_;
   std::set<std::string> param_name_set_;
   std::map<std::string, int> param_name_to_orch_index_;
-  /// Orchestration-scope Var base-names marked via ``pl.dump_tag(...)``.
-  /// Empty when the user did not request selective dump on this orch — in that
-  /// case we keep the legacy "every-task-every-tensor" dump behaviour. Filled
-  /// from ``Function::attrs_[kAttrDumpTaggedNames]`` by ``GenerateOrchestration``.
-  std::set<std::string> dump_tagged_names_;
-  /// Set the first time a per-task ``ParamEntry`` matches ``dump_tagged_names_``.
+  /// Set the first time a per-task ``ParamEntry`` is selected for ``Arg::dump``
+  /// (i.e. its arg's Var was marked via ``kAttrDumpVars``). Gates the global
+  /// ``enable_dump_tensor_selective()`` toggle.
   bool selective_dump_emitted_ = false;
   std::ostringstream code_;
   int indent_ = 4;
@@ -2921,21 +2933,9 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   std::ostringstream oss;
 
-  // Selective tensor dump (simpler#844): the user marks tensors with
-  // ``pl.dump_tag(t)`` at orchestration scope and the parser stashes the set of
-  // tagged Var name_hints on the Function's attrs under kAttrDumpTaggedNames as
-  // ``std::vector<std::string>``. Convert to a ``std::set<std::string>`` for the
-  // codegen's per-task O(log N) membership check.
-  std::set<std::string> dump_tagged_names;
-  if (func->HasAttr(kAttrDumpTaggedNames)) {
-    auto names = func->GetAttr<std::vector<std::string>>(kAttrDumpTaggedNames);
-    dump_tagged_names.insert(names.begin(), names.end());
-  }
-
   OrchestrationStmtCodegen stmt_codegen(program, &func_name_to_id, &func_name_to_core_type,
                                         &func_name_to_signature, &next_func_id, std::move(emit_name_map),
-                                        std::move(param_name_set), std::move(param_name_to_orch_index),
-                                        std::move(dump_tagged_names));
+                                        std::move(param_name_set), std::move(param_name_to_orch_index));
   stmt_codegen.SetCallTupleElements(info_collector.call_tuple_elements);
   stmt_codegen.SetCallToTupleKey(info_collector.call_to_tuple_key);
   stmt_codegen.SetTupleVarToKey(info_collector.tuple_var_to_key);

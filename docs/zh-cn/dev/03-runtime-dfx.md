@@ -63,41 +63,62 @@ pytest tests/st/runtime/ \
 `enable_dump_tensor=True` 会把每个 task 的每个绑定都写入 `tensor_dump/`。
 在大规模工作负载下，host 端 dump 收集器（约 42 MB/s 排空速率）会被打满，
 进而 AICPU 会被 STARS 算子执行超时机制杀掉 —— 1 GB 量级的 KV-cache 等
-大绑定填充队列的速度远快于排空速度。可以在 orchestration 作用域内用
-[`pl.dump_tag`](../../../python/pypto/language/op/tensor_ops.py) 标记
-只关注的张量，把 dump 范围收窄：
+大绑定填充队列的速度远快于排空速度。可以标记只关注的张量把 dump 范围
+收窄。提供两层 API，底层都由 runtime 的 `enable_dump_tensor_selective()`
+开关 + `Arg::dump(...)` API（simpler#844）支撑：
+
+**逐调用（`pl.dump(arg)`）** —— 在 kernel call 上包装某个参数，只 dump
+这一次 task 启动的这个参数槽（与 `Arg::dump` 一一对应）：
+
+```python
+out = self.qk_pv(pl.dump(q), k_cache, pl.dump(out))
+# codegen → params_t0.dump(ext_q, ext_out);
+```
+
+**逐张量（`pl.dump_tag(t)`）** —— 语法糖，desugar 成对每个**后续**消费
+该值的 call 加 `pl.dump`：
 
 ```python
 @pl.function(type=pl.FunctionType.Orchestration)
 def orch(self, q: pl.Tensor[...], k_cache: pl.Tensor[...], out: pl.Out[...]):
     pl.dump_tag(q)
     pl.dump_tag(out)
-    out = self.qk_pv(q, k_cache, out)
+    out = self.qk_pv(q, k_cache, out)   # q、out 被 dump；k_cache 被过滤掉
 ```
 
-标记对整段 orch 作用域生效 —— 同一个 orch 内所有消费 `q` 或 `out` 的
-kernel call 都会 dump 这两个张量；`k_cache` 则被过滤掉，不进入收集器
-队列。`enable_dump_tensor=False` 时该标记不起作用（dump 流水线整体关闭）。
-底层由 runtime 的 `enable_dump_tensor_selective()` 开关 +
-`Arg::dump(...)` API（simpler#844）支撑。
+dump 目标记录在消费 Call 的 `dump_vars` attr 上，以 **Var 身份**跟踪 ——
+而非名字。它像 `manual_dep_edges` 一样随 SSA、内联、codegen 流动，因此没有
+模糊名字匹配、没有误报。`enable_dump_tensor=False` 时两种形式都不起作用
+（dump 流水线整体关闭）。
 
 `pl.dump_tag` 同样可以写在 Inline helper（`@pl.jit.inline` /
-`FunctionType.Inline`）内。`InlineFunctions` pass 会在丢弃 inline
-function 之前，把被内联的 callee 的 tagged-name 列表合并到调用方
-orchestration 上，因此写在 inline 体内的标记可以在内联点生效。inline
-参数和 inline 体内的 `pl.create_tensor(...)` 结果都支持；多层内联
-（inline → inline → inline）也会在 pass 的 fixpoint 内被正确处理。
-合并机制详见 [`01-inline_functions.md`](passes/01-inline_functions.md#函数级属性合并)。
+`FunctionType.Inline`）内，对两种 kernel 调用风格都生效：
+
+- **显式 `self.kernel(...)` 派发** —— 标记在消费 Call 上 desugar 成
+  `dump_vars`；`InlineFunctions` pass 把该 call splice 进调用方，并把每个
+  inline 形参替换为调用方实参，因此写在 inline 形参或 inline 体内的
+  `pl.create_tensor(...)` 结果上的标记会在内联点生效。
+- **`@pl.jit` / 张量算子风格（`with pl.incore()`、`c = a + 1.0`）** ——
+  此时 kernel 派发由 outline pass *合成*，而非在 parse 阶段写出。标记改为
+  写入所在 scope 的 `dump_vars`（round-trip 成 `pl.at(..., dump_args=[...])`）；
+  写在内联调用点的标记先落在该 call 的 `dump_vars` 上，再由
+  `InlineFunctions` 转移到它 splice 进来的 scope 上。outliner 随后按 Var
+  身份把每个被 scope 捕获的 dump Var 翻译成合成派发的 `dump_vars` ——
+  与 `no_dep_args=` 走的 scope-attr → Call-attr 路径相同。scope 实际未作为
+  kernel 实参消费的标记会被静默丢弃。
+
+两种情况都无需任何 tag 迁移；多层内联在 pass 的 fixpoint 内被正确处理。
 
 ### 限制
 
 | 标记位置 / 目标 | 状态 |
 | --------------- | ---- |
-| 写在 Orchestration 或 Inline 函数体内的独立语句 | 支持。 |
-| 写在 kernel-call 参数位置（如 `self.k(pl.dump_tag(q))`） | **静默失效** —— DSL 包装是恒等函数，pre-scan 只收集语句位置的标记，因此该名字不会被标记，也不会报错。请单独写一行 `pl.dump_tag(q)`。 |
-| `pl.submit(...)` 的合成输出（隐式 `Out`） | 不支持 —— 合成输出没有源级 `Var` 名可供匹配。 |
+| `pl.dump(arg)` 写在 kernel-call 参数位置 | 支持（逐调用）。 |
+| `pl.dump_tag(t)` 写在 Orchestration 或 Inline 函数体内的独立语句 | 支持（逐张量语法糖）。 |
+| 标记被 outline 合成的派发消费（`@pl.jit` / `with pl.incore()` / 张量算子风格） | 支持 —— 标记随 scope 级 `dump_vars` 载体（`dump_args=`）传递，outliner 再把它映射到合成派发的实参上。 |
+| `pl.submit(...)` 的合成输出（隐式 `Out`） | 不支持 —— 合成输出没有调用点实参可包装。 |
 | HOST 层 Python `SubWorker` 张量 | 不支持 —— runtime 没有对应的 `Arg::dump` 接口。 |
-| `pl.reshape(x, ...)`（或任何产生新 view 的）rebind 之后 | rebind 出来的是**新 `Var`**，带新的 `name_hint`；前面的 `pl.dump_tag(x)` **不会**自动覆盖。若 kernel 消费的是 reshape 后的形式，需要对新名字再标一次（`y = pl.reshape(x, ...); pl.dump_tag(y)`）。 |
+| 对被标记的值重新赋值（如 `q = self.foo(q)`） | rebind 出来的是**新值**；前面的 `pl.dump_tag(q)` **不会**自动覆盖（以 Var 身份跟踪，而非名字）。若 kernel 消费的是新值，需要再标一次。 |
 
 ## 将 `deps.json` 渲染为 HTML
 

@@ -368,9 +368,25 @@ class _AtKwargState:
     # ScopeStmt.attrs[arg_direction_overrides_vars], and translated into
     # per-arg-index overrides by the outliner.
     no_dep_args_kw: "ast.keyword | None" = field(default=None)
+    # ``dump_args=[t1, t2]`` AST kept verbatim; resolved into outer-scope Var
+    # refs by the caller and written to ScopeStmt.attrs[dump_vars]. This is the
+    # round-trip surface for the scope-level selective-dump carrier: the printer
+    # emits it for any scope carrying ``kAttrDumpVars`` (seeded by ``pl.dump_tag``
+    # at parse and by the inline-call ``dump_vars`` transfer), and the outliner
+    # translates it into the synthesised dispatch's ``kAttrDumpVars``.
+    dump_args_kw: "ast.keyword | None" = field(default=None)
 
 
 _SPMD_SCOPE_NAME_SUFFIX = "_spmd"
+
+# ``pl.at()`` kwargs whose AST node is stashed verbatim on ``_AtKwargState`` for
+# later resolution (duplicate-checked, then resolved by ``_parse_at_meta``).
+# Maps the kwarg name to its ``_AtKwargState`` field.
+_AT_STASH_KWARGS = {
+    "deps": "deps_kw",
+    "no_dep_args": "no_dep_args_kw",
+    "dump_args": "dump_args_kw",
+}
 
 
 def _split_spmd_for_loop_name_hints(name_hint: str) -> tuple[str, str]:
@@ -463,6 +479,11 @@ class ASTParser:
         # Depth of nested ``with pl.manual_scope():`` blocks. Used to gate the
         # ``deps=[var]`` kwarg recognition on kernel calls.
         self._manual_scope_depth: int = 0
+
+        # Forward-sticky ``pl.dump_tag`` set (per function, reset at function
+        # entry). Holds the bound Vars whose subsequent kernel-call uses get a
+        # per-call ``dump_vars`` entry. See ``_handle_dump_tag``.
+        self._dump_tagged_vars: list[Any] = []
 
         # Inline function expansion state
         self._inline_mode = False
@@ -595,28 +616,18 @@ class ASTParser:
         # Enter function scope
         self.scope_manager.enter_scope("function")
 
-        # Pre-scan the body for ``pl.dump_tag(<Name>)`` statement-position
-        # markers (sticky selective tensor dump, simpler#844). The orchestration
-        # codegen needs the tagged-Var-name set as a Function attr before any
-        # task emit, so we collect it up-front and pass it as initial attrs.
-        # The in-body ``parse_evaluation_statement`` still intercepts the call
-        # to validate form and prevent EvalStmt emission. Two scopes accept
-        # the marker:
-        #   * Orchestration — codegen consumes the attr directly.
-        #   * Inline — InlineFunctions pass merges the inline's attr onto its
-        #     caller orchestration before the inline function is dropped (see
-        #     ``src/ir/transforms/inline_functions_pass.cpp::MergeDumpTaggedNames``).
-        # Any other function type rejects the marker at statement position
-        # (see ``_handle_dump_tag``), so the pre-scan is also restricted to
-        # these two scopes to keep the two paths in sync and avoid stashing
-        # an unread attr on AIV / AIC / Mix kernel bodies.
-        accepts_dump_tag = func_type in (ir.FunctionType.Orchestration, ir.FunctionType.Inline)
-        dump_tagged = (
-            self._collect_dump_tag_names(func_def.body) if (inline_body is None and accepts_dump_tag) else []
-        )
-        if dump_tagged:
-            func_attrs = dict(func_attrs or {})
-            func_attrs["dump_tagged_names"] = dump_tagged
+        # Forward-sticky selective tensor dump (simpler#844): a
+        # ``pl.dump_tag(t)`` statement (handled in ``_handle_dump_tag``) records
+        # the bound Var; every subsequent kernel call consuming that exact Var
+        # gets it merged into the call's ``dump_vars`` attr (the per-call
+        # ``pl.dump(arg)`` primitive). Tracked by Var identity — the scope
+        # manager returns a stable object per binding, so a later reassignment
+        # of the same name yields a new Var that is not tagged. Reset per
+        # function; populated only inside Orchestration / Inline bodies (other
+        # scopes reject the marker in ``_handle_dump_tag``). Inlining needs no
+        # special migration: ``dump_vars`` rides on the spliced Call nodes and
+        # the mutator substitutes the callee Var for the caller's arg.
+        self._dump_tagged_vars: list[Any] = []
 
         # Begin building function
         with self.builder.function(
@@ -2499,17 +2510,17 @@ class ASTParser:
     def _handle_dump_tag(self, stmt: ast.Expr) -> None:
         """Handle ``pl.dump_tag(<name>)`` at statement position.
 
-        Validates the scope (Orchestration / Inline only) and call shape. The
-        actual name is harvested by :meth:`_collect_dump_tag_names` during the
-        pre-pass before the function body is parsed, so no IR or attr mutation
-        happens here — the marker is consumed (no EvalStmt emitted).
+        ``pl.dump_tag(t)`` is the per-tensor sugar over the per-call
+        ``pl.dump(arg)`` primitive. It records the bound Var so that every
+        *subsequent* kernel call consuming that exact Var gets it merged into
+        the call's ``dump_vars`` attr (see :meth:`_parse_kernel_call`). No IR
+        statement is emitted; the marker is consumed here.
 
         ``FunctionType.Inline`` is accepted because the InlineFunctions pass
-        merges callee ``kAttrDumpTaggedNames`` onto the caller orchestration
-        before the inline function is dropped (see
-        ``src/ir/transforms/inline_functions_pass.cpp::MergeDumpTaggedNames``).
-        Markers inside ``@pl.jit.inline`` therefore reach the entry orch by
-        the time codegen reads them.
+        splices the inline body — including any ``dump_vars`` attrs on its
+        kernel calls — into the caller orchestration, with the mutator
+        substituting the callee Var for the caller's arg. No attr migration is
+        needed.
         """
         call = stmt.value
         assert isinstance(call, ast.Call)
@@ -2544,52 +2555,21 @@ class ASTParser:
                     "not supported."
                 ),
             )
-        # Pre-scan already captured this name into the enclosing function's
-        # attrs["dump_tagged_names"]; nothing more to do at the statement site.
-
-    @staticmethod
-    def _collect_dump_tag_names(body: list[ast.stmt]) -> list[str]:
-        """Walk the function body AST and collect names from every
-        ``pl.dump_tag(<Name>)`` statement, regardless of nesting depth.
-
-        Returns the names in source order with duplicates dropped. The
-        orchestration codegen reads this list off the Function's
-        ``attrs["dump_tagged_names"]`` and emits ``Arg::dump(...)`` for every
-        kernel-call arg whose IR Var name (after ``GetCompatibleBaseName``)
-        matches.
-
-        Cases that are *not* a valid dump_tag marker (call args at expression
-        position, attribute access on a non-``pl`` namespace, etc.) are simply
-        skipped here — the in-body interceptor surfaces precise errors when
-        the malformed form appears at statement position.
-        """
-        seen: set[str] = set()
-        ordered: list[str] = []
-
-        def visit(node: ast.AST) -> None:
-            if (
-                isinstance(node, ast.Expr)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute)
-                and node.value.func.attr == "dump_tag"
-                and isinstance(node.value.func.value, ast.Name)
-                and node.value.func.value.id == "pl"
-                and len(node.value.args) == 1
-                and not node.value.keywords
-                and isinstance(node.value.args[0], ast.Name)
-            ):
-                name = node.value.args[0].id
-                if name not in seen:
-                    seen.add(name)
-                    ordered.append(name)
-                # Don't descend further — the call has no nested DSL stmts.
-                return
-            for child in ast.iter_child_nodes(node):
-                visit(child)
-
-        for s in body:
-            visit(s)
-        return ordered
+        # Forward-sticky: record the bound Var so subsequent kernel calls that
+        # consume this exact Var add it to their ``dump_vars`` attr (see
+        # ``_parse_kernel_call``). The scope manager returns a stable object per
+        # binding, so identity matching is reliable and a later reassignment of
+        # the same name yields a new (untagged) Var.
+        name = call.args[0].id
+        var = self.scope_manager.lookup_var(name)
+        if var is None:
+            raise ParserSyntaxError(
+                f"pl.dump_tag() argument '{name}' is not defined at this point",
+                span=span,
+                hint="Tag a tensor only after it is bound (a parameter or an earlier assignment).",
+            )
+        if not any(var is t for t in self._dump_tagged_vars):
+            self._dump_tagged_vars.append(var)
 
     def _validate_while_call_args(self, while_call: ast.Call) -> None:
         """Validate that pl.while_() has no positional arguments."""
@@ -3002,20 +2982,8 @@ class ASTParser:
             self._handle_at_legacy_split_kw(kw, state)
         elif kw.arg == "name_hint":
             state.name_hint = self._parse_scope_name_hint(kw.value, "pl.at()")
-        elif kw.arg == "deps":
-            if state.deps_kw is not None:
-                raise ParserSyntaxError(
-                    "pl.at() got multiple values for argument 'deps'",
-                    span=self.span_tracker.get_span(kw),
-                )
-            state.deps_kw = kw
-        elif kw.arg == "no_dep_args":
-            if state.no_dep_args_kw is not None:
-                raise ParserSyntaxError(
-                    "pl.at() got multiple values for argument 'no_dep_args'",
-                    span=self.span_tracker.get_span(kw),
-                )
-            state.no_dep_args_kw = kw
+        elif kw.arg in _AT_STASH_KWARGS:
+            self._stash_at_kwarg(kw, state)
         elif kw.arg is None:
             raise ParserSyntaxError(
                 "Unsupported **kwargs in pl.at()",
@@ -3026,8 +2994,23 @@ class ASTParser:
             raise ParserSyntaxError(
                 f"Unknown keyword argument '{kw.arg}' in pl.at()",
                 span=self.span_tracker.get_span(kw),
-                hint="Supported arguments: level, role, optimizations, deps, no_dep_args, name_hint",
+                hint=(
+                    "Supported arguments: level, role, optimizations, deps, "
+                    "no_dep_args, dump_args, name_hint"
+                ),
             )
+
+    def _stash_at_kwarg(self, kw: ast.keyword, state: "_AtKwargState") -> None:
+        """Stash a verbatim-kept ``pl.at()`` kwarg (``deps`` / ``no_dep_args`` /
+        ``dump_args``) onto ``state``, rejecting a duplicate."""
+        assert kw.arg is not None  # caller dispatches here only for _AT_STASH_KWARGS keys
+        attr = _AT_STASH_KWARGS[kw.arg]
+        if getattr(state, attr) is not None:
+            raise ParserSyntaxError(
+                f"pl.at() got multiple values for argument '{kw.arg}'",
+                span=self.span_tracker.get_span(kw),
+            )
+        setattr(state, attr, kw)
 
     def _handle_at_optimizations_kw(self, kw: ast.keyword, state: "_AtKwargState") -> None:
         if state.new_optimizations_kw is not None:
@@ -3786,6 +3769,53 @@ class ASTParser:
                 # own for-loop variable-leaking semantics.
                 self.scope_manager.exit_scope(leak_vars=True)
 
+    def _merge_forward_sticky_dump(
+        self,
+        attrs: "list[tuple[str, Any]] | None",
+        scope_kind: "ir.ScopeKind",
+    ) -> "list[tuple[str, Any]] | None":
+        """Merge forward-sticky ``pl.dump_tag`` tensors into a scope's dump_vars attr.
+
+        The single injection point for the scope-level selective-dump carrier on
+        first parse — the ``dump_args=`` round-trip surface is handled separately
+        by :meth:`_parse_at_meta`. Both the ``pl.at`` and the legacy
+        ``pl.incore`` / ``pl.cluster`` paths route through
+        :meth:`_parse_scope_body`, so attaching here covers every scope kind that
+        becomes a kernel dispatch. Runtime scopes (``pl.manual_scope`` /
+        ``pl.auto_scope``) are skipped: they are not outlined into a dispatch, and
+        ``pl.submit`` inside a manual scope carries its own per-call ``dump_vars``.
+
+        Tags are captured at scope entry (forward-sticky), so they are bound
+        before the scope and live at its entry — exactly the SSA version the
+        synthesised dispatch receives as an arg. Entries the scope never consumes
+        are dropped later by the outliner. ``dump_vars`` is kept before
+        ``task_id_var`` so a print -> reparse (which rebuilds the canonical order
+        via :meth:`_parse_at_meta`) compares equal under structural_equal's
+        positional attr check.
+        """
+        if scope_kind == ir.ScopeKind.Runtime:
+            return attrs
+        tagged = [v for v in self._dump_tagged_vars if isinstance(v.type, ir.TensorType)]
+        if not tagged:
+            return attrs
+
+        new_attrs: list[tuple[str, Any]] = list(attrs) if attrs else []
+        for i, (k, v) in enumerate(new_attrs):
+            if k == "dump_vars":
+                merged = list(v)
+                seen = {id(x) for x in merged}
+                for t in tagged:
+                    if id(t) not in seen:
+                        merged.append(t)
+                        seen.add(id(t))
+                new_attrs[i] = ("dump_vars", merged)
+                return new_attrs
+        insert_at = next(
+            (i for i, (k, _) in enumerate(new_attrs) if k == "task_id_var"), len(new_attrs)
+        )
+        new_attrs.insert(insert_at, ("dump_vars", tagged))
+        return new_attrs
+
     def _parse_scope_body(  # noqa: PLR0913 — kwargs map 1:1 to ScopeStmt fields
         self,
         stmt: ast.With,
@@ -3802,6 +3832,7 @@ class ASTParser:
         attrs: "list[tuple[str, Any]] | None" = None,
     ) -> None:
         """Build a scope statement from a with-statement body."""
+        attrs = self._merge_forward_sticky_dump(attrs, scope_kind)
         with self.builder.scope(
             scope_kind,
             span,
@@ -3832,6 +3863,7 @@ class ASTParser:
         name_hint = state.name_hint
         deps_kw = state.deps_kw
         no_dep_args_kw = state.no_dep_args_kw
+        dump_args_kw = state.dump_args_kw
         assert level is not None  # _parse_at_kwargs raises if level is missing
         span = self.span_tracker.get_span(stmt)
 
@@ -3869,7 +3901,7 @@ class ASTParser:
         # an ``Array[N, TASK_ID]`` carry. ``with pl.at(...) as tid:`` binds a
         # fresh ``Scalar[TASK_ID]`` Var in the outer scope; the outliner
         # later wires it to ``TupleGetItem(call_lhs, last_idx)``.
-        scope_attrs = self._parse_at_meta(deps_kw, no_dep_args_kw, optional_vars, span)
+        scope_attrs = self._parse_at_meta(deps_kw, no_dep_args_kw, dump_args_kw, optional_vars, span)
 
         # ``with pl.at(...) as tid:`` allocates ``tid`` as an outer-scope Var
         # whose real definition is synthesised later by ``OutlineIncoreScopes``
@@ -3938,31 +3970,47 @@ class ASTParser:
         self,
         deps_kw: "ast.keyword | None",
         no_dep_args_kw: "ast.keyword | None",
+        dump_args_kw: "ast.keyword | None",
         optional_vars: "ast.expr | None",
         span: "ir.Span",
     ) -> "list[tuple[str, Any]] | None":
         """Build the ScopeStmt ``attrs`` list from a ``pl.at(...)`` ``deps=`` /
-        ``no_dep_args=`` kwarg pair and a ``with ... as <tid>:`` capture target.
+        ``no_dep_args=`` / ``dump_args=`` kwarg set and a ``with ... as <tid>:``
+        capture target.
 
         Returns ``None`` when none are present, leaving the scope's ``attrs_``
         empty (the typical plain ``pl.at(...)`` case). Otherwise returns a list
-        with up to three reserved keys:
+        with up to four reserved keys, always in this canonical order (so a
+        print -> reparse cycle reproduces it byte-for-byte; structural_equal
+        compares scope attrs positionally):
 
           * ``manual_dep_edges``: ``list[VarPtr]`` — same shape as the
             ``pl.submit(..., deps=)`` attr; consumed by codegen via
             ``Arg::set_dependencies``.
-          * ``task_id_var``: ``VarPtr`` — the outer-scope ``Scalar[TASK_ID]``
-            Var the outliner binds to the producer TaskId tuple element.
           * ``arg_direction_overrides_vars``: ``list[VarPtr]`` — outer-scope
             tensor Vars whose corresponding arg slots on the synthesised Call
             must be ``ArgDirection.NoDep``. The outliner translates this Var
             list into positional indices using the captured-var order and
             writes the result back as ``arg_direction_overrides`` on the Call.
+          * ``dump_vars``: ``list[VarPtr]`` — outer-scope tensor Vars to mark for
+            selective tensor dump. Seeded by ``pl.dump_tag`` (forward-sticky,
+            from :attr:`_dump_tagged_vars`) at parse and recovered from the
+            ``dump_args=`` kwarg on a print/reparse roundtrip. The outliner
+            translates this into the synthesised dispatch's ``kAttrDumpVars``.
+          * ``task_id_var``: ``VarPtr`` — the outer-scope ``Scalar[TASK_ID]``
+            Var the outliner binds to the producer TaskId tuple element.
 
         The ``tid`` Var is defined in the outer scope so subsequent statements
         (e.g. another ``pl.at(..., deps=[tid])``) can reference it.
         """
-        if deps_kw is None and no_dep_args_kw is None and optional_vars is None:
+        # ``dump_args=`` is the round-trip surface for the scope-level dump
+        # carrier. The forward-sticky ``pl.dump_tag`` seed is merged in later by
+        # :meth:`_parse_scope_body` (the single injection point shared by the
+        # ``pl.at`` and legacy ``pl.incore`` / ``pl.cluster`` paths), so it is
+        # not consulted here.
+        dump_vars: list[ir.Var] = self._parse_at_dump_args_kwarg(dump_args_kw) if dump_args_kw else []
+
+        if deps_kw is None and no_dep_args_kw is None and not dump_vars and optional_vars is None:
             return None
 
         attrs: list[tuple[str, Any]] = []
@@ -3971,15 +4019,18 @@ class ASTParser:
             dep_vars = self._parse_submit_deps_kwarg("pl.at()", [deps_kw], span)
             if dep_vars:
                 # Attr keys mirror the C++ ``kAttrManualDepEdges`` /
-                # ``kAttrTaskIdVar`` / ``kAttrArgDirOverrideVars`` constants
-                # (include/pypto/ir/expr.h); passed as raw strings since they
-                # are not exposed to Python.
+                # ``kAttrTaskIdVar`` / ``kAttrArgDirOverrideVars`` /
+                # ``kAttrDumpVars`` constants (include/pypto/ir/expr.h); passed
+                # as raw strings since they are not exposed to Python.
                 attrs.append(("manual_dep_edges", dep_vars))
 
         if no_dep_args_kw is not None:
             no_dep_vars = self._parse_at_no_dep_args_kwarg(no_dep_args_kw)
             if no_dep_vars:
                 attrs.append(("arg_direction_overrides_vars", no_dep_vars))
+
+        if dump_vars:
+            attrs.append(("dump_vars", dump_vars))
 
         if optional_vars is not None:
             if not isinstance(optional_vars, ast.Name):
@@ -4051,6 +4102,61 @@ class ASTParser:
                     f"pl.at(no_dep_args=[...]) lists '{elt.id}' more than once",
                     span=self.span_tracker.get_span(elt),
                     hint="Each tensor may appear at most once in `no_dep_args=`.",
+                )
+            seen.add(id(var))
+            resolved.append(var)
+        return resolved
+
+    def _parse_at_dump_args_kwarg(self, kw: "ast.keyword") -> list[ir.Var]:
+        """Resolve ``pl.at(dump_args=[t1, t2])`` entries to outer-scope tensor Vars.
+
+        Mirrors :meth:`_parse_at_no_dep_args_kwarg`: each entry must be a bare
+        Name resolving to a Tensor-typed Var. This kwarg is the round-trip
+        surface for the scope-level selective-dump carrier — the printer emits it
+        for any scope carrying ``kAttrDumpVars`` (seeded by ``pl.dump_tag`` /
+        ``pl.dump`` at parse and by the inline-call ``dump_vars`` transfer). The
+        outliner translates the returned Var list into the synthesised
+        dispatch's ``kAttrDumpVars`` by Var identity; entries the scope does not
+        actually capture are skipped there (no error), so unlike ``no_dep_args``
+        there is no capture requirement at parse.
+
+        Returns an empty list for ``dump_args=[]`` so callers treat it as a no-op.
+        """
+        if not isinstance(kw.value, (ast.List, ast.Tuple)):
+            raise ParserTypeError(
+                "pl.at(dump_args=...) must be a list literal of tensor names",
+                span=self.span_tracker.get_span(kw),
+                hint="Use `dump_args=[t1, t2]` with bare tensor names visible to the enclosing function.",
+            )
+
+        resolved: list[ir.Var] = []
+        seen: set[int] = set()
+        for elt in kw.value.elts:
+            if not isinstance(elt, ast.Name):
+                raise ParserTypeError(
+                    "pl.at(dump_args=[...]) entries must be bare tensor names",
+                    span=self.span_tracker.get_span(elt),
+                    hint="Use `dump_args=[t]` where `t` is a tensor variable visible "
+                    "to the enclosing function scope.",
+                )
+            var = self.scope_manager.lookup_var(elt.id)
+            if var is None:
+                raise ParserTypeError(
+                    f"pl.at(dump_args=[...]) references unknown name '{elt.id}'",
+                    span=self.span_tracker.get_span(elt),
+                    hint="Each entry must resolve to a tensor visible in the enclosing function scope.",
+                )
+            if not isinstance(var.type, ir.TensorType):
+                raise ParserTypeError(
+                    f"pl.at(dump_args=[...]) entry '{elt.id}' is not a tensor (got type {var.type})",
+                    span=self.span_tracker.get_span(elt),
+                    hint="Only tensors can be selectively dumped.",
+                )
+            if id(var) in seen:
+                raise ParserTypeError(
+                    f"pl.at(dump_args=[...]) lists '{elt.id}' more than once",
+                    span=self.span_tracker.get_span(elt),
+                    hint="Each tensor may appear at most once in `dump_args=`.",
                 )
             seen.add(id(var))
             resolved.append(var)
@@ -4814,10 +4920,29 @@ class ASTParser:
         # Parser/printer round-trip support for post-DeriveCallDirections IR.
         # User source should spell manual deps with pl.submit(..., deps=[...]).
         manual_dep_edges = self._extract_manual_dep_edges_from_attrs(method_name, keywords, span)
-        # Detect ``pl.no_dep(...)`` wrappers at call-arg positions and collect
-        # their indices for the arg_direction_overrides attr.
-        unwrapped_args, no_dep_indices = self._strip_no_dep_wrappers(arg_nodes)
+        # Detect ``pl.no_dep(...)`` / ``pl.dump(...)`` wrappers at call-arg
+        # positions and collect their indices for the arg_direction_overrides
+        # and dump_vars attrs respectively.
+        unwrapped_args, no_dep_indices, dump_indices = self._strip_call_arg_markers(arg_nodes)
         args = [self.parse_expression(arg) for arg in unwrapped_args]
+        # Validate that each explicit ``pl.dump(arg)`` wraps a tensor Var.
+        for i in dump_indices:
+            if not isinstance(args[i], ir.Var):
+                raise ParserSyntaxError(
+                    "pl.dump() argument must be a tensor variable",
+                    span=self.span_tracker.get_span(unwrapped_args[i]),
+                    hint="Write pl.dump(q) where q is a tensor argument of this kernel call.",
+                )
+        # Build the per-call selective-dump set in arg order: explicit
+        # ``pl.dump(arg)`` wrappers plus forward-sticky ``pl.dump_tag`` matches
+        # (by Var identity). Stored as ``attrs['dump_vars']`` (VarPtr list), so
+        # the dump target is tracked by Var through SSA / inline / codegen.
+        dump_index_set = set(dump_indices)
+        dump_vars: list[ir.Var] = []
+        for i, arg in enumerate(args):
+            tagged = any(arg is t for t in self._dump_tagged_vars)
+            if (i in dump_index_set or tagged) and isinstance(arg, ir.Var):
+                dump_vars.append(arg)
         # ``pl.submit`` parses the optional ``deps=[tid, ...]`` kwarg into a
         # list of TaskId Vars for the explicit-edge attr.
         user_dep_vars: list[ir.Var] = []
@@ -4849,6 +4974,7 @@ class ASTParser:
             span,
             arg_directions=arg_directions,
             no_dep_indices=no_dep_indices,
+            dump_vars=dump_vars,
             user_dep_vars=user_dep_vars,
             device_expr=device_expr,
             augment_task_id=as_submit,
@@ -5194,6 +5320,7 @@ class ASTParser:
         span: ir.Span,
         arg_directions: list[ir.ArgDirection] | None = None,
         no_dep_indices: list[int] | None = None,
+        dump_vars: list[ir.Var] | None = None,
         user_dep_vars: list[ir.Var] | None = None,
         device_expr: ir.Expr | None = None,
         augment_task_id: bool = False,
@@ -5218,6 +5345,11 @@ class ASTParser:
                 at the call site. Stored as ``attrs['arg_direction_overrides']`` so
                 ``DeriveCallDirections`` can overwrite the auto-derived direction at
                 each indicated slot to ``ArgDirection.NoDep``.
+            dump_vars: Optional list of argument Vars wrapped in ``pl.dump(...)``
+                (per-call selective tensor dump). Stored as ``attrs['dump_vars']``
+                (``vector<VarPtr>``); orchestration codegen marks each matching
+                ``Arg`` slot via ``Arg::dump(...)``. Tracked by Var identity so it
+                stays consistent with ``args_`` through SSA / inline / codegen.
             user_dep_vars: Optional list of TaskId Vars from a ``pl.submit(...)``
                 ``deps=[tid1, tid2]`` kwarg. Each entry is a
                 ``Scalar[TASK_ID]`` (from a prior ``_, tid = pl.submit(...)`` /
@@ -5250,8 +5382,15 @@ class ASTParser:
             return_type = ir.TupleType(return_types)
 
         attrs: dict[str, Any] | None = None
+        # dump_vars is written at parse time; arg_directions is appended later by
+        # DeriveCallDirections. Insert dump_vars first so a print -> reparse of a
+        # post-derive Call reproduces the canonical [dump_vars, arg_directions]
+        # attr order (structural_equal compares attrs positionally).
+        if dump_vars:
+            attrs = {"dump_vars": list(dump_vars)}
         if arg_directions:
-            attrs = {"arg_directions": list(arg_directions)}
+            attrs = attrs or {}
+            attrs["arg_directions"] = list(arg_directions)
         if no_dep_indices:
             attrs = attrs or {}
             attrs["arg_direction_overrides"] = list(no_dep_indices)
@@ -5306,52 +5445,80 @@ class ASTParser:
         return ir.Call(gvar, args, return_type, span)
 
     @staticmethod
-    def _strip_no_dep_wrappers(
+    def _match_call_arg_marker(node: ast.expr, name: str) -> ast.expr | None:
+        """Return the inner arg if *node* is a ``pl.<name>(arg)`` / ``<name>(arg)``
+        single-positional-arg marker call, else ``None``.
+
+        The match is intentionally tight — only the bare ``pl.<name>`` attribute
+        access (or a bare ``<name>`` import) with exactly one positional arg and
+        no keywords qualifies. ``obj.<name>(x)`` on a user-defined object is left
+        in place so the parser surfaces a normal-call error instead of silently
+        stripping the wrapper.
+        """
+        if (
+            isinstance(node, ast.Call)
+            and len(node.args) == 1
+            and not node.keywords
+            and (
+                (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == name
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "pl"
+                )
+                or (isinstance(node.func, ast.Name) and node.func.id == name)
+            )
+        ):
+            return node.args[0]
+        return None
+
+    @classmethod
+    def _strip_call_arg_markers(
+        cls,
         arg_nodes: list[ast.expr],
-    ) -> tuple[list[ast.expr], list[int]]:
-        """Detect ``pl.no_dep(arg)`` wrappers in a kernel-call argument list.
+    ) -> tuple[list[ast.expr], list[int], list[int]]:
+        """Peel ``pl.no_dep(arg)`` / ``pl.dump(arg)`` wrappers from a kernel-call
+        argument list.
 
-        Returns a parallel list of unwrapped arg ASTs (so the inner expression
-        is what gets parsed into IR) plus the indices of arguments that were
-        wrapped — these become ``ArgDirection.NoDep`` overrides at codegen
-        time via ``DeriveCallDirections``.
+        Returns the unwrapped arg ASTs (innermost expression parsed into IR)
+        plus the indices of arguments wrapped by each marker:
 
-        Recognised forms (single positional arg only, no kwargs):
-            pl.no_dep(t)   — Attribute(value=Name("pl"), attr="no_dep")
-            no_dep(t)      — Name("no_dep")  (in case the user does
-                             ``from pypto.language import no_dep``)
+        * ``no_dep`` indices → ``ArgDirection.NoDep`` overrides applied later by
+          ``DeriveCallDirections`` (stored as ``attrs['arg_direction_overrides']``).
+        * ``dump`` indices → per-call selective tensor dump; the caller maps each
+          to the parsed arg Var and stores them as ``attrs['dump_vars']``.
 
-        The match is intentionally tight — only the bare ``pl.no_dep``
-        attribute access (or a ``no_dep`` import) qualifies. ``obj.no_dep(x)``
-        on a user-defined object is left in place so the parser surfaces a
-        normal-call error path instead of silently stripping the wrapper.
-
-        A trailing ``pl.no_dep`` with multiple args or any keyword is NOT a
-        valid wrapper and is left in place; the parser will hit it later
-        as a normal call and surface a clear error.
+        Both markers may wrap the same argument in any nesting order, e.g.
+        ``pl.dump(pl.no_dep(x))`` — wrappers are peeled iteratively until the
+        node is no longer a recognized marker call. A wrapper with multiple args
+        or any keyword is not recognized and is left in place (the parser hits it
+        later as a normal call and surfaces a clear error).
         """
         unwrapped: list[ast.expr] = []
-        indices: list[int] = []
+        no_dep_indices: list[int] = []
+        dump_indices: list[int] = []
         for i, raw in enumerate(arg_nodes):
-            if (
-                isinstance(raw, ast.Call)
-                and len(raw.args) == 1
-                and not raw.keywords
-                and (
-                    (
-                        isinstance(raw.func, ast.Attribute)
-                        and raw.func.attr == "no_dep"
-                        and isinstance(raw.func.value, ast.Name)
-                        and raw.func.value.id == "pl"
-                    )
-                    or (isinstance(raw.func, ast.Name) and raw.func.id == "no_dep")
-                )
-            ):
-                unwrapped.append(raw.args[0])
-                indices.append(i)
-            else:
-                unwrapped.append(raw)
-        return unwrapped, indices
+            node = raw
+            saw_no_dep = False
+            saw_dump = False
+            while True:
+                inner = cls._match_call_arg_marker(node, "no_dep")
+                if inner is not None:
+                    saw_no_dep = True
+                    node = inner
+                    continue
+                inner = cls._match_call_arg_marker(node, "dump")
+                if inner is not None:
+                    saw_dump = True
+                    node = inner
+                    continue
+                break
+            unwrapped.append(node)
+            if saw_no_dep:
+                no_dep_indices.append(i)
+            if saw_dump:
+                dump_indices.append(i)
+        return unwrapped, no_dep_indices, dump_indices
 
     @staticmethod
     def _reject_keyword_args(

@@ -239,9 +239,9 @@ inline std::string StripLegacyBaseName(const std::string& name) {
 /// The suffix uses a single underscore intentionally — ``__`` is reserved by
 /// :func:`ValidateBaseName` for the ``name__role__version`` auto-name scheme
 /// — so :func:`Parse` does not see it as a recognised auto-suffix. This
-/// helper exists to give downstream name-based matching (e.g. orchestration
-/// codegen's ``kAttrDumpTaggedNames`` lookup) a way back to the user-written
-/// base name for Vars that originated inside an inlined function body.
+/// helper exists to give downstream name-based matching a way back to the
+/// user-written base name for Vars that originated inside an inlined function
+/// body.
 ///
 /// Multi-level inlining stacks the suffix (e.g. inner inline produces
 /// ``q_inline0``; outer inline of the surrounding function renames again to

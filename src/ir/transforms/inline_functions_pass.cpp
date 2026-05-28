@@ -361,6 +361,117 @@ std::vector<StmtPtr> SpliceInlineCallAsReturn(const FunctionPtr& callee, const s
 }
 
 // =============================================================================
+// Selective-dump carry-through across inlining (simpler#844)
+// =============================================================================
+
+// Collect every Var pointer referenced in a statement (use- and def-sites;
+// VisitVarLike_ covers both Var and IterArg per ir-kind-traits).
+class VarUseCollector : public IRVisitor {
+ public:
+  std::unordered_set<const Var*> uses;
+  void VisitVarLike_(const VarPtr& op) override {
+    if (op) uses.insert(op.get());
+    IRVisitor::VisitVarLike_(op);
+  }
+};
+
+// Transfer an inline call-site's ``kAttrDumpVars`` onto the spliced callee body.
+//
+// The dump entries are caller arg Vars; ``CloneInlineBody`` has already
+// substituted each in for its matching callee param, so a tagged arg consumed
+// inside the callee now appears verbatim in the spliced body. Two carriers are
+// stamped (both round-trip and are tracked by Var identity downstream):
+//
+//   * ``with pl.at(...)`` scopes whose body uses a tagged arg get it merged into
+//     their ``kAttrDumpVars`` — the same scope-level carrier ``pl.dump_tag``
+//     seeds at parse. The outliner later maps it onto the synthesised dispatch.
+//   * Nested cross-function (``GlobalVar``) Calls that take a tagged arg get it
+//     merged into the Call's ``kAttrDumpVars``. This is what makes a tag survive
+//     *multi-level* inlining: when the callee itself just forwards the arg into
+//     a deeper ``self.foo(...)`` (no scope of its own consumes it), the tag
+//     rides that Call so the next inline iteration (or the final dispatch, if
+//     ``foo`` is a real kernel) carries it.
+//
+// Builtin tile/tensor op Calls (``OpExpr`` callee) are intentionally NOT
+// stamped: their ``dump_vars`` would not round-trip (the printer only emits the
+// marker for ``GlobalVar`` calls and scopes), and codegen never reads them.
+//
+// A tag not consumed by any scope or dispatch in the spliced body is dropped:
+// there is no kernel launch to dump it on.
+class InlineDumpVarTransfer : public IRMutator {
+ public:
+  explicit InlineDumpVarTransfer(std::vector<VarPtr> dump_vars) : dump_vars_(std::move(dump_vars)) {}
+
+  StmtPtr VisitStmt_(const InCoreScopeStmtPtr& op) override { return Attach<InCoreScopeStmt>(op); }
+  StmtPtr VisitStmt_(const AutoInCoreScopeStmtPtr& op) override { return Attach<AutoInCoreScopeStmt>(op); }
+  StmtPtr VisitStmt_(const HierarchyScopeStmtPtr& op) override { return Attach<HierarchyScopeStmt>(op); }
+  StmtPtr VisitStmt_(const ClusterScopeStmtPtr& op) override { return Attach<ClusterScopeStmt>(op); }
+  StmtPtr VisitStmt_(const SpmdScopeStmtPtr& op) override { return Attach<SpmdScopeStmt>(op); }
+
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    // Only cross-function dispatches carry a round-trippable dump attr; skip
+    // builtin tile/tensor ops (OpExpr callee).
+    if (!As<GlobalVar>(op->op_)) return IRMutator::VisitExpr_(op);
+    auto existing = op->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
+    auto merged = Merge(existing, ArgVarSet(op->args_));
+    if (!Changed(existing, merged)) return op;
+    auto result = MutableCopy(op);
+    result->attrs_ = WithDumpVarsAttr(op->attrs_, std::move(merged));
+    return result;
+  }
+
+ private:
+  template <typename ScopeT>
+  StmtPtr Attach(const std::shared_ptr<const ScopeT>& op) {
+    // Recurse first so nested scopes / dispatch calls also receive their tags.
+    auto recursed_stmt = IRMutator::VisitStmt_(op);
+    auto recursed = std::dynamic_pointer_cast<const ScopeT>(recursed_stmt);
+    if (!recursed) return recursed_stmt;
+
+    VarUseCollector uc;
+    uc.VisitStmt(recursed->body_);
+
+    auto existing = recursed->template GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
+    auto merged = Merge(existing, uc.uses);
+    if (!Changed(existing, merged)) return recursed_stmt;
+
+    auto result = MutableCopy(recursed);
+    result->attrs_ = WithDumpVarsAttr(recursed->attrs_, std::move(merged));
+    return result;
+  }
+
+  std::unordered_set<const Var*> ArgVarSet(const std::vector<ExprPtr>& args) const {
+    std::unordered_set<const Var*> s;
+    for (const auto& a : args) {
+      if (auto v = AsVarLike(a)) s.insert(v.get());
+    }
+    return s;
+  }
+
+  // Append the dump vars present in ``candidates`` to ``existing`` (dedup,
+  // preserving existing entries first then dump_vars_ order).
+  std::vector<VarPtr> Merge(std::vector<VarPtr> existing,
+                            const std::unordered_set<const Var*>& candidates) const {
+    std::unordered_set<const Var*> present;
+    for (const auto& v : existing) {
+      if (v) present.insert(v.get());
+    }
+    for (const auto& dv : dump_vars_) {
+      if (!dv || candidates.count(dv.get()) == 0) continue;
+      if (!present.insert(dv.get()).second) continue;
+      existing.push_back(dv);
+    }
+    return existing;
+  }
+
+  static bool Changed(const std::vector<VarPtr>& before, const std::vector<VarPtr>& after) {
+    return before.size() != after.size();
+  }
+
+  std::vector<VarPtr> dump_vars_;
+};
+
+// =============================================================================
 // InlineCallsMutator — walks a function body and replaces top-level inline-call
 // statements with the spliced inline body.
 // =============================================================================
@@ -447,27 +558,40 @@ class InlineCallsMutator : public IRMutator {
   // or `ReturnStmt({inline_call(args...)})` and return the spliced sequence;
   // otherwise return std::nullopt.
   std::optional<std::vector<StmtPtr>> HandleTopLevelInlineCall(const StmtPtr& stmt) {
+    std::optional<std::vector<StmtPtr>> spliced;
+    std::vector<VarPtr> call_dump_vars;
     if (auto call = transform_utils::GetCallFromStmt(stmt)) {
       if (auto callee = LookupInlineCallee(call)) {
+        call_dump_vars = call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
         if (auto assign = As<AssignStmt>(stmt)) {
-          return SpliceAssignCallSite(callee, call->args_, assign->var_, assign->span_);
-        }
-        if (auto eval = As<EvalStmt>(stmt)) {
-          return SpliceInlineCallAsEval(callee, call->args_);
+          spliced = SpliceAssignCallSite(callee, call->args_, assign->var_, assign->span_);
+        } else if (auto eval = As<EvalStmt>(stmt)) {
+          spliced = SpliceInlineCallAsEval(callee, call->args_);
         }
       }
     }
     // ReturnStmt's value list isn't covered by GetCallFromStmt — handle it
     // here. The form is exactly `return inline_call(args...)`: a single Call
     // expression as the only return value.
-    if (auto ret = As<ReturnStmt>(stmt); ret && ret->value_.size() == 1) {
-      if (auto call = As<Call>(ret->value_[0])) {
-        if (auto callee = LookupInlineCallee(call)) {
-          return SpliceInlineCallAsReturn(callee, call->args_, ret->span_);
+    if (!spliced.has_value()) {
+      if (auto ret = As<ReturnStmt>(stmt); ret && ret->value_.size() == 1) {
+        if (auto call = As<Call>(ret->value_[0])) {
+          if (auto callee = LookupInlineCallee(call)) {
+            call_dump_vars = call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
+            spliced = SpliceInlineCallAsReturn(callee, call->args_, ret->span_);
+          }
         }
       }
     }
-    return std::nullopt;
+    // Carry the call-site selective-dump tags onto the spliced scopes — the
+    // inline Call node (which held ``kAttrDumpVars``) is about to be destroyed,
+    // so the dump intent must move onto the surviving scope bodies (see
+    // InlineDumpVarTransfer) to reach the outliner by Var identity.
+    if (spliced.has_value() && !call_dump_vars.empty()) {
+      InlineDumpVarTransfer attacher(std::move(call_dump_vars));
+      for (auto& s : *spliced) s = attacher.VisitStmt(s);
+    }
+    return spliced;
   }
 
   // Dispatch on callee return arity: single-return → `LHS = value` AssignStmt;
@@ -489,22 +613,8 @@ class InlineCallsMutator : public IRMutator {
     if (!gv) return nullptr;
     auto it = inline_fns_.find(gv->name_);
     if (it == inline_fns_.end()) return nullptr;
-    if (inlined_callees_seen_.insert(it->second).second) {
-      inlined_callees_ordered_.push_back(it->second);
-    }
     return it->second;
   }
-
- public:
-  /// Inline callees actually spliced by this mutator instance, in
-  /// first-resolved order. The outer pass reads this to migrate
-  /// function-level attrs (e.g. ``kAttrDumpTaggedNames``) from each inlined
-  /// callee onto the caller before the inline function is dropped at the end
-  /// of ``InlineFunctions``. Ordered (not just deduped) so the merged
-  /// ``kAttrDumpTaggedNames`` vector is deterministic across runs —
-  /// ``structural_equal`` compares it element-by-element and
-  /// ``IRPythonPrinter`` re-emits ``pl.dump_tag(...)`` in vector order.
-  const std::vector<FunctionPtr>& GetInlinedCallees() const { return inlined_callees_ordered_; }
 
  private:
   const std::unordered_map<std::string, FunctionPtr>& inline_fns_;
@@ -514,52 +624,7 @@ class InlineCallsMutator : public IRMutator {
   // with the corresponding value, so the LHS Var ends up with no references
   // and we never emit a `LHS = MakeTuple(...)` assignment.
   std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_subs_;
-  // Inline callees recorded by LookupInlineCallee on every successful resolve.
-  // Mutable because LookupInlineCallee is logically const but records side
-  // information for the outer pass. Tracked as a (set, vector) pair so
-  // GetInlinedCallees can return first-resolved order while the set keeps
-  // O(1) dedup.
-  mutable std::unordered_set<FunctionPtr> inlined_callees_seen_;
-  mutable std::vector<FunctionPtr> inlined_callees_ordered_;
 };
-
-// Union the ``kAttrDumpTaggedNames`` lists (``pl.dump_tag`` markers, see
-// :doc:`expr.h:kAttrDumpTaggedNames`) of every callee just spliced into
-// ``caller`` onto the caller's own list. Inline functions are dropped at the
-// end of the pass, so without this migration any markers written inside
-// ``@pl.jit.inline`` would be lost before orchestration codegen reads the
-// attr.
-//
-// Order preservation: caller's existing names appear first, then names from
-// each callee in first-resolved order (deterministic across runs), with
-// duplicates dropped on first sight.
-void MergeDumpTaggedNames(const std::shared_ptr<Function>& caller,
-                          const std::vector<FunctionPtr>& inlined_callees) {
-  std::vector<std::string> merged;
-  std::unordered_set<std::string> seen;
-  auto append_names = [&](const std::vector<std::string>& names) {
-    for (const auto& n : names) {
-      if (seen.insert(n).second) merged.push_back(n);
-    }
-  };
-  if (caller->HasAttr(kAttrDumpTaggedNames)) {
-    append_names(caller->GetAttr<std::vector<std::string>>(kAttrDumpTaggedNames));
-  }
-  for (const auto& callee : inlined_callees) {
-    if (!callee->HasAttr(kAttrDumpTaggedNames)) continue;
-    append_names(callee->GetAttr<std::vector<std::string>>(kAttrDumpTaggedNames));
-  }
-  if (merged.empty()) return;
-  bool replaced = false;
-  for (auto& [k, v] : caller->attrs_) {
-    if (k == kAttrDumpTaggedNames) {
-      v = std::move(merged);
-      replaced = true;
-      break;
-    }
-  }
-  if (!replaced) caller->attrs_.emplace_back(kAttrDumpTaggedNames, std::move(merged));
-}
 
 }  // namespace
 
@@ -643,11 +708,6 @@ Pass InlineFunctions() {
         if (mutator.Changed()) {
           auto updated = MutableCopy(fn);
           updated->body_ = new_body;
-          // Migrate dump_tag markers from each inlined callee onto this
-          // caller before the inline functions are dropped below. The pass
-          // runs at fixpoint, so multi-level inline (A inlines B inlines C)
-          // propagates names up the chain on successive iterations.
-          MergeDumpTaggedNames(updated, mutator.GetInlinedCallees());
           fn = updated;
           any_changed = true;
         }

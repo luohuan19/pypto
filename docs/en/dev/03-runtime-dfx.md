@@ -67,45 +67,69 @@ pytest tests/st/runtime/ \
 `tensor_dump/`. On large workloads this can saturate the host-side dump
 collector (~42 MB/s drain) and the AICPU will be killed by the STARS
 op-execute timeout — large bindings such as a 1 GB KV-cache fill the
-queue faster than it drains. Mark the *interesting* tensors with the
-[`pl.dump_tag`](../../../python/pypto/language/op/tensor_ops.py) marker
-at orchestration scope to limit dump to those tensors:
+queue faster than it drains. Mark the *interesting* tensors to limit dump
+to those tensors. Two layers, both backed by the runtime
+`enable_dump_tensor_selective()` toggle + `Arg::dump(...)` API from
+simpler#844:
+
+**Per-call (`pl.dump(arg)`)** — wrap an argument at a kernel call to dump
+exactly that arg slot on exactly that task launch (1:1 with `Arg::dump`):
+
+```python
+out = self.qk_pv(pl.dump(q), k_cache, pl.dump(out))
+# codegen → params_t0.dump(ext_q, ext_out);
+```
+
+**Per-tensor (`pl.dump_tag(t)`)** — sugar that desugars to `pl.dump` on
+every *subsequent* call consuming the tagged value:
 
 ```python
 @pl.function(type=pl.FunctionType.Orchestration)
 def orch(self, q: pl.Tensor[...], k_cache: pl.Tensor[...], out: pl.Out[...]):
     pl.dump_tag(q)
     pl.dump_tag(out)
-    out = self.qk_pv(q, k_cache, out)
+    out = self.qk_pv(q, k_cache, out)   # q and out dumped; k_cache filtered out
 ```
 
-The marker is sticky over the orch scope — every kernel call in the
-same orch that consumes `q` or `out` dumps them; `k_cache` is filtered
-out of the collector queue. When `enable_dump_tensor=False` the marker
-is inert (the whole dump pipeline is dormant). Backed by the runtime
-`enable_dump_tensor_selective()` toggle + `Arg::dump(...)` API from
-simpler#844.
+The dump target is tracked by **Var identity** on the consuming Call's
+`dump_vars` attr — never by name. It rides through SSA, inlining, and
+codegen the same way `manual_dep_edges` does, so no fuzzy name matching
+and no false positives. When `enable_dump_tensor=False` both forms are
+inert (the whole dump pipeline is dormant).
 
 `pl.dump_tag` is also accepted inside an Inline helper
-(`@pl.jit.inline` / `FunctionType.Inline`). The `InlineFunctions` pass
-merges each inlined callee's tagged-name list onto the caller
-orchestration before the inline function is dropped, so markers written
-inside an inline body take effect at the inlined call sites. Markers on
-both inline parameters and inline body-local `pl.create_tensor(...)`
-results are supported, and multi-level inlining (inline → inline →
-inline) is handled at the pass's fixpoint. See
-[`01-inline_functions.md`](passes/01-inline_functions.md#function-level-attribute-merge)
-for the merge mechanics.
+(`@pl.jit.inline` / `FunctionType.Inline`), and works for both kernel-call
+styles:
+
+- **Explicit `self.kernel(...)` dispatch** — the tag desugars to `dump_vars`
+  on the consuming Call; the `InlineFunctions` pass splices that call into the
+  caller and substitutes the caller's arg for each inline parameter, so tags
+  on inline parameters and inline body-local `pl.create_tensor(...)` results
+  take effect at the inlined call sites.
+- **`@pl.jit` / tensor-op style (`with pl.incore()`, `c = a + 1.0`)** — here
+  the kernel dispatch is *synthesised by the outline passes*, not written at
+  parse time. The tag instead seeds the enclosing scope's `dump_vars` (which
+  round-trips as `pl.at(..., dump_args=[...])`); a tag applied at the inline
+  call site rides the call's `dump_vars` and is transferred by
+  `InlineFunctions` onto the scopes it splices in. The outliner then
+  translates each captured scope dump Var into the synthesised dispatch's
+  `dump_vars` by Var identity — the same scope-attr → Call-attr path
+  `no_dep_args=` uses. A tag the scope never consumes as a kernel arg is
+  silently dropped.
+
+No tag migration is needed in either case; multi-level inlining is handled at
+the pass's fixpoint.
 
 ### Limitations
 
 | Marker location / target | Status |
 | ------------------------ | ------ |
-| Standalone statement in an Orchestration or Inline body | Supported. |
-| Inside a kernel-call argument position (e.g. `self.k(pl.dump_tag(q))`) | **Silently ineffective** — the marker is passed through (the DSL wrapper is an identity function and the pre-scan only collects statement-position markers), so no name is tagged and no error is raised. Write `pl.dump_tag(q)` on its own line. |
-| Synthetic outputs of `pl.submit(...)` (implicit `Out`) | Not supported — synth outputs carry no source-level `Var` name to match against. |
+| `pl.dump(arg)` at a kernel-call argument position | Supported (per-call). |
+| `pl.dump_tag(t)` as a standalone statement in an Orchestration or Inline body | Supported (per-tensor sugar). |
+| Tag consumed by an outline-synthesised dispatch (`@pl.jit` / `with pl.incore()` / tensor-op style) | Supported — the tag rides a scope-level `dump_vars` carrier (`dump_args=`) and the outliner maps it onto the synthesised dispatch arg. |
+| Synthetic outputs of `pl.submit(...)` (implicit `Out`) | Not supported — synth outputs have no call-site arg to wrap. |
 | HOST-tier Python `SubWorker` tensors | Not supported — runtime exposes no equivalent `Arg::dump` hook. |
-| After a `pl.reshape(x, ...)` (or any view-producing) rebind | The rebound result is a **new `Var`** with a new `name_hint`; a previous `pl.dump_tag(x)` does **not** carry over. Re-tag the rebound name (`y = pl.reshape(x, ...); pl.dump_tag(y)`) if the kernel consumes the rebound form. |
+| Reassigning a tagged value (e.g. `q = self.foo(q)`) | The rebound result is a **new value**; a previous `pl.dump_tag(q)` does **not** carry over (tracked by Var identity, not name). Re-tag the rebound value if the kernel consumes it. |
 
 ## Rendering `deps.json` to HTML
 

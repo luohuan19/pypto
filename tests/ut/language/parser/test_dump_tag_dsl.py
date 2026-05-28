@@ -7,37 +7,41 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Parser coverage for ``pl.dump_tag(<name>)`` — the DSL marker that drives
-the orchestration codegen's selective tensor dump (simpler#844).
+"""Parser coverage for ``pl.dump_tag(<name>)`` — the per-tensor sugar over the
+per-call ``pl.dump(arg)`` selective tensor dump primitive (simpler#844).
 
-The marker is a statement-position DSL call whose effect is captured on the
-enclosing :class:`ir.Function`'s ``attrs["dump_tagged_names"]`` (a list of
-Var name_hints) at parse time. No IR statement is emitted; the marker has no
-runtime side effect.
+``pl.dump_tag(t)`` is a statement-position marker that records the bound Var;
+every *subsequent* kernel call consuming that exact Var gets it merged into the
+call's ``attrs['dump_vars']`` (the same per-call attr ``pl.dump(arg)`` writes).
+No IR statement is emitted and no Function-level attr is written — the dump
+target is tracked by Var identity on the consuming Call nodes.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
 import pypto.language as pl
 import pytest
+from pypto import ir
 from pypto.language.parser.diagnostics import ParserSyntaxError
 
 
-def _get_orch(program) -> Any:
-    """Return the orchestration ``Function`` from a parsed program."""
-    from pypto import ir  # noqa: PLC0415
+def _kernel_calls(program: ir.Program, callee_name: str = "kernel") -> list[ir.Call]:
+    """Collect every ``self.<callee_name>(...)`` Call in *program*."""
+    found: list[ir.Call] = []
 
-    for func in program.functions.values():
-        if func.func_type == ir.FunctionType.Orchestration:
-            return func
-    raise AssertionError("no orchestration function in program")
+    class _Collector(ir.IRVisitor):
+        def visit_call(self, op):
+            if op.op.name == callee_name:
+                found.append(op)
+            super().visit_call(op)
+
+    _Collector().visit_program(program)
+    return found
 
 
-def test_dump_tag_attaches_names_to_orch_attrs() -> None:
-    """Each ``pl.dump_tag(<name>)`` at orch scope adds the bound name to
-    ``Function.attrs['dump_tagged_names']`` in source order."""
+def test_dump_tag_desugars_to_per_call_dump_vars() -> None:
+    """Each ``pl.dump_tag(t)`` makes subsequent calls consuming ``t`` carry it
+    in ``Call.attrs['dump_vars']`` (arg order, by Var identity)."""
 
     @pl.program
     class P:
@@ -66,14 +70,15 @@ def test_dump_tag_attaches_names_to_orch_attrs() -> None:
             d = self.kernel(a, b, d)
             return d
 
-    orch = _get_orch(P)
-    assert "dump_tagged_names" in orch.attrs, "parser failed to record dump_tag set"
-    assert orch.attrs["dump_tagged_names"] == ["a", "d"]
+    calls = _kernel_calls(P)
+    assert len(calls) == 1
+    assert "dump_vars" in calls[0].attrs
+    names = {v.name_hint for v in calls[0].attrs["dump_vars"]}
+    assert names == {"a", "d"}
 
 
-def test_dump_tag_dedups_repeated_names() -> None:
-    """Marking the same name twice records it once — the set is a name-keyed
-    allowlist, not a multiset."""
+def test_dump_tag_dedups_repeated_tags() -> None:
+    """Marking the same Var twice merges it once into the call's dump_vars."""
 
     @pl.program
     class P:
@@ -98,13 +103,48 @@ def test_dump_tag_dedups_repeated_names() -> None:
             d = self.kernel(a, d)
             return d
 
-    orch = _get_orch(P)
-    assert orch.attrs["dump_tagged_names"] == ["a"]
+    calls = _kernel_calls(P)
+    assert len(calls) == 1
+    names = [v.name_hint for v in calls[0].attrs["dump_vars"]]
+    assert names == ["a"]
+
+
+def test_dump_tag_is_forward_sticky() -> None:
+    """A tag affects only *subsequent* calls — a call written before the marker
+    does not carry the tagged Var."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kernel(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP32],
+            output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            t: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+            o: pl.Tensor[[16, 16], pl.FP32] = pl.store(t, [0, 0], output)
+            return o
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orch(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP32],
+            c: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            c = self.kernel(a, c)  # before the tag — a not dumped here
+            pl.dump_tag(a)
+            d = self.kernel(a, d)  # after the tag — a dumped here
+            return d
+
+    calls = _kernel_calls(P)
+    assert len(calls) == 2
+    assert "dump_vars" not in calls[0].attrs
+    assert {v.name_hint for v in calls[1].attrs["dump_vars"]} == {"a"}
 
 
 def test_dump_tag_absent_when_unused() -> None:
-    """No ``pl.dump_tag`` -> no attr on the Function. Codegen reads this as
-    the legacy full-dump path."""
+    """No ``pl.dump_tag`` -> no ``dump_vars`` attr on the consuming call."""
 
     @pl.program
     class P:
@@ -127,8 +167,9 @@ def test_dump_tag_absent_when_unused() -> None:
             d = self.kernel(a, d)
             return d
 
-    orch = _get_orch(P)
-    assert "dump_tagged_names" not in orch.attrs
+    calls = _kernel_calls(P)
+    assert len(calls) == 1
+    assert "dump_vars" not in calls[0].attrs
 
 
 def test_dump_tag_rejects_non_name_argument() -> None:

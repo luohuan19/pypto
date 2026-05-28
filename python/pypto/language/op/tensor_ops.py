@@ -21,6 +21,7 @@ __all__ = [
     "create_tensor",
     "create",
     "no_dep",
+    "dump",
     "dump_tag",
     "read",
     "write",
@@ -198,14 +199,51 @@ def no_dep(tensor: Tensor) -> Tensor:
     return tensor
 
 
+def dump(tensor: Tensor) -> Tensor:
+    """Mark one kernel-call argument for selective tensor dump (per-call).
+
+    Per-call primitive mapping 1:1 to the runtime's ``Arg::dump(...)`` API
+    (simpler#844 selective tensor dump). Wrapping an argument at a kernel
+    call site tells the orchestration codegen to mark that argument's
+    ``Arg`` slot for dump on this task launch only::
+
+        # Dump q and out for this call; k_cache is not dumped.
+        out = self.qk_matmul(pl.dump(q), k_cache, pl.dump(out))
+        # codegen → params_t0.dump(ext_q, ext_out);
+
+    The wrapped tensor is recorded on the IR Call's
+    ``attrs['dump_vars']`` (a list of the dumped argument Vars), so the
+    dump target is tracked by Var identity through every pass — never by
+    name. ``pl.dump_tag(t)`` is the per-tensor convenience layer that
+    desugars to this primitive (see :func:`dump_tag`).
+
+    No-op when ``RunConfig.enable_dump_tensor`` is ``False`` — selective
+    dump only filters within an enabled dump pipeline.
+
+    Only valid as a direct argument to a kernel call. Outside a kernel-call
+    argument list it is a no-op (returns ``tensor`` unchanged); the parser
+    only injects the dump marker at recognized call sites.
+
+    Args:
+        tensor: The tensor argument to mark. Must be a ``Tensor`` value
+            passed positionally to the kernel call.
+
+    Returns:
+        The tensor unchanged. The marker is consumed at parse time.
+    """
+    return tensor
+
+
 def dump_tag(tensor: Tensor) -> Tensor:
     """Mark a tensor for selective dump within the enclosing orchestration.
 
-    Sticky orch-scoped marker — writing ``pl.dump_tag(q)`` as a standalone
-    statement inside an orchestration function body tells the codegen that
-    every kernel call in this orch that consumes ``q`` should mark its
-    ``Arg`` slot for tensor dump via the runtime's ``Arg::dump(...)`` API
-    (simpler#844 selective tensor dump).
+    Per-tensor convenience sugar over the per-call :func:`dump` primitive
+    (simpler#844 selective tensor dump). Writing ``pl.dump_tag(q)`` as a
+    standalone statement records ``q`` so that every *subsequent* kernel call
+    consuming that exact value gets ``q`` merged into the call's
+    ``dump_vars`` — i.e. it desugars to wrapping ``q`` in ``pl.dump(q)`` at
+    each consuming call. The runtime then marks those ``Arg`` slots via
+    ``Arg::dump(...)``.
 
     Use this to keep ``enable_dump_tensor=True`` viable on large workloads
     (e.g. paged-attention 64bat/8192ctx) where the host-side dump collector
@@ -217,14 +255,16 @@ def dump_tag(tensor: Tensor) -> Tensor:
 
     Semantics:
 
-    * Sticky over the orch scope where written — one ``pl.dump_tag(q)``
-      statement affects all subsequent kernel calls in the same orch that
-      consume ``q`` (matched by IR Var name).
+    * Forward-sticky over the orch scope — one ``pl.dump_tag(q)`` statement
+      affects all *subsequent* kernel calls in the same orch that consume the
+      tagged value. Tracked by **Var identity**, never by name: reassigning
+      ``q`` (e.g. ``q = self.foo(q)``) produces a new value that the prior
+      tag does **not** cover — re-tag it if needed.
     * No-op when ``RunConfig.enable_dump_tensor`` is ``False`` — selective
       dump only filters within an enabled dump pipeline; without the
       pipeline there is nothing to filter.
-    * Consumed at parse time — the parser records the tagged Var name on
-      the enclosing Function's attrs and emits no IR statement.
+    * Consumed at parse time — desugars to per-call ``dump_vars`` and emits
+      no IR statement.
 
     Valid as a standalone statement inside an Orchestration function or an
     Inline helper (``@pl.jit.inline`` / ``FunctionType.Inline``) that the
@@ -238,29 +278,19 @@ def dump_tag(tensor: Tensor) -> Tensor:
             s = self.qk_matmul(q, k_cache, scratch)  # q is dumped here
             out = self.pv_matmul(s, k_cache, out)    # out is dumped here
 
-    Inline helpers (``@pl.jit.inline`` / ``FunctionType.Inline``)::
+    For per-call precision (dump one arg of one call only), use the
+    :func:`dump` wrapper directly: ``self.qk_matmul(pl.dump(q), k_cache, scratch)``.
 
-        @pl.jit.inline
-        def helper(q: pl.Tensor[...], out: pl.Out[...]):
-            pl.dump_tag(q)                       # inline param — works after inlining
-            tmp = pl.create_tensor([...], dtype=pl.FP32)
-            pl.dump_tag(tmp)                     # inline body-local — also works
-            tmp = self.kernel(q, tmp)
-            out = self.kernel2(tmp, out)
-            return out
-
-    The ``InlineFunctions`` pass migrates each inline callee's tag set onto
-    the caller orchestration before the inline function is dropped, so
-    markers on both inline parameters and inline body-local
+    Inside an Inline helper, the desugared ``dump_vars`` ride on the inline
+    body's kernel calls; the ``InlineFunctions`` pass splices those calls into
+    the caller and the mutator substitutes the caller's arg for each inline
+    parameter, so tags on both inline parameters and inline body-local
     ``pl.create_tensor(...)`` results take effect at the inlined call sites.
-    Multi-level inlining (an inline helper that calls another inline helper
-    which writes ``pl.dump_tag``) is handled at the pass's fixpoint.
+    No tag migration is needed; multi-level inlining works at the pass's
+    fixpoint.
 
     Limitations (MVP):
 
-    * Not supported inside kernel-call argument positions
-      (``self.k(pl.dump_tag(q))``) — write ``pl.dump_tag(q)`` as a separate
-      statement above the call instead.
     * Distributed L3+ programs: only chip-level orchestration tasks honour
       the tag; HOST-tier Python SubWorker tensors are not covered by the
       runtime's selective dump path.

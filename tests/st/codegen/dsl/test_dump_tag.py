@@ -12,10 +12,10 @@
 A tiny ``(a + 1) * 2`` kernel built as a ``@pl.jit`` entry composed of two
 ``@pl.jit.inline`` helpers. ``pl.dump_tag`` markers live in both scopes:
 
-  - Inline-scope: ``pl.dump_tag(x)`` inside ``add_inline``. The
-    ``InlineFunctions`` pass migrates this marker onto the caller orch
-    after splicing, where the inline param ``x`` resolves to the entry's
-    ``a``.
+  - Inline-scope: ``pl.dump_tag(x)`` inside ``add_inline``. It desugars to
+    ``dump_vars`` on the inline body's call; after ``InlineFunctions``
+    splices the body in, the inline param ``x`` is substituted with the
+    entry's ``a``, so the dump rides through to the inlined call.
   - Entry-scope: ``pl.dump_tag(intermediate)`` on the body-local
     ``pl.create_tensor`` result.
 
@@ -61,10 +61,10 @@ _REQUIRED_FIELDS: dict[str, type | tuple[type, ...]] = {
 
 @pl.jit.inline
 def add_inline(a: pl.Tensor, c: pl.Tensor):
-    """c = a + 1.0. Inline-scope dump_tag — ``MergeDumpTaggedNames`` migrates
-    the literal name ``a`` to the caller's ``dump_tagged_names``; codegen
-    matches it against the call-site arg's IR Var name, which is the entry's
-    ``a`` after inline param-substitution.
+    """c = a + 1.0. Inline-scope dump_tag — desugars to ``dump_vars`` on the
+    inline body's kernel call; after inlining, the mutator substitutes the
+    caller's arg for the inline param ``a``, so the dump rides through to the
+    inlined call site (tracked by Var identity).
     """
     pl.dump_tag(a)
     with pl.incore():
@@ -241,17 +241,13 @@ class TestDumpTagManifest:
     def test_only_tagged_kernel_dumps(self, dump_manifest):
         """Selective dump must drop kernel2 entirely.
 
-        After ``InlineFunctions`` migration the orch carries
-        ``dump_tagged_names = {"a", "intermediate"}``. Kernel1 (``add_inline``)
-        consumes ``a`` and writes ``intermediate`` — both tagged — so codegen
-        emits ``params_t0.dump(ext_a, intermediate)``.
-
-        Kernel2 (``mul_inline``) consumes the SSA-rebound ``intermediate_v1``
-        and writes ``c``. Neither name matches the tag set (``intermediate_v1``
-        is a distinct IR binding from ``intermediate`` — dump_tag matching is
-        documented as IR-name-based), so codegen emits no ``params_t1.dump``
-        call. The manifest must therefore contain entries from a single
-        ``func_id`` only.
+        The tagged values (``a`` and the ``intermediate`` produced by kernel1)
+        ride on each consuming call's ``dump_vars`` by Var identity, so kernel1
+        (``add_inline``) dumps both. Kernel2 (``mul_inline``) consumes the
+        value rebound after kernel1 (a distinct Var from the tagged
+        ``intermediate``) and writes ``c`` — neither is tagged, so codegen
+        emits no ``params_t1.dump`` call. The manifest must therefore contain
+        entries from a single ``func_id`` only.
         """
         entries, manifest_path, _ = dump_manifest
         func_ids = {e["func_id"] for e in entries}

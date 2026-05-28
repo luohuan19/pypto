@@ -337,6 +337,13 @@ class IRPythonPrinter : public IRVisitor {
   // recovers ``deps=`` on ``pl.at(...)`` via _parse_at_meta.
   bool PrintScopeDepsAttr(const ScopeStmtPtr& op);
 
+  // Emit ``dump_args=[t1, t2]`` if the scope carries ``kAttrDumpVars``; returns
+  // true when something was printed. Mirrors PrintScopeNoDepsAttr — the scope
+  // dump list is the carrier from ``pl.dump_tag`` / ``pl.dump`` to the outliner
+  // (which translates it into the synthesised dispatch's ``kAttrDumpVars``), so
+  // it must survive a print/reparse roundtrip while the scope still exists.
+  bool PrintScopeDumpAttr(const ScopeStmtPtr& op);
+
   // Emit `` as <tid>`` if the scope carries ``kAttrTaskIdVar``. The caller is
   // responsible for placing the ``)`` before and the ``:\n`` after this call.
   bool PrintScopeTaskIdVarSuffix(const ScopeStmtPtr& op);
@@ -645,9 +652,28 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       // This is a cross-function call - print as self.method_name()
       stream_ << "self." << gvar->name_ << "(";
 
+      // Per-call selective dump (``kAttrDumpVars``): wrap each marked arg in
+      // ``pl.dump(...)`` so the round-trip recovers the same attr. Matched by
+      // VarPtr identity — never by name.
+      std::set<const Var*> dump_set;
+      for (const auto& [k, v] : op->attrs_) {
+        if (k != kAttrDumpVars) continue;
+        if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&v)) {
+          for (const auto& var : *vars) {
+            if (var) dump_set.insert(var.get());
+          }
+        }
+      }
+
       for (size_t i = 0; i < op->args_.size(); ++i) {
         if (i > 0) stream_ << ", ";
+        bool wrap_dump = false;
+        if (!dump_set.empty()) {
+          if (auto var = AsVarLike(op->args_[i])) wrap_dump = dump_set.count(var.get()) > 0;
+        }
+        if (wrap_dump) stream_ << prefix_ << ".dump(";
         VisitExpr(op->args_[i]);
+        if (wrap_dump) stream_ << ")";
       }
 
       // Surface manual_scope dep edges so they show up in IR dumps. The
@@ -917,9 +943,26 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
     // the printer never crashes on a hand-built Submit.
     stream_ << op->op_->name_;
   }
+  // Per-call selective dump (``kAttrDumpVars``): wrap each marked arg in
+  // ``pl.dump(...)`` so the round-trip recovers the same attr (VarPtr identity).
+  std::set<const Var*> dump_set;
+  for (const auto& [k, v] : op->attrs_) {
+    if (k != kAttrDumpVars) continue;
+    if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&v)) {
+      for (const auto& var : *vars) {
+        if (var) dump_set.insert(var.get());
+      }
+    }
+  }
   for (const auto& arg : op->args_) {
     stream_ << ", ";
+    bool wrap_dump = false;
+    if (!dump_set.empty()) {
+      if (auto var = AsVarLike(arg)) wrap_dump = dump_set.count(var.get()) > 0;
+    }
+    if (wrap_dump) stream_ << prefix_ << ".dump(";
     VisitExpr(arg);
+    if (wrap_dump) stream_ << ")";
   }
 
   if (!op->deps_.empty()) {
@@ -1403,6 +1446,10 @@ bool IRPythonPrinter::PrintScopeDepsAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrManualDepEdges, "deps");
 }
 
+bool IRPythonPrinter::PrintScopeDumpAttr(const ScopeStmtPtr& op) {
+  return PrintScopeVarListKwarg(op, kAttrDumpVars, "dump_args");
+}
+
 bool IRPythonPrinter::PrintScopeTaskIdVarSuffix(const ScopeStmtPtr& op) {
   for (const auto& [k, v] : op->attrs_) {
     if (k != kAttrTaskIdVar) continue;
@@ -1455,6 +1502,7 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   }
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
+  PrintScopeDumpAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1473,6 +1521,7 @@ void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   }
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
+  PrintScopeDumpAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1494,6 +1543,7 @@ void IRPythonPrinter::VisitStmt_(const AutoInCoreScopeStmtPtr& op) {
   }
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
+  PrintScopeDumpAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1815,13 +1865,7 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
     // ``auto_scope`` rides in attrs_ but prints as a dedicated kwarg (and is
     // filtered from the attrs={...} dict). Absent ⇒ default True ⇒ not printed.
     bool auto_scope_off = !func->GetAttr<bool>("auto_scope", true);
-    // Both ``auto_scope`` (dedicated kwarg) and ``kAttrDumpTaggedNames`` (round-
-    // tripped via the function body as ``pl.dump_tag(<name>)`` statements, which
-    // the parser pre-scans back into the attr) must be filtered from the
-    // attrs={...} dict, else they would duplicate or fail to reparse.
-    auto is_filtered_attr_key = [](const std::string& k) {
-      return k == "auto_scope" || k == kAttrDumpTaggedNames;
-    };
+    auto is_filtered_attr_key = [](const std::string& k) { return k == "auto_scope"; };
     bool has_attrs = std::any_of(func->attrs_.begin(), func->attrs_.end(),
                                  [&](const auto& kv) { return !is_filtered_attr_key(kv.first); });
     auto print_func_attr_value = [&](const std::string& key, const std::any& value) {
@@ -1933,16 +1977,6 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
 
   // Print body - convert yield to return in function context
   IncreaseIndent();
-  // Re-emit ``pl.dump_tag(<name>)`` markers at the top of the body so the
-  // parser's pre-scan re-populates ``Function::attrs_[kAttrDumpTaggedNames]``
-  // on roundtrip. The attr is invisible on the decorator (see the has_attrs
-  // logic above) — the DSL body call is the canonical surface.
-  if (func->HasAttr(kAttrDumpTaggedNames)) {
-    auto names = func->GetAttr<std::vector<std::string>>(kAttrDumpTaggedNames, std::vector<std::string>{});
-    for (const auto& name : names) {
-      stream_ << GetIndent() << prefix_ << ".dump_tag(" << name << ")\n";
-    }
-  }
   if (func->body_) {
     if (auto seq_stmts = As<SeqStmts>(func->body_)) {
       if (seq_stmts->stmts_.empty()) {

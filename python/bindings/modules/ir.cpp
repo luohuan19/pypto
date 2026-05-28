@@ -165,22 +165,13 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
       //   - kAttrArgDirections             -> vector<ArgDirection>
       //   - kAttrArgDirectionOverrides     -> vector<int32_t>
       //   - kAttrManualDepEdges /
-      //     kAttrArgDirOverrideVars        -> vector<VarPtr>
-      //   - kAttrDumpTaggedNames           -> vector<std::string>
+      //     kAttrArgDirOverrideVars /
+      //     kAttrDumpVars                  -> vector<VarPtr>
       // Inferring from the first element would silently accept mismatched
       // payloads (e.g. ``manual_dep_edges=[1]``) and fail later in codegen
       // instead of raising at parse time.
       auto seq = nb::cast<nb::sequence>(item.second);
-      if (key == kAttrDumpTaggedNames) {
-        std::vector<std::string> names;
-        for (auto elem : seq) {
-          if (!nb::isinstance<nb::str>(elem)) {
-            throw pypto::TypeError("Unsupported list element type for key: " + key + " (expected str)");
-          }
-          names.push_back(nb::cast<std::string>(elem));
-        }
-        kwargs.emplace_back(key, std::move(names));
-      } else if (key == kAttrArgDirectionOverrides) {
+      if (key == kAttrArgDirectionOverrides) {
         std::vector<int32_t> idxs;
         for (auto elem : seq) {
           if (nb::isinstance<nb::bool_>(elem) || !nb::isinstance<nb::int_>(elem)) {
@@ -194,7 +185,7 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
           idxs.push_back(static_cast<int32_t>(v));
         }
         kwargs.emplace_back(key, std::move(idxs));
-      } else if (key == kAttrManualDepEdges || key == kAttrArgDirOverrideVars) {
+      } else if (key == kAttrManualDepEdges || key == kAttrArgDirOverrideVars || key == kAttrDumpVars) {
         std::vector<VarPtr> vars;
         for (auto elem : seq) {
           if (!nb::isinstance<Var>(elem)) {
@@ -950,7 +941,8 @@ void BindIR(nb::module_& m) {
         }
         result[key.c_str()] = lst;
       } else if (value.type() == typeid(std::vector<VarPtr>)) {
-        // Used by attrs["manual_dep_edges"].
+        // Used by attrs["manual_dep_edges"], attrs["arg_direction_overrides_vars"],
+        // and attrs["dump_vars"].
         const auto& vars = AnyCast<std::vector<VarPtr>>(value, "converting to Python: " + key);
         nb::list lst;
         for (const auto& v : vars) {
@@ -1632,11 +1624,6 @@ void BindIR(nb::module_& m) {
             result[key.c_str()] = AnyCast<PadValue>(value, "converting to Python: " + key);
           } else if (value.type() == typeid(ExprPtr)) {
             result[key.c_str()] = nb::cast(AnyCast<ExprPtr>(value, "converting to Python: " + key));
-          } else if (value.type() == typeid(std::vector<std::string>)) {
-            const auto& names = AnyCast<std::vector<std::string>>(value, "converting to Python: " + key);
-            nb::list py_list;
-            for (const auto& s : names) py_list.append(nb::str(s.c_str()));
-            result[key.c_str()] = py_list;
           }
         }
         return result;
