@@ -64,6 +64,7 @@ class TestKernelConfigSignature:
         text = _generate_config_file(**_base_inputs(), func_name_to_signature={})
         assert "ArgDirection" not in text
         assert '"signature"' not in text
+        assert _is_valid_python(text)
 
     def test_signature_emitted_verbatim_tensor_only(self) -> None:
         # Codegen records only tensor-arg directions (scalars are excluded, as

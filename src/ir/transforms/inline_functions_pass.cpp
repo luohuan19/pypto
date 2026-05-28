@@ -409,14 +409,18 @@ class InlineDumpVarTransfer : public IRMutator {
   StmtPtr VisitStmt_(const SpmdScopeStmtPtr& op) override { return Attach<SpmdScopeStmt>(op); }
 
   ExprPtr VisitExpr_(const CallPtr& op) override {
+    // Recurse first so nested args (this pass runs pre-flatten, so a call arg
+    // may itself be a dispatch Call) are mutated before we stamp the attr.
+    auto mutated_expr = IRMutator::VisitExpr_(op);
+    auto mutated_call = As<Call>(mutated_expr);
     // Only cross-function dispatches carry a round-trippable dump attr; skip
     // builtin tile/tensor ops (OpExpr callee).
-    if (!As<GlobalVar>(op->op_)) return IRMutator::VisitExpr_(op);
-    auto existing = op->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
-    auto merged = Merge(existing, ArgVarSet(op->args_));
-    if (!Changed(existing, merged)) return op;
-    auto result = MutableCopy(op);
-    result->attrs_ = WithDumpVarsAttr(op->attrs_, std::move(merged));
+    if (!mutated_call || !As<GlobalVar>(mutated_call->op_)) return mutated_expr;
+    auto existing = mutated_call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
+    auto merged = Merge(existing, ArgVarSet(mutated_call->args_));
+    if (!Changed(existing, merged)) return mutated_expr;
+    auto result = MutableCopy(mutated_call);
+    result->attrs_ = WithDumpVarsAttr(mutated_call->attrs_, std::move(merged));
     return result;
   }
 

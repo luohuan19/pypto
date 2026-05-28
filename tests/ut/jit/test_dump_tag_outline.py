@@ -108,24 +108,11 @@ def _dispatch_dump_vars(program: ir.Program) -> dict[str, list[str]]:
 
     class _Collector(ir.IRVisitor):
         def visit_call(self, op):
-            try:
-                name = op.op.name
-            except Exception:
-                name = ""
+            name = getattr(getattr(op, "op", None), "name", "")
             if "_incore_" in name:
                 dv = (op.attrs or {}).get("dump_vars")
                 out[name] = sorted(v.name_hint for v in dv) if dv else []
             super().visit_call(op)
-
-        def visit_submit(self, op):
-            try:
-                name = op.op.name
-            except Exception:
-                name = ""
-            if "_incore_" in name:
-                dv = (op.attrs or {}).get("dump_vars")
-                out[name] = sorted(v.name_hint for v in dv) if dv else []
-            super().visit_submit(op)
 
     _Collector().visit_program(program)
     return out

@@ -2568,6 +2568,15 @@ class ASTParser:
                 span=span,
                 hint="Tag a tensor only after it is bound (a parameter or an earlier assignment).",
             )
+        # ``lookup_var`` may return a non-Var placeholder (e.g. a loop-yield
+        # name string), and only tensors are dumpable. Reject early so
+        # ``_merge_forward_sticky_dump`` never sees a typeless binding.
+        if not isinstance(var, ir.Var) or not isinstance(var.type, ir.TensorType):
+            raise ParserTypeError(
+                f"pl.dump_tag() argument '{name}' is not a tensor (got {type(var).__name__})",
+                span=self.span_tracker.get_span(call.args[0]),
+                hint="Only tensors can be selectively dumped.",
+            )
         if not any(var is t for t in self._dump_tagged_vars):
             self._dump_tagged_vars.append(var)
 
@@ -2995,8 +3004,7 @@ class ASTParser:
                 f"Unknown keyword argument '{kw.arg}' in pl.at()",
                 span=self.span_tracker.get_span(kw),
                 hint=(
-                    "Supported arguments: level, role, optimizations, deps, "
-                    "no_dep_args, dump_args, name_hint"
+                    "Supported arguments: level, role, optimizations, deps, no_dep_args, dump_args, name_hint"
                 ),
             )
 
@@ -3810,9 +3818,7 @@ class ASTParser:
                         seen.add(id(t))
                 new_attrs[i] = ("dump_vars", merged)
                 return new_attrs
-        insert_at = next(
-            (i for i, (k, _) in enumerate(new_attrs) if k == "task_id_var"), len(new_attrs)
-        )
+        insert_at = next((i for i, (k, _) in enumerate(new_attrs) if k == "task_id_var"), len(new_attrs))
         new_attrs.insert(insert_at, ("dump_vars", tagged))
         return new_attrs
 
@@ -4927,7 +4933,7 @@ class ASTParser:
         args = [self.parse_expression(arg) for arg in unwrapped_args]
         # Validate that each explicit ``pl.dump(arg)`` wraps a tensor Var.
         for i in dump_indices:
-            if not isinstance(args[i], ir.Var):
+            if not isinstance(args[i], ir.Var) or not isinstance(args[i].type, ir.TensorType):
                 raise ParserSyntaxError(
                     "pl.dump() argument must be a tensor variable",
                     span=self.span_tracker.get_span(unwrapped_args[i]),
