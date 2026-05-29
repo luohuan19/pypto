@@ -5022,6 +5022,36 @@ class TestManualScopeCodegen:
         ), code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
+    def test_submit_dumps_emits_per_task_dump(self):
+        """``pl.submit(..., dumps=[x])`` feeds the same dump_vars path as the
+        Call-side ``pl.dump`` wrapper: codegen emits the selective-dump toggle
+        and a per-task ``.dump(...)`` for the listed arg. Confirms the existing
+        codegen path consumes a Submit's dump_vars from the new kwarg surface.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    out, _ = pl.submit(self.k, x, dumps=[x])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "enable_dump_tensor_selective();" in code, code
+        dump_lines = [ln for ln in code.split("\n") if ".dump(" in ln]
+        assert dump_lines, code
+        assert any("ext_x" in ln for ln in dump_lines), code
+
 
 class TestTupleReturnNoDepAliasing:
     """``GenerateTupleReturnAliases`` must classify output slots by the

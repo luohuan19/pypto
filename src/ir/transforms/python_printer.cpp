@@ -943,8 +943,10 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
     // the printer never crashes on a hand-built Submit.
     stream_ << op->op_->name_;
   }
-  // Per-call selective dump (``kAttrDumpVars``): wrap each marked arg in
-  // ``pl.dump(...)`` so the round-trip recovers the same attr (VarPtr identity).
+  // Selective dump (``kAttrDumpVars``) is surfaced below as a ``dumps=[...]``
+  // kwarg (symmetric with ``deps=``), NOT by wrapping args in ``pl.dump(...)``
+  // — that wrapper is Call-only. Collect the marked Vars now; emit the kwarg
+  // after ``deps=`` so the round-trip recovers the same attr (VarPtr identity).
   std::set<const Var*> dump_set;
   for (const auto& [k, v] : op->attrs_) {
     if (k != kAttrDumpVars) continue;
@@ -956,13 +958,7 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
   }
   for (const auto& arg : op->args_) {
     stream_ << ", ";
-    bool wrap_dump = false;
-    if (!dump_set.empty()) {
-      if (auto var = AsVarLike(arg)) wrap_dump = dump_set.count(var.get()) > 0;
-    }
-    if (wrap_dump) stream_ << prefix_ << ".dump(";
     VisitExpr(arg);
-    if (wrap_dump) stream_ << ")";
   }
 
   if (!op->deps_.empty()) {
@@ -971,6 +967,23 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
       if (i > 0) stream_ << ", ";
       INTERNAL_CHECK_SPAN(op->deps_[i], op->span_) << "Submit dep at index " << i << " is null";
       VisitExpr(op->deps_[i]);
+    }
+    stream_ << "]";
+  }
+
+  // ``dumps=[...]`` — emitted in arg order so the round-trip recovers the same
+  // dump_vars vector (the parser builds it in arg order too). Only emitted when
+  // non-empty, mirroring ``deps=``. Strict parse validation guarantees every
+  // dump_var is a positional arg, so arg-order emission covers them all.
+  if (!dump_set.empty()) {
+    stream_ << ", dumps=[";
+    bool first = true;
+    for (const auto& arg : op->args_) {
+      auto var = AsVarLike(arg);
+      if (!var || dump_set.count(var.get()) == 0) continue;
+      if (!first) stream_ << ", ";
+      first = false;
+      VisitExpr(arg);
     }
     stream_ << "]";
   }

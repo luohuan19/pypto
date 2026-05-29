@@ -7,40 +7,54 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Lightweight system test for ``pl.dump_tag`` end-to-end.
+"""System tests for selective tensor dump end-to-end (simpler#844).
 
-A tiny ``(a + 1) * 2`` kernel built as a ``@pl.jit`` entry composed of two
-``@pl.jit.inline`` helpers. ``pl.dump_tag`` markers live in both scopes:
+Selective dump has three front-ends, all backed by the same per-call
+``dump_vars`` attr → ``enable_dump_tensor_selective()`` + ``Arg::dump(...)``
+runtime path. This file exercises two of them on-board:
 
-  - Inline-scope: ``pl.dump_tag(x)`` inside ``add_inline``. It desugars to
-    ``dump_vars`` on the inline body's call; after ``InlineFunctions``
-    splices the body in, the inline param ``x`` is substituted with the
-    entry's ``a``, so the dump rides through to the inlined call.
-  - Entry-scope: ``pl.dump_tag(intermediate)`` on the body-local
-    ``pl.create_tensor`` result.
+1. ``pl.dump_tag`` via a ``@pl.jit`` entry — ``TestDumpTag*`` below.
+   A tiny ``(a + 1) * 2`` kernel built as a ``@pl.jit`` entry composed of two
+   ``@pl.jit.inline`` helpers. ``pl.dump_tag`` markers live in both scopes:
 
-The entry output ``c`` is intentionally never tagged. With
-``--dump-tensor`` the runtime's selective-dump filter should retain only
-the tagged bindings in the manifest, so the test can assert both the
-positive (``a`` / ``intermediate`` present) and negative (``c`` filtered)
-paths in one pass.
+     - Inline-scope: ``pl.dump_tag(x)`` inside ``add_inline``. It desugars to
+       ``dump_vars`` on the inline body's call; after ``InlineFunctions``
+       splices the body in, the inline param ``x`` is substituted with the
+       entry's ``a``, so the dump rides through to the inlined call.
+     - Entry-scope: ``pl.dump_tag(intermediate)`` on the body-local
+       ``pl.create_tensor`` result.
 
-Correctness always runs. Manifest validation (parsing the JSON via
-``simpler_setup.tools.dump_viewer`` and decoding sample bytes from the
-companion bin file referenced by ``manifest["bin_file"]``) is gated
-behind ``--dump-tensor`` and ``not codegen_only``.
+   The entry output ``c`` is intentionally never tagged.
+
+2. ``pl.submit(..., dumps=[...])`` via the ``PTOTestCase`` harness —
+   ``TestSubmitDumps*`` below. ``dumps=`` is the submit-side selective-dump
+   surface (symmetric with ``deps=``); ``pl.dump_tag`` / ``pl.dump`` cannot be
+   used here because ``@pl.jit`` has no ``pl.submit`` / ``pl.manual_scope``.
+   A 2-stage submit pipeline tags only stage1, so stage2 must be filtered out.
+
+In both scenarios, with ``--dump-tensor`` the runtime's selective-dump filter
+retains only the tagged bindings in the manifest, so each test asserts both the
+positive (tagged present) and negative (untagged filtered) paths in one pass.
+
+Correctness always runs. Manifest validation (parsing the JSON, and for the
+dump_tag case decoding sample bytes via ``simpler_setup.tools.dump_viewer``) is
+gated behind ``--dump-tensor`` and ``not codegen_only``.
 """
 
 import dataclasses
 import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pypto.language as pl
 import pytest
 import torch
+from harness.core.harness import PLATFORMS, DataType, PTOTestCase, TensorSpec
+from pypto.ir.pass_manager import OptimizationStrategy
 
-_DUMP_TAG_WORK_DIR = Path(__file__).resolve().parents[4] / "build_output" / "dump_tag_test"
+_BUILD_OUTPUT_DIR = Path(__file__).resolve().parents[4] / "build_output"
+_DUMP_TAG_WORK_DIR = _BUILD_OUTPUT_DIR / "dump_tag_test"
 
 _REQUIRED_FIELDS: dict[str, type | tuple[type, ...]] = {
     "task_id": str,
@@ -258,6 +272,167 @@ class TestDumpTagManifest:
         roles = {e["role"] for e in entries}
         assert "input" in roles, f"{manifest_path}: missing role=input entries; have {sorted(roles)}"
         assert "inout" in roles, f"{manifest_path}: missing role=inout entries; have {sorted(roles)}"
+
+
+# ===========================================================================
+# pl.submit(..., dumps=[...]) — submit-side selective dump (PTOTestCase harness)
+# ===========================================================================
+#
+# ``@pl.jit`` (above) cannot express ``pl.submit`` / ``pl.manual_scope``, so the
+# submit ``dumps=`` surface is exercised through the PTOTestCase / test_runner
+# harness instead. Same runtime dump pipeline, different DSL front-end.
+
+_SUBMIT_DUMPS_ROWS = 128
+_SUBMIT_DUMPS_COLS = 128
+
+
+def _build_submit_dumps_program():
+    """Build a 2-stage submit pipeline with ``dumps=`` on stage1 only."""
+    ROWS, COLS = _SUBMIT_DUMPS_ROWS, _SUBMIT_DUMPS_COLS
+
+    @pl.program
+    class SubmitDumpsProgram:
+        """``out = (x + 1) * 2`` via two submitted stages; stage1 dumps x + scratch."""
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def stage1(
+            self,
+            x: pl.Tensor[[ROWS, COLS], pl.FP32],
+            scratch: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+        ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+            t: pl.Tile[[ROWS, COLS], pl.FP32] = pl.load(x, [0, 0], [ROWS, COLS])
+            r: pl.Tile[[ROWS, COLS], pl.FP32] = pl.add(t, 1.0)  # x + 1
+            ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [0, 0], scratch)
+            return ret
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def stage2(
+            self,
+            scratch: pl.Tensor[[ROWS, COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+        ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+            t: pl.Tile[[ROWS, COLS], pl.FP32] = pl.load(scratch, [0, 0], [ROWS, COLS])
+            r: pl.Tile[[ROWS, COLS], pl.FP32] = pl.mul(t, 2.0)  # scratch * 2
+            ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [0, 0], out)
+            return ret
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            x: pl.Tensor[[ROWS, COLS], pl.FP32],
+            scratch: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+            out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+        ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+            with pl.manual_scope():
+                # stage1 dumps its input x and inout scratch; stage2 dumps
+                # nothing, so selective dump must filter stage2 out entirely.
+                scratch, stage1_tid = pl.submit(self.stage1, x, scratch, dumps=[x, scratch])
+                out, _ = pl.submit(self.stage2, scratch, out, deps=[stage1_tid])
+            return out
+
+    return SubmitDumpsProgram
+
+
+class _SubmitDumpsPipelinePTO(PTOTestCase):
+    """``out = (x + 1) * 2`` via a 2-stage submit pipeline with stage1 dumps=."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"submit_dumps_pipeline_{_SUBMIT_DUMPS_ROWS}x{_SUBMIT_DUMPS_COLS}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [_SUBMIT_DUMPS_ROWS, _SUBMIT_DUMPS_COLS], DataType.FP32, init_value=torch.randn),
+            TensorSpec("scratch", [_SUBMIT_DUMPS_ROWS, _SUBMIT_DUMPS_COLS], DataType.FP32, init_value=0.0),
+            TensorSpec(
+                "out", [_SUBMIT_DUMPS_ROWS, _SUBMIT_DUMPS_COLS], DataType.FP32, init_value=0.0, is_output=True
+            ),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_submit_dumps_program()
+
+    def compute_expected(self, tensors, params=None):
+        # out = (x + 1) * 2 element-wise.
+        tensors["out"][:] = (tensors["x"] + 1.0) * 2.0
+
+
+class TestSubmitDumpsCorrectness:
+    """Numerical correctness — runs on every supported platform.
+
+    Guards that ``dumps=`` is inert to the computed result: marking args for
+    selective dump must not perturb the kernel output.
+    """
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_pipeline_correctness(self, test_runner, platform):
+        result = test_runner.run(_SubmitDumpsPipelinePTO(platform=platform))
+        assert result.passed, f"submit dumps= pipeline execution failed: {result.error}"
+
+
+@pytest.fixture(scope="module")
+def submit_dumps_manifest_file(test_runner) -> Path:
+    """Run the submit pipeline once with --dump-tensor and return the manifest path."""
+    if not test_runner.config.enable_dump_tensor:
+        pytest.skip("pass --dump-tensor to validate the submit dumps= manifest")
+    if test_runner.config.codegen_only:
+        pytest.skip("--codegen-only skips device execution; no manifest is written")
+
+    pattern = "*/dfx_outputs/tensor_dump/tensor_dump.json"
+    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob(pattern))
+    result = test_runner.run(_SubmitDumpsPipelinePTO())
+    assert result.passed, f"submit dumps= pipeline failed: {result.error}"
+
+    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob(pattern))
+    new_files = after - before
+    assert new_files, "No tensor_dump.json was generated for the submit dumps= run"
+    return max(new_files, key=lambda p: p.stat().st_mtime)
+
+
+@pytest.fixture(scope="module")
+def submit_dumps_manifest(submit_dumps_manifest_file: Path) -> list[dict]:
+    """Parse ``tensor_dump.json`` and return the entry list (the ``tensors`` key)."""
+    manifest = json.loads(submit_dumps_manifest_file.read_text())
+    assert isinstance(manifest, dict), (
+        f"{submit_dumps_manifest_file}: expected a dict, got {type(manifest).__name__}"
+    )
+    entries = manifest.get("tensors")
+    assert isinstance(entries, list) and entries, (
+        f"{submit_dumps_manifest_file}: 'tensors' missing or empty — dump pipeline produced no entries"
+    )
+    return entries
+
+
+class TestSubmitDumpsManifest:
+    """Manifest validation for ``dumps=`` — only runs when ``--dump-tensor`` is enabled."""
+
+    def test_only_dumped_submit_appears(self, submit_dumps_manifest):
+        """Selective dump must drop stage2 entirely.
+
+        Only stage1 carries ``dumps=[x, scratch]``; stage2 has no ``dumps=``,
+        so codegen emits no ``.dump(...)`` for it. The manifest must therefore
+        contain entries from a single ``func_id`` (stage1) only — the submit
+        analogue of ``test_only_tagged_kernel_dumps`` above.
+        """
+        entries = submit_dumps_manifest
+        func_ids = {e["func_id"] for e in entries}
+        assert len(func_ids) == 1, (
+            f"selective dump should retain entries from a single submitted kernel, "
+            f"found {len(func_ids)} func_ids={sorted(func_ids)}"
+        )
+
+    def test_dumped_roles_cover_input_and_inout(self, submit_dumps_manifest):
+        """``dumps=[x, scratch]`` dumps one input (x) and one inout (scratch) slot."""
+        roles = {e["role"] for e in submit_dumps_manifest}
+        assert "input" in roles, f"missing role=input entries; have {sorted(roles)}"
+        assert "inout" in roles, f"missing role=inout entries; have {sorted(roles)}"
 
 
 if __name__ == "__main__":

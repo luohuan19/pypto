@@ -91,8 +91,19 @@ def orch(self, q: pl.Tensor[...], k_cache: pl.Tensor[...], out: pl.Out[...]):
     out = self.qk_pv(q, k_cache, out)   # q and out dumped; k_cache filtered out
 ```
 
-The dump target is tracked by **Var identity** on the consuming Call's
-`dump_vars` attr — never by name. It rides through SSA, inlining, and
+**Per-submit (`dumps=[...]`)** — `pl.submit(...)` uses a `dumps=[...]` kwarg
+(symmetric with `deps=[...]`) as its selective-dump surface; the `pl.dump(arg)`
+wrapper is rejected inside a submit's argument list. Each entry must be a tensor
+argument of that submit:
+
+```python
+with pl.manual_scope():
+    out, tid = pl.submit(self.qk_pv, q, k_cache, out, deps=[prev], dumps=[q, out])
+    # codegen → params_t0.dump(ext_q, ext_out);
+```
+
+The dump target is tracked by **Var identity** on the consuming Call's (or
+`Submit`'s) `dump_vars` attr — never by name. It rides through SSA, inlining, and
 codegen the same way `manual_dep_edges` does, so no fuzzy name matching
 and no false positives. When `enable_dump_tensor=False` both forms are
 inert (the whole dump pipeline is dormant).
@@ -125,8 +136,11 @@ the pass's fixpoint.
 | Marker location / target | Status |
 | ------------------------ | ------ |
 | `pl.dump(arg)` at a kernel-call argument position | Supported (per-call). |
+| `dumps=[arg]` on `pl.submit(...)` | Supported — submit-side per-call surface (symmetric with `deps=`); each entry must be a positional arg of the submit. |
+| `pl.dump(arg)` wrapper inside `pl.submit(...)` arguments | Not supported — raises `ParserSyntaxError`. Use the `dumps=[...]` kwarg instead. |
 | `pl.dump_tag(t)` as a standalone statement in an Orchestration or Inline body | Supported (per-tensor sugar). |
 | Tag consumed by an outline-synthesised dispatch (`@pl.jit` / `with pl.incore()` / tensor-op style) | Supported — the tag rides a scope-level `dump_vars` carrier (`dump_args=`) and the outliner maps it onto the synthesised dispatch arg. |
+| `pl.dump_tag(t)` inside a `@pl.function(type=pl.FunctionType.InCore/AIC/AIV/Group)` body | Not supported — raises `ParserSyntaxError` at parse time. Dump filtering is applied by orchestration codegen at the kernel-call site; kernel-body functions have no corresponding call-site arg to attach the marker to. Place `pl.dump_tag` in the enclosing `Orchestration` (or `Inline`) function instead. |
 | Synthetic outputs of `pl.submit(...)` (implicit `Out`) | Not supported — synth outputs have no call-site arg to wrap. |
 | HOST-tier Python `SubWorker` tensors | Not supported — runtime exposes no equivalent `Arg::dump` hook. |
 | Reassigning a tagged value (e.g. `q = self.foo(q)`) | The rebound result is a **new value**; a previous `pl.dump_tag(q)` does **not** carry over (tracked by Var identity, not name). Re-tag the rebound value if the kernel consumes it. |

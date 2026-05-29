@@ -86,7 +86,17 @@ def orch(self, q: pl.Tensor[...], k_cache: pl.Tensor[...], out: pl.Out[...]):
     out = self.qk_pv(q, k_cache, out)   # q、out 被 dump；k_cache 被过滤掉
 ```
 
-dump 目标记录在消费 Call 的 `dump_vars` attr 上，以 **Var 身份**跟踪 ——
+**逐 submit（`dumps=[...]`）** —— `pl.submit(...)` 使用 `dumps=[...]` kwarg
+（与 `deps=[...]` 对称）作为其选择性 dump 入口；`pl.dump(arg)` 包装在 submit
+的参数列表里会被拒绝。每个条目必须是该 submit 的某个张量实参：
+
+```python
+with pl.manual_scope():
+    out, tid = pl.submit(self.qk_pv, q, k_cache, out, deps=[prev], dumps=[q, out])
+    # codegen → params_t0.dump(ext_q, ext_out);
+```
+
+dump 目标记录在消费 Call（或 `Submit`）的 `dump_vars` attr 上，以 **Var 身份**跟踪 ——
 而非名字。它像 `manual_dep_edges` 一样随 SSA、内联、codegen 流动，因此没有
 模糊名字匹配、没有误报。`enable_dump_tensor=False` 时两种形式都不起作用
 （dump 流水线整体关闭）。
@@ -114,8 +124,11 @@ dump 目标记录在消费 Call 的 `dump_vars` attr 上，以 **Var 身份**跟
 | 标记位置 / 目标 | 状态 |
 | --------------- | ---- |
 | `pl.dump(arg)` 写在 kernel-call 参数位置 | 支持（逐调用）。 |
+| `dumps=[arg]` 写在 `pl.submit(...)` 上 | 支持 —— submit 侧的逐调用入口（与 `deps=` 对称）；每个条目必须是该 submit 的位置实参。 |
+| `pl.dump(arg)` 包装写在 `pl.submit(...)` 的参数里 | 不支持 —— 抛出 `ParserSyntaxError`。请改用 `dumps=[...]` kwarg。 |
 | `pl.dump_tag(t)` 写在 Orchestration 或 Inline 函数体内的独立语句 | 支持（逐张量语法糖）。 |
 | 标记被 outline 合成的派发消费（`@pl.jit` / `with pl.incore()` / 张量算子风格） | 支持 —— 标记随 scope 级 `dump_vars` 载体（`dump_args=`）传递，outliner 再把它映射到合成派发的实参上。 |
+| `pl.dump_tag(t)` 写在 `@pl.function(type=pl.FunctionType.InCore/AIC/AIV/Group)` 函数体内 | 不支持 —— parse 阶段抛出 `ParserSyntaxError`。dump 过滤由编排层 codegen 在 kernel 调用点完成；kernel 函数体内没有对应的调用点实参可挂载标记。请将 `pl.dump_tag` 放在外层 `Orchestration`（或 `Inline`）函数里。 |
 | `pl.submit(...)` 的合成输出（隐式 `Out`） | 不支持 —— 合成输出没有调用点实参可包装。 |
 | HOST 层 Python `SubWorker` 张量 | 不支持 —— runtime 没有对应的 `Arg::dump` 接口。 |
 | 对被标记的值重新赋值（如 `q = self.foo(q)`） | rebind 出来的是**新值**；前面的 `pl.dump_tag(q)` **不会**自动覆盖（以 Var 身份跟踪，而非名字）。若 kernel 消费的是新值，需要再标一次。 |

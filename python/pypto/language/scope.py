@@ -126,6 +126,7 @@ def submit(*args: Any, **kwargs: Any) -> Any:
 
         out, tid    = pl.submit(self.stage1, x, scratch, deps=[prev_tid])
         (a, b), tid = pl.submit(self.multi_out_kernel, x)
+        out, tid    = pl.submit(self.stage1, x, scratch, deps=[prev_tid], dumps=[x])
 
     The kernel-side ``ir.Submit`` natively returns
     ``Tuple[<kernel return>, TASK_ID]``; element 0 is the tensor result(s),
@@ -139,6 +140,15 @@ def submit(*args: Any, **kwargs: Any) -> Any:
     auto-tracking (final fanin = auto ∪ explicit). In auto scope, use
     ``deps=[...]`` as a precision tool to patch edges the runtime cannot
     infer; in ``pl.manual_scope()``, use it to declare every edge.
+
+    The optional ``dumps=[...]`` kwarg is the submit-side selective tensor
+    dump surface (symmetric with ``deps=``): it lists tensor arguments of
+    this submit to mark for dump (simpler#844), so an enabled dump pipeline
+    filters down to just those bindings. Each entry must be a tensor passed
+    positionally to the submitted kernel. ``dumps=`` is the *only* dump
+    surface on a submit — the Call-side ``pl.dump(arg)`` wrapper is rejected
+    inside ``pl.submit(...)`` arguments. No-op when
+    ``RunConfig.enable_dump_tensor`` is ``False``.
 
     The return annotation is ``Any`` (not ``NoReturn``) because the parser
     intercepts the call and binds a 2-tuple to the LHS — downstream code

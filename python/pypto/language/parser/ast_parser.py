@@ -4891,6 +4891,7 @@ class ASTParser:
         allowed_kwargs = {"attrs"}
         if as_submit:
             allowed_kwargs.add("deps")
+            allowed_kwargs.add("dumps")
         if as_spmd:
             allowed_kwargs.update({"core_num", "sync_start"})
         if func_obj is not None and func_obj.role == ir.Role.Orchestrator:
@@ -4909,6 +4910,11 @@ class ASTParser:
                         f"'{kw.arg}' is an SPMD launch parameter. Launch the kernel "
                         "across multiple blocks with "
                         "`out, tid = pl.spmd_submit(self.kernel, ..., core_num=N)`."
+                    )
+                elif kw.arg == "dumps" and not as_submit:
+                    hint = (
+                        "dumps= is only valid on pl.submit(...). For a plain kernel "
+                        "call, wrap the arg: `self.kernel(pl.dump(x), ...)`."
                     )
                 raise ParserTypeError(
                     f"Function '{method_name}' does not accept keyword argument '{kw.arg}'",
@@ -4939,23 +4945,38 @@ class ASTParser:
                     span=self.span_tracker.get_span(unwrapped_args[i]),
                     hint="Write pl.dump(q) where q is a tensor argument of this kernel call.",
                 )
-        # Build the per-call selective-dump set in arg order: explicit
-        # ``pl.dump(arg)`` wrappers plus forward-sticky ``pl.dump_tag`` matches
-        # (by Var identity). Stored as ``attrs['dump_vars']`` (VarPtr list), so
-        # the dump target is tracked by Var through SSA / inline / codegen.
+        # ``pl.submit`` uses the ``dumps=[...]`` kwarg (symmetric with ``deps=``)
+        # as its sole selective-dump surface; the ``pl.dump(arg)`` wrapper is a
+        # Call-only primitive and is rejected inside a submit's argument list.
         dump_index_set = set(dump_indices)
+        if as_submit and dump_index_set:
+            raise ParserSyntaxError(
+                "pl.dump(...) wrapper is not supported inside pl.submit(...) arguments",
+                span=span,
+                hint="List the tensors to dump via the dumps=[...] kwarg, e.g. "
+                "`out, tid = pl.submit(self.kernel, x, dumps=[x])`.",
+            )
+        # ``pl.submit`` parses the optional ``deps=[tid, ...]`` (explicit-edge
+        # attr) and ``dumps=[tensor, ...]`` (selective dump) kwargs. dumps=
+        # feeds the same dump_vars set as the Call-side pl.dump wrapper.
+        user_dep_vars: list[ir.Var] = []
+        submit_dump_vars: list[ir.Var] = []
+        if as_submit:
+            user_dep_vars = self._parse_submit_deps_kwarg(method_name, keywords, span)
+            submit_dump_vars = self._parse_submit_dumps_kwarg(method_name, args, keywords, span)
+        elif manual_dep_edges is not None:
+            user_dep_vars = manual_dep_edges
+        # Build the per-call selective-dump set in arg order (stable round-trip):
+        # explicit ``pl.dump(arg)`` wrappers (Call only), forward-sticky
+        # ``pl.dump_tag`` matches, and ``dumps=`` entries (submit only) — all by
+        # Var identity. Stored as ``attrs['dump_vars']`` (VarPtr list), so the
+        # dump target is tracked by Var through SSA / inline / codegen.
         dump_vars: list[ir.Var] = []
         for i, arg in enumerate(args):
             tagged = any(arg is t for t in self._dump_tagged_vars)
-            if (i in dump_index_set or tagged) and isinstance(arg, ir.Var):
+            in_dumps = any(arg is d for d in submit_dump_vars)
+            if (i in dump_index_set or tagged or in_dumps) and isinstance(arg, ir.Var):
                 dump_vars.append(arg)
-        # ``pl.submit`` parses the optional ``deps=[tid, ...]`` kwarg into a
-        # list of TaskId Vars for the explicit-edge attr.
-        user_dep_vars: list[ir.Var] = []
-        if as_submit:
-            user_dep_vars = self._parse_submit_deps_kwarg(method_name, keywords, span)
-        elif manual_dep_edges is not None:
-            user_dep_vars = manual_dep_edges
         # Orchestration dispatch ``device=`` kwarg: resolves to a ConstInt or
         # an enclosing-loop induction Var.
         device_expr = self._parse_dispatch_device_kwarg(keywords)
@@ -5284,6 +5305,52 @@ class ASTParser:
             return []
         synth = self._synthesize_deps_array(direct_entries, span)
         return [synth]
+
+    def _parse_submit_dumps_kwarg(
+        self, method_name: str, args: list[ir.Expr], keywords: list[ast.keyword], span: ir.Span
+    ) -> list[ir.Var]:
+        """Extract the optional ``dumps=[t1, t2]`` kwarg on a ``pl.submit(...)`` call.
+
+        The submit-side counterpart to the Call ``pl.dump(arg)`` wrapper: each
+        entry marks one tensor argument of this submit for selective tensor dump
+        (simpler#844). Entries feed the same ``attrs['dump_vars']`` set, tracked
+        by Var identity through SSA / inline / codegen.
+
+        Each entry must be a tensor-typed Var that is a positional argument of
+        this submit (matched by identity). Returns an empty list when ``dumps=``
+        is absent.
+        """
+        dumps_kw = next((kw for kw in keywords if kw.arg == "dumps"), None)
+        if dumps_kw is None:
+            return []
+        if not isinstance(dumps_kw.value, (ast.List, ast.Tuple)):
+            raise ParserTypeError(
+                f"'{method_name}' dumps= must be a list / tuple of tensor arguments",
+                span=self.span_tracker.get_span(dumps_kw.value),
+                hint="Write dumps=[x, y] listing tensors passed to this submit.",
+            )
+        result: list[ir.Var] = []
+        for elt in dumps_kw.value.elts:
+            elt_span = self.span_tracker.get_span(elt)
+            val = self.parse_expression(elt)
+            if not isinstance(val, ir.Var) or not isinstance(val.type, ir.TensorType):
+                raise ParserTypeError(
+                    f"'{method_name}' dumps= entries must be tensor variables — "
+                    f"got '{ast.unparse(elt)}'",
+                    span=elt_span,
+                    hint="List tensors passed to this submit, e.g. dumps=[x].",
+                )
+            if not any(val is a for a in args):
+                raise ParserTypeError(
+                    f"'{method_name}' dumps= entry '{ast.unparse(elt)}' is not an "
+                    f"argument of this submit",
+                    span=elt_span,
+                    hint="dumps= may only name tensors passed positionally to the "
+                    "submitted kernel.",
+                )
+            if not any(val is e for e in result):  # dedup by identity
+                result.append(val)
+        return result
 
     def _parse_dispatch_device_kwarg(
         self,
