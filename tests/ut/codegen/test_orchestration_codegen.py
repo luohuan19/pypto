@@ -2125,9 +2125,9 @@ class TestOrchestration:
         assert ".expected_arg_count = 5," in code
 
     def test_dump_tag_emits_toggle_and_per_task_dump(self):
-        """``pl.dump_tag(t)`` at orchestration scope makes codegen emit the
-        ``enable_dump_tensor_selective()`` toggle plus a per-task
-        ``Arg::dump(...)`` carrying only the tagged tensors.
+        """``pl.dump_tag(t)`` at orchestration scope makes codegen emit a per-task
+        ``Arg::dump(...)`` carrying only the tagged tensors. No orch-body toggle
+        is emitted (simpler#953): the runtime latches the dump level host-side.
 
         Two kernel calls both consume ``a`` and ``b``; only ``a`` is tagged,
         so both tasks should dump ``ext_a`` and neither should dump ``ext_b``.
@@ -2165,8 +2165,9 @@ class TestOrchestration:
 
         code = _generate_orch_code(DumpTagProgram)
 
-        # Toggle emitted exactly once at orch entry.
-        assert code.count("enable_dump_tensor_selective();") == 1
+        # No orch-body toggle (simpler#953): the runtime latches the dump level
+        # (off / partial / full) host-side; codegen only emits ``.dump(...)``.
+        assert "enable_dump_tensor_selective" not in code
 
         # Both tasks dump only the tagged arg (ext_a), never ext_b.
         assert code.count("params_t0.dump(ext_a);") == 1
@@ -2178,10 +2179,10 @@ class TestOrchestration:
                 assert "ext_b" not in line, f"Untagged ext_b should not be dumped: {line!r}"
 
     def test_no_dump_tag_emits_no_toggle_or_dump(self):
-        """Without any ``pl.dump_tag`` the legacy full-dump path is preserved:
-        no selective-mode toggle, no ``.dump(...)`` calls. The runtime's
-        ``CallConfig::enable_dump_tensor`` flag then drives the "dump every
-        tensor of every task" path as before #844.
+        """Without any ``pl.dump_tag`` no ``.dump(...)`` calls are emitted. The
+        runtime's ``CallConfig::enable_dump_tensor`` level then drives the dump
+        behaviour: level 2 (full) dumps every tensor of every task; level 1
+        (partial) dumps only ``.dump(...)``-marked tensors (here: none).
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -2219,10 +2220,8 @@ class TestOrchestration:
 
     def test_dump_tag_with_no_kernel_use_emits_nothing(self):
         """Tagging a Var that no kernel call consumes is a user mistake we
-        keep quiet about: zero hits → no toggle, no ``.dump(...)``. Emitting
-        only the toggle would switch the runtime to selective mode with no
-        selected slots and silently drop *all* tensor dump output, which is
-        worse than the no-op behaviour we deliver here.
+        keep quiet about: zero hits → no ``.dump(...)`` call emitted. The orch
+        falls back to whatever the runtime dump level dictates.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -2265,7 +2264,7 @@ class TestOrchestration:
         desugars to ``dump_vars`` on the inline body's kernel calls; after
         ``InlineFunctions`` splices the body in, the mutator substitutes the
         caller's arg for the inline param, so the dump rides through to the
-        inlined call site. Codegen then emits the toggle + per-task dump.
+        inlined call site. Codegen then emits the per-task ``.dump(...)``.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -2310,7 +2309,7 @@ class TestOrchestration:
         transformed = pm.run_passes(InlineDumpTagProgram)
         code = _generate_orch_code(transformed)
 
-        assert code.count("enable_dump_tensor_selective();") == 1
+        assert "enable_dump_tensor_selective" not in code
         assert code.count("params_t0.dump(ext_a);") == 1
         for line in code.split("\n"):
             if ".dump(" in line:
@@ -2368,7 +2367,7 @@ class TestOrchestration:
         transformed = pm.run_passes(InlineBodyVarDumpTagProgram)
         code = _generate_orch_code(transformed)
 
-        assert "enable_dump_tensor_selective();" in code
+        assert "enable_dump_tensor_selective" not in code
         # The dump rides on the call's ``dump_vars`` Var ref, which follows the
         # FreshName rename (e.g. ``tmp_inline0``) and SSA versioning, so the
         # emitted dump references the renamed local — at least one
@@ -2459,7 +2458,7 @@ class TestOrchestration:
         # level stack happened at all), then assert the dump emit picks it up
         # via the Var ref riding through the renames.
         assert "_inline" in code, "expected at least one inline-renamed Var in the code"
-        assert code.count("enable_dump_tensor_selective();") == 1
+        assert "enable_dump_tensor_selective" not in code
         dump_lines = [line for line in code.split("\n") if ".dump(" in line]
         assert dump_lines, f"expected dump calls after multi-level inline, got code:\n{code}"
         assert any("tmp" in line for line in dump_lines), (
@@ -2525,7 +2524,7 @@ class TestOrchestration:
         transformed = pm.run_passes(TwoLevelInlineDumpTagProgram)
         code = _generate_orch_code(transformed)
 
-        assert code.count("enable_dump_tensor_selective();") == 1
+        assert "enable_dump_tensor_selective" not in code
         assert code.count("params_t0.dump(ext_a);") == 1
 
 
@@ -3969,8 +3968,9 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(DumpPerSubmitProgram)
         code = _generate_orch_code(transformed)
 
-        # Toggle emitted exactly once at orch entry.
-        assert code.count("enable_dump_tensor_selective();") == 1
+        # No orch-body toggle (simpler#953): the runtime latches the dump level
+        # (off / partial / full) host-side; codegen only emits ``.dump(...)``.
+        assert "enable_dump_tensor_selective" not in code
 
         # Only task 0 dumps ext_x; task 1 dumps nothing.
         assert code.count("params_t0.dump(ext_x);") == 1
@@ -5037,7 +5037,7 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        assert "enable_dump_tensor_selective();" in code, code
+        assert "enable_dump_tensor_selective" not in code, code
         dump_lines = [ln for ln in code.split("\n") if ".dump(" in ln]
         assert dump_lines, code
         assert any("ext_x" in ln for ln in dump_lines), code

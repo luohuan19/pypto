@@ -216,12 +216,12 @@ def dump_tag(tensor: Tensor) -> Tensor:
     targets explicitly at a single task launch; use ``pl.dump_tag`` when one
     declaration should stick across every subsequent consumer.
 
-    Use this to keep ``enable_dump_tensor=True`` viable on large workloads
-    (e.g. paged-attention 64bat/8192ctx) where the host-side dump collector
-    drain rate (~42 MB/s) would otherwise be saturated by unconditional
-    full-tensor dump of every binding, eventually triggering a STARS
-    op-timeout kill on the AICPU side. By tagging only the tensors of
-    interest, the runtime filters out large bindings (1 GB kv-cache,
+    Use this to keep tensor dump viable on large workloads (e.g.
+    paged-attention 64bat/8192ctx) where full dump (``enable_dump_tensor=2``)
+    saturates the host-side dump collector (~42 MB/s drain rate) by dumping
+    every binding, eventually triggering a STARS op-timeout kill on the AICPU
+    side. Run partial dump (``enable_dump_tensor=1``) and tag only the tensors
+    of interest, so the runtime filters out large bindings (1 GB kv-cache,
     output buffers, etc.) from the collector queue.
 
     Semantics:
@@ -231,9 +231,10 @@ def dump_tag(tensor: Tensor) -> Tensor:
       tagged value. Tracked by **Var identity**, never by name: reassigning
       ``q`` (e.g. ``q = self.foo(q)``) produces a new value that the prior
       tag does **not** cover — re-tag it if needed.
-    * No-op when ``RunConfig.enable_dump_tensor`` is ``False`` — selective
-      dump only filters within an enabled dump pipeline; without the
-      pipeline there is nothing to filter.
+    * Only effective under partial dump (``RunConfig.enable_dump_tensor == 1``)
+      — selective dump filters within the partial pipeline. A no-op when dump
+      is off (``0``); under full dump (``2``) every binding is captured, so the
+      tag has nothing to narrow.
     * Consumed at parse time — recorded into the consuming dispatch's
       ``dump_vars`` and emits no IR statement of its own.
 

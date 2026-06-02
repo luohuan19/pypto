@@ -10,7 +10,7 @@ pytest flag in `tests/st/conftest.py`, so the two surfaces stay aligned.
 | `RunConfig` field | pytest flag | `CallConfig` member | Artefact under `dfx_outputs/` | Post-run converter |
 | ----------------- | ----------- | ------------------- | ----------------------------- | ------------------ |
 | `enable_l2_swimlane: bool` | `--enable-l2-swimlane` | `enable_l2_swimlane` | `l2_swimlane_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
-| `enable_dump_tensor: bool` | `--dump-tensor` | `enable_dump_tensor` | `tensor_dump/{tensor_dump.json,bin}` | `dump_viewer` (manual) |
+| `enable_dump_tensor: int` | `--dump-tensor [LEVEL]` (bare = `1`) | `enable_dump_tensor` (`0` off, `1` partial, `2` full) | `tensor_dump/{tensor_dump.json,bin}` | `dump_viewer` (manual) |
 | `enable_pmu: int` | `--enable-pmu [N]` (bare = `2`) | `enable_pmu` (`0` off, `>0` event type) | `pmu.csv` | — |
 | `enable_dep_gen: bool` | `--enable-dep-gen` | `enable_dep_gen` | `deps.json` | `deps_to_graph` (manual) |
 | `enable_scope_stats: bool` | `--enable-scope-stats` | `enable_scope_stats` | `scope_stats/scope_stats.jsonl` | `scope_stats_plot` (manual) |
@@ -63,14 +63,16 @@ pytest tests/st/runtime/ \
 
 ## Selective tensor dump
 
-`enable_dump_tensor=True` writes every binding of every task to
-`tensor_dump/`. On large workloads this can saturate the host-side dump
+`enable_dump_tensor` is a **level** (`0`=off, `1`=partial, `2`=full;
+`True`→`1`, `False`→`0`). Level `2` writes every binding of every task to
+`tensor_dump/`. On large workloads that can saturate the host-side dump
 collector (~42 MB/s drain) and the AICPU will be killed by the STARS
 op-execute timeout — large bindings such as a 1 GB KV-cache fill the
-queue faster than it drains. Mark the *interesting* tensors to limit dump
-to those tensors. Two surfaces, both backed by the runtime
-`enable_dump_tensor_selective()` toggle + `Arg::dump(...)` API from
-simpler#844. They mirror the two `deps=` surfaces exactly — a declarative
+queue faster than it drains. Run **partial** dump (level `1`) and mark the
+*interesting* tensors to limit dump to those tensors. Two surfaces, both backed
+by the runtime `Arg::dump(...)` API (simpler#844). Selective-vs-full is latched
+host-side from the dump level, so no orch-body toggle is emitted (simpler#953).
+They mirror the two `deps=` surfaces exactly — a declarative
 marker (`pl.dump_tag`, the dump analogue of auto-inferred deps) and an
 explicit kwarg (`dumps=`, the dump analogue of `deps=`):
 
@@ -103,8 +105,9 @@ no `dumps=` surface; use `pl.dump_tag` to mark its inputs, or submit it with
 `pl.submit(..., dumps=[...])`. Both surfaces feed the same `dump_vars` attr on
 the consuming Call / `Submit`, tracked by **Var identity** — never by name. It
 rides through SSA, inlining, and codegen the same way `manual_dep_edges` does,
-so no fuzzy name matching and no false positives. When `enable_dump_tensor=False`
-both surfaces are inert (the whole dump pipeline is dormant).
+so no fuzzy name matching and no false positives. The marks only take effect
+under partial dump (`enable_dump_tensor == 1`); they are inert when dump is off
+(`0`) and irrelevant under full dump (`2`), which captures every binding.
 
 `pl.dump_tag` is also accepted inside an Inline helper
 (`@pl.jit.inline` / `FunctionType.Inline`), and works for both kernel-call

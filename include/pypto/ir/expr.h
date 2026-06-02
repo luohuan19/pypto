@@ -780,8 +780,10 @@ inline std::vector<std::pair<std::string, std::any>> WithManualDepEdgesAttr(
  * Codegen matches each ``args_[i]`` against this set by VarPtr identity, so no
  * name comparison is ever needed.
  *
- * Empty / absent attr means the call dumps nothing. When no call in an orch
- * carries a non-empty set, codegen omits ``enable_dump_tensor_selective()``.
+ * Empty / absent attr means the call dumps nothing. Codegen emits one
+ * ``Arg::dump(...)`` marker per call carrying a non-empty set; the runtime
+ * latches the dump level (off / partial / full) host-side, so no orch-body
+ * toggle is emitted.
  *
  * Also appears on a ``ScopeStmt`` as the post-outline carrier (simpler#844):
  * for the ``@pl.jit`` / tensor-op style the kernel dispatch is synthesised by

@@ -147,8 +147,10 @@ def submit(*args: Any, **kwargs: Any) -> Any:
     filters down to just those bindings. Each entry must be a tensor passed
     positionally to the submitted kernel. ``dumps=`` is the explicit dump
     surface on a submit; the declarative ``pl.dump_tag(t)`` statement feeds the
-    same ``dump_vars`` set. No-op when ``RunConfig.enable_dump_tensor`` is
-    ``False``.
+    same ``dump_vars`` set. These marks only take effect under partial dump
+    (``RunConfig.enable_dump_tensor == 1``); they are a no-op when dump is off
+    (``0``) and irrelevant under full dump (``2``), which captures every
+    binding regardless.
 
     The return annotation is ``Any`` (not ``NoReturn``) because the parser
     intercepts the call and binds a 2-tuple to the LHS — downstream code

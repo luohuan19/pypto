@@ -283,14 +283,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
     declared_var_names_ = param_name_set_;
   }
 
-  /// True iff at least one ``.dump(...)`` call was emitted in this orch — i.e.
-  /// a tagged Var actually reached a kernel call. ``GenerateOrchestration``
-  /// reads this to decide whether to prepend ``enable_dump_tensor_selective();``
-  /// at the orch entry: a non-empty tag set with zero hits emits neither the
-  /// toggle nor any ``.dump(...)`` call (a no-op user mistake we keep quiet,
-  /// matching the legacy full-dump-disabled path).
-  bool SelectiveDumpEmitted() const { return selective_dump_emitted_; }
-
   void SetCallTupleElements(const std::map<std::string, std::vector<TupleElement>>& elements) {
     tuple_var_to_elements_ = elements;
     for (auto& [key, vec] : tuple_var_to_elements_) {
@@ -1311,17 +1303,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// (``p.dump``, set by VarPtr identity in the param builders). Scalar entries
   /// are never dumpable (the runtime rejects them in ``Arg::dump``'s
   /// static_assert) and are skipped.
-  ///
-  /// Each match sets ``selective_dump_emitted_``, which the caller (top of
-  /// ``GenerateOrchestration``) reads to decide whether to emit the global
-  /// ``enable_dump_tensor_selective();`` toggle.
   std::vector<std::string> CollectSelectiveDumpValues(const std::vector<ParamEntry>& params) {
     std::vector<std::string> out;
     for (const auto& p : params) {
       if (p.direction == ArgDirection::Scalar) continue;
       if (!p.dump) continue;
       out.push_back(p.value);
-      selective_dump_emitted_ = true;
     }
     return out;
   }
@@ -2783,10 +2770,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::set<std::string> declared_var_names_;
   std::set<std::string> param_name_set_;
   std::map<std::string, int> param_name_to_orch_index_;
-  /// Set the first time a per-task ``ParamEntry`` is selected for ``Arg::dump``
-  /// (i.e. its arg's Var was marked via ``kAttrDumpVars``). Gates the global
-  /// ``enable_dump_tensor_selective()`` toggle.
-  bool selective_dump_emitted_ = false;
   std::ostringstream code_;
   int indent_ = 4;
   std::string current_result_var_;
@@ -2955,18 +2938,14 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   oss << "__attribute__((visibility(\"default\")))\n";
   oss << "void aicpu_orchestration_entry(const ChipStorageTaskArgs& orch_args) {\n";
 
-  // Selective tensor dump toggle (simpler#844). The runtime reads this static
-  // bool on every ``Arg::reset()`` and ``Arg::dump(...)``, so flipping it once
-  // at orch entry — before any task ``Arg`` is constructed inside
-  // ``PTO2_SCOPE()`` — is sufficient. We only emit when at least one tagged
-  // tensor was actually consumed by a kernel call in this orch: a non-empty
-  // tag set with zero matches means the user marked tensors that no kernel
-  // uses, so emitting the toggle without any companion ``.dump()`` would just
-  // switch the runtime into selective mode with no selected slots and
-  // silently drop *all* dump output.
-  if (stmt_codegen.SelectiveDumpEmitted()) {
-    oss << "    enable_dump_tensor_selective();\n\n";
-  }
+  // Selective vs. full tensor dump is no longer requested from the orch body.
+  // simpler#953 removed the ``enable_dump_tensor_selective()`` toggle: the
+  // runtime now latches the dump level (off / partial / full) host-side at
+  // ``dump_tensor_init`` from ``DumpDataHeader`` (driven by
+  // ``CallConfig.enable_dump_tensor``), race-free regardless of submit order.
+  // Codegen only emits the per-task ``Arg::dump(...)`` markers (see
+  // ``EmitSelectiveDumpCall``); partial mode selecting exactly those marked
+  // tensors is enabled by ``enable_dump_tensor == 1``.
 
   oss << "    // External tensors\n";
   int orch_idx = 0;

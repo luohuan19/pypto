@@ -10,8 +10,9 @@
 """System tests for selective tensor dump end-to-end (simpler#844).
 
 Selective dump has three front-ends, all backed by the same per-call
-``dump_vars`` attr → ``enable_dump_tensor_selective()`` + ``Arg::dump(...)``
-runtime path. This file exercises two of them on-board:
+``dump_vars`` attr → ``Arg::dump(...)`` runtime path (the runtime latches the
+dump level host-side; no orch-body toggle since simpler#953). This file
+exercises two of them on-board:
 
 1. ``pl.dump_tag`` via a ``@pl.jit`` entry — ``TestDumpTag*`` below.
    A tiny ``(a + 1) * 2`` kernel built as a ``@pl.jit`` entry composed of two
