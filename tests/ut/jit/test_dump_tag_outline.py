@@ -246,9 +246,7 @@ def _cluster_mixed_writeback(
 
 
 @pl.jit
-def _cluster_mixed_with_dump_tag(
-    a: pl.Tensor, b: pl.Tensor, bias: pl.Tensor, c: pl.Out[pl.Tensor]
-):
+def _cluster_mixed_with_dump_tag(a: pl.Tensor, b: pl.Tensor, bias: pl.Tensor, c: pl.Out[pl.Tensor]):
     c = _cluster_mixed_writeback(a, b, bias, c)
     return c
 
