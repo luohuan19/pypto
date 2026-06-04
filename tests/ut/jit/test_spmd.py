@@ -158,5 +158,65 @@ def test_jit_spmd_sibling_pipeline_loops_reuse_names():
     )
 
 
+def test_jit_spmd_with_form_as_tid_captures_and_wires_deps():
+    """``with pl.spmd(N) as tid:`` (capture form) compiles end-to-end through @pl.jit.
+
+    Exercises the full pipeline on the SPMD producer-TaskId capture: an inline
+    ``as tid`` body (auto-outlined like the for-form) plus a downstream dispatch
+    wired via ``deps=[tid0]``. Two separate Out buffers keep the dependency on the
+    explicit ``deps=`` edge (not on a chained tuple-return). Asserts not just that
+    two Spmd wrappers exist, but that the ``deps=[tid0]`` edge actually survives JIT
+    specialization + lowering — otherwise the specializer could drop/rebind it and
+    this test would still pass.
+    """
+    torch = pytest.importorskip("torch")
+
+    @jit
+    def entry(a: pl.Tensor, out1: pl.Out[pl.Tensor], out2: pl.Out[pl.Tensor]):
+        with pl.spmd(2, name_hint="stage1") as tid0:
+            i = pl.tile.get_block_idx()
+            t = pl.load(a, [i * 64, 0], [64, 128])
+            out1 = pl.store(pl.add(t, t), [i * 64, 0], out1)
+        with pl.spmd(2, name_hint="stage2", deps=[tid0]) as tid1:  # noqa: F841
+            j = pl.tile.get_block_idx()
+            u = pl.load(a, [j * 64, 0], [64, 128])
+            out2 = pl.store(pl.add(u, u), [j * 64, 0], out2)
+        return out2
+
+    post = entry.compile_for_test(torch.randn(128, 128), torch.empty(128, 128), torch.empty(128, 128))
+    spmd_fns = [f for f in post.functions.values() if f.func_type == ir.FunctionType.Spmd]
+    assert len(spmd_fns) == 2, (
+        f"expected two Spmd functions from the two captured pl.spmd() dispatches, got {len(spmd_fns)}"
+    )
+    spmd_fn_names = {f.name for f in spmd_fns}
+
+    # Inspect the lowered orchestration IR: the full pipeline lowers the captured
+    # Submits to Calls of the outlined Spmd functions (DeriveCallDirections), and the
+    # surviving deps=[tid0] edge rides as the consumer Call's manual_dep_edges attr.
+    # Exactly one of the two dispatches must carry a single dep edge — proving the
+    # specializer neither dropped nor duplicated the JIT-specific dependency wiring.
+    orch = next(f for f in post.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+    assert orch.name == "entry"
+    spmd_calls = []
+
+    def _walk(node):
+        if isinstance(node, ir.SeqStmts):
+            for s in node.stmts:
+                _walk(s)
+        elif isinstance(node, ir.AssignStmt):
+            if isinstance(node.value, ir.Call) and node.value.op.name in spmd_fn_names:
+                spmd_calls.append(node.value)
+        elif hasattr(node, "body") and node.body is not None:
+            _walk(node.body)
+
+    _walk(orch.body)
+    assert len(spmd_calls) == 2, f"expected two spmd dispatch calls, got {[c.op.name for c in spmd_calls]}"
+    dep_counts = sorted(len(c.attrs.get("manual_dep_edges", [])) for c in spmd_calls)
+    assert dep_counts == [0, 1], (
+        f"expected the deps=[tid0] edge to survive as exactly one dep on the consumer "
+        f"dispatch, got per-dispatch dep counts {dep_counts}"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
