@@ -627,7 +627,9 @@ class TestConvertTensorToTileOps:
                 return result
 
         # Sanity: the dump tag rides the orchestration call before the pass.
-        before_call = _find_first_call_to(Before.get_function("main"), "main_incore_0")
+        before_main = Before.get_function("main")
+        assert before_main is not None
+        before_call = _find_first_call_to(before_main, "main_incore_0")
         assert before_call is not None
         assert {v.name_hint for v in before_call.attrs["dump_vars"]} == {"lhs"}
 
@@ -635,7 +637,9 @@ class TestConvertTensorToTileOps:
 
         # The call gains the ``ret0__out`` arg, but its dump_vars attr must
         # survive the rewrite.
-        after_call = _find_first_call_to(After.get_function("main"), "main_incore_0")
+        after_main = After.get_function("main")
+        assert after_main is not None
+        after_call = _find_first_call_to(after_main, "main_incore_0")
         assert after_call is not None
         assert "dump_vars" in after_call.attrs
         assert {v.name_hint for v in after_call.attrs["dump_vars"]} == {"lhs"}
