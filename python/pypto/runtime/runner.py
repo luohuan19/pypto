@@ -50,6 +50,11 @@ if TYPE_CHECKING:
     # time. The field is plumbed through to ``ir.compile()`` lazily anyway.
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
+    # ``RunTiming`` is a simpler nanobind type re-exported via
+    # ``task_interface``. Under TYPE_CHECKING only so importing ``runner`` does
+    # not pull in the optional ``simpler`` package at import time.
+    from .task_interface import RunTiming  # pyright: ignore[reportAttributeAccessIssue]
+
 
 def _load_golden_from_data_dir(out_dir: Path, output_names: set[str]) -> dict[str, torch.Tensor] | None:
     """Load pre-computed golden outputs from ``data/out/{name}.pt`` files.
@@ -245,8 +250,20 @@ class RunResult:
         test_name: Optional test case name.  Set by the harness when running
             a named test case; ``None`` for direct :func:`run` calls.
         error: Human-readable error message when ``passed`` is ``False``.
-        execution_time: Wall-clock time in seconds for the full run (compile +
-            execute + validate).
+        execution_time: Python wall-clock time in seconds for the full run
+            (compile + execute + validate). This mixes host-side compile/golden
+            overhead with the actual dispatch, so it cannot isolate device time
+            — use *device_wall_us* / *host_wall_us* for that (issue #1679).
+        device_wall_us: On-NPU orchestrator wall time in microseconds, taken
+            from the dispatch's :class:`RunTiming.device_wall_us`. ``None`` when
+            the run never reached device dispatch (pre-compile failure,
+            ``codegen_only``). For L2 single-task runs this is the real on-NPU
+            wall; on a runtime built without ``PTO2_PROFILING`` it is ``0``.
+        host_wall_us: Host-side wall time in microseconds around the dispatch
+            (:class:`RunTiming.host_wall_us`). ``None`` under the same
+            conditions as *device_wall_us*. Unlike *execution_time*, this
+            excludes compile/golden overhead — it brackets only the device
+            dispatch.
     """
 
     __test__ = False  # Not a pytest test class
@@ -256,6 +273,8 @@ class RunResult:
     error: str | None = None
     execution_time: float | None = None
     profile: dict[str, Any] | None = None
+    device_wall_us: float | None = None
+    host_wall_us: float | None = None
 
     def __str__(self) -> str:
         time_str = f" ({self.execution_time:.2f}s)" if self.execution_time else ""
@@ -517,7 +536,7 @@ def _execute_on_device(
     platform: str,
     device_id: int,
     dfx: _DfxOpts = _DfxOpts(),
-) -> None:
+) -> "RunTiming":
     """Load inputs, execute on device, and validate against golden.
 
     Shared execution logic used by both :func:`run` and the test harness
@@ -536,6 +555,13 @@ def _execute_on_device(
         dfx: Runtime DFX toggles. When any flag is enabled the artefacts
             land under ``<work_dir>/dfx_outputs/`` and the matching
             post-run converter is invoked.
+
+    Returns:
+        The :class:`RunTiming` from :func:`execute_on_device` (``host_wall_us``
+        plus ``device_wall_us``). The harness surfaces these on
+        :class:`RunResult` so callers can isolate device time from the
+        compile + golden + validate wall captured by ``execution_time``
+        (issue #1679).
     """
     from .device_runner import (  # noqa: PLC0415
         build_orch_args_from_inputs,
@@ -571,7 +597,7 @@ def _execute_on_device(
         dfx_dir = work_dir / "dfx_outputs"
         dfx_dir.mkdir(parents=True, exist_ok=True)
 
-    execute_on_device(
+    timing = execute_on_device(
         chip_callable,
         orch_args,
         platform,
@@ -595,6 +621,8 @@ def _execute_on_device(
         rtol=getattr(golden_module, "RTOL", 1e-5),
         atol=getattr(golden_module, "ATOL", 1e-5),
     )
+
+    return timing
 
 
 # ---------------------------------------------------------------------------
@@ -798,7 +826,7 @@ def execute_compiled(  # noqa: PLR0913
     level: int = 2,
     block_dim: int | None = None,
     aicpu_thread_num: int | None = None,
-) -> None:
+) -> "RunTiming":
     """Execute a pre-compiled program with user-provided tensors and scalars.
 
     Reuses :func:`device_runner.compile_and_assemble` for binary compilation
@@ -832,6 +860,14 @@ def execute_compiled(  # noqa: PLR0913
             precedence over ``RUNTIME_CONFIG``.
         aicpu_thread_num: Optional override of the AICPU thread count;
             same precedence rules as ``block_dim``.
+
+    Returns:
+        The :class:`RunTiming` from :func:`execute_on_device` (``host_wall_us``
+        plus ``device_wall_us``; ``device_wall_us`` is the real on-NPU wall for
+        L2 single-task runs and ``0`` for L3+ DAG runs). Always a
+        :class:`RunTiming` — the underlying simpler ``Worker.run`` never returns
+        ``None`` (on a non-``PTO2_PROFILING`` build ``device_wall_us`` is ``0``,
+        not absent). Callers that do not need timing can ignore it.
     """
     work_dir = Path(work_dir)
 
@@ -861,7 +897,7 @@ def execute_compiled(  # noqa: PLR0913
         dfx_dir = work_dir / "dfx_outputs"
         dfx_dir.mkdir(parents=True, exist_ok=True)
 
-    execute_on_device(
+    timing = execute_on_device(
         chip_callable,
         orch_args,
         platform,
@@ -881,3 +917,5 @@ def execute_compiled(  # noqa: PLR0913
     # Collect DFX artefacts after execution (no-op when dfx_dir is None)
     if dfx_dir is not None:
         _collect_dfx_artifacts(dfx_dir, platform, dfx)
+
+    return timing
