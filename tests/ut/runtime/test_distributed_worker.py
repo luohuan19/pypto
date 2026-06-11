@@ -15,6 +15,7 @@ no real compile/fork. The reuse contract is observed by counting how often the
 setup helpers vs. ``_dispatch`` run.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,7 +25,7 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 from pypto.runtime import DeviceTensor
-from pypto.runtime.distributed_runner import DistributedWorker
+from pypto.runtime.distributed_runner import DistributedWorker, _assemble_chip_callables
 
 
 def _param(name: str, shape: list[int], direction: ParamDirection = ParamDirection.In) -> _ParamInfo:
@@ -705,6 +706,39 @@ class TestMultiProgram:
         prog_b = _fake_compiled([_param("b", [8])], [])
         with pytest.raises(ValueError, match="same runtime"):
             DistributedWorker([prog_a, prog_b])
+
+
+class TestAssembleChipCallables:
+    """``_assemble_chip_callables`` is driven by the on-disk ``next_levels/``
+    layout (no live IR), so it works for both freshly-compiled programs and ones
+    reconstructed via ``from_dir`` (the L3 runtime_dir replay path, #1689)."""
+
+    @staticmethod
+    def _build(tmp_path, chip_names, *, stray=False):
+        nl = tmp_path / "next_levels"
+        for name in chip_names:
+            (nl / name).mkdir(parents=True, exist_ok=True)
+            (nl / name / "kernel_config.py").write_text("KERNELS = []\nORCHESTRATION = {}\n")
+        if stray:  # a dir without kernel_config.py must be skipped, not assembled
+            (nl / "_not_a_chip").mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(output_dir=tmp_path, platform="a2a3sim")
+
+    def test_picks_up_chip_dirs_with_kernel_config(self, tmp_path):
+        compiled = self._build(tmp_path, ["chip_a", "chip_b"], stray=True)
+        with patch("pypto.runtime.device_runner.compile_and_assemble") as ca:
+            ca.return_value = (MagicMock(name="ChipCallable"), "tensormap_and_ringbuffer", {})
+            chip_callables, runtime_name = _assemble_chip_callables(compiled)
+
+        assert set(chip_callables) == {"chip_a", "chip_b"}  # stray dir skipped
+        assert runtime_name == "tensormap_and_ringbuffer"
+        called_dirs = {call.args[0] for call in ca.call_args_list}
+        assert called_dirs == {tmp_path / "next_levels" / "chip_a", tmp_path / "next_levels" / "chip_b"}
+        assert all(call.args[1] == "a2a3sim" for call in ca.call_args_list)
+
+    def test_raises_when_no_chip_dirs(self, tmp_path):
+        compiled = SimpleNamespace(output_dir=tmp_path, platform="a2a3sim")  # no next_levels/
+        with pytest.raises(RuntimeError, match="No chip-level tasks found"):
+            _assemble_chip_callables(compiled)
 
 
 if __name__ == "__main__":
