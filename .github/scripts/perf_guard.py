@@ -8,10 +8,12 @@
 # -----------------------------------------------------------------------------------------------------------
 """Non-failing performance-regression guard for CI model runs.
 
-Reads a captured run log (stdout of a `--enable-l2-swimlane` model run), extracts the
-device makespan that the swimlane converter prints, and compares it against a committed
-baseline. A regression beyond the threshold (or missing perf data) is reported as a
-GitHub warning annotation + a Step Summary row and signalled with a non-zero exit code.
+Reads a captured run log (stdout of one or more `--enable-l2-swimlane` model runs),
+averages the device makespan that the swimlane converter prints across all runs, and
+compares the average against a committed baseline. The daily perf job samples the model
+several times and appends each run to the log; averaging absorbs run-to-run jitter.
+A regression beyond the threshold (or missing perf data) is reported as a GitHub warning
+annotation + a Step Summary row and signalled with a non-zero exit code.
 
 The non-zero exit is intentional: paired with ``continue-on-error: true`` on the CI step
 it renders the step yellow ⚠ while keeping the job green. The guard never asserts
@@ -36,24 +38,30 @@ _MAKESPAN_RE = re.compile(r"Total Test Time:\s*([0-9.]+)\s*us")
 _TOTAL_RE = re.compile(r"^TOTAL\s+\d+\s+([0-9.]+)\s+([0-9.]+)", re.MULTILINE)
 
 
-def _parse_log(path: Path) -> dict[str, float]:
+def _parse_log(path: Path) -> tuple[dict[str, float], list[float]]:
     """Extract perf numbers from a captured run log.
 
-    Returns a dict with ``makespan_us`` plus optional ``exec_us`` / ``latency_us``.
-    Raises ValueError if the makespan line is absent (no usable perf signal).
+    The log may concatenate several runs (the daily perf job samples N times and
+    appends each run's stdout). All ``Total Test Time`` lines are averaged so the
+    reported metric is stable against run-to-run jitter.
+
+    Returns ``(metrics, makespans)`` where ``metrics`` holds the averaged
+    ``makespan_us`` plus optional averaged ``exec_us`` / ``latency_us``, and
+    ``makespans`` is the per-run sample list (for spread reporting).
+    Raises ValueError if no makespan line is present (no usable perf signal).
     """
     text = path.read_text(errors="replace") if path.exists() else ""
-    makespan_match = _MAKESPAN_RE.search(text)
-    if makespan_match is None:
+    makespans = [float(m) for m in _MAKESPAN_RE.findall(text)]
+    if not makespans:
         raise ValueError(
             f"no 'Total Test Time: <X> us' line found in {path} (perf run produced no usable number)"
         )
-    metrics = {"makespan_us": float(makespan_match.group(1))}
-    total_match = _TOTAL_RE.search(text)
-    if total_match is not None:
-        metrics["exec_us"] = float(total_match.group(1))
-        metrics["latency_us"] = float(total_match.group(2))
-    return metrics
+    metrics = {"makespan_us": sum(makespans) / len(makespans)}
+    totals = _TOTAL_RE.findall(text)
+    if totals:
+        metrics["exec_us"] = sum(float(e) for e, _ in totals) / len(totals)
+        metrics["latency_us"] = sum(float(latency) for _, latency in totals) / len(totals)
+    return metrics, makespans
 
 
 def _load_baseline(path: Path) -> dict | None:
@@ -98,16 +106,21 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # 1. Parse the captured log.
+    # 1. Parse the captured log (averaging across all sampled runs).
     try:
-        metrics = _parse_log(args.log)
+        metrics, makespans = _parse_log(args.log)
     except ValueError as exc:
         _warning(f"{args.name} perf: no data", str(exc))
         _summary(f"### ⚠️ {args.name} performance guard\n\nNo perf data: {exc}")
         return 1
 
+    n_runs = len(makespans)
     measured_line = ", ".join(f"{k}={v:.2f}" for k, v in metrics.items())
-    print(f"[perf-guard] {args.name} measured: {measured_line}")
+    print(f"[perf-guard] {args.name} measured (avg of {n_runs} run(s)): {measured_line}")
+    if n_runs > 1:
+        samples = ", ".join(f"{m:.2f}" for m in makespans)
+        print(f"[perf-guard]   makespan_us samples: {samples}")
+        print(f"[perf-guard]   spread: min={min(makespans):.2f} max={max(makespans):.2f} us")
 
     if args.metric not in metrics:
         _warning(
@@ -142,6 +155,7 @@ def main() -> int:
 
     row = (
         f"### {args.name} performance guard\n\n"
+        f"Measured = average of {n_runs} run(s).\n\n"
         f"| Metric | Measured | Baseline | Δ | Threshold |\n"
         f"| --- | --- | --- | --- | --- |\n"
         f"| `{args.metric}` | {measured:.2f} | {base_value:.2f} | "
