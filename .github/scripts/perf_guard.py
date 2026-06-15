@@ -1,5 +1,11 @@
-#!/usr/bin/env python3
-# Copyright (c) PyPTO contributors.
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Non-failing performance-regression guard for CI model runs.
 
 Reads a captured run log (stdout of a `--enable-l2-swimlane` model run), extracts the
@@ -16,6 +22,7 @@ Metric source (printed by runtime/simpler_setup/tools/swimlane_converter.py):
     Total Test Time: 907.88 us (from earliest dispatch to latest finish)   # makespan_us
     TOTAL                   579       22672.70         33239.52             # exec / latency
 """
+
 import argparse
 import json
 import os
@@ -39,8 +46,7 @@ def _parse_log(path: Path) -> dict[str, float]:
     makespan_match = _MAKESPAN_RE.search(text)
     if makespan_match is None:
         raise ValueError(
-            f"no 'Total Test Time: <X> us' line found in {path} "
-            "(perf run produced no usable number)"
+            f"no 'Total Test Time: <X> us' line found in {path} (perf run produced no usable number)"
         )
     metrics = {"makespan_us": float(makespan_match.group(1))}
     total_match = _TOTAL_RE.search(text)
@@ -77,14 +83,19 @@ def _warning(title: str, message: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--log", type=Path, required=True,
-                        help="captured run log to parse for the perf number")
-    parser.add_argument("--baseline", type=Path, required=True,
-                        help="baseline JSON with metric/value/threshold_pct")
-    parser.add_argument("--name", type=str, default="model",
-                        help="display name for messages and the summary")
-    parser.add_argument("--metric", type=str, default="makespan_us",
-                        help="which parsed metric to compare against the baseline")
+    parser.add_argument(
+        "--log", type=Path, required=True, help="captured run log to parse for the perf number"
+    )
+    parser.add_argument(
+        "--baseline", type=Path, required=True, help="baseline JSON with metric/value/threshold_pct"
+    )
+    parser.add_argument("--name", type=str, default="model", help="display name for messages and the summary")
+    parser.add_argument(
+        "--metric",
+        type=str,
+        default="makespan_us",
+        help="which parsed metric to compare against the baseline",
+    )
     args = parser.parse_args()
 
     # 1. Parse the captured log.
@@ -99,10 +110,14 @@ def main() -> int:
     print(f"[perf-guard] {args.name} measured: {measured_line}")
 
     if args.metric not in metrics:
-        _warning(f"{args.name} perf: missing metric",
-                 f"metric '{args.metric}' not present in parsed log; got {measured_line}")
-        _summary(f"### ⚠️ {args.name} performance guard\n\n"
-                 f"Metric `{args.metric}` not found. Measured: {measured_line}")
+        _warning(
+            f"{args.name} perf: missing metric",
+            f"metric '{args.metric}' not present in parsed log; got {measured_line}",
+        )
+        _summary(
+            f"### ⚠️ {args.name} performance guard\n\n"
+            f"Metric `{args.metric}` not found. Measured: {measured_line}"
+        )
         return 1
     measured = metrics[args.metric]
 
@@ -122,6 +137,8 @@ def main() -> int:
     base_value = float(baseline["value"])
     threshold_pct = float(baseline.get("threshold_pct", 10))
     delta_pct = (measured - base_value) / base_value * 100.0
+    regressed = delta_pct > threshold_pct
+    verdict = "REGRESSION (exceeds threshold)" if regressed else "within threshold"
 
     row = (
         f"### {args.name} performance guard\n\n"
@@ -131,8 +148,16 @@ def main() -> int:
         f"{delta_pct:+.1f}% | {threshold_pct:.1f}% |\n"
     )
 
+    # Echo the full comparison to stdout so the CI log is self-explanatory
+    # (the rich table still goes to the Step Summary panel via _summary).
+    print(f"[perf-guard] {args.name} comparison ({args.metric}):")
+    print(f"  measured : {measured:.2f} us")
+    print(f"  baseline : {base_value:.2f} us  (pypto_ref={baseline.get('pypto_ref', '?')})")
+    print(f"  delta    : {delta_pct:+.1f}%  (threshold +{threshold_pct:.1f}%)")
+    print(f"  verdict  : {'⚠ ' if regressed else '✅ '}{verdict}")
+
     # 3. Compare. Regression (slower => larger) beyond threshold => yellow ⚠.
-    if delta_pct > threshold_pct:
+    if regressed:
         _warning(
             f"{args.name} perf regression",
             f"{args.metric} {measured:.2f}us vs baseline {base_value:.2f}us "
