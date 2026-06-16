@@ -130,7 +130,7 @@ def test_build_args_spec_scalar(tmp_path):
 
 def test_build_args_spec_rejects_unknown_type(tmp_path):
     with pytest.raises(TypeError):
-        _build_args_spec(["not an arg"], tmp_path)
+        _build_args_spec(["not an arg"], tmp_path)  # type: ignore[list-item]  # pyright: ignore[reportArgumentType]
 
 
 if __name__ == "__main__":

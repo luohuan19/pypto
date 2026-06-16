@@ -139,9 +139,7 @@ class TestSwimlaneOutput:
         name_maps = list(dfx_dir.glob("name_map_*.json"))
         assert name_maps, f"No name_map_*.json generated in {dfx_dir}"
         data = json.loads(name_maps[0].read_text(encoding="utf-8"))
-        assert data.get("callable_id_to_name"), (
-            f"name_map {name_maps[0].name} has empty callable_id_to_name"
-        )
+        assert data.get("callable_id_to_name"), f"name_map {name_maps[0].name} has empty callable_id_to_name"
 
     def test_top_level_structure(self, swimlane_data: dict):
         """Top-level 'l2_swimlane_level' and 'tasks' fields are present and valid."""

@@ -29,6 +29,7 @@ import json
 import shlex
 import subprocess
 import sys
+import uuid
 from collections.abc import Callable
 from ctypes import _SimpleCData
 from dataclasses import dataclass, field, replace
@@ -584,6 +585,7 @@ def _load_golden_module(golden_path: "Path", module_name: str = "_golden") -> An
 def _build_args_spec(
     args: "list[torch.Tensor | DeviceTensor | _SimpleCData]",
     save_dir: Path,
+    run_id: str = "",
 ) -> list[dict]:
     """Describe orch arguments for the dep_gen subprocess (see below).
 
@@ -598,12 +600,15 @@ def _build_args_spec(
       device-resident tensor routes the graph the capture is approximate.
     * ctypes scalar — value preserved exactly.
 
-    Mirrors the type dispatch in :func:`_coerced_to_orch_args`.
+    *run_id* (when given) is woven into the saved tensor filenames so concurrent
+    captures sharing one *save_dir* do not overwrite each other's args. Mirrors
+    the type dispatch in :func:`_coerced_to_orch_args`.
     """
+    prefix = f"_dep_gen_arg_{run_id}_" if run_id else "_dep_gen_arg_"
     spec: list[dict] = []
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
-            path = save_dir / f"_dep_gen_arg_{i}.pt"
+            path = save_dir / f"{prefix}{i}.pt"
             torch.save(arg.detach().contiguous().cpu(), path)
             spec.append({"kind": "tensor_file", "path": str(path)})
         elif isinstance(arg, DeviceTensor):
@@ -619,28 +624,43 @@ def _build_args_spec(
     return spec
 
 
-def _capture_deps_subprocess(spec: dict, dfx_dir: Path) -> None:
+# Upper bound for the best-effort dep_gen graph-capture subprocess: it compiles
+# (cached) and runs the kernel once, so generous, but bounded so a stalled run
+# never hangs the swimlane timing pass.
+_DEP_GEN_CAPTURE_TIMEOUT_S = 900
+
+
+def _capture_deps_subprocess(spec: dict, dfx_dir: Path, run_id: str = "") -> None:
     """Capture ``deps.json`` for swimlane in a child process (best-effort).
 
     A child process is used so the SVM host-register mappings the dep_gen
     collector allocates are fully reclaimed on exit, before the in-process
     swimlane pass registers its own (see :func:`_execute_dfx_passes`). The spec
     tells :mod:`pypto.runtime._dep_gen_capture` how to rebuild the orch args.
+    *run_id* (when given) uniquifies the spec filename so concurrent captures
+    sharing one *dfx_dir* do not collide.
 
-    Failure is logged, not raised: the swimlane pass still runs, just without a
-    captured graph (lanes degrade to anonymous ``task(rXtY)`` with no arrows).
+    Failure (non-zero exit or timeout) is logged, not raised: the swimlane pass
+    still runs, just without a captured graph (lanes degrade to anonymous
+    ``task(rXtY)`` with no arrows).
     """
     dfx_dir.mkdir(parents=True, exist_ok=True)
-    spec_path = dfx_dir / "_dep_gen_spec.json"
+    spec_path = dfx_dir / (f"_dep_gen_spec_{run_id}.json" if run_id else "_dep_gen_spec.json")
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
     cmd = [sys.executable, "-m", "pypto.runtime._dep_gen_capture", str(spec_path)]
     try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
+        # Bounded so a stalled dep_gen run can never hang the timing pass.
+        subprocess.run(cmd, check=True, timeout=_DEP_GEN_CAPTURE_TIMEOUT_S)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        detail = (
+            f"timed out after {_DEP_GEN_CAPTURE_TIMEOUT_S}s"
+            if isinstance(e, subprocess.TimeoutExpired)
+            else f"exit {e.returncode}"
+        )
         # Keep the spec + staged arg tensors so a failed capture can be re-run
         # and debugged by hand.
         print(
-            f"dep_gen graph capture subprocess failed (exit {e.returncode}); the swimlane will "
+            f"dep_gen graph capture subprocess failed ({detail}); the swimlane will "
             f"render without dependency arrows / resolved kernel names (expected "
             f"{dfx_dir / 'deps.json'}). Inputs kept at {spec_path} for re-run."
         )
@@ -849,6 +869,7 @@ def _execute_on_device(
         # Harness path: the child regenerates inputs deterministically from
         # golden.py, so the captured graph is faithful (no zero-tensor proxy).
         assert dfx_dir is not None  # swimlane-on implies dfx.any() -> dfx_dir set
+        run_id = uuid.uuid4().hex
         _capture_deps_subprocess(
             {
                 "mode": "golden",
@@ -861,6 +882,7 @@ def _execute_on_device(
                 "level": 2,
             },
             dfx_dir,
+            run_id,
         )
 
     # When swimlane is on (onboard), capture deps.json in a subprocess first,
@@ -996,7 +1018,9 @@ def _write_name_map(work_dir: Path, dfx_dir: Path) -> Path | None:
     if not kernel_config_path.exists():
         return None
     try:
-        from simpler_setup.tools.swimlane_converter import load_kernel_config  # noqa: PLC0415
+        from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+            load_kernel_config,
+        )
 
         func_id_to_name = load_kernel_config(str(kernel_config_path))
     except Exception as e:  # noqa: BLE001 - best-effort diagnostics, never fatal
@@ -1251,10 +1275,11 @@ def execute_compiled(  # noqa: PLR0913
         # cross the process boundary, so the child rebuilds zero tensors of the
         # recorded shapes plus the exact scalars (graph is structural).
         assert dfx_dir is not None  # swimlane-on implies dfx.any() -> dfx_dir set
+        run_id = uuid.uuid4().hex
         _capture_deps_subprocess(
             {
                 "mode": "argspec",
-                "args": _build_args_spec(args, dfx_dir),
+                "args": _build_args_spec(args, dfx_dir, run_id),
                 "work_dir": str(work_dir),
                 "platform": platform,
                 "device_id": device_id,
@@ -1265,6 +1290,7 @@ def execute_compiled(  # noqa: PLR0913
                 "aicpu_thread_num": effective_aicpu_thread_num,
             },
             dfx_dir,
+            run_id,
         )
 
     # When swimlane is on (onboard), capture deps.json in a subprocess first,

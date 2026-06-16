@@ -101,8 +101,10 @@ def main(argv: list[str]) -> int:
 
     spec = json.loads(Path(argv[0]).read_text(encoding="utf-8"))
 
-    print("[swimlane:dep_gen subprocess] capturing the task dependency graph for the swimlane; "
-          "the following compile/run output is for deps.json only (timing is discarded).")
+    print(
+        "[swimlane:dep_gen subprocess] capturing the task dependency graph for the swimlane; "
+        "the following compile/run output is for deps.json only (timing is discarded)."
+    )
 
     from .device_runner import compile_and_assemble, execute_on_device  # noqa: PLC0415
 
