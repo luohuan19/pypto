@@ -165,6 +165,17 @@ python -m simpler_setup.tools.deps_to_graph <work_dir>/dfx_outputs/deps.json \
 `brew install graphviz`）。生成的 HTML 用浏览器直接打开即可——
 拖拽平移、滚轮缩放、`f` 自适应窗口、`r` 重置。
 
+### 可读的 kernel 名称（`name_map_*.json`）
+
+默认情况下，swimlane / 依赖图工具用数字 id 标注任务（`task(rXtY)` /
+`func_<id>(...)`）。要恢复真实 kernel 名称（`matmul(rXtY)`），records
+旁边必须有一份 name map。Simpler 自带的 SceneTest harness 会写这个文件；
+pypto 不使用 SceneTest，因此当开启 `enable_l2_swimlane` 或
+`enable_dep_gen` 时，runner 会从 `kernel_config.py` 已有的 `func_id` /
+`name` 字段合成 `<work_dir>/dfx_outputs/name_map_<case>.json`。它会被自动
+消费：`swimlane_converter` 通过 `--func-names <name_map>` 调用，
+`deps_to_graph` 则自动发现同目录下的 `name_map_*.json`。无需手动操作。
+
 ## 将 `scope_stats.jsonl` 渲染为 HTML
 
 `enable_scope_stats` 产出原始的 `scope_stats/scope_stats.jsonl`（第 1
@@ -189,6 +200,7 @@ python runtime/tools/scope_stats_plot.py \
 | `CallConfig` 透传 | [device_runner.py](../../../python/pypto/runtime/device_runner.py) | `execute_on_device(..., enable_*, output_prefix)` |
 | 流水线打包 | [runner.py](../../../python/pypto/runtime/runner.py) | `_DfxOpts` dataclass + `_DfxOpts.from_run_config` |
 | 按 flag 后处理分发 | [runner.py](../../../python/pypto/runtime/runner.py) | `_collect_dfx_artifacts` |
+| kernel 名称映射合成 | [runner.py](../../../python/pypto/runtime/runner.py) | `_write_name_map` |
 | pytest 入口 | [tests/st/conftest.py](../../../tests/st/conftest.py) | `pytest_addoption` |
 | Harness 流水线上下文 | [tests/st/harness/core/test_runner.py](../../../tests/st/harness/core/test_runner.py) | `start_pipeline(..., enable_*)` |
 

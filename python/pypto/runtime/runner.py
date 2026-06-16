@@ -25,6 +25,7 @@ Typical usage::
 """
 
 import importlib.util
+import json
 import shlex
 import subprocess
 import sys
@@ -717,6 +718,17 @@ def _collect_dfx_artifacts(
     partial DFX run (e.g. only ``enable_dump_tensor``) must not crash on
     the swimlane converter looking for ``l2_swimlane_records.json``.
     """
+    # Synthesise the func_id→name map the profiling tools need for readable
+    # labels. simpler's SceneTest harness writes this itself; pypto does not
+    # use SceneTest, so we derive it from ``kernel_config.py`` and drop it next
+    # to the records. ``deps_to_graph`` auto-discovers ``name_map_*.json`` in
+    # the same directory, and ``swimlane_converter`` is pointed at it below via
+    # ``--func-names``. Written whenever swimlane or dep_gen is enabled (the two
+    # consumers); harmless no-op when no kernel names are available.
+    name_map_path: Path | None = None
+    if dfx.enable_l2_swimlane or dfx.enable_dep_gen:
+        name_map_path = _write_name_map(dfx_dir.parent, dfx_dir)
+
     if dfx.enable_l2_swimlane and (dfx_dir / "l2_swimlane_records.json").exists():
         # Swimlane conversion is onboard-only — the simulator produces
         # ``l2_swimlane_records.json`` but does not yet ship the matching
@@ -726,6 +738,7 @@ def _collect_dfx_artifacts(
                 dfx_dir.parent,
                 dfx_dir,
                 dfx_dir / "l2_swimlane_records.json",
+                func_names=name_map_path,
             )
         else:
             print(
@@ -776,10 +789,57 @@ def _collect_dfx_artifacts(
         )
 
 
+def _write_name_map(work_dir: Path, dfx_dir: Path) -> Path | None:
+    """Synthesise a ``name_map_*.json`` in *dfx_dir* from ``kernel_config.py``.
+
+    The profiling tools render human-readable kernel names (``QK(rXtY)``
+    instead of the anonymous ``task(rXtY)``) only when a name map sits next to
+    the records: ``swimlane_converter`` consumes it via ``--func-names`` and
+    ``deps_to_graph`` auto-discovers any sibling ``name_map_*.json``. simpler's
+    SceneTest harness writes this file itself, but pypto does not use SceneTest,
+    so we build the same ``callable_id_to_name`` mapping from the
+    ``func_id``/``name`` fields already emitted into ``kernel_config.py``.
+
+    Args:
+        work_dir: Directory containing ``kernel_config.py``.
+        dfx_dir: ``dfx_outputs`` directory where the name map is written
+            (alongside ``l2_swimlane_records.json`` / ``deps.json``).
+
+    Returns:
+        The written path, or ``None`` when ``kernel_config.py`` is absent or
+        carries no named kernels (the tools then fall back to default labels).
+    """
+    kernel_config_path = work_dir / "kernel_config.py"
+    if not kernel_config_path.exists():
+        return None
+    try:
+        from simpler_setup.tools.swimlane_converter import load_kernel_config  # noqa: PLC0415
+
+        func_id_to_name = load_kernel_config(str(kernel_config_path))
+    except Exception as e:  # noqa: BLE001 - best-effort diagnostics, never fatal
+        print(f"Skipping name_map generation ({type(e).__name__}: {e})")
+        return None
+    if not func_id_to_name:
+        return None
+
+    # level 2 = orchestration entry + incore kernels: the only level pypto's
+    # user-API compiles to (device_runner rejects level != 2). orchestrator_name
+    # stays None — the C++ orch entry has no SceneTest-style display name.
+    name_map = {
+        "level": 2,
+        "orchestrator_name": None,
+        "callable_id_to_name": func_id_to_name,
+    }
+    out_path = dfx_dir / f"name_map_{work_dir.name}.json"
+    out_path.write_text(json.dumps(name_map, indent=2), encoding="utf-8")
+    return out_path
+
+
 def _generate_swimlane(
     work_dir: Path,
     swimlane_dir: Path,
     perf_file: Path | None,
+    func_names: Path | None = None,
 ) -> None:
     """Run ``python -m simpler_setup.tools.swimlane_converter`` to generate ``merged_swimlane_*.json``.
 
@@ -791,6 +851,9 @@ def _generate_swimlane(
         perf_file: Path to the ``l2_swimlane_records_*.json`` file produced by
             CodeRunner and already moved into *swimlane_dir*.  When ``None``,
             swimlane conversion is skipped.
+        func_names: Optional ``name_map_*.json`` (see :func:`_write_name_map`)
+            passed to the converter via ``--func-names``. Takes precedence over
+            the ``-k kernel_config.py`` fallback for label resolution.
     """
     converter_module = "simpler_setup.tools.swimlane_converter"
     try:
@@ -819,6 +882,10 @@ def _generate_swimlane(
         "-k",
         str(kernel_config_path),
     ]
+    # ``--func-names`` (the synthesised name_map) takes precedence over ``-k``
+    # for label resolution; ``-k`` stays as the fallback when no map was written.
+    if func_names is not None:
+        cmd += ["--func-names", str(func_names)]
 
     try:
         subprocess.run(cmd, check=True)

@@ -179,6 +179,19 @@ Requires Graphviz on `PATH` (`apt install graphviz` /
 `brew install graphviz`). Open the resulting HTML in any browser —
 drag to pan, wheel to zoom, `f` to fit, `r` to reset.
 
+### Human-readable kernel names (`name_map_*.json`)
+
+By default the swimlane / dependency-graph tools label tasks by numeric
+id (`task(rXtY)` / `func_<id>(...)`). To recover real kernel names
+(`matmul(rXtY)`), a name map must sit next to the records. Simpler's own
+SceneTest harness writes this file; pypto does not use SceneTest, so when
+`enable_l2_swimlane` or `enable_dep_gen` is set the runner synthesises
+`<work_dir>/dfx_outputs/name_map_<case>.json` from the `func_id` / `name`
+fields already in `kernel_config.py`. It is consumed automatically:
+`swimlane_converter` is invoked with `--func-names <name_map>`, and
+`deps_to_graph` auto-discovers the sibling `name_map_*.json`. No manual
+step is required.
+
 ## Rendering `scope_stats.jsonl` to HTML
 
 `enable_scope_stats` emits the raw `scope_stats/scope_stats.jsonl`
@@ -203,6 +216,7 @@ this hint at the end of every scope-stats-enabled run.
 | `CallConfig` plumbing | [device_runner.py](../../../python/pypto/runtime/device_runner.py) | `execute_on_device(..., enable_*, output_prefix)` |
 | Pipeline bundle | [runner.py](../../../python/pypto/runtime/runner.py) | `_DfxOpts` dataclass + `_DfxOpts.from_run_config` |
 | Per-flag post-run dispatch | [runner.py](../../../python/pypto/runtime/runner.py) | `_collect_dfx_artifacts` |
+| Kernel-name map synthesis | [runner.py](../../../python/pypto/runtime/runner.py) | `_write_name_map` |
 | pytest entry | [tests/st/conftest.py](../../../tests/st/conftest.py) | `pytest_addoption` |
 | Harness pipeline ctx | [tests/st/harness/core/test_runner.py](../../../tests/st/harness/core/test_runner.py) | `start_pipeline(..., enable_*)` |
 
