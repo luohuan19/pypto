@@ -19,6 +19,7 @@ register/load every call (hundreds of ms of host overhead that swamps the
 """
 
 import statistics
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -125,7 +126,7 @@ class BenchmarkStats:
 
 def benchmark(
     compiled: Any,
-    args: list[Any],
+    args: Sequence[Any],
     *,
     rounds: int = 100,
     warmup: int = 3,
@@ -177,9 +178,7 @@ def benchmark(
     if warmup < 0:
         raise ValueError(f"warmup must be non-negative, got {warmup}")
     if config is not None and (platform is not None or device_id is not None):
-        raise ValueError(
-            "benchmark(): pass either config=... or platform=/device_id=, not both"
-        )
+        raise ValueError("benchmark(): pass either config=... or platform=/device_id=, not both")
 
     if config is not None:
         rc = config

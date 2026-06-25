@@ -383,7 +383,7 @@ class ChipWorker(Worker):
                 ``compiled.runtime_name`` != ``self.runtime``.
             RuntimeError: ChipWorker not initialized.
         """
-        outputs, _timing = self._dispatch(compiled, args, config)
+        outputs, _timing = self._dispatch(compiled, args, config, op="run")
         return outputs
 
     def run_timed(
@@ -408,32 +408,35 @@ class ChipWorker(Worker):
         ``device_wall_us``).
 
         .. note::
-           ``device_wall_us`` is the real on-NPU orchestrator wall only for L2
-           single-task runs; it is ``0`` on a runtime built without
-           ``PTO2_PROFILING``, and L3+ DAG runs (``DistributedWorker``) report
-           ``0`` (use ``host_wall_us`` there).
+           This is L2 single-chip only — ``device_wall_us`` is the real on-NPU
+           orchestrator wall, ``0`` only on a runtime built without
+           ``PTO2_PROFILING``. L3+ ``DistributedWorker`` does not support
+           ``run_timed`` (the base :meth:`Worker.run_timed` raises).
 
         Raises:
             ValueError: ``compiled.platform`` != ``self.platform`` or
                 ``compiled.runtime_name`` != ``self.runtime``.
             RuntimeError: ChipWorker not initialized.
         """
-        return self._dispatch(compiled, args, config)
+        return self._dispatch(compiled, args, config, op="run_timed")
 
     def _dispatch(
         self,
         compiled: CompiledProgram,
         args: tuple[CallArg, ...],
         config: RunConfig | None,
+        *,
+        op: str,
     ) -> tuple[Any, Any]:
         """Shared dispatch core for :meth:`run` / :meth:`run_timed`.
 
         Returns ``(outputs, timing)``: *outputs* follows :meth:`run`'s contract
         and *timing* is the simpler ``RunTiming`` from :meth:`_run_chip`. The
         only difference between the two public methods is whether they keep
-        *timing*.
+        *timing*. *op* is the calling method name, used so the
+        not-initialized error names the public entry point the caller used.
         """
-        self._require_initialized("run")
+        self._require_initialized(op)
         self._check_binding(compiled)
 
         # Import lazily to avoid a cycle: compiled_program imports from

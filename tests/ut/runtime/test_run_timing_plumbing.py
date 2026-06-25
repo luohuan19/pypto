@@ -116,7 +116,7 @@ def test_chip_worker_run_timed_returns_outputs_and_timing():
 
     assert outputs is sentinel_out  # single-output return-style → unwrapped
     assert timing is _TIMING_SENTINEL
-    worker._run_chip.assert_called_once()
+    cast(MagicMock, worker._run_chip).assert_called_once()
 
 
 @requires_simpler

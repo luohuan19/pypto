@@ -342,9 +342,7 @@ class TestL2RunTimingSurface:
             f"expected {rounds} measured samples (warmup excluded), got {len(stats.device_wall_us)}"
         )
         assert stats.rounds == rounds and stats.warmup == warmup
-        assert not stats.all_zero_device, (
-            "device_wall_us must be > 0 on the default PTO2_PROFILING build"
-        )
+        assert not stats.all_zero_device, "device_wall_us must be > 0 on the default PTO2_PROFILING build"
         assert stats.device_us_min > 0.0
         assert stats.device_us_max >= stats.device_us_min
         assert stats.device_us_min <= stats.device_us_median <= stats.device_us_max

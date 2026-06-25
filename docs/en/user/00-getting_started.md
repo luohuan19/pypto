@@ -319,9 +319,10 @@ Pass `platform=` / `device_id=` for the common case, or a full `RunConfig` via
 exposed under both `device_wall_us_*` (issue-aligned) and shorter `device_us_*`
 names, with `samples` aliasing the raw `device_wall_us` list.
 
-`device_wall_us` is a real on-NPU wall only for L2 single-chip runs; it is `0`
-on a runtime built without `PTO2_PROFILING` (check `stats.all_zero_device`) and
-for L3+ DAG runs (read `host_wall_us` there).
+`device_wall_us` is a real on-NPU wall only for L2 single-chip runs. It is `0`
+on runtimes built without `PTO2_PROFILING` (check `stats.all_zero_device`).
+For L3+ DAG runs, aggregate device-wall timing is currently unsupported —
+`run_timed` / `benchmark` raise rather than report a zero-valued wall.
 
 ### Distributed (L3+) programs
 

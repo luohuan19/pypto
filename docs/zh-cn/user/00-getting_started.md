@@ -311,8 +311,9 @@ print(stats.device_wall_us_median, stats.device_wall_us_min, len(stats.samples))
 是原始 `device_wall_us` 列表的别名。
 
 `device_wall_us` 仅在 L2 单芯片运行时是真实的 NPU 墙钟；在未开启
-`PTO2_PROFILING` 的 runtime 上为 `0`（用 `stats.all_zero_device` 判断），L3+
-DAG 运行同样为 `0`（此时读 `host_wall_us`）。
+`PTO2_PROFILING` 的 runtime 上为 `0`（用 `stats.all_zero_device` 判断）。L3+
+DAG 运行当前不支持聚合 device 墙钟——`run_timed` / `benchmark` 会直接报错，而不是
+返回 0 值。
 
 ### 分布式（L3+）程序
 
