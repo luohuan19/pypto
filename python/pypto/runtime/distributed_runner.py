@@ -361,7 +361,12 @@ def _bind_sub_workers(
     return {**loaded, **callbacks}
 
 
-def _make_call_config(dc: DistributedConfig, run_config: RunConfig | None = None) -> Any:
+def _make_call_config(
+    dc: DistributedConfig,
+    run_config: RunConfig | None = None,
+    *,
+    dfx_base: Path | None = None,
+) -> Any:
     """Build a simpler ``CallConfig`` from the distributed config.
 
     The ``block_dim`` / ``aicpu_thread_num`` baseline always comes from the
@@ -372,13 +377,29 @@ def _make_call_config(dc: DistributedConfig, run_config: RunConfig | None = None
     config. ``None`` (the default) leaves the baseline untouched and the runtime
     applies its own ``PTO2_RING_*`` env var / compile-time fallback.
 
+    DFX diagnostics (``enable_dump_tensor`` / ``enable_pmu`` / ``enable_dep_gen``
+    / ``enable_scope_stats``) are likewise read from *run_config* and written to
+    the shared ``config`` the host_orch chip dispatch forwards to every
+    ``orch.submit_next_level``; their artifacts land under *dfx_base*
+    (``<output_dir>/dfx_outputs``). ``enable_l2_swimlane`` is not yet supported
+    on the L3 path — it needs the two-pass ``deps.json`` capture the single-chip
+    runner does — so it is rejected here rather than silently dropped.
+
     Args:
         dc: The program's distributed configuration (baseline).
-        run_config: Optional per-dispatch :class:`RunConfig` whose ``ring_*``
-            overrides are applied. ``None`` means no ring override.
+        run_config: Optional per-dispatch :class:`RunConfig` whose ``ring_*`` and
+            DFX overrides are applied. ``None`` means no override.
+        dfx_base: Directory under which DFX artifacts are written
+            (``<output_dir>/dfx_outputs``). Required whenever *run_config*
+            enables a DFX flag; created if missing.
 
     Returns:
         A fresh simpler ``CallConfig``.
+
+    Raises:
+        NotImplementedError: *run_config* enables ``enable_l2_swimlane`` (not yet
+            supported on L3).
+        ValueError: a DFX flag is enabled but *dfx_base* is ``None``.
     """
     from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
         CallConfig,
@@ -389,10 +410,60 @@ def _make_call_config(dc: DistributedConfig, run_config: RunConfig | None = None
         call_config.block_dim = dc.block_dim
     call_config.aicpu_thread_num = dc.aicpu_thread_num
     if run_config is not None:
-        from .runner import _apply_ring_overrides  # noqa: PLC0415
+        from .runner import _apply_ring_overrides, _DfxOpts  # noqa: PLC0415
 
         _apply_ring_overrides(call_config, run_config)
+
+        dfx = _DfxOpts.from_run_config(run_config)
+        if dfx.any():
+            if dfx.enable_l2_swimlane:
+                raise NotImplementedError(
+                    "enable_l2_swimlane is not yet supported on the L3 distributed path "
+                    "(it requires the two-pass deps.json capture). Use enable_dump_tensor / "
+                    "enable_pmu / enable_dep_gen / enable_scope_stats here, or run the "
+                    "single-chip (L2) path for swimlane."
+                )
+            if dfx_base is None:
+                raise ValueError(
+                    "_make_call_config: dfx_base is required when a DFX flag is enabled on L3"
+                )
+            dfx_base.mkdir(parents=True, exist_ok=True)
+            call_config.enable_dump_tensor = dfx.enable_dump_tensor
+            call_config.enable_pmu = dfx.enable_pmu
+            call_config.enable_dep_gen = dfx.enable_dep_gen
+            call_config.enable_scope_stats = dfx.enable_scope_stats
+            # Base dir shared by every chip; ``_submit_chip`` namespaces it per
+            # rank (``<dfx_base>/rank{worker}``) so per-chip artifacts (pmu.csv,
+            # deps.json, ...) don't overwrite each other.
+            call_config.output_prefix = str(dfx_base)
     return call_config
+
+
+def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int) -> Any:
+    """``orch.submit_next_level`` with per-rank DFX ``output_prefix`` isolation.
+
+    The runtime path helpers root every diagnostic artifact at a fixed filename
+    under ``output_prefix`` (``<prefix>/pmu.csv`` etc.), so multiple chips
+    sharing one prefix would clobber each other. This wrapper appends
+    ``/rank{worker}`` for the duration of the submit, then restores the shared
+    ``config`` — safe because ``submit_next_level`` copies the ``CallConfig`` into
+    the task slot synchronously (orchestrator ``s.config = config``) before it
+    returns, so the restore never races the already-queued task.
+
+    When DFX is off (``output_prefix`` unset) or the dispatch is unconstrained
+    (``worker < 0``) the call is forwarded unchanged.
+
+    The codegen emits this for every rank-pinned chip dispatch; the comm-less
+    single-dispatch path keeps the bare ``orch.submit_next_level(...)`` call.
+    """
+    base = config.output_prefix
+    if not base or worker < 0:
+        return orch.submit_next_level(callable_id, task_args, config, worker=worker)
+    config.output_prefix = f"{base}/rank{worker}"
+    try:
+        return orch.submit_next_level(callable_id, task_args, config, worker=worker)
+    finally:
+        config.output_prefix = base
 
 
 def _is_simpler_tensor(arg: Any) -> bool:
@@ -465,9 +536,13 @@ def execute_distributed(
             worker-resident :class:`~pypto.runtime.DeviceTensor`.
         config: Optional per-dispatch :class:`RunConfig`. Its per-task
             ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
-            ``ring_dep_pool``) size this dispatch's runtime ring buffers; the
-            remaining (compile-side / DFX) fields are not consumed on the L3
-            dispatch path. ``None`` defers every ring field to the runtime.
+            ``ring_dep_pool``) size this dispatch's runtime ring buffers, and its
+            runtime-diagnostic DFX flags (``enable_dump_tensor`` / ``enable_pmu``
+            / ``enable_dep_gen`` / ``enable_scope_stats``) are written under
+            ``<output_dir>/dfx_outputs/``. ``enable_l2_swimlane`` is not yet
+            supported on L3 (raises ``NotImplementedError``); the remaining
+            compile-side fields are not consumed on the dispatch path. ``None``
+            defers every ring field to the runtime and leaves DFX off.
 
     Returns:
         The simpler ``RunTiming`` from the dispatch (``host_wall_us`` /
@@ -514,7 +589,13 @@ def execute_distributed(
         sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
         w.init()
         return _dispatch(
-            w, entry_fn, tensors, chip_cids, sub_ids, _make_call_config(dc, config), len(dc.device_ids)
+            w,
+            entry_fn,
+            tensors,
+            chip_cids,
+            sub_ids,
+            _make_call_config(dc, config, dfx_base=output_dir / "dfx_outputs"),
+            len(dc.device_ids),
         )
     finally:
         if w is not None:
@@ -547,8 +628,11 @@ def execute_distributed_compiled(
             parameter order (in-place, or input-only for a return-style program).
         config: Optional per-dispatch :class:`RunConfig`, forwarded to
             ``__call__``. Its per-task ring-sizing overrides size this dispatch's
-            runtime ring buffers; other (compile-side / DFX) fields are not
-            consumed on the L3 dispatch path.
+            runtime ring buffers, and its runtime-diagnostic DFX flags
+            (``enable_dump_tensor`` / ``enable_pmu`` / ``enable_dep_gen`` /
+            ``enable_scope_stats``) are written under ``<output_dir>/dfx_outputs/``;
+            ``enable_l2_swimlane`` is not yet supported on L3. Other compile-side
+            fields are not consumed on the dispatch path.
         platform: Override the persisted platform (e.g. ``a2a3sim`` → ``a2a3``).
         distributed_config: Override the persisted run config (e.g. a different
             set of ``device_ids``).
@@ -903,7 +987,9 @@ class DistributedWorker(Worker):
         # mutated). With no RunConfig the prepared baseline is reused as-is.
         call_config = state["call_config"]
         if config is not None:
-            call_config = _make_call_config(compiled._distributed_config, config)
+            call_config = _make_call_config(
+                compiled._distributed_config, config, dfx_base=compiled.output_dir / "dfx_outputs"
+            )
 
         param_infos = state["param_infos"]
         n_params = len(param_infos)

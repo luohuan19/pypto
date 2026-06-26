@@ -350,8 +350,12 @@ class DistributedCompiledProgram:
 
         ``config`` is an optional per-dispatch :class:`RunConfig`; its per-task
         ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
-        ``ring_dep_pool``) size this dispatch's runtime ring buffers. Other
-        (compile-side / DFX) fields are not consumed on the L3 dispatch path.
+        ``ring_dep_pool``) size this dispatch's runtime ring buffers, and its
+        runtime-diagnostic DFX flags (``enable_dump_tensor`` / ``enable_pmu`` /
+        ``enable_dep_gen`` / ``enable_scope_stats``) are written under
+        ``<output_dir>/dfx_outputs/``. ``enable_l2_swimlane`` is not yet supported
+        on L3 (raises ``NotImplementedError``); other compile-side fields are not
+        consumed on the dispatch path.
         """
         from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
 
