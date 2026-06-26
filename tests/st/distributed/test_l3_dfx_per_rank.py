@@ -25,10 +25,10 @@ This exercises the driver wiring (``_make_call_config`` setting the DFX flags +
 base ``output_prefix``) and the codegen wiring (``_submit_chip`` appending the
 ``/rank{worker}`` suffix per dispatch).
 
-``enable_l2_swimlane`` is intentionally NOT exercised here: it is rejected on the
-L3 path (it needs the two-pass deps.json capture the single-chip runner does), a
-contract covered by the ``test_distributed_worker`` / ``test_run_config`` unit
-tests.
+``enable_l2_swimlane`` is also covered: on L3 it co-enables dep_gen and emits
+``rank{r}/l2_swimlane_records.json`` + ``rank{r}/deps.json`` per chip; onboard it
+is additionally converted to ``rank{r}/merged_swimlane_*.json`` (conversion is
+skipped on the simulator, which does not ship the converter's task metadata).
 """
 
 import sys
@@ -132,6 +132,54 @@ class TestL3DfxPerRank:
             assert scope_stats.is_file() and scope_stats.stat().st_size > 0, (
                 f"empty/missing scope_stats.jsonl for rank {r}: {scope_stats}"
             )
+
+    def test_swimlane_per_rank(self, test_config, device_ids):
+        """Swimlane on L3 co-enables dep_gen and produces per-rank records.
+
+        On a real device the records are additionally converted to
+        ``rank{r}/merged_swimlane_*.json``; on the simulator conversion is
+        skipped (no task metadata), so only the raw records are asserted.
+        """
+        n_ranks = 2
+        if len(device_ids) < n_ranks:
+            pytest.skip(f"swimlane P={n_ranks} needs {n_ranks} devices, got {device_ids}")
+
+        program = _build_per_rank_program()
+        compiled = ir.compile(
+            program,
+            platform=test_config.platform,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:n_ranks],
+                num_sub_workers=0,
+            ),
+        )
+
+        inputs = torch.randn((n_ranks, ROWS, COLS), dtype=torch.float32)
+        outputs = torch.zeros((n_ranks, ROWS, COLS), dtype=torch.float32)
+
+        # User asks for swimlane only; dep_gen is co-enabled by the driver.
+        run_config = RunConfig(platform=test_config.platform, enable_l2_swimlane=True)
+        compiled(inputs, outputs, config=run_config)
+
+        assert torch.allclose(outputs, inputs + 1.0)
+
+        is_sim = test_config.platform.endswith("sim")
+        dfx_base = compiled.output_dir / "dfx_outputs"
+        for r in range(n_ranks):
+            rank_dir = dfx_base / f"rank{r}"
+            records = rank_dir / "l2_swimlane_records.json"
+            assert records.is_file() and records.stat().st_size > 0, (
+                f"empty/missing l2_swimlane_records.json for rank {r}: {records}"
+            )
+            # dep_gen is co-enabled so the converter has a task graph.
+            deps = rank_dir / "deps.json"
+            assert deps.is_file() and deps.stat().st_size > 0, f"empty/missing deps.json for rank {r}: {deps}"
+
+            if not is_sim:
+                merged = list(rank_dir.glob("merged_swimlane_*.json"))
+                assert merged and merged[0].stat().st_size > 0, (
+                    f"missing merged_swimlane_*.json for rank {r} in {rank_dir}"
+                )
 
 
 if __name__ == "__main__":

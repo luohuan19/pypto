@@ -352,10 +352,10 @@ class DistributedCompiledProgram:
         ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
         ``ring_dep_pool``) size this dispatch's runtime ring buffers, and its
         runtime-diagnostic DFX flags (``enable_dump_tensor`` / ``enable_pmu`` /
-        ``enable_dep_gen`` / ``enable_scope_stats``) are written under
-        ``<output_dir>/dfx_outputs/``. ``enable_l2_swimlane`` is not yet supported
-        on L3 (raises ``NotImplementedError``); other compile-side fields are not
-        consumed on the dispatch path.
+        ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``) are
+        written per rank under ``<output_dir>/dfx_outputs/rank{r}/`` (swimlane
+        co-enables dep_gen and emits ``merged_swimlane_*.json`` per rank, onboard
+        only). Other compile-side fields are not consumed on the dispatch path.
         """
         from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
 

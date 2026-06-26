@@ -384,14 +384,19 @@ class TestMakeCallConfigDfx:
         # The builder creates the base dir so the runtime's validate() accepts it.
         assert dfx_base.is_dir()
 
-    def test_swimlane_rejected_on_l3(self, monkeypatch, tmp_path):
+    def test_swimlane_sets_flag_and_co_enables_dep_gen(self, monkeypatch, tmp_path):
         from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
 
+        dfx_base = tmp_path / "dfx_outputs"
+        # User asks for swimlane only; dep_gen is auto-enabled because the
+        # converter needs deps.json to resolve task arrows / kernel names.
         run_config = RunConfig(platform="a2a3sim", enable_l2_swimlane=True)
-        with pytest.raises(NotImplementedError, match="enable_l2_swimlane is not yet supported"):
-            _make_dist_call_config_with_fake(
-                DistributedConfig(), run_config, monkeypatch, dfx_base=tmp_path / "dfx_outputs"
-            )
+        cfg = _make_dist_call_config_with_fake(
+            DistributedConfig(), run_config, monkeypatch, dfx_base=dfx_base
+        )
+        assert cfg.enable_l2_swimlane is True
+        assert cfg.enable_dep_gen is True  # co-enabled
+        assert cfg.output_prefix == str(dfx_base)
 
     def test_dfx_without_base_raises(self, monkeypatch):
         from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
