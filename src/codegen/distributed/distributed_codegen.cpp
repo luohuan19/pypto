@@ -919,7 +919,8 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
     // ``device=`` attr → omit the kwarg, byte-compatible with comm-less L3.
     emitter_.EmitLine("_keep.append(" + ta_var + ")");
     if (rank_expr.empty()) {
-      emitter_.EmitLine("orch.submit_next_level(callables[\"" + callee->name_ + "\"], " + ta_var + ", config)");
+      emitter_.EmitLine("orch.submit_next_level(callables[\"" + callee->name_ + "\"], " + ta_var +
+                        ", config)");
     } else {
       // Rank-pinned dispatch routes through ``_submit_chip`` so DFX artifacts
       // land in a per-rank subdir (``<output_prefix>/rank{r}``); a no-op

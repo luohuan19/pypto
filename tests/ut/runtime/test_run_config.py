@@ -403,9 +403,7 @@ class TestMakeCallConfigDfx:
 
         run_config = RunConfig(platform="a2a3sim", enable_pmu=1)
         with pytest.raises(ValueError, match="dfx_base is required"):
-            _make_dist_call_config_with_fake(
-                DistributedConfig(), run_config, monkeypatch, dfx_base=None
-            )
+            _make_dist_call_config_with_fake(DistributedConfig(), run_config, monkeypatch, dfx_base=None)
 
     def test_no_run_config_leaves_dfx_off(self, monkeypatch):
         from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415

@@ -416,9 +416,7 @@ def _make_call_config(
         dfx = _DfxOpts.from_run_config(run_config)
         if dfx.any():
             if dfx_base is None:
-                raise ValueError(
-                    "_make_call_config: dfx_base is required when a DFX flag is enabled on L3"
-                )
+                raise ValueError("_make_call_config: dfx_base is required when a DFX flag is enabled on L3")
             dfx_base.mkdir(parents=True, exist_ok=True)
             call_config.enable_dump_tensor = dfx.enable_dump_tensor
             call_config.enable_pmu = dfx.enable_pmu
@@ -663,9 +661,7 @@ def execute_distributed(
             w = _construct_worker(dc, compiled.platform, runtime_name, num_sub)
             sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
             w.init()
-            return _dispatch(
-                w, entry_fn, tensors, chip_cids, sub_ids, call_config, len(dc.device_ids)
-            )
+            return _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, call_config, len(dc.device_ids))
         finally:
             if w is not None:
                 w.close()
@@ -673,7 +669,7 @@ def execute_distributed(
     dfx_base = output_dir / "dfx_outputs"
     swimlane = config is not None and config.enable_l2_swimlane
 
-    if swimlane and not compiled.platform.endswith("sim"):
+    if config is not None and config.enable_l2_swimlane and not compiled.platform.endswith("sim"):
         # Two-pass for clean timing, mirroring the L2 swimlane workflow: dep_gen
         # collection perturbs timing, so the per-rank task graph and the kept
         # timing come from separate dispatches.
