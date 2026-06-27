@@ -724,7 +724,9 @@ def execute_distributed(
             "[swimlane] L3 swimlane enabled -> running the dispatch twice "
             "(dep_gen perturbs timing, so the graph and the timing are captured separately):"
         )
-        print("[swimlane] run 1/2: capturing the per-dispatch task graph (deps.json); its timing is discarded.")
+        print(
+            "[swimlane] run 1/2: capturing the per-dispatch task graph (deps.json); its timing is discarded."
+        )
         deps_cfg = dataclasses.replace(
             config,
             enable_l2_swimlane=False,

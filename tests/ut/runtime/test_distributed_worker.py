@@ -847,6 +847,9 @@ class _RecordingOrch:
 
     def __init__(self) -> None:
         self.calls: list[tuple[Any, int, str]] = []
+        # ``_submit_chip`` reads/writes this per-card dispatch counter on the
+        # orch; declare it so the attribute is known to the type checker.
+        self._dfx_dispatch_idx: dict[int, int] = {}
 
     def submit_next_level(self, callable_id: Any, task_args: Any, config: Any, *, worker: int) -> str:
         self.calls.append((callable_id, worker, config.output_prefix))
