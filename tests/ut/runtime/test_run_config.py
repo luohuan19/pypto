@@ -356,10 +356,11 @@ class TestMakeCallConfigRing:
 class TestMakeCallConfigDfx:
     """Verify L3 ``_make_call_config`` wires the runtime DFX diagnostics.
 
-    The four runtime-diagnostic flags (``enable_dump_tensor`` / ``enable_pmu`` /
-    ``enable_dep_gen`` / ``enable_scope_stats``) are transcribed onto the shared
-    ``CallConfig`` and their artifacts rooted at ``dfx_base``;
-    ``enable_l2_swimlane`` is not yet supported on L3.
+    The runtime-diagnostic flags (``enable_dump_tensor`` / ``enable_pmu`` /
+    ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``) are
+    transcribed onto the shared ``CallConfig`` and their artifacts rooted at
+    ``dfx_base``. ``enable_l2_swimlane`` additionally co-enables ``dep_gen`` so
+    the converter has a task graph (see :class:`test_swimlane_sets_flag...`).
     """
 
     def test_dfx_flags_transcribed_and_prefix_set(self, monkeypatch, tmp_path):

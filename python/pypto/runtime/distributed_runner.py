@@ -490,7 +490,9 @@ def _collect_l3_swimlane(output_dir: Path, n_ranks: int, platform: str) -> None:
 
     from .runner import _generate_swimlane  # noqa: PLC0415
 
-    chip_dirs = sorted((output_dir / "next_levels").glob("*/"))
+    # ``glob("*/")`` directory filtering is only reliable on 3.11+; filter
+    # explicitly so this works on the 3.10 baseline too.
+    chip_dirs = sorted(d for d in (output_dir / "next_levels").glob("*") if d.is_dir())
     merged: dict = {}
     try:
         from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
@@ -510,20 +512,26 @@ def _collect_l3_swimlane(output_dir: Path, n_ranks: int, platform: str) -> None:
         records = rank_dir / "l2_swimlane_records.json"
         if not records.exists():
             continue
-        name_map_path: Path | None = None
-        if merged:
-            name_map_path = rank_dir / "name_map.json"
-            name_map_path.write_text(
-                json.dumps(
-                    {"level": 2, "orchestrator_name": None, "callable_id_to_name": merged},
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        # ``work_dir`` only feeds the converter's ``-k`` fallback; the merged
-        # ``name_map`` passed as ``func_names`` takes precedence for labels.
-        work_dir = chip_dirs[0] if chip_dirs else output_dir
-        _generate_swimlane(work_dir, rank_dir, records, func_names=name_map_path)
+        # Best-effort, as documented: a write/convert failure for one rank must
+        # not turn a successful dispatch into a post-processing crash. The raw
+        # records remain on disk for manual conversion.
+        try:
+            name_map_path: Path | None = None
+            if merged:
+                name_map_path = rank_dir / "name_map.json"
+                name_map_path.write_text(
+                    json.dumps(
+                        {"level": 2, "orchestrator_name": None, "callable_id_to_name": merged},
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            # ``work_dir`` only feeds the converter's ``-k`` fallback; the merged
+            # ``name_map`` passed as ``func_names`` takes precedence for labels.
+            work_dir = chip_dirs[0] if chip_dirs else output_dir
+            _generate_swimlane(work_dir, rank_dir, records, func_names=name_map_path)
+        except Exception as e:  # noqa: BLE001 - best-effort post-pass, never fatal
+            print(f"Skipping L3 swimlane conversion for rank {r} ({type(e).__name__}: {e}); raw records kept")
 
 
 def _is_simpler_tensor(arg: Any) -> bool:
@@ -1135,6 +1143,13 @@ class DistributedWorker(Worker):
         )
 
         # Offline post-pass (reads the per-rank records on disk; no worker needed).
+        # Note: unlike the one-shot ``execute_distributed`` path, the prepared
+        # worker reuses its forked chip children across dispatches, so it cannot
+        # re-fork between a deps pass and a timing pass without tripping the
+        # per-child ``halHostRegister`` cap (rc 8). It therefore runs swimlane
+        # single-pass (dep_gen co-enabled), so ``last_run_timing`` here includes
+        # dep_gen collection overhead. Use ``execute_distributed`` (one-shot) for
+        # clean two-pass swimlane timing.
         if config is not None and config.enable_l2_swimlane:
             _collect_l3_swimlane(compiled.output_dir, state["device_nums"], compiled.platform)
 
