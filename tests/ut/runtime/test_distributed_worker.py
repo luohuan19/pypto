@@ -27,7 +27,12 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 from pypto.runtime import DeviceTensor
-from pypto.runtime.distributed_runner import DistributedWorker, _assemble_chip_callables, _submit_chip
+from pypto.runtime.distributed_runner import (
+    DistributedWorker,
+    _assemble_chip_callables,
+    _clear_dfx_dispatch_dirs,
+    _submit_chip,
+)
 
 
 def _param(name: str, shape: list[int], direction: ParamDirection = ParamDirection.In) -> _ParamInfo:
@@ -925,6 +930,34 @@ class TestSubmitChip:
         _submit_chip(orch, "chip", "ta", cfg, -1)
         assert orch.calls == [("chip", -1, "/work/dfx_outputs")]
         assert cfg.output_prefix == "/work/dfx_outputs"
+
+
+class TestClearDfxDispatchDirs:
+    """``_clear_dfx_dispatch_dirs`` drops stale ``rank*/d{k}`` dirs before a run."""
+
+    def test_removes_only_dispatch_dirs(self, tmp_path):
+        # A prior run left rank0/{d0,d1,d2} and rank1/d0; the current run will
+        # only write d0, so the stale d1/d2 must be cleared. A sibling non-d{k}
+        # dir (e.g. a future diagnostic) is preserved.
+        dfx = tmp_path / "dfx_outputs"
+        for d in ("rank0/d0", "rank0/d1", "rank0/d2", "rank1/d0", "rank0/keepme"):
+            (dfx / d).mkdir(parents=True)
+            (dfx / d / "l2_swimlane_records.json").write_text("{}", encoding="utf-8")
+
+        _clear_dfx_dispatch_dirs(dfx)
+
+        # All d{k} dirs gone...
+        assert not (dfx / "rank0" / "d0").exists()
+        assert not (dfx / "rank0" / "d1").exists()
+        assert not (dfx / "rank0" / "d2").exists()
+        assert not (dfx / "rank1" / "d0").exists()
+        # ...but the non-dispatch dir and the rank dirs themselves remain.
+        assert (dfx / "rank0" / "keepme").is_dir()
+        assert (dfx / "rank0").is_dir()
+
+    def test_missing_base_is_noop(self, tmp_path):
+        # No dfx_outputs yet (first dispatch) -> nothing to clear, no error.
+        _clear_dfx_dispatch_dirs(tmp_path / "dfx_outputs")
 
 
 if __name__ == "__main__":

@@ -483,6 +483,30 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
         config.output_prefix = base
 
 
+def _clear_dfx_dispatch_dirs(dfx_base: Path) -> None:
+    """Remove stale ``rank*/d{k}`` dispatch dirs before a fresh DFX run.
+
+    The per-card dispatch counter resets to ``d0`` at the start of every run, so
+    a prepared :class:`DistributedWorker` reusing one ``output_dir`` across
+    dispatches would otherwise leave higher-numbered ``d{k}`` dirs from an
+    earlier, larger run on disk. ``_collect_l3_swimlane`` globs ``d[0-9]*``, so
+    those stale dirs would be re-converted as if they belonged to the current
+    run. Clearing them once, before the first dispatch of a DFX run, scopes the
+    artifacts (and their post-processing) to exactly this run. Called only when
+    DFX is enabled; best-effort (a removal failure must not abort the dispatch).
+    """
+    if not dfx_base.is_dir():
+        return
+    import shutil  # noqa: PLC0415
+
+    for rank_dir in dfx_base.glob("rank*"):
+        if not rank_dir.is_dir():
+            continue
+        for disp_dir in rank_dir.glob("d[0-9]*"):
+            if disp_dir.is_dir():
+                shutil.rmtree(disp_dir, ignore_errors=True)
+
+
 def _collect_l3_swimlane(output_dir: Path, n_ranks: int, platform: str) -> None:
     """Convert each dispatch's swimlane records into a ``merged_swimlane_*.json``.
 
@@ -532,8 +556,10 @@ def _collect_l3_swimlane(output_dir: Path, n_ranks: int, platform: str) -> None:
         if not rank_dir.is_dir():
             continue
         # One card may have run several dispatches: ``rank{r}/d0``, ``d1``, ...
-        # Convert each independently (each is single-chip). 3.10-safe dir filter.
-        dispatch_dirs = sorted(d for d in rank_dir.glob("d*") if d.is_dir())
+        # Match only ``d`` + digits (the names ``_submit_chip`` emits) so an
+        # unrelated diagnostic dir under rank_dir is never picked up. 3.10-safe
+        # dir filter (``glob`` directory filtering is only reliable on 3.11+).
+        dispatch_dirs = sorted(d for d in rank_dir.glob("d[0-9]*") if d.is_dir())
         for disp_dir in dispatch_dirs:
             records = disp_dir / "l2_swimlane_records.json"
             if not records.exists():
@@ -713,6 +739,14 @@ def execute_distributed(
 
     dfx_base = output_dir / "dfx_outputs"
     swimlane = config is not None and config.enable_l2_swimlane
+
+    # Scope DFX artifacts to this run: drop any stale ``rank*/d{k}`` dirs from an
+    # earlier (possibly larger) run before the first dispatch writes new ones.
+    if config is not None:
+        from .runner import _DfxOpts  # noqa: PLC0415
+
+        if _DfxOpts.from_run_config(config).any():
+            _clear_dfx_dispatch_dirs(dfx_base)
 
     if config is not None and config.enable_l2_swimlane and not compiled.platform.endswith("sim"):
         # Two-pass for clean timing, mirroring the L2 swimlane workflow: dep_gen
@@ -1136,9 +1170,15 @@ class DistributedWorker(Worker):
         # mutated). With no RunConfig the prepared baseline is reused as-is.
         call_config = state["call_config"]
         if config is not None:
-            call_config = _make_call_config(
-                compiled._distributed_config, config, dfx_base=compiled.output_dir / "dfx_outputs"
-            )
+            dfx_base = compiled.output_dir / "dfx_outputs"
+            call_config = _make_call_config(compiled._distributed_config, config, dfx_base=dfx_base)
+            # This worker reuses one output_dir across dispatches, so stale
+            # ``rank*/d{k}`` dirs from an earlier, larger run must be cleared
+            # before this run rewrites ``d0, d1, ...`` (see _clear_dfx_dispatch_dirs).
+            from .runner import _DfxOpts  # noqa: PLC0415
+
+            if _DfxOpts.from_run_config(config).any():
+                _clear_dfx_dispatch_dirs(dfx_base)
 
         param_infos = state["param_infos"]
         n_params = len(param_infos)
