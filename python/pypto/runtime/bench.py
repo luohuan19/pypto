@@ -40,10 +40,10 @@ outside the loop is unaffected.
 """
 
 import os
-import re
 import statistics
 import tempfile
-from collections.abc import Iterator, Sequence
+from collections import defaultdict
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,18 +53,166 @@ from .log_config import configure_log, current_level
 from .runner import RunConfig
 from .worker import ChipWorker
 
-__all__ = ["BenchmarkStats", "benchmark"]
+__all__ = ["BenchmarkStats", "TraceInvocation", "TraceSpan", "benchmark"]
 
-# ``[STRACE]`` marker grammar (simpler ``v=1`` wire format, emitted by the host
-# logger — see ``src/common/log/include/common/strace.h`` and parsed by
-# ``simpler_setup.tools.strace_timing``). Matched anywhere on the line so the
-# CANN/host log prefix is ignored. Only the fields ``benchmark`` reads are
-# captured; the parser is inlined (not imported from the simpler tool) so it
-# stays self-contained and unit-testable without a simpler runtime.
-_STRACE_RE = re.compile(
-    r"\[STRACE\]\s+v=\d+\s+pid=(?P<pid>\d+)\s+tid=\d+\s+inv=(?P<inv>\d+)\s+"
-    r"hid=(?P<hid>[0-9a-fA-F]+)\s+depth=\d+\s+name=(?P<name>\S+)\s+ts=\d+\s+dur=(?P<dur>\d+)"
-)
+# ``[STRACE]`` marker parsing is delegated to simpler's ``strace_timing`` (the
+# single source of truth for the ``v=1`` wire grammar). Its ``Span`` /
+# ``Invocation`` types are mirrored into the pypto-owned ``TraceSpan`` /
+# ``TraceInvocation`` below so ``benchmark`` callers get the full per-launch
+# span tree without importing simpler types (see ``_parse_stats_from_strace``).
+
+
+@dataclass
+class TraceSpan:
+    """One ``[STRACE]`` span — a node in a measured launch's call tree.
+
+    A pypto-owned mirror of simpler's ``strace_timing.Span`` so ``benchmark``
+    callers never depend on simpler types.
+
+    Attributes:
+        depth: Nesting level; a span at depth ``d`` is a child of the nearest
+            enclosing span at depth ``d-1``.
+        name: Dotted span path (e.g. ``run_prepared.runner_run.device_wall``).
+        ts: Start timestamp in nanoseconds (host clock, or device clock when
+            :attr:`is_device`).
+        dur: Span duration in nanoseconds.
+        attrs: Raw trailing attribute string (carries ``clk=dev`` for device
+            spans).
+    """
+
+    pid: int
+    tid: int
+    inv: int
+    hid: str
+    depth: int
+    name: str
+    ts: int
+    dur: int
+    attrs: str
+
+    @property
+    def is_device(self) -> bool:
+        """``True`` for device-domain spans (emitted with ``clk=dev``)."""
+        return "clk=dev" in self.attrs
+
+    @property
+    def dur_us(self) -> float:
+        """Span duration in microseconds."""
+        return self.dur / 1000.0
+
+
+@dataclass
+class TraceInvocation:
+    """Every ``[STRACE]`` span emitted by one measured launch.
+
+    One ``(pid, inv)`` group, in emission (scope-exit) order. Use
+    :meth:`format_tree` to render the nested call tree.
+    """
+
+    pid: int
+    inv: int
+    hid: str
+    spans: list[TraceSpan] = field(default_factory=list)
+
+    def root(self) -> "TraceSpan | None":
+        """The depth-0 span (``run_prepared``), or ``None`` if absent."""
+        for s in self.spans:
+            if s.depth == 0:
+                return s
+        return None
+
+    def by_name(self) -> dict[str, "TraceSpan"]:
+        """Map span name → its first-seen span."""
+        m: dict[str, TraceSpan] = {}
+        for s in self.spans:
+            m.setdefault(s.name, s)
+        return m
+
+    def format_tree(
+        self, *, us: bool = True, value_fn: "Callable[[TraceSpan], list[str]] | None" = None
+    ) -> str:
+        """Render this launch's span tree with ``|-`` / `` `- `` branch connectors.
+
+        Hierarchy is drawn with ASCII connectors (``|- `` for a non-last child,
+        `` `- `` for the last, ``|  `` / ``   `` for continuation) rather than by
+        indentation alone. Nesting is reconstructed from the dotted span names (a
+        span's parent is the span whose name is its longest proper dotted
+        prefix), which is robust to the host/device clock-domain split —
+        device-domain spans (``run_prepared.runner_run.device_wall.*``) correctly
+        nest under their host parent even though they are emitted as a separate
+        batch. Siblings are ordered by start timestamp; device-domain spans are
+        tagged ``[dev]``.
+
+        Output is column-aligned: the name column (connectors + leaf + tag) is
+        left-padded to a common width and the value columns are right-aligned, so
+        the numbers line up regardless of nesting depth. ``value_fn`` returns the
+        value column(s) per span (default: a single duration column, microseconds
+        when ``us`` else nanoseconds); :meth:`BenchmarkStats.format_mean_tree`
+        uses it to add aligned ``±stdev`` / ``[min..max]`` columns.
+        """
+        by_name: dict[str, TraceSpan] = {}
+        for s in self.spans:
+            by_name.setdefault(s.name, s)
+
+        def _parent(name: str) -> "str | None":
+            parts = name.split(".")
+            for cut in range(len(parts) - 1, 0, -1):
+                cand = ".".join(parts[:cut])
+                if cand in by_name:
+                    return cand
+            return None
+
+        children: dict[str, list[str]] = defaultdict(list)
+        roots: list[str] = []
+        for name in by_name:
+            parent = _parent(name)
+            (children[parent] if parent is not None else roots).append(name)
+
+        def _by_ts(names: list[str]) -> list[str]:
+            return sorted(names, key=lambda n: by_name[n].ts)
+
+        def _columns(name: str) -> list[str]:
+            span = by_name[name]
+            if value_fn is not None:
+                return value_fn(span)
+            return [f"{span.dur / 1000.0:.1f}us" if us else f"{span.dur}ns"]
+
+        # First pass: collect (name column, value columns) in display order.
+        rows: list[tuple[str, list[str]]] = []
+
+        def _walk(name: str, prefix: str, child_prefix: str) -> None:
+            parent = _parent(name)
+            leaf = name[len(parent) + 1:] if parent is not None else name
+            tag = " [dev]" if by_name[name].is_device else ""
+            rows.append((f"{prefix}{leaf}{tag}", _columns(name)))
+            kids = _by_ts(children[name])
+            for i, kid in enumerate(kids):
+                last = i == len(kids) - 1
+                _walk(
+                    kid,
+                    child_prefix + ("`- " if last else "|- "),
+                    child_prefix + ("   " if last else "|  "),
+                )
+
+        for r in _by_ts(roots):
+            _walk(r, "", "")
+
+        # Second pass: left-align the name column, right-align each value column.
+        name_w = max((len(label) for label, _ in rows), default=0)
+        ncols = max((len(cols) for _, cols in rows), default=0)
+        col_w = [0] * ncols
+        for _, cols in rows:
+            for i, c in enumerate(cols):
+                col_w[i] = max(col_w[i], len(c))
+
+        lines: list[str] = []
+        for label, cols in rows:
+            line = label.ljust(name_w)
+            for i, c in enumerate(cols):
+                line += "  " + c.rjust(col_w[i])
+            lines.append(line.rstrip())
+        return "\n".join(lines)
+
 
 # Span names read per launch (mirror ``strace_timing._ROUNDS_TABLE_NAMES``).
 # ``host`` is the whole ``run_prepared`` wall; ``device`` is the on-NPU
@@ -94,12 +242,118 @@ class BenchmarkStats:
             from each launch's ``[STRACE]`` ``run_prepared`` span.
         rounds: Number of measured launches.
         warmup: Number of leading launches discarded before measurement.
+        invocations: Full per-measured-launch span tree (one
+            :class:`TraceInvocation` per measured launch, warmup excluded).
+            Empty when no ``[STRACE]`` markers were captured. Render with
+            :meth:`format_tree` / :meth:`print_tree`.
     """
 
     device_wall_us: list[float] = field(default_factory=list)
     host_wall_us: list[float] = field(default_factory=list)
     rounds: int = 0
     warmup: int = 0
+    invocations: list[TraceInvocation] = field(default_factory=list)
+
+    def format_tree(self, launch: int | None = None, *, us: bool = True) -> str:
+        """Render the captured ``[STRACE]`` span tree(s) as indented text.
+
+        Args:
+            launch: Measured-launch index to render; ``None`` (default) renders
+                every measured launch.
+            us: Show durations in microseconds (default) or nanoseconds.
+        """
+        if not self.invocations:
+            return "BenchmarkStats: no span tree captured (non-SIMPLER_PROFILING build or *sim platform)"
+        selected = (
+            list(enumerate(self.invocations))
+            if launch is None
+            else [(launch, self.invocations[launch])]
+        )
+        out: list[str] = []
+        for i, inv in selected:
+            out.append(f"launch[{i}] (pid={inv.pid} inv={inv.inv} hid={inv.hid}):")
+            out.append(inv.format_tree(us=us))
+        return "\n".join(out)
+
+    def print_tree(self, launch: int | None = None, *, us: bool = True, file: Any = None) -> None:
+        """Print :meth:`format_tree` to *file* (default stdout)."""
+        print(self.format_tree(launch, us=us), file=file)
+
+    def mean_invocation(self) -> "TraceInvocation | None":
+        """A synthetic :class:`TraceInvocation` whose every span's ``dur`` (and
+        ``ts``) is the mean across all measured launches (warmup excluded).
+
+        Spans are matched by name; ``depth`` / ``attrs`` (hence
+        :attr:`TraceSpan.is_device`) come from the first launch that carried the
+        span. ``inv`` is ``-1`` to mark the aggregate. Returns ``None`` when no
+        span tree was captured. Useful for rendering one noise-smoothed tree.
+        """
+        if not self.invocations:
+            return None
+        durs: dict[str, list[int]] = defaultdict(list)
+        tss: dict[str, list[int]] = defaultdict(list)
+        template: dict[str, TraceSpan] = {}
+        for inv in self.invocations:
+            for s in inv.spans:
+                durs[s.name].append(s.dur)
+                tss[s.name].append(s.ts)
+                template.setdefault(s.name, s)
+        spans = [
+            TraceSpan(
+                pid=t.pid, tid=t.tid, inv=-1, hid=t.hid, depth=t.depth, name=name,
+                ts=round(statistics.fmean(tss[name])), dur=round(statistics.fmean(durs[name])),
+                attrs=t.attrs,
+            )
+            for name, t in template.items()
+        ]
+        first = self.invocations[0]
+        return TraceInvocation(pid=first.pid, inv=-1, hid=first.hid, spans=spans)
+
+    def format_mean_tree(self, *, us: bool = True, spread: str = "stdev") -> str:
+        """Render a span tree whose every node's duration is the mean across all
+        measured launches (warmup excluded), annotated with the per-node spread.
+
+        Args:
+            us: Show values in microseconds (default) or nanoseconds.
+            spread: Spread shown after each node's mean — ``"stdev"`` (``±sd``,
+                default), ``"minmax"`` (``[min..max]``), ``"both"``, or
+                ``"none"``. Computed across the measured launches.
+        """
+        mean_inv = self.mean_invocation()
+        if mean_inv is None:
+            return "BenchmarkStats: no span tree captured (non-SIMPLER_PROFILING build or *sim platform)"
+
+        durs: dict[str, list[int]] = defaultdict(list)
+        for inv in self.invocations:
+            for s in inv.spans:
+                durs[s.name].append(s.dur)
+        scale = 1000.0 if us else 1.0
+        unit = "us" if us else "ns"
+
+        def _value(span: TraceSpan) -> list[str]:
+            ds = durs[span.name]
+            cols = [f"{statistics.fmean(ds) / scale:.1f}{unit}"]
+            if spread in ("stdev", "both"):
+                sd = statistics.stdev(ds) / scale if len(ds) > 1 else 0.0
+                cols.append(f"±{sd:.1f}")
+            if spread in ("minmax", "both"):
+                cols.append(f"[{min(ds) / scale:.1f}..{max(ds) / scale:.1f}]")
+            return cols
+
+        legend = "mean"
+        if spread in ("stdev", "both"):
+            legend += " ±stdev"
+        if spread in ("minmax", "both"):
+            legend += " [min..max]"
+        header = (
+            f"mean of {len(self.invocations)} launches (warmup {self.warmup} excluded); "
+            f"each node: {legend}:"
+        )
+        return f"{header}\n{mean_inv.format_tree(us=us, value_fn=_value)}"
+
+    def print_mean_tree(self, *, us: bool = True, spread: str = "stdev", file: Any = None) -> None:
+        """Print :meth:`format_mean_tree` to *file* (default stdout)."""
+        print(self.format_mean_tree(us=us, spread=spread), file=file)
 
     @property
     def device_us_min(self) -> float:
@@ -211,51 +465,49 @@ def _capture_fd_stderr(path: Path) -> Iterator[None]:
 def _parse_stats_from_strace(log_text: str, *, rounds: int, warmup: int) -> BenchmarkStats:
     """Build a :class:`BenchmarkStats` from captured ``[STRACE]`` log text.
 
-    Groups markers into per-launch invocations keyed by ``(pid, inv)``, buckets
-    them by callable hash, takes the busiest bucket (our register-once callable
-    emits one invocation per launch — warmup + measured all share one hash),
-    orders by ``inv``, drops the first *warmup* invocations, and reads each
-    remaining launch's host (``run_prepared``) and device
-    (``run_prepared.runner_run.device_wall``) span duration in microseconds.
-
-    Pure host logic — no device or worker needed — so it is unit-tested
-    directly against synthetic marker lines.
+    Parsing is delegated to simpler's ``strace_timing`` — the single source of
+    truth for the marker grammar — then each launch's full span tree is mirrored
+    into pypto-owned :class:`TraceInvocation` / :class:`TraceSpan` so callers
+    never import simpler types. Groups markers by ``(pid, inv)``, buckets by
+    callable hash, takes the busiest bucket (our register-once callable emits one
+    invocation per launch), orders by ``inv``, drops the first *warmup*
+    invocations, and reads each remaining launch's host (``run_prepared``) and
+    device (``run_prepared.runner_run.device_wall``) span durations (µs).
     """
+    from simpler_setup.tools.strace_timing import (  # noqa: PLC0415
+        bucket_by_hid,
+        group_invocations,
+        parse_spans,
+    )
+
     stats = BenchmarkStats(rounds=rounds, warmup=warmup)
-
-    # (pid, inv) -> {span name -> dur_ns}, plus the launch's hid and a stable
-    # first-seen order. One pass, O(N) over marker lines.
-    launches: dict[tuple[int, int], dict[str, int]] = {}
-    launch_hid: dict[tuple[int, int], str] = {}
-    order: list[tuple[int, int]] = []
-    for line in log_text.splitlines():
-        m = _STRACE_RE.search(line)
-        if m is None:
-            continue
-        key = (int(m["pid"]), int(m["inv"]))
-        if key not in launches:
-            launches[key] = {}
-            launch_hid[key] = m["hid"].lower()
-            order.append(key)
-        launches[key].setdefault(m["name"], int(m["dur"]))
-
-    if not launches:
+    invocations = group_invocations(parse_spans(log_text.splitlines()))
+    if not invocations:
         return stats
 
-    # Busiest hid bucket = our register-once callable. Order keys within it by
-    # inv (the process-wide monotonic launch id) so warmup is dropped in
-    # dispatch order regardless of log interleaving.
-    by_hid: dict[str, list[tuple[int, int]]] = {}
-    for key in order:
-        by_hid.setdefault(launch_hid[key], []).append(key)
-    busiest = sorted(max(by_hid.values(), key=len), key=lambda k: k[1])
-
-    for key in busiest[warmup:]:
-        spans = launches[key]
-        host_ns = spans.get(_SPAN_HOST)
-        device_ns = spans.get(_SPAN_DEVICE)
-        stats.host_wall_us.append(host_ns / 1000.0 if host_ns is not None else 0.0)
-        stats.device_wall_us.append(device_ns / 1000.0 if device_ns is not None else 0.0)
+    # Busiest hid bucket = our register-once callable (one invocation per launch);
+    # bucket_by_hid orders each bucket by inv, so warmup drops in dispatch order.
+    busiest = max(bucket_by_hid(invocations).values(), key=len)
+    for inv in busiest[warmup:]:
+        named = inv.by_name()
+        host = named.get(_SPAN_HOST)
+        device = named.get(_SPAN_DEVICE)
+        stats.host_wall_us.append(host.dur / 1000.0 if host is not None else 0.0)
+        stats.device_wall_us.append(device.dur / 1000.0 if device is not None else 0.0)
+        stats.invocations.append(
+            TraceInvocation(
+                pid=inv.pid,
+                inv=inv.inv,
+                hid=inv.hid,
+                spans=[
+                    TraceSpan(
+                        pid=s.pid, tid=s.tid, inv=s.inv, hid=s.hid, depth=s.depth,
+                        name=s.name, ts=s.ts, dur=s.dur, attrs=s.attrs,
+                    )
+                    for s in inv.spans
+                ],
+            )
+        )
 
     return stats
 

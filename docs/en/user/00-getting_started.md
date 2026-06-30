@@ -327,6 +327,34 @@ real on-NPU wall only for L2 single-chip runs; it is `0` on runtimes built
 without `SIMPLER_PROFILING` or on `*sim` platforms (check
 `stats.all_zero_device`).
 
+Beyond the aggregates, each measured launch keeps its full `[STRACE]` span tree
+on `stats.invocations` (a list of `TraceInvocation`; warmup excluded). Render it
+with branch connectors — one launch, or averaged across all launches with a
+per-node spread (`spread` is `"stdev"` (default), `"minmax"`, `"both"`, or
+`"none"`):
+
+```python
+stats.print_tree(launch=0)            # one launch's nested span tree
+stats.print_mean_tree(spread="both")  # mean per node, with ±stdev and [min..max]
+```
+
+```text
+mean of 20 launches (warmup 5 excluded); each node: mean ±stdev [min..max]:
+run_prepared               71784.1us  ±6797.5  [66482.4..89832.6]
+|- bind                    27943.6us  ±4163.7  [24836.7..37713.3]
+|- runner_run               3030.8us   ±184.4    [2822.3..3694.7]
+|  `- device_wall [dev]     2005.2us    ±74.6    [1875.1..2173.2]
+|     `- graph_build [dev]  1634.8us    ±64.6    [1490.2..1777.6]
+`- validate                40697.7us  ±3063.5  [38606.3..48200.6]
+```
+
+Nesting is reconstructed from the dotted span names, so device-domain spans
+(`...device_wall.*`, tagged `[dev]`) nest under their host parent. Each node is a
+wall-clock window, *not* a partition: children may overlap (e.g. `orch`/`sched`
+run concurrently) or sit in a different clock domain (`runner_run` host wall vs
+`device_wall` on-NPU), so child durations need not sum to the parent. Drill into
+raw spans via `stats.invocations[i].by_name()[<name>].dur_us`.
+
 ### Distributed (L3+) programs
 
 L3+ distributed programs returned by `ir.compile` (a `DistributedCompiledProgram`)

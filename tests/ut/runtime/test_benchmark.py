@@ -45,6 +45,13 @@ def _launch_lines(inv: int, *, host_us: float, device_us: float) -> list[str]:
     ]
 
 
+def _row_present(tree: str, expected: str) -> bool:
+    """True if some tree line contains *expected* ignoring column-alignment
+    whitespace runs (tree output right-aligns value columns with padding)."""
+    want = " ".join(expected.split())
+    return any(want in " ".join(line.split()) for line in tree.splitlines())
+
+
 # ---------------------------------------------------------------------------
 # _parse_stats_from_strace — span extraction, warmup discard, aggregation
 # ---------------------------------------------------------------------------
@@ -88,7 +95,102 @@ def test_parse_no_markers_returns_empty():
     stats = _parse_stats_from_strace("no strace markers here\n", rounds=5, warmup=1)
     assert stats.device_wall_us == []
     assert stats.host_wall_us == []
-    assert stats.rounds == 5
+    assert stats.invocations == []
+
+
+def test_parse_populates_full_span_tree_and_format():
+    """Each measured launch keeps its full span tree; format_tree draws the
+    hierarchy with ``|-`` / `` `- `` connectors and tags device spans."""
+    # A branching tree (siblings tie on ts -> kept in line order):
+    #   run_prepared
+    #   |- bind
+    #   |  |- args
+    #   |  `- prebuilt
+    #   `- runner_run
+    #      `- device_wall [dev]
+    lines = [
+        _strace_line(0, "run_prepared", 10_000, depth=0),
+        _strace_line(0, "run_prepared.bind", 6_000, depth=1),
+        _strace_line(0, "run_prepared.bind.args", 4_000, depth=2),
+        _strace_line(0, "run_prepared.bind.prebuilt", 2_000, depth=2),
+        _strace_line(0, "run_prepared.runner_run", 3_000, depth=1),
+        _strace_line(0, "run_prepared.runner_run.device_wall", 2_000, depth=2, dev=True),
+    ]
+    stats = _parse_stats_from_strace("\n".join(lines), rounds=1, warmup=0)
+
+    assert stats.device_wall_us == [2.0]
+    assert stats.host_wall_us == [10.0]
+    assert len(stats.invocations) == 1
+    inv = stats.invocations[0]
+    assert inv.root().name == "run_prepared"
+    assert inv.by_name()["run_prepared.runner_run.device_wall"].is_device
+
+    tree = stats.format_tree(launch=0)
+    # Branch connectors mark hierarchy (not indentation alone).
+    assert "|- bind" in tree
+    assert "|  |- args" in tree
+    assert "|  `- prebuilt" in tree
+    assert "`- runner_run" in tree
+    assert "   `- device_wall [dev]" in tree
+
+
+def test_format_tree_no_capture_message():
+    stats = BenchmarkStats(rounds=2, warmup=0)
+    assert "no span tree captured" in stats.format_tree()
+    assert "no span tree captured" in stats.format_mean_tree()
+
+
+def test_mean_tree_averages_durations_across_launches():
+    """The mean tree averages each span's duration across measured launches."""
+    # Two launches; run_prepared -> runner_run.device_wall. Device wall is 10
+    # then 20 us -> mean 15; host run_prepared 100 then 300 -> mean 200.
+    lines = []
+    for inv, host_us, dev_us in [(0, 100.0, 10.0), (1, 300.0, 20.0)]:
+        lines.append(_strace_line(inv, "run_prepared", int(host_us * 1000), depth=0))
+        lines.append(
+            _strace_line(inv, "run_prepared.runner_run.device_wall", int(dev_us * 1000), depth=2, dev=True)
+        )
+    stats = _parse_stats_from_strace("\n".join(lines), rounds=2, warmup=0)
+
+    mean = stats.mean_invocation()
+    assert mean is not None
+    by = mean.by_name()
+    assert by["run_prepared"].dur == 200_000  # mean of 100k, 300k ns
+    assert by["run_prepared.runner_run.device_wall"].dur == 15_000  # mean of 10k, 20k
+    assert by["run_prepared.runner_run.device_wall"].is_device
+
+    tree = stats.format_mean_tree()
+    assert "mean of 2 launches" in tree
+    assert _row_present(tree, "run_prepared 200.0us")
+    assert _row_present(tree, "device_wall [dev] 15.0us")
+
+
+def test_mean_tree_spread_annotations():
+    """Mean-tree nodes carry ±stdev and [min..max] across launches."""
+    lines = []
+    for inv, host_us, dev_us in [(0, 100.0, 10.0), (1, 300.0, 20.0)]:
+        lines.append(_strace_line(inv, "run_prepared", int(host_us * 1000), depth=0))
+        lines.append(
+            _strace_line(inv, "run_prepared.runner_run.device_wall", int(dev_us * 1000), depth=2, dev=True)
+        )
+    stats = _parse_stats_from_strace("\n".join(lines), rounds=2, warmup=0)
+
+    # stdev([10,20]) = 7.07; min/max = 10/20.
+    stdev_tree = stats.format_mean_tree(spread="stdev")
+    assert _row_present(stdev_tree, "device_wall [dev] 15.0us ±7.1")
+    assert "[10.0..20.0]" not in stdev_tree
+
+    minmax_tree = stats.format_mean_tree(spread="minmax")
+    assert _row_present(minmax_tree, "device_wall [dev] 15.0us [10.0..20.0]")
+    assert "±" not in minmax_tree
+
+    both_tree = stats.format_mean_tree(spread="both")
+    assert _row_present(both_tree, "device_wall [dev] 15.0us ±7.1 [10.0..20.0]")
+
+    none_tree = stats.format_mean_tree(spread="none")
+    assert _row_present(none_tree, "device_wall [dev] 15.0us")
+    # No spread markers (the "[" in "[dev]" is the device tag, not a range).
+    assert "±" not in none_tree and ".." not in none_tree
 
 
 # ---------------------------------------------------------------------------
