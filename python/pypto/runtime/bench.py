@@ -182,7 +182,7 @@ class TraceInvocation:
 
         def _walk(name: str, prefix: str, child_prefix: str) -> None:
             parent = _parent(name)
-            leaf = name[len(parent) + 1:] if parent is not None else name
+            leaf = name[len(parent) + 1 :] if parent is not None else name
             tag = " [dev]" if by_name[name].is_device else ""
             rows.append((f"{prefix}{leaf}{tag}", _columns(name)))
             kids = _by_ts(children[name])
@@ -265,9 +265,7 @@ class BenchmarkStats:
         if not self.invocations:
             return "BenchmarkStats: no span tree captured (non-SIMPLER_PROFILING build or *sim platform)"
         selected = (
-            list(enumerate(self.invocations))
-            if launch is None
-            else [(launch, self.invocations[launch])]
+            list(enumerate(self.invocations)) if launch is None else [(launch, self.invocations[launch])]
         )
         out: list[str] = []
         for i, inv in selected:
@@ -300,8 +298,14 @@ class BenchmarkStats:
                 template.setdefault(s.name, s)
         spans = [
             TraceSpan(
-                pid=t.pid, tid=t.tid, inv=-1, hid=t.hid, depth=t.depth, name=name,
-                ts=round(statistics.fmean(tss[name])), dur=round(statistics.fmean(durs[name])),
+                pid=t.pid,
+                tid=t.tid,
+                inv=-1,
+                hid=t.hid,
+                depth=t.depth,
+                name=name,
+                ts=round(statistics.fmean(tss[name])),
+                dur=round(statistics.fmean(durs[name])),
                 attrs=t.attrs,
             )
             for name, t in template.items()
@@ -346,8 +350,7 @@ class BenchmarkStats:
         if spread in ("minmax", "both"):
             legend += " [min..max]"
         header = (
-            f"mean of {len(self.invocations)} launches (warmup {self.warmup} excluded); "
-            f"each node: {legend}:"
+            f"mean of {len(self.invocations)} launches (warmup {self.warmup} excluded); each node: {legend}:"
         )
         return f"{header}\n{mean_inv.format_tree(us=us, value_fn=_value)}"
 
@@ -474,7 +477,11 @@ def _parse_stats_from_strace(log_text: str, *, rounds: int, warmup: int) -> Benc
     invocations, and reads each remaining launch's host (``run_prepared``) and
     device (``run_prepared.runner_run.device_wall``) span durations (µs).
     """
-    from simpler_setup.tools.strace_timing import (  # noqa: PLC0415
+    # ``simpler`` is an optional runtime-provided package: present on devices
+    # where the runtime is installed, absent on the lint / unit-test host. The
+    # import is resolved lazily at call time; pyright cannot see it in the lint
+    # env, and unit tests skip the parse path when it is not installed.
+    from simpler_setup.tools.strace_timing import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
         bucket_by_hid,
         group_invocations,
         parse_spans,
@@ -501,8 +508,15 @@ def _parse_stats_from_strace(log_text: str, *, rounds: int, warmup: int) -> Benc
                 hid=inv.hid,
                 spans=[
                     TraceSpan(
-                        pid=s.pid, tid=s.tid, inv=s.inv, hid=s.hid, depth=s.depth,
-                        name=s.name, ts=s.ts, dur=s.dur, attrs=s.attrs,
+                        pid=s.pid,
+                        tid=s.tid,
+                        inv=s.inv,
+                        hid=s.hid,
+                        depth=s.depth,
+                        name=s.name,
+                        ts=s.ts,
+                        dur=s.dur,
+                        attrs=s.attrs,
                     )
                     for s in inv.spans
                 ],
@@ -560,11 +574,15 @@ def benchmark(
     Raises:
         ValueError: ``rounds <= 0``, ``warmup < 0``, or *config* passed
             together with *platform* / *device_id*.
+        RuntimeError: No ``[STRACE]`` markers were captured at all, so no timing
+            could be read. The markers are gated by the runtime's compile-time
+            ``SIMPLER_PROFILING`` macro; a runtime built without it emits none.
 
     Note:
-        Only L2 single-chip runs carry a real ``device_wall_us``. On a runtime
-        built without ``SIMPLER_PROFILING`` or on a ``*sim`` platform every
-        sample is ``0`` — check :attr:`BenchmarkStats.all_zero_device`.
+        Only L2 single-chip runs carry a real ``device_wall_us``. On a ``*sim``
+        platform the host ``run_prepared`` span is still emitted but the
+        device-domain spans are not, so every ``device_wall_us`` sample is ``0``
+        — check :attr:`BenchmarkStats.all_zero_device`.
     """
     if rounds <= 0:
         raise ValueError(f"rounds must be positive, got {rounds}")
@@ -600,4 +618,16 @@ def benchmark(
     finally:
         configure_log(prior_level)
 
-    return _parse_stats_from_strace(log_text, rounds=rounds, warmup=warmup)
+    stats = _parse_stats_from_strace(log_text, rounds=rounds, warmup=warmup)
+    # We dispatched warmup + rounds launches, so a marker-emitting runtime always
+    # yields at least one host span. Zero markers means the runtime emitted none
+    # (built without SIMPLER_PROFILING) — surface that rather than returning a
+    # silently-empty result a caller could misread as "0 device timing".
+    if not stats.host_wall_us:
+        raise RuntimeError(
+            f"benchmark(): no [STRACE] markers captured across {warmup + rounds} launches. "
+            "The runtime emits per-launch timing markers only when built with the "
+            "SIMPLER_PROFILING macro (LOG_INFO_V9 tier); this runtime emitted none. "
+            "Rebuild the runtime with SIMPLER_PROFILING enabled to read benchmark timing."
+        )
+    return stats

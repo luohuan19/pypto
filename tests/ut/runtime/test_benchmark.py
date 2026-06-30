@@ -11,11 +11,13 @@
 
 After simpler PR #1177, ``benchmark`` reads per-launch timing from the
 runtime's ``[STRACE]`` stderr markers rather than a ``run_timed`` return value.
-The parse + aggregate path (:func:`_parse_stats_from_strace`) is pure host
-logic, so it is tested directly against synthetic marker lines — no device and
-no ``simpler`` runtime needed. The ``benchmark`` driver (register-once, warmup,
-log-level + stderr capture) is tested with the ``ChipWorker`` and the capture /
-parse seams patched out.
+The parse + aggregate path (:func:`_parse_stats_from_strace`) delegates the
+marker grammar to simpler's ``strace_timing``, so those tests feed synthetic
+marker lines through it and **skip when the optional ``simpler`` runtime is not
+installed** (e.g. the unit-test CI host) via the ``require_simpler`` fixture.
+The ``benchmark`` driver (register-once, warmup, log-level + stderr capture) and
+the pure-``BenchmarkStats`` aggregate helpers patch the parse seam out, so they
+run everywhere without ``simpler``.
 """
 
 from typing import Any
@@ -24,6 +26,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pypto.runtime import RunConfig
 from pypto.runtime.bench import BenchmarkStats, _parse_stats_from_strace, benchmark
+
+
+@pytest.fixture
+def require_simpler():
+    """Skip the test unless the optional ``simpler`` runtime is importable.
+
+    :func:`_parse_stats_from_strace` lazily imports ``simpler_setup.tools.
+    strace_timing`` (the single source of truth for the ``[STRACE]`` grammar);
+    it is absent on the unit-test CI host, where these parse tests skip.
+    """
+    pytest.importorskip("simpler_setup.tools.strace_timing")
 
 
 def _strace_line(
@@ -57,7 +70,7 @@ def _row_present(tree: str, expected: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_parse_discards_warmup_and_collects_rounds():
+def test_parse_discards_warmup_and_collects_rounds(require_simpler):
     """Warmup invocations are dropped; only the trailing ``rounds`` are measured."""
     lines: list[str] = []
     # 2 warmup launches (inv 0,1) then 3 measured (inv 2,3,4).
@@ -75,14 +88,14 @@ def test_parse_discards_warmup_and_collects_rounds():
     assert stats.warmup == 2
 
 
-def test_parse_no_warmup_keeps_all():
+def test_parse_no_warmup_keeps_all(require_simpler):
     lines = _launch_lines(0, host_us=50, device_us=5) + _launch_lines(1, host_us=60, device_us=15)
     stats = _parse_stats_from_strace("\n".join(lines), rounds=2, warmup=0)
     assert stats.device_wall_us == [5.0, 15.0]
     assert stats.host_wall_us == [50.0, 60.0]
 
 
-def test_parse_no_device_span_reads_zero():
+def test_parse_no_device_span_reads_zero(require_simpler):
     """On sim / non-profiling builds only the host span is emitted -> device 0."""
     lines = [_strace_line(0, "run_prepared", 50_000, depth=0)]
     stats = _parse_stats_from_strace("\n".join(lines), rounds=1, warmup=0)
@@ -91,14 +104,14 @@ def test_parse_no_device_span_reads_zero():
     assert stats.all_zero_device is True
 
 
-def test_parse_no_markers_returns_empty():
+def test_parse_no_markers_returns_empty(require_simpler):
     stats = _parse_stats_from_strace("no strace markers here\n", rounds=5, warmup=1)
     assert stats.device_wall_us == []
     assert stats.host_wall_us == []
     assert stats.invocations == []
 
 
-def test_parse_populates_full_span_tree_and_format():
+def test_parse_populates_full_span_tree_and_format(require_simpler):
     """Each measured launch keeps its full span tree; format_tree draws the
     hierarchy with ``|-`` / `` `- `` connectors and tags device spans."""
     # A branching tree (siblings tie on ts -> kept in line order):
@@ -122,7 +135,9 @@ def test_parse_populates_full_span_tree_and_format():
     assert stats.host_wall_us == [10.0]
     assert len(stats.invocations) == 1
     inv = stats.invocations[0]
-    assert inv.root().name == "run_prepared"
+    root = inv.root()
+    assert root is not None
+    assert root.name == "run_prepared"
     assert inv.by_name()["run_prepared.runner_run.device_wall"].is_device
 
     tree = stats.format_tree(launch=0)
@@ -140,7 +155,7 @@ def test_format_tree_no_capture_message():
     assert "no span tree captured" in stats.format_mean_tree()
 
 
-def test_mean_tree_averages_durations_across_launches():
+def test_mean_tree_averages_durations_across_launches(require_simpler):
     """The mean tree averages each span's duration across measured launches."""
     # Two launches; run_prepared -> runner_run.device_wall. Device wall is 10
     # then 20 us -> mean 15; host run_prepared 100 then 300 -> mean 200.
@@ -165,7 +180,7 @@ def test_mean_tree_averages_durations_across_launches():
     assert _row_present(tree, "device_wall [dev] 15.0us")
 
 
-def test_mean_tree_spread_annotations():
+def test_mean_tree_spread_annotations(require_simpler):
     """Mean-tree nodes carry ±stdev and [min..max] across launches."""
     lines = []
     for inv, host_us, dev_us in [(0, 100.0, 10.0), (1, 300.0, 20.0)]:
@@ -300,6 +315,22 @@ def test_benchmark_rejects_bad_rounds_warmup():
 def test_benchmark_rejects_config_with_platform():
     with pytest.raises(ValueError, match="not both"):
         benchmark(_compiled_mock(), [MagicMock()], config=RunConfig(platform="a2a3"), platform="a2a3")
+
+
+def test_benchmark_raises_when_no_markers_captured():
+    """A runtime built without SIMPLER_PROFILING emits no markers; the parser
+    returns empty stats and ``benchmark`` surfaces a clear error rather than a
+    silently-empty result (which callers could misread as 0 device timing)."""
+    worker = _FakeWorker()
+    empty = BenchmarkStats(rounds=1, warmup=0)  # no markers -> empty host/device
+    with (
+        patch("pypto.runtime.bench.ChipWorker", return_value=worker),
+        patch("pypto.runtime.bench.configure_log"),
+        patch("pypto.runtime.bench.current_level", return_value=20),
+        patch("pypto.runtime.bench._parse_stats_from_strace", return_value=empty),
+        pytest.raises(RuntimeError, match="no \\[STRACE\\] markers captured"),
+    ):
+        benchmark(_compiled_mock(), [MagicMock(name="arg")], rounds=1, warmup=0)
 
 
 if __name__ == "__main__":
