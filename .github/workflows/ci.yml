@@ -19,7 +19,14 @@ jobs:
     # runtime owns it and enforces build == run). Both are re-exported as outputs
     # consumed via `needs.toolchain.outputs.*`. Bumping the runtime submodule
     # moves pypto's pto-isa in lockstep.
-    runs-on: ubuntu-latest
+    #
+    # Runs on the same self-hosted arm64 CPU runner + container as clang-tidy so
+    # the whole pipeline stays on in-house infra (no GitHub-hosted minutes) and
+    # every job sees the same base image. This job only greps/reads pinned files,
+    # so it needs no pip cache mount.
+    runs-on: [self-hosted, linux, arm64, cpu]
+    container:
+      image: localhost:5000/ci-py310:latest
     permissions:
       contents: read
     outputs:
