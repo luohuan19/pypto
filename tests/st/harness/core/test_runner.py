@@ -880,11 +880,16 @@ def _batch_submitter(batch_size: int, cache_dir: Path) -> None:
 
         key_by_fut = {cfut: key for key, cfut in _compile_futures.items()}
         batch_idx = 0
-        # A batch child opens ONE ChipWorker from its first entry's platform, so a
-        # batch must never mix platforms (a mixed --platform=a2a3,a5 run would
-        # otherwise execute a5 artifacts under an a2a3 device context). Bucket
-        # pending artifacts per resolved platform and chunk within each bucket.
-        pending: dict[str, list[tuple[str, Path, str]]] = {}  # platform → (key, wd, platform)
+        # A batch child opens ONE ChipWorker from its first entry, so a batch must
+        # never mix the (platform, runtime) that the worker is keyed on. ChipWorker
+        # reuse matches on (level, platform, device_id, runtime); level/device_id
+        # are fixed per batch child, so a differing platform OR runtime inside the
+        # batch would miss ChipWorker.current() and open a SECOND Worker.init() on
+        # the same card while the batch worker still holds it — the 2-inits-on-a-
+        # busy-card halMemCtl EACCES hazard. Bucket by (resolved_platform,
+        # runtime_name) to align with that reuse key and chunk within each bucket.
+        # (platform, runtime) → list of (key, wd, platform)
+        pending: dict[tuple[str, str | None], list[tuple[str, Path, str]]] = {}
 
         # Consume in completion order: fill a batch as cases finish compiling and
         # submit it immediately, so execution and compilation overlap.
@@ -897,14 +902,15 @@ def _batch_submitter(batch_size: int, cache_dir: Path) -> None:
                 continue
             if artifact.resolved_platform.endswith("sim"):
                 continue
-            bucket = pending.setdefault(artifact.resolved_platform, [])
+            bucket_key = (artifact.resolved_platform, artifact.runtime_name)
+            bucket = pending.setdefault(bucket_key, [])
             bucket.append((key_by_fut[cfut], artifact.work_dir, artifact.resolved_platform))
             if len(bucket) >= batch_size:
                 _submit(bucket[:batch_size], batch_idx)
                 batch_idx += 1
-                pending[artifact.resolved_platform] = bucket[batch_size:]
+                pending[bucket_key] = bucket[batch_size:]
 
-        for leftover in pending.values():  # final short batch per platform
+        for leftover in pending.values():  # final short batch per (platform, runtime)
             if leftover:
                 _submit(leftover, batch_idx)
                 batch_idx += 1

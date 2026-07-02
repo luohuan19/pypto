@@ -260,6 +260,65 @@ def test_batch_missing_task_submit(tmp_path):
     assert "do not pass --execute-via-task-submit" in error
 
 
+# ---------------------------------------------------------------------------
+# _batch_submitter — bucketing keeps each batch single (platform, runtime)
+# ---------------------------------------------------------------------------
+
+
+def test_batch_submitter_never_mixes_runtimes_within_a_batch(tmp_path):
+    """A batch child opens ONE ChipWorker keyed on (platform, runtime); if a
+    batch mixed runtimes, a differing artifact would miss ChipWorker.current()
+    and open a second Worker.init() on the same card (halMemCtl EACCES). Two
+    same-platform but different-runtime artifacts must land in SEPARATE batches.
+    """
+    from concurrent.futures import Future  # noqa: PLC0415
+
+    runtime_by_wd: dict[str, str] = {}
+    compile_futures: dict[str, Future] = {}
+    for name, runtime in [("a", "rtA"), ("b", "rtB"), ("c", "rtA"), ("d", "rtB")]:
+        wd = tmp_path / f"{name}@a2a3"
+        runtime_by_wd[str(wd)] = runtime
+        fut: Future = Future()
+        fut.set_result(
+            test_runner.CompileArtifact(
+                work_dir=wd,
+                resolved_platform="a2a3",
+                error=None,
+                runtime_name=runtime,
+                chip_callable=object(),
+            )
+        )
+        compile_futures[f"{name}@a2a3"] = fut
+
+    submitted: list[list[tuple[Path, str]]] = []
+
+    def _fake_submit(_fn, entries, *_args):
+        submitted.append(list(entries))
+        done: Future = Future()
+        done.set_result({})
+        return done
+
+    fake_pool = SimpleNamespace(submit=_fake_submit)
+    test_runner._case_to_batch.clear()
+    test_runner._batches_ready.clear()
+    with (
+        patch.object(test_runner, "_execute_pool", fake_pool),
+        patch.dict(test_runner._compile_futures, compile_futures, clear=True),
+    ):
+        # A batch_size larger than either bucket forces the flush through the
+        # per-(platform, runtime) leftover path, exercising the bucket key.
+        test_runner._batch_submitter(batch_size=10, cache_dir=tmp_path)
+
+    assert test_runner._batches_ready.is_set()
+    # Two runtimes → two batches, each pure in its runtime.
+    assert len(submitted) == 2
+    for batch in submitted:
+        runtimes = {runtime_by_wd[str(wd)] for wd, _plat in batch}
+        assert len(runtimes) == 1, f"batch mixed runtimes: {runtimes}"
+    # All four cases assigned; the two runtimes split 2/2.
+    assert sorted(len(b) for b in submitted) == [2, 2]
+
+
 def test_marker_value():
     line = "PYPTO_EXEC_RESULT=PASS work_dir=/x/y device=4"
     assert test_runner._marker_value(line, "work_dir=") == "/x/y"
