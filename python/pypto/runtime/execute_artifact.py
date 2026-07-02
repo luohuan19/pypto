@@ -33,8 +33,11 @@ The same CLI doubles as a manual reproduction entry point for a failed case::
 Exit contract (the harness relies on it; ``task-submit`` propagates it verbatim):
 
 - Success: prints ``PYPTO_EXEC_RESULT=PASS device=<N>`` to stdout, exits ``0``.
-- Failure: prints the traceback to stderr, then ``PYPTO_EXEC_RESULT=FAIL``,
-  exits ``1``.
+- Device / validation failure: prints the traceback to stderr, then
+  ``PYPTO_EXEC_RESULT=FAIL``, exits ``1``.
+- Setup / reconstruction failure (stale/missing cache, bad ``work_dir``): prints
+  the traceback to stderr, then ``PYPTO_EXEC_RESULT=INFRA``, exits ``1`` — kept
+  distinct from ``FAIL`` so an infra miss isn't misread as a numerical regression.
 """
 
 import argparse
@@ -102,14 +105,10 @@ def execute_artifact_dir(
             (``main`` turns it into ``PYPTO_EXEC_RESULT=FAIL`` + exit ``1``).
     """
     chip_callable, runtime_name = _reconstruct_artifact(work_dir, platform, pto_isa_commit=pto_isa_commit)
-    _run_on_device(
-        work_dir, platform, device_id, chip_callable, runtime_name, dfx=dfx, validate=validate
-    )
+    _run_on_device(work_dir, platform, device_id, chip_callable, runtime_name, dfx=dfx, validate=validate)
 
 
-def _reconstruct_artifact(
-    work_dir: Path, platform: str, *, pto_isa_commit: str | None
-) -> tuple[Any, str]:
+def _reconstruct_artifact(work_dir: Path, platform: str, *, pto_isa_commit: str | None) -> tuple[Any, str]:
     """Rebuild the cached artifact, reclassifying any failure as infra.
 
     ``compile_and_assemble`` reuses the cached ``.o``/``.so`` next to each kernel
@@ -211,9 +210,7 @@ def execute_batch_manifest(
 
     def _run_one(work_dir: Path, platform: str) -> None:
         chip_callable, runtime_name = _rebind(work_dir, platform)
-        _run_on_device(
-            work_dir, platform, device_id, chip_callable, runtime_name, dfx=dfx, validate=validate
-        )
+        _run_on_device(work_dir, platform, device_id, chip_callable, runtime_name, dfx=dfx, validate=validate)
 
     def _run_and_mark(entry: dict) -> None:
         nonlocal all_ok

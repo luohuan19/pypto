@@ -110,8 +110,7 @@ jobs:
             | while read -r tid; do
                 echo "  killing $tid"
                 task-submit --kill "$tid" || true
-              done
-          true
+              done || true
 
   qwen3-perf:
     # Qwen3-14B decode performance monitoring (moved out of per-PR ci.yml).
@@ -159,6 +158,13 @@ jobs:
         # Namespace ccache by the pinned pto-isa commit so an ISA bump forces a
         # real recompile instead of serving stale objects (mirrors pypto-lib).
         run: echo "CCACHE_NAMESPACE=pto-isa-${{ needs.toolchain.outputs.pto_isa_commit }}" >> "$GITHUB_ENV"
+
+      - name: Relax shared ccache permissions
+        # The container codegen-tests job (ci.yml) writes this same ci-cache/ccache
+        # dir as root; CCACHE_UMASK only affects NEW entries, so pre-existing
+        # root-owned buckets can be unwritable by this host (ci-runner) job.
+        # Best-effort relax them before the first compiler launch (no-op if absent).
+        run: chmod -R a+rwX "$CCACHE_DIR" 2>/dev/null || true
 
       - name: Install ptoas (local cache)
         env:
@@ -279,8 +285,7 @@ jobs:
             | while read -r tid; do
                 echo "  killing $tid"
                 task-submit --kill "$tid" || true
-              done
-          true
+              done || true
 
   notify-on-failure:
     name: Open issue on failure

@@ -809,8 +809,19 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         return
 
     # The pre-compile pipeline only has work when cases were statically
-    # discovered; undiscovered suites fall back to the inline path handled above.
+    # discovered; undiscovered suites fall back to the inline path. Those
+    # dynamically-created cases still run through TestRunner._run_inline(), which
+    # must borrow a card via task-submit too — so wire the inline path before
+    # returning, exactly as the ``max_workers is None`` branch does above.
+    # Otherwise a --precompile-workers + --execute-via-task-submit run with only
+    # dynamic cases would execute them in-process on a card-free host.
     if not seen:
+        if execute_via_task_submit:
+            configure_inline_task_submit(
+                task_max_time=task_max_time,
+                task_queue_timeout=task_queue_timeout,
+                task_submit_device=task_submit_device,
+            )
         return
 
     dump_passes: bool = session.config.getoption("--dump-passes")

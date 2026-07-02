@@ -188,7 +188,7 @@ def test_task_submit_exec_failure(tmp_path, exc):
 
 def _artifact(platform):
     return test_runner.CompileArtifact(
-        work_dir=Path("/tmp/x"),
+        work_dir=Path("unused_work_dir"),
         resolved_platform=platform,
         error=None,
         runtime_name="rt",

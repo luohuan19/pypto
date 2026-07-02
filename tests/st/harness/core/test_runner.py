@@ -667,8 +667,18 @@ def _run_batch_via_task_submit(
     # Artifacts without a marker: the batch process died early, or an infra kill
     # (queue timeout / watchdog) that produced no per-artifact markers at all.
     # ``buf`` holds whatever the process printed after the last marker (the crash).
+    # rc != 0 is a batch-level failure. Classify it (queue timeout / watchdog /
+    # bootstrap crash / batch-level INFRA) only when it looks batch-wide — no
+    # per-artifact markers parsed, an INFRA marker present, or no child output at
+    # all. Otherwise (rc == 1 with some FAIL/PASS markers) each artifact already
+    # carries its own verdict and the unmarked tail is a genuine died-before-this
+    # case, so keep the per-artifact "no result marker" message.
     infra_err = None
-    if proc.returncode not in (0, 1):
+    if proc.returncode != 0 and (
+        not results
+        or f"{_RESULT_MARKER_PREFIX}=INFRA" in proc.stdout
+        or (not proc.stdout.strip() and not proc.stderr.strip())
+    ):
         infra_err = _classify_task_submit_failure(proc.returncode, proc.stdout, proc.stderr)
     tail = "\n".join(buf[-40:]).strip()
     for wd, _ in entries:
@@ -827,72 +837,79 @@ def _batch_submitter(batch_size: int, cache_dir: Path) -> None:
 
     Compile failures / sim / codegen-only are skipped here and handled by
     ``run``'s lazy per-item path.
+
+    The whole body runs under ``try/finally`` so ``_batches_ready`` is ALWAYS
+    set: if this daemon thread raised before setting it, every task-submit case
+    would block forever on ``_batches_ready.wait()`` in ``run``. On failure the
+    cases simply find no ``_case_to_batch`` entry and report "not assigned to a
+    batch" instead of hanging the session.
     """
-    assert _execute_pool is not None, "execute pool not initialised"
-    device = _pipeline_ctx.get("task_submit_device", "auto")
-    dfx = _pipeline_ctx.get("dfx", _DfxOpts())
-    pto_isa_commit = _pipeline_ctx.get("pto_isa_commit")
-    max_time = _pipeline_ctx.get("task_max_time", 600)
-    queue_timeout = _pipeline_ctx.get("task_queue_timeout", 1800)
-    # A 0 / negative batch size would never fill a batch (``len(pending) >= 0`` is
-    # always true, submitting empty chunks while pending never drains), hanging
-    # every task-submit test on ``_batches_ready``. Clamp to a sane minimum.
-    batch_size = max(1, batch_size)
+    try:
+        assert _execute_pool is not None, "execute pool not initialised"
+        device = _pipeline_ctx.get("task_submit_device", "auto")
+        dfx = _pipeline_ctx.get("dfx", _DfxOpts())
+        pto_isa_commit = _pipeline_ctx.get("pto_isa_commit")
+        max_time = _pipeline_ctx.get("task_max_time", 600)
+        queue_timeout = _pipeline_ctx.get("task_queue_timeout", 1800)
+        # A 0 / negative batch size would never fill a batch (``len(pending) >= 0``
+        # is always true, submitting empty chunks while pending never drains),
+        # hanging every task-submit test on ``_batches_ready``. Clamp to a minimum.
+        batch_size = max(1, batch_size)
 
-    def _submit(chunk: "list[tuple[str, Path, str]]", idx: int) -> None:
-        entries = [(wd, plat) for _, wd, plat in chunk]
-        manifest_path = cache_dir / f"batch_{idx}.json"
-        # ``--task-max-time`` is a PER-CASE budget, but a batch runs all its
-        # entries in one task-submit task, so scale the watchdog by the batch
-        # length — otherwise a valid batch of many slow-but-passing artifacts is
-        # killed at the single-case limit and the harness reports the survivors as
-        # infra failures.
-        batch_max_time = max_time * len(entries)
-        fut = _execute_pool.submit(
-            _run_batch_via_task_submit,
-            entries,
-            manifest_path,
-            device,
-            dfx,
-            pto_isa_commit,
-            batch_max_time,
-            queue_timeout,
-        )
-        for key, wd, _ in chunk:
-            _case_to_batch[key] = (fut, wd)
+        def _submit(chunk: "list[tuple[str, Path, str]]", idx: int) -> None:
+            entries = [(wd, plat) for _, wd, plat in chunk]
+            manifest_path = cache_dir / f"batch_{idx}.json"
+            # ``--task-max-time`` is a PER-CASE budget, but a batch runs all its
+            # entries in one task-submit task, so scale the watchdog by the batch
+            # length — otherwise a valid batch of many slow-but-passing artifacts is
+            # killed at the single-case limit and the harness reports the survivors
+            # as infra failures.
+            batch_max_time = max_time * len(entries)
+            fut = _execute_pool.submit(
+                _run_batch_via_task_submit,
+                entries,
+                manifest_path,
+                device,
+                dfx,
+                pto_isa_commit,
+                batch_max_time,
+                queue_timeout,
+            )
+            for key, wd, _ in chunk:
+                _case_to_batch[key] = (fut, wd)
 
-    key_by_fut = {cfut: key for key, cfut in _compile_futures.items()}
-    batch_idx = 0
-    # A batch child opens ONE ChipWorker from its first entry's platform, so a
-    # batch must never mix platforms (a mixed --platform=a2a3,a5 run would
-    # otherwise execute a5 artifacts under an a2a3 device context). Bucket pending
-    # artifacts per resolved platform and chunk within each bucket.
-    pending: dict[str, list[tuple[str, Path, str]]] = {}  # platform → (cache_key, work_dir, platform)
+        key_by_fut = {cfut: key for key, cfut in _compile_futures.items()}
+        batch_idx = 0
+        # A batch child opens ONE ChipWorker from its first entry's platform, so a
+        # batch must never mix platforms (a mixed --platform=a2a3,a5 run would
+        # otherwise execute a5 artifacts under an a2a3 device context). Bucket
+        # pending artifacts per resolved platform and chunk within each bucket.
+        pending: dict[str, list[tuple[str, Path, str]]] = {}  # platform → (key, wd, platform)
 
-    # Consume in completion order: fill a batch as cases finish compiling and
-    # submit it immediately, so execution and compilation overlap.
-    for cfut in as_completed(key_by_fut):
-        try:
-            artifact = cfut.result()
-        except Exception:  # noqa: BLE001 — run() re-raises the compile crash with context
-            continue
-        if artifact.error is not None or _pipeline_ctx.get("codegen_only"):
-            continue
-        if artifact.resolved_platform.endswith("sim"):
-            continue
-        bucket = pending.setdefault(artifact.resolved_platform, [])
-        bucket.append((key_by_fut[cfut], artifact.work_dir, artifact.resolved_platform))
-        if len(bucket) >= batch_size:
-            _submit(bucket[:batch_size], batch_idx)
-            batch_idx += 1
-            pending[artifact.resolved_platform] = bucket[batch_size:]
+        # Consume in completion order: fill a batch as cases finish compiling and
+        # submit it immediately, so execution and compilation overlap.
+        for cfut in as_completed(key_by_fut):
+            try:
+                artifact = cfut.result()
+            except Exception:  # noqa: BLE001 — run() re-raises the compile crash with context
+                continue
+            if artifact.error is not None or _pipeline_ctx.get("codegen_only"):
+                continue
+            if artifact.resolved_platform.endswith("sim"):
+                continue
+            bucket = pending.setdefault(artifact.resolved_platform, [])
+            bucket.append((key_by_fut[cfut], artifact.work_dir, artifact.resolved_platform))
+            if len(bucket) >= batch_size:
+                _submit(bucket[:batch_size], batch_idx)
+                batch_idx += 1
+                pending[artifact.resolved_platform] = bucket[batch_size:]
 
-    for leftover in pending.values():  # final short batch per platform
-        if leftover:
-            _submit(leftover, batch_idx)
-            batch_idx += 1
-
-    _batches_ready.set()
+        for leftover in pending.values():  # final short batch per platform
+            if leftover:
+                _submit(leftover, batch_idx)
+                batch_idx += 1
+    finally:
+        _batches_ready.set()
 
 
 def start_pipeline(  # noqa: PLR0913
@@ -1056,6 +1073,12 @@ def configure_inline_task_submit(
     # no local device). With a pipeline, undiscovered cases stay in-process —
     # see _run_inline.
     _pipeline_ctx["inline_via_task_submit"] = True
+    # No _batch_submitter runs on this path, so nothing would ever set
+    # _batches_ready. _run_inline still calls _await_all_batches() before its
+    # per-case task-submit child (to serialize card init); mark the (empty) batch
+    # set ready here so that wait returns immediately instead of hanging forever.
+    _case_to_batch.clear()
+    _batches_ready.set()
 
 
 def shutdown_pipeline() -> None:
