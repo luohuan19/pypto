@@ -939,6 +939,23 @@ def benchmark(
 
     distributed = isinstance(compiled, DistributedCompiledProgram)
 
+    # Validate mutually-exclusive arguments up front, before any logging setup,
+    # so a bad argument combination is rejected regardless of whether the
+    # simpler-backed logger is importable (it is optional in offline envs).
+    if distributed:
+        # Device set is fixed at compile time via ``distributed_config``;
+        # platform/device_id do not apply. ``config`` is still forwarded per
+        # dispatch (ring overrides).
+        if platform is not None or device_id is not None:
+            raise ValueError(
+                "benchmark(): platform=/device_id= do not apply to an L3 "
+                "DistributedCompiledProgram — the device set is fixed at compile "
+                "time via distributed_config. Pass config=RunConfig(...) for "
+                "per-dispatch ring overrides instead."
+            )
+    elif config is not None and (platform is not None or device_id is not None):
+        raise ValueError("benchmark(): pass either config=... or platform=/device_id=, not both")
+
     # The C++ host logger that prints the ``[STRACE]`` markers is seeded from the
     # simpler Python logger snapshot at worker ``init`` (and inherited by the L3
     # fork), so raise the level before constructing the worker. Restore afterward.
@@ -948,16 +965,6 @@ def benchmark(
         with tempfile.TemporaryDirectory(prefix="pypto-bench-") as tmp:
             log_path = Path(tmp) / "strace.log"
             if distributed:
-                # Device set is fixed at compile time via ``distributed_config``;
-                # platform/device_id do not apply. ``config`` is still forwarded
-                # per dispatch (ring overrides).
-                if platform is not None or device_id is not None:
-                    raise ValueError(
-                        "benchmark(): platform=/device_id= do not apply to an L3 "
-                        "DistributedCompiledProgram — the device set is fixed at compile "
-                        "time via distributed_config. Pass config=RunConfig(...) for "
-                        "per-dispatch ring overrides instead."
-                    )
                 # The L3 chip workers are forked inside ``prepare()`` and inherit
                 # fd 2 at fork time, so the stderr redirect MUST wrap ``prepare()``
                 # — a redirect established after the fork would not capture the
@@ -974,8 +981,6 @@ def benchmark(
                         print(captured, file=sys.stderr, end="")
                     raise
             else:
-                if config is not None and (platform is not None or device_id is not None):
-                    raise ValueError("benchmark(): pass either config=... or platform=/device_id=, not both")
                 if config is not None:
                     rc = config
                 else:
