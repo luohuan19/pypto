@@ -135,8 +135,9 @@ class RunConfig:
             Output: ``<work_dir>/dfx_outputs/pmu.csv``. Mirrors
             ``--enable-pmu N``.
         enable_dep_gen: Capture PTO2 dependency edges into
-            ``<work_dir>/dfx_outputs/deps.json``. Render to HTML on demand
-            via ``python -m simpler_setup.tools.deps_viewer``. Mirrors
+            ``<work_dir>/dfx_outputs/deps.json``. Render to HTML on demand via
+            ``python -m simpler_setup.tools.deps_viewer <deps.json> --format
+            html`` (the CLI defaults to text output). Mirrors
             ``--enable-dep-gen``.
         enable_scope_stats: Capture per-scope heap / task_window / tensormap
             ring-fill peaks into
