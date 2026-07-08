@@ -1194,8 +1194,7 @@ class _BoolStrictCallConfig:
     def enable_dep_gen(self, value: object) -> None:
         if not isinstance(value, bool):
             raise TypeError(
-                "incompatible function arguments: enable_dep_gen expects bool, "
-                f"got {type(value).__name__}"
+                f"incompatible function arguments: enable_dep_gen expects bool, got {type(value).__name__}"
             )
         self._enable_dep_gen = value
 
@@ -1225,23 +1224,24 @@ class TestMakeCallConfigDepGenType:
     chain can yield an int, which the ``bool``-only pybind setter rejects.
     """
 
+    # The pypto-lib CLI wires ``--enable-l2-swimlane`` as ``type=int,
+    # choices=(0, 1, 2)``, so ``RunConfig`` receives an ``int`` here even though
+    # the field is annotated ``bool`` — that int is precisely the crash trigger
+    # under test, hence the deliberate ``pyright: ignore[reportArgumentType]``.
+
     def test_int_swimlane_flag_yields_bool_dep_gen(self, tmp_path, fake_simpler_task_interface):
         # ``--enable-l2-swimlane 1`` reaches RunConfig as the int ``1``; the
         # co-enable path must still hand ``enable_dep_gen`` a genuine ``bool``.
-        cfg = _make_call_config(
-            DistributedConfig(), RunConfig(enable_l2_swimlane=1), dfx_base=tmp_path / "dfx"
-        )
+        run_config = RunConfig(enable_l2_swimlane=1)  # pyright: ignore[reportArgumentType]
+        cfg = _make_call_config(DistributedConfig(), run_config, dfx_base=tmp_path / "dfx")
         assert cfg.enable_dep_gen is True
         assert cfg.enable_l2_swimlane == 1
 
     def test_int_zero_swimlane_yields_bool_false_dep_gen(self, tmp_path, fake_simpler_task_interface):
         # Another DFX flag opens the block while swimlane is the int ``0``; the
         # ``and``/``or`` chain would otherwise assign int ``0`` and still crash.
-        cfg = _make_call_config(
-            DistributedConfig(),
-            RunConfig(enable_dump_tensor=1, enable_l2_swimlane=0),
-            dfx_base=tmp_path / "dfx",
-        )
+        run_config = RunConfig(enable_dump_tensor=1, enable_l2_swimlane=0)  # pyright: ignore[reportArgumentType]
+        cfg = _make_call_config(DistributedConfig(), run_config, dfx_base=tmp_path / "dfx")
         assert cfg.enable_dep_gen is False
 
 
