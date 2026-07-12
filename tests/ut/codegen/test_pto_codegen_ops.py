@@ -1161,6 +1161,63 @@ class TestTileSliceCodegen:
             f"{colexpand_lines[0]}"
         )
 
+    def test_column_slice_of_multirow_tile_into_col_expand_uses_disjoint_buffer(self):
+        """Regression for #2010: ``t[:, a:b]`` on a multi-row tile feeding
+        ``col_expand_mul`` must materialize into a buffer disjoint from its source.
+
+        The slice's own buffer is dense (row pitch 64) yet aliases the source (row
+        pitch 128), so the lazy ``pto.textract`` used to repack strided -> dense on
+        top of its own live source and destroy it — only row 0 survived. The fix
+        canonicalizes the slice into a ``tile.extract``, which gets a fresh
+        allocation. Both the SSA identity *and* the allocated addresses are checked:
+        the pre-fix codegen already emitted a distinct destination SSA, and it was
+        the *address* the destination landed on that made it corrupt.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                gamma: pl.Tensor[[1, 64], pl.FP32],
+                dst: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                t: pl.Tile[[16, 128], pl.FP32] = pl.load(x, [0, 0], [16, 128])
+                gamma_t: pl.Tile[[1, 64], pl.FP32] = pl.load(gamma, [0, 0], [1, 64])
+                hi: pl.Tile[[16, 64], pl.FP32] = t[:, 64:128]
+                scaled: pl.Tile[[16, 64], pl.FP32] = pl.tile.col_expand_mul(hi, gamma_t)
+                return pl.store(scaled, [0, 0], dst)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.subview" not in mlir, (
+            f"a column slice feeding col_expand_mul must be canonicalized to tile.extract, got:\n{mlir}"
+        )
+
+        textract_lines = [ln.strip() for ln in mlir.splitlines() if "pto.textract" in ln]
+        assert len(textract_lines) == 1, f"expected exactly one pto.textract, got:\n{mlir}"
+
+        def _first_ssa(clause: str) -> str:
+            return clause.split(":", 1)[0].split(",")[0].strip()
+
+        src = _first_ssa(textract_lines[0].split("ins(", 1)[1])
+        dst_ssa = _first_ssa(textract_lines[0].split("outs(", 1)[1])
+        assert dst_ssa != src, f"pto.textract must not write into its own source, got:\n{textract_lines[0]}"
+
+        # The destination must also be allocated at a different address: sharing the
+        # source's base is exactly the #2010 corruption, whatever the SSA names say.
+        addrs = {}
+        for line in mlir.splitlines():
+            if "pto.alloc_tile" not in line:
+                continue
+            name = line.strip().split("=", 1)[0].strip()
+            addrs[name] = line.split("addr = ", 1)[1].split()[0]
+        assert src in addrs and dst_ssa in addrs, f"both tiles must be allocated, got {sorted(addrs)}"
+        assert addrs[src] != addrs[dst_ssa], (
+            f"pto.textract destination {dst_ssa} is allocated at the source's address "
+            f"{addrs[src]} — the repack would corrupt its own source (#2010)"
+        )
+
     def test_tile_slice_codegen_rank_reducing(self):
         """A rank-reducing tile subscript `t[i]` (→ tile.slice with drop_dims) reaches
         PTO codegen and emits pto.subview — the result is clamped to 2D [1, N]."""
