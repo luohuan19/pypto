@@ -174,27 +174,91 @@ def _is_tensor(obj: Any) -> bool:
     return isinstance(obj, torch.Tensor)
 
 
-def _extract_tensor_meta(
-    tensor: Any,
+def _build_tensor_meta(
+    extents: Sequence[int],
+    dtype: DataType,
     dyn_dims: dict[int, DynDim] | None = None,
 ) -> TensorMeta:
-    """Extract TensorMeta from a torch.Tensor.
+    """Build a :class:`TensorMeta` from per-dim extents and a resolved dtype.
 
     ``dyn_dims`` maps ``dim_idx → DynDim`` for dims declared dynamic at this
     parameter (via ``bind_dynamic`` or an annotation-embedded ``pl.dynamic()``).
-    The DynDim's ``static_bound`` is filled from the actual tensor extent at
-    this call site.
+    The DynDim's ``static_bound`` is filled from the corresponding extent.
+    Shared by the torch-tensor path (:func:`_extract_tensor_meta`, extent = the
+    real tensor dim) and the signature path (:meth:`JITFunction._bind_args_from_signature`,
+    extent = the static annotation dim or a placeholder for dynamic dims).
     """
     dyn = dyn_dims or {}
     shape: list[ShapeDim] = []
-    for i, d in enumerate(tensor.shape):
+    for i, d in enumerate(extents):
         extent = int(d)
         bound = dyn.get(i)
         if bound is None:
             shape.append(extent)
         else:
             shape.append(DynDim(name=bound.name, literal=bound.literal, static_bound=extent))
-    return TensorMeta(shape=tuple(shape), dtype=_torch_dtype_to_pypto(tensor.dtype))
+    return TensorMeta(shape=tuple(shape), dtype=dtype)
+
+
+def _extract_tensor_meta(
+    tensor: Any,
+    dyn_dims: dict[int, DynDim] | None = None,
+) -> TensorMeta:
+    """Extract TensorMeta from a torch.Tensor (shape/dtype only — no data read)."""
+    return _build_tensor_meta(tensor.shape, _torch_dtype_to_pypto(tensor.dtype), dyn_dims)
+
+
+def _signature_tensor_meta(
+    annotation: Any,
+    dtype: DataType,
+    dyn_for_param: dict[int, DynDim],
+    dynvar_cls: type,
+) -> TensorMeta:
+    """Build TensorMeta from a shaped ``pl.Tensor[[...], dtype]`` annotation.
+
+    Static dims use the annotation integer; dynamic dims (``pl.dynamic`` /
+    ``bind_dynamic``) get a placeholder extent since the compiled artifact is
+    extent-independent. ``dynvar_cls`` is the lazily-imported ``DynVar`` type.
+    """
+    shape = annotation.shape
+    extents = [
+        1 if (i in dyn_for_param or isinstance(dim, dynvar_cls)) else int(dim) for i, dim in enumerate(shape)
+    ]
+    # Record annotation-only DynVars not already bound via bind_dynamic.
+    dyn_dims = dict(dyn_for_param)
+    for i, dim in enumerate(shape):
+        if isinstance(dim, dynvar_cls) and i not in dyn_dims:
+            dyn_dims[i] = DynDim(name=dim.name, literal=dim.name, static_bound=0)
+    return _build_tensor_meta(extents, dtype, dyn_dims)
+
+
+def _signature_scalar_value(
+    func_name: str,
+    name: str,
+    param: inspect.Parameter,
+    kwargs: dict[str, Any],
+) -> int | float | bool:
+    """Resolve a scalar parameter's value for signature-mode compile.
+
+    Value comes from ``kwargs`` (by param name) or the signature default; a
+    scalar with neither is an error (the signature carries no value).
+    """
+    if name in kwargs:
+        value = kwargs[name]
+    elif param.default is not inspect.Parameter.empty:
+        value = param.default
+    else:
+        raise TypeError(
+            f"@pl.jit function '{func_name}': scalar parameter '{name}' has no value. When "
+            f"compiling from the signature, pass scalar values as keyword arguments, e.g. "
+            f"compile({name}=...)."
+        )
+    if not isinstance(value, (int, float, bool)):
+        raise TypeError(
+            f"@pl.jit function '{func_name}': scalar parameter '{name}' must be an int/float/bool, "
+            f"got {type(value).__name__}."
+        )
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -1435,6 +1499,114 @@ class JITFunction:
 
         return param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn_maps
 
+    def _bind_args_from_signature(
+        self, kwargs: dict[str, Any]
+    ) -> tuple[
+        list[str],
+        dict[str, Any],
+        dict[str, TensorMeta],
+        dict[str, int | float | bool],
+        dict[str, DataType],
+        dict[int, dict[str, dict[int, DynDim]]],
+    ]:
+        """Derive the same metadata as :meth:`_bind_args`, but from the kernel's
+        own parameter annotations — no tensor arguments required.
+
+        Used by :meth:`compile` when called with no positional arguments. Each
+        tensor parameter's ``pl.Tensor[[...], dtype]`` annotation supplies the
+        shape/dtype contract directly: static dims are annotation integers,
+        dynamic dims (``pl.dynamic`` / ``bind_dynamic``) are marked dynamic and
+        given a placeholder extent — the compiled artifact is extent-independent
+        because dynamic dims collapse to ``None`` in the cache key and lower to
+        runtime ``pl.tensor.dim`` reads.
+
+        Scalar parameters carry no value in the signature, so their values must
+        come from ``kwargs`` (or a signature default).
+
+        Raises:
+            TypeError: if a tensor parameter has a bare ``pl.Tensor`` annotation
+                (no shape to read), or a scalar parameter has no supplied value.
+        """
+        from pypto.language.typing.dynamic import DynVar  # noqa: PLC0415
+        from pypto.language.typing.scalar import Scalar  # noqa: PLC0415
+        from pypto.language.typing.tensor import Tensor  # noqa: PLC0415
+
+        param_names = self._param_names()
+        sig = inspect.signature(self._func)
+
+        # Namespace for resolving string annotations (``from __future__ import
+        # annotations``): the function's globals merged with its closure free-vars,
+        # so an annotation referencing an enclosing scope (e.g. a ``pl.dynamic`` /
+        # constant defined in an outer function) resolves. We ``eval`` each string
+        # annotation directly rather than via ``typing.get_type_hints`` because the
+        # latter runs ``_type_check`` on the result, which rejects our custom
+        # ``Tensor`` / ``Scalar`` instance annotations on Python 3.10.
+        ann_ns: dict[str, Any] | None = None
+        if any(isinstance(p.annotation, str) for n, p in sig.parameters.items() if n != "self"):
+            ann_ns = _func_name_lookup(self._func)
+
+        deps, callers_by_id, _, call_args_cache = self._get_dep_graph()
+        per_func_dyn_maps = _compute_per_func_dyndim_maps(
+            self._func, param_names, deps, callers_by_id, call_args_cache
+        )
+        entry_dyn_map = per_func_dyn_maps[id(self._func)]
+
+        tensor_meta: dict[str, TensorMeta] = {}
+        scalar_values: dict[str, int | float | bool] = {}
+        scalar_dtypes: dict[str, DataType] = {}
+
+        for name in param_names:
+            param = sig.parameters[name]
+            annotation = param.annotation
+            if isinstance(annotation, str) and ann_ns is not None:
+                try:
+                    # Trusted input: the kernel's own annotation source, evaluated
+                    # in its own globals+closure namespace (same as Python would).
+                    annotation = eval(annotation, ann_ns)  # noqa: S307
+                except Exception:  # noqa: BLE001 - leave as string; handled below as "cannot infer"
+                    pass
+
+            # A bare ``pl.Tensor`` is the Tensor *class* itself (no shape);
+            # ``pl.Tensor[[...], dtype]`` is a Tensor *instance* carrying
+            # shape/dtype. ``pl.Out[...]``/``pl.InOut[...]`` unwrap to their
+            # inner type, so both directions flow through the instance branch.
+            bare_msg = (
+                f"@pl.jit function '{self.__name__}': cannot compile from the signature because "
+                f"parameter '{name}' has a bare 'pl.Tensor' annotation with no shape. Give it a "
+                f"full 'pl.Tensor[[...], dtype]' annotation, or call compile(*sample_tensors) "
+                f"with sample tensors instead."
+            )
+            if isinstance(annotation, Tensor):
+                if annotation.shape is None or annotation.dtype is None:
+                    raise TypeError(bare_msg)
+                tensor_meta[name] = _signature_tensor_meta(
+                    annotation, annotation.dtype, entry_dyn_map.get(name, {}), DynVar
+                )
+                continue
+            if isinstance(annotation, type) and issubclass(annotation, Tensor):
+                raise TypeError(bare_msg)
+
+            # Scalar-like annotation: pl.Scalar[dtype] or a bare DataType.
+            scalar_dtype = annotation.dtype if isinstance(annotation, Scalar) else None
+            if scalar_dtype is None and isinstance(annotation, DataType):
+                scalar_dtype = annotation
+            if scalar_dtype is not None:
+                scalar_values[name] = _signature_scalar_value(self.__name__, name, param, kwargs)
+                scalar_dtypes[name] = scalar_dtype
+                continue
+
+            # Unknown / unannotated parameter — cannot infer without a value.
+            raise TypeError(
+                f"@pl.jit function '{self.__name__}': cannot infer parameter '{name}' from the "
+                f"signature (annotation: {annotation!r}). Annotate it as a shaped 'pl.Tensor' / "
+                f"'pl.Scalar[dtype]', or call compile(*sample_args) with sample values."
+            )
+
+        # No positional args in signature mode; ``ordered_args`` (unused by
+        # compile()) derives from this, so scalars suffice as its source.
+        arguments = dict(scalar_values)
+        return param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn_maps
+
     # ------------------------------------------------------------------
     # Call
     # ------------------------------------------------------------------
@@ -1443,6 +1615,7 @@ class JITFunction:
         self,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
+        allow_signature_mode: bool = False,
     ) -> tuple[Any, list[Any], Any | None]:
         """Bind args, look up or build the CompiledProgram, return it with the
         ordered positional arg list and the consumed RunConfig.
@@ -1456,6 +1629,11 @@ class JITFunction:
         - cache-key construction (platform + strategy participate so artefacts
           for different targets never collide)
         - on-miss ``_compile()`` invocation
+
+        When ``allow_signature_mode`` is set and no positional args are given,
+        the shape/dtype contract is read from the kernel's own annotations via
+        :meth:`_bind_args_from_signature` (compile-only; ``__call__`` never
+        enables this because on-device dispatch needs real tensors).
 
         Returns:
             ``(compiled, ordered_args, run_config)`` where ``ordered_args``
@@ -1473,9 +1651,20 @@ class JITFunction:
         if "config" in kwargs:
             kwargs = {k: v for k, v in kwargs.items() if k != "config"}
 
-        param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = self._bind_args(
-            args, kwargs
-        )
+        # Signature mode (compile() only) reads shapes from the annotations,
+        # but ONLY when no tensor values were supplied — positionally OR by
+        # keyword. Keyword tensor samples (``compile(a=x, b=y)``) must still bind
+        # through ``_bind_args``/``sig.bind`` as before; scalar/config kwargs do
+        # not block signature mode.
+        signature_mode = allow_signature_mode and not args and not any(_is_tensor(v) for v in kwargs.values())
+        if signature_mode:
+            param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = (
+                self._bind_args_from_signature(kwargs)
+            )
+        else:
+            param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = self._bind_args(
+                args, kwargs
+            )
 
         # Compile-side knobs (strategy, dump_passes, ...) come from the
         # RunConfig. Forwarding them lets a @pl.jit kernel honour the same
@@ -1598,6 +1787,19 @@ class JITFunction:
         same specialization key hit the L1 cache and return the same
         ``CompiledProgram`` instance.
 
+        **Compiling without tensors.** When called with **no tensor
+        arguments** — neither positional nor keyword — the shape/dtype contract
+        is read directly from the kernel's own parameter annotations, so no
+        throwaway ``torch.empty(...)`` dummies are needed. (Passing tensors by
+        keyword, e.g. ``compile(a=sample_a)``, still binds them normally.) This
+        requires every tensor parameter to carry a full ``pl.Tensor[[...],
+        dtype]`` annotation (a bare ``pl.Tensor`` has no shape to read and
+        raises). Dynamic dims (``pl.dynamic`` / ``bind_dynamic``) need no value —
+        the artifact is extent-independent. Scalar parameters have no value in
+        the signature, so pass them as keyword args (or via a signature
+        default). This shares the same cache entry as an equivalent
+        ``compile(*sample_tensors)`` call.
+
         Example::
 
             @pl.jit
@@ -1605,7 +1807,13 @@ class JITFunction:
                 ...
 
             worker = ChipWorker(config=RunConfig(platform="a2a3"))
+
+            # From sample tensors (shape/dtype read; contents ignored):
             compiled = my_kernel.compile(sample_x, sample_w, sample_out)
+
+            # Or straight from the (fully-annotated) signature — no tensors:
+            compiled = my_kernel.compile()
+
             w_dev = worker.alloc_tensor(real_w.shape, real_w.dtype, init=real_w)
             h = worker.register(compiled)
             for batch in stream:
@@ -1613,15 +1821,17 @@ class JITFunction:
 
         Args:
             *args: Positional arguments matching the decorated function's
-                params. Tensor values are inspected for shape/dtype only;
-                their contents are not read.
+                params. Tensor values are inspected for shape/dtype only; their
+                contents are not read. Omit **all** positional args to compile
+                straight from the signature annotations instead.
             **kwargs: Keyword arguments. A ``config`` keyword, if present, is
-                a :class:`~pypto.runtime.runner.RunConfig`.
+                a :class:`~pypto.runtime.runner.RunConfig`. In signature mode,
+                scalar parameter values are also passed here (by name).
 
         Returns:
             The cached :class:`CompiledProgram` for this specialization.
         """
-        compiled, _ordered_args, _run_config = self._resolve_compiled(args, kwargs)
+        compiled, _ordered_args, _run_config = self._resolve_compiled(args, kwargs, allow_signature_mode=True)
         return compiled
 
     # ------------------------------------------------------------------
