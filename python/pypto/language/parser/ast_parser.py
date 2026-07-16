@@ -162,16 +162,19 @@ _DISPATCH_PRED_OPS: dict[str, "ir.DispatchPredicateOp"] = {
 
 
 def _ast_int_literal(node: ast.expr) -> int | None:
-    """Return the int value of an integer literal AST (``5`` / ``-5``), else None.
+    """Return the int value of an integer literal AST (``5`` / ``-5`` / ``+5``), else None.
 
     Rejects bools (``True`` is an ``int`` subclass in Python but not a valid
     predicate target).
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
         return node.value
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        inner = _ast_int_literal(node.operand)
-        return None if inner is None else -inner
+    if isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.USub):
+            inner = _ast_int_literal(node.operand)
+            return None if inner is None else -inner
+        if isinstance(node.op, ast.UAdd):
+            return _ast_int_literal(node.operand)
     return None
 
 
@@ -585,6 +588,12 @@ class ASTParser:
         # Depth of nested ``with pl.manual_scope():`` blocks. Used to gate the
         # ``deps=[var]`` kwarg recognition on kernel calls.
         self._manual_scope_depth: int = 0
+
+        # Maps a Var bound from a ``pl.submit(...)`` result tuple, by
+        # ``unique_id``, to the producer TaskId Var bound by that same submit.
+        # Lets ``_validate_predicate_deps`` enforce the "predicate operand's
+        # producer must be one of deps=" contract at the parser boundary.
+        self._submit_producer_tid: dict[int, ir.Var] = {}
 
         # Forward-sticky ``pl.dump_tag`` set (per function, reset at function
         # entry). Holds the bound Vars whose subsequent kernel-call uses get a
@@ -1563,22 +1572,25 @@ class ASTParser:
             hint="Use simple variable assignments or tuple unpacking with pl.yield_()",
         )
 
-    def _bind_unpack_target(self, target: ast.expr, value_expr: ir.Expr, span: ir.Span) -> None:
+    def _bind_unpack_target(self, target: ast.expr, value_expr: ir.Expr, span: ir.Span) -> list[ir.Var]:
         """Bind a tuple-unpacking target (a Name or a nested Tuple) to an IR expr.
 
         Used by the ``pl.submit(...)`` desugaring so a multi-output kernel can
         be unpacked as ``(a, b), tid = pl.submit(...)``.
+
+        Returns the Vars bound, in binding order (flattened across nesting).
         """
         if isinstance(target, ast.Name):
             var = self._assign_or_let(target.id, value_expr, span)
             self.scope_manager.define_var(target.id, var, span=span)
-            return
+            return [var]
         if isinstance(target, ast.Tuple):
             tuple_var = self.builder.let("_tuple_tmp", value_expr, span=span)
+            bound: list[ir.Var] = []
             for i, elt in enumerate(target.elts):
                 item_expr = ir.TupleGetItemExpr(tuple_var, i, span)
-                self._bind_unpack_target(elt, item_expr, span)
-            return
+                bound.extend(self._bind_unpack_target(elt, item_expr, span))
+            return bound
         raise ParserSyntaxError(
             f"Tuple unpacking target must be a variable name or nested tuple, got {ast.unparse(target)}",
             span=span,
@@ -1683,11 +1695,16 @@ class ASTParser:
         # Bind the flat tuple: elements 0..N-1 -> kernel results, element N ->
         # the producer TaskId.
         submit_var = self.builder.let("_submit_tmp", call_expr, span=span)
+        produced: list[ir.Var] = []
         for i, elt in enumerate(out_names):
-            self._bind_unpack_target(elt, ir.TupleGetItemExpr(submit_var, i, span), span)
+            produced.extend(self._bind_unpack_target(elt, ir.TupleGetItemExpr(submit_var, i, span), span))
         task_id_expr = ir.TupleGetItemExpr(submit_var, n_outs, span)
         tid_var = self._assign_or_let(tid_target.id, task_id_expr, span)
         self.scope_manager.define_var(tid_target.id, tid_var, span=span)
+        # Record this submit's result Vars against its producer TaskId so a
+        # later submit's predicate= operand can be checked against its deps=.
+        for out_var in produced:
+            self._submit_producer_tid[out_var.unique_id] = tid_var
 
     def _build_submit_single_lhs_expr(self, call: ast.Call, *, is_spmd: bool = False) -> ir.Expr:
         """Build the ``ir.Submit`` expression for the single-LHS form
@@ -3485,9 +3502,10 @@ class ASTParser:
             return
         self._parse_spmd_scope(stmt, context_expr, scope_kind_map, optional_vars=optional_vars)
 
-    # Integer dtypes accepted for an SPMD ``core_num`` (block count). Shared by
-    # the ``pl.spmd`` scope path and the ``pl.spmd_submit`` task-launch path.
-    _CORE_NUM_INTEGER_DTYPES = frozenset(
+    # Integer dtypes accepted wherever the DSL requires an integer-typed scalar
+    # expression: an SPMD ``core_num`` (block count, via ``pl.spmd`` and
+    # ``pl.spmd_submit``) and the ``pl.dispatch_pred`` element indices.
+    _INTEGER_DTYPES = frozenset(
         {
             DataType.INT4,
             DataType.INT8,
@@ -3517,7 +3535,7 @@ class ASTParser:
         # here, but cast for mypy's sake.
         expr = self.parse_expression(cast("ast.expr", value_node))
         expr_type = expr.type
-        is_integer = isinstance(expr_type, ir.ScalarType) and expr_type.dtype in self._CORE_NUM_INTEGER_DTYPES
+        is_integer = isinstance(expr_type, ir.ScalarType) and expr_type.dtype in self._INTEGER_DTYPES
         if not is_integer:
             raise ParserSyntaxError(
                 f"core_num must be an integer expression, got {python_print(expr_type, format=False)}",
@@ -5750,6 +5768,8 @@ class ASTParser:
         if as_submit:
             allow_early_resolve = self._parse_submit_allow_early_resolve_kwarg(method_name, keywords)
             predicate = self._parse_submit_predicate_kwarg(method_name, keywords, span)
+            if predicate is not None:
+                self._validate_predicate_deps(method_name, predicate[0], user_dep_vars, span)
         return_types = func_obj.return_types if func_obj else []
         # A callee that declares no ``-> `` annotation has empty ``return_types``
         # but may ``return <value>`` (e.g. an InCore kernel returning its
@@ -6164,8 +6184,8 @@ class ASTParser:
 
         The predicate ``op`` is a string spelling (one of ==, !=, >, <, >=, <=);
         ``target`` is an integer literal. The operand tensor's producer MUST be
-        one of the submit's ``deps=`` — this is not checked here but by a
-        SubmitVerifier once directions/deps are resolved.
+        one of the submit's ``deps=`` — see :meth:`_validate_predicate_deps`,
+        which the caller runs once the ``deps=`` list is also parsed.
         """
         kw = next((k for k in keywords if k.arg == "predicate"), None)
         if kw is None:
@@ -6186,10 +6206,11 @@ class ASTParser:
             )
         operand_ast, indices_ast, op_ast, target_ast = pred_call.args
         operand = self.parse_expression(operand_ast)
-        if not isinstance(operand.type, ir.TensorType):
+        operand_type = operand.type
+        if not isinstance(operand_type, ir.TensorType):
             raise ParserTypeError(
                 "pl.dispatch_pred(...) operand must be a tensor, got "
-                f"{python_print(operand.type, format=False)}",
+                f"{python_print(operand_type, format=False)}",
                 span=self.span_tracker.get_span(operand_ast),
                 hint=hint,
             )
@@ -6203,6 +6224,29 @@ class ASTParser:
         if not indices:
             raise ParserSyntaxError(
                 "pl.dispatch_pred(...) indices must locate a single element (non-empty)",
+                span=self.span_tracker.get_span(indices_ast),
+                hint=hint,
+            )
+        # Each index renders as a scalar C++ expression into the runtime
+        # predicate index array, so it must be an integer-typed scalar (a
+        # ConstInt or an int/index Var) — not, e.g., a tensor. Reject here
+        # rather than emit invalid C++ at orchestration codegen.
+        for idx_expr, idx_ast in zip(indices, indices_ast.elts):
+            idx_type = idx_expr.type
+            if not (isinstance(idx_type, ir.ScalarType) and idx_type.dtype in self._INTEGER_DTYPES):
+                raise ParserTypeError(
+                    "pl.dispatch_pred(...) indices must be integer scalars, got "
+                    f"{python_print(idx_type, format=False)}",
+                    span=self.span_tracker.get_span(idx_ast),
+                    hint=hint,
+                )
+        # The indices must locate exactly one element, so their count has to
+        # match the operand tensor's rank.
+        rank = len(operand_type.shape)
+        if len(indices) != rank:
+            raise ParserTypeError(
+                f"pl.dispatch_pred(...) needs {rank} index(es) to locate a single element of a "
+                f"rank-{rank} tensor, got {len(indices)}",
                 span=self.span_tracker.get_span(indices_ast),
                 hint=hint,
             )
@@ -6228,6 +6272,44 @@ class ASTParser:
                 hint=hint,
             )
         return operand, indices, int(op_enum.value), target_val
+
+    def _validate_predicate_deps(
+        self, method_name: str, operand: ir.Expr, dep_vars: list[ir.Var], span: ir.Span
+    ) -> None:
+        """Enforce that a ``predicate=`` operand's producer is one of ``deps=``.
+
+        The scheduler evaluates the predicate at the dispatch point. If the task
+        that writes the operand tensor is not a dependency, the predicate may be
+        evaluated before that producer has completed and the dispatch decision
+        is made from stale data. The contract is therefore that the operand's
+        producer appears in ``deps=``.
+
+        Only violations that are statically provable here are reported: the
+        check applies when the operand is a Var bound from a prior
+        ``pl.submit(...)`` result. An operand from any other source (a function
+        parameter, say) has no tracked producer, and an ``Array[N, TASK_ID]``
+        dep entry does not name its producers individually — both are skipped
+        rather than risk rejecting a correct program.
+        """
+        if not isinstance(operand, ir.Var):
+            return
+        producer_tid = self._submit_producer_tid.get(operand.unique_id)
+        if producer_tid is None:
+            return
+        if any(isinstance(d.type, ir.ArrayType) for d in dep_vars):
+            return
+        if any(d is producer_tid for d in dep_vars):
+            return
+        tid_name = producer_tid.name_hint
+        raise ParserSyntaxError(
+            f"'{method_name}' predicate reads '{operand.name_hint}', which is produced by the task "
+            f"bound to '{tid_name}', but '{tid_name}' is not in deps=",
+            span=span,
+            hint=(
+                f"Add the producer to the dependency list: deps=[{tid_name}]. Without it the scheduler "
+                "may evaluate the predicate before the producing task has written the tensor."
+            ),
+        )
 
     def _parse_dispatch_device_kwarg(
         self,
@@ -6408,7 +6490,12 @@ class ASTParser:
             # opt-in; either requires the full ctor form even when there are no
             # attrs. A plain pl.submit with no attrs / hints keeps the minimal
             # form so existing golden output is byte-identical.
-            if submit_attrs is not None or core_num is not None or allow_early_resolve or predicate is not None:
+            if (
+                submit_attrs is not None
+                or core_num is not None
+                or allow_early_resolve
+                or predicate is not None
+            ):
                 pred_operand, pred_indices, pred_op, pred_target = (
                     predicate if predicate is not None else (None, [], 0, 0)
                 )

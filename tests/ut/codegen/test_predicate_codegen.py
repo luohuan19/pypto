@@ -46,7 +46,11 @@ class _WithPredicate:
         with pl.manual_scope():
             rc, g_tid = pl.spmd_submit(self.gate, rc, core_num=1)
             out, _ = pl.spmd_submit(
-                self.expert, x, out, core_num=1, deps=[g_tid],
+                self.expert,
+                x,
+                out,
+                core_num=1,
+                deps=[g_tid],
                 predicate=pl.dispatch_pred(rc, [0, 0], ">", 0),
             )
         return out

@@ -19,6 +19,7 @@ first-class ``Submit.predicate_operand`` / ``predicate_indices`` / ``predicate_o
 import pypto.language as pl
 import pytest
 from pypto import ir
+from pypto.ir import python_print
 from pypto.language.parser.diagnostics.exceptions import ParserSyntaxError, ParserTypeError
 
 
@@ -36,36 +37,46 @@ def _flatten(stmt):
 def _main_submits(prog):
     fn = prog.get_function("main")
     assert fn is not None
-    return [s.value for s in _flatten(fn.body) if isinstance(s, ir.AssignStmt) and isinstance(s.value, ir.Submit)]
+    stmts = _flatten(fn.body)
+    return [s.value for s in stmts if isinstance(s, ir.AssignStmt) and isinstance(s.value, ir.Submit)]
 
 
-def _program(predicate_src: str):
+_FP32_T = "pl.Tensor[[512, 128], pl.FP32]"
+_INT32_T = "pl.Tensor[[512, 128], pl.INT32]"
+
+
+def _program(predicate_src: str, deps_src: str = "[g_tid]"):
     """Build a two-kernel program whose expert submit carries ``predicate_src``.
 
-    ``predicate_src`` is spliced verbatim as the ``predicate=`` argument text.
+    ``predicate_src`` is spliced verbatim as the ``predicate=`` argument text,
+    ``deps_src`` as the ``deps=`` argument text. The expert submit's predicate
+    reads ``rc``, which the gate submit (bound to ``g_tid``) produces — so the
+    default ``deps_src`` satisfies the "producer must be in deps=" contract.
     """
-    src = f'''
+    src = f"""
 @pl.program
 class Prog:
     @pl.function(type=pl.FunctionType.InCore)
-    def expert(self, x: pl.Tensor[[512, 128], pl.FP32], out: pl.Out[pl.Tensor[[512, 128], pl.FP32]]) -> pl.Tensor[[512, 128], pl.FP32]:
+    def expert(self, x: {_FP32_T}, out: pl.Out[{_FP32_T}]) -> {_FP32_T}:
         t = pl.load(x, [0, 0], [128, 128])
         out = pl.store(t, [0, 0], out)
         return out
 
     @pl.function(type=pl.FunctionType.InCore)
-    def gate(self, g: pl.Out[pl.Tensor[[512, 128], pl.INT32]]) -> pl.Tensor[[512, 128], pl.INT32]:
+    def gate(self, g: pl.Out[{_INT32_T}]) -> {_INT32_T}:
         t = pl.load(g, [0, 0], [128, 128])
         g = pl.store(t, [0, 0], g)
         return g
 
     @pl.function(type=pl.FunctionType.Orchestration)
-    def main(self, x: pl.Tensor[[512, 128], pl.FP32], out: pl.Out[pl.Tensor[[512, 128], pl.FP32]], rc: pl.Out[pl.Tensor[[512, 128], pl.INT32]]) -> pl.Tensor[[512, 128], pl.FP32]:
+    def main(self, x: {_FP32_T}, out: pl.Out[{_FP32_T}], rc: pl.Out[{_INT32_T}]) -> {_FP32_T}:
         with pl.manual_scope():
             rc, g_tid = pl.spmd_submit(self.gate, rc, core_num=1)
-            out, _ = pl.spmd_submit(self.expert, x, out, core_num=1, deps=[g_tid], predicate={predicate_src})
+            out, _ = pl.spmd_submit(
+                self.expert, x, out, core_num=1, deps={deps_src}, predicate={predicate_src}
+            )
         return out
-'''
+"""
     return pl.parse_program(src)
 
 
@@ -108,6 +119,11 @@ def test_negative_target_literal():
     assert _main_submits(prog)[1].predicate_target == -5
 
 
+def test_explicitly_positive_target_literal():
+    prog = _program('pl.dispatch_pred(rc, [0, 0], ">=", +5)')
+    assert _main_submits(prog)[1].predicate_target == 5
+
+
 def test_bad_op_spelling_rejected():
     with pytest.raises(ParserSyntaxError, match="not supported"):
         _program('pl.dispatch_pred(rc, [0, 0], "=<", 0)')
@@ -122,6 +138,33 @@ def test_non_tensor_operand_rejected():
 def test_indices_must_be_list_literal():
     with pytest.raises(ParserSyntaxError, match="indices must be a list"):
         _program('pl.dispatch_pred(rc, 0, ">", 0)')
+
+
+def test_tensor_index_rejected():
+    # ``x`` is a tensor param — it would otherwise render into the runtime
+    # predicate index array as ``ext_x``, emitting invalid C++.
+    with pytest.raises(ParserTypeError, match="indices must be integer scalars"):
+        _program('pl.dispatch_pred(rc, [x, 0], ">", 0)')
+
+
+def test_index_count_must_match_operand_rank():
+    # ``rc`` is rank-2; a single index does not locate one element.
+    with pytest.raises(ParserTypeError, match="rank-2 tensor, got 1"):
+        _program('pl.dispatch_pred(rc, [0], ">", 0)')
+
+
+def test_predicate_operand_producer_must_be_in_deps():
+    # ``rc`` is produced by the gate submit (``g_tid``). Dropping it from deps=
+    # would let the scheduler evaluate the predicate against stale data.
+    with pytest.raises(ParserSyntaxError, match="not in deps="):
+        _program('pl.dispatch_pred(rc, [0, 0], ">", 0)', deps_src="[]")
+
+
+def test_predicate_operand_without_tracked_producer_allowed():
+    # ``x`` is a function parameter, not a submit result — nothing to prove, so
+    # the deps= contract check stays out of the way.
+    prog = _program('pl.dispatch_pred(x, [0, 0], ">", 0)', deps_src="[]")
+    assert _main_submits(prog)[1].predicate_op == int(ir.DispatchPredicateOp.Gt.value)
 
 
 def test_non_literal_target_rejected():
@@ -142,8 +185,6 @@ def test_no_predicate_leaves_fields_default():
 
 
 def test_print_parse_round_trip():
-    from pypto.ir import python_print
-
     prog = _program('pl.dispatch_pred(rc, [0, 0], ">=", 2)')
     printed = python_print(prog)
     # The predicate surfaces on the submit line for the round trip.

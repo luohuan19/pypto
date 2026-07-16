@@ -245,7 +245,7 @@ def dispatch_pred(tensor: Any, indices: Any, op: str, target: int) -> Any:
     """
     raise RuntimeError(
         "pl.dispatch_pred is a DSL parser construct and cannot be called directly; "
-        'use it as the predicate= argument of pl.spmd_submit / pl.submit, e.g. '
+        "use it as the predicate= argument of pl.spmd_submit / pl.submit, e.g. "
         'predicate=pl.dispatch_pred(row_count, [e], ">", 0).'
     )
 

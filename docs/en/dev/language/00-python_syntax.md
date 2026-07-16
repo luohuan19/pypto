@@ -481,8 +481,8 @@ orchestration to read the per-expert count.
 
 | Arg | Meaning | Constraint |
 | --- | ------- | ---------- |
-| `tensor` | operand tensor read at the dispatch point | must be a tensor |
-| `indices` | element locator into `tensor` | a **list literal**; each element a `ConstInt` or loop `Var`; non-empty |
+| `tensor` | operand tensor read at the dispatch point | must be a named tensor (a parameter or a variable bound to one) |
+| `indices` | element locator into `tensor` | a **list literal**; each element an integer scalar (`ConstInt` or an int/index `Var`); one index per `tensor` dimension |
 | `op` | comparison spelling | a **string literal**, one of `==` `!=` `>` `<` `>=` `<=` |
 | `target` | right-hand side | an **integer literal** (may be negative) |
 
@@ -492,11 +492,16 @@ orchestration codegen (operand → its `ext_<name>` reference, `op` →
 the tensor dtype).
 
 **Contract:** the predicate operand tensor's producer **must** be one of the
-submit's `deps=`, so the dispatch-point read observes the current value.
-Currently only structural well-formedness is verified at construction (operand
-present and a tensor, indices non-empty, `op` in range); the dataflow
-"producer ∈ deps" check is not yet enforced, so the author is responsible for
-`deps=`.
+submit's `deps=`, so the dispatch-point read observes the current value. Omitting
+it lets the scheduler evaluate the predicate before the producer has written the
+tensor, deciding from stale data.
+
+The parser enforces this wherever it can prove a violation — when the operand is
+a variable bound from a prior `pl.submit(...)` result, its producer TaskId must
+appear in `deps=`. Two cases are accepted without proof and remain the author's
+responsibility: an operand with no tracked producer (a function parameter, say),
+and a `deps=` entry that is an `Array[N, TASK_ID]`, which does not name its
+producers individually.
 
 **Expressiveness** is fixed to `tensor[indices] OP const` — one comparison,
 matching the runtime's single-comparison `DispatchPredicate`. Multiple

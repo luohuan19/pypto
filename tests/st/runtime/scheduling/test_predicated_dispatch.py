@@ -40,7 +40,6 @@ from typing import Any
 
 import pypto.language as pl
 import pytest
-import torch
 from harness.core.harness import PLATFORMS, DataType, PTOTestCase, TensorSpec
 from pypto.ir.pass_manager import OptimizationStrategy
 
@@ -85,7 +84,10 @@ def _build_program():
                 x, xp_tid = pl.spmd_submit(self.x_producer, x, core_num=1)
                 # Predicated clobber: reads gate[0, 0] at the dispatch point.
                 x, clobber_tid = pl.spmd_submit(
-                    self.clobber, x, core_num=1, deps=[xp_tid],
+                    self.clobber,
+                    x,
+                    core_num=1,
+                    deps=[xp_tid],
                     predicate=pl.dispatch_pred(gate, [0, 0], ">", 0),
                 )
                 # Consumer depends on the clobber TaskId even when the clobber is

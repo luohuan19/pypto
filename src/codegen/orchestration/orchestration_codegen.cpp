@@ -2288,17 +2288,19 @@ class OrchestrationStmtCodegen : public CodegenBase {
     auto pred = call->GetAttr<DispatchPredicateInit>("predicate");
     INTERNAL_CHECK_SPAN(pred.operand, call->span_) << "Submit dispatch predicate has a null operand tensor";
     const std::string var_name = TryGetVarName(pred.operand);
-    INTERNAL_CHECK_SPAN(!var_name.empty(), call->span_)
-        << "Submit dispatch predicate operand must be a tensor Var, got kind="
-        << static_cast<int>(pred.operand->GetKind());
+    CHECK_SPAN(!var_name.empty(), call->span_)
+        << "pl.dispatch_pred operand must be a named tensor (a function parameter or a variable "
+           "bound to a tensor), got an unnamed expression of kind "
+        << static_cast<int>(pred.operand->GetKind())
+        << ". Bind the tensor to a variable first and pass that variable.";
     const std::string tname = GetExternalTensorName(var_name);
     const std::string pv = task_var + "_pred";
     EmitIndentedLine("L0TaskPredicate " + pv + ";");
     EmitIndentedLine(pv + ".operand.tensor = &" + tname + ";");
     EmitIndentedLine(pv + ".operand.ndims = " + std::to_string(pred.indices.size()) + ";");
     for (size_t i = 0; i < pred.indices.size(); ++i) {
-      EmitIndentedLine(pv + ".operand.indices[" + std::to_string(i) + "] = " +
-                       GenerateExprString(pred.indices[i]) + ";");
+      EmitIndentedLine(pv + ".operand.indices[" + std::to_string(i) +
+                       "] = " + GenerateExprString(pred.indices[i]) + ";");
     }
     EmitIndentedLine(pv + ".op = PredicateOp::" + RenderDispatchPredicateOp(pred.op) + ";");
     EmitIndentedLine(pv + ".target = " + std::to_string(pred.target) + ";");

@@ -489,7 +489,8 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
       INTERNAL_CHECK_SPAN(op->predicate_indices_[i], op->span_)
           << "Submit has null predicate index at index " << i;
       auto remapped = ExprFunctor<ExprPtr>::VisitExpr(op->predicate_indices_[i]);
-      INTERNAL_CHECK_SPAN(remapped, op->span_) << "Submit predicate index at index " << i << " mutated to null";
+      INTERNAL_CHECK_SPAN(remapped, op->span_)
+          << "Submit predicate index at index " << i << " mutated to null";
       if (remapped.get() != op->predicate_indices_[i].get()) predicate_changed = true;
       init.indices.push_back(std::move(remapped));
     }
@@ -544,8 +545,9 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
   }
 
   if (!args_changed && !deps_changed && !type_changed && !attrs_changed && !core_num_changed &&
-      !predicate_changed)
+      !predicate_changed) {
     return op;
+  }
   std::vector<std::pair<std::string, std::any>> attrs_to_use;
   if (attrs_changed) {
     attrs_to_use = std::move(new_attrs);

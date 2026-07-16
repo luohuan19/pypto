@@ -868,8 +868,8 @@ enum class DispatchPredicateOp : int64_t { None = 0, Eq, Ne, Gt, Lt, Ge, Le };
  * op/target as int64 leaves). See ``Submit`` for the full contract.
  */
 struct DispatchPredicateInit {
-  ExprPtr operand;                // tensor whose element is read at dispatch
-  std::vector<ExprPtr> indices;   // element locator (ConstInt or loop Var)
+  ExprPtr operand;               // tensor whose element is read at dispatch
+  std::vector<ExprPtr> indices;  // element locator (ConstInt or loop Var)
   DispatchPredicateOp op = DispatchPredicateOp::None;
   int64_t target = 0;
 };
@@ -972,8 +972,7 @@ class Submit : public Expr {
          std::vector<std::pair<std::string, std::any>> kwargs,
          std::vector<std::pair<std::string, std::any>> attrs, TypePtr type, Span span,
          std::optional<ExprPtr> core_num = std::nullopt, bool sync_start = false,
-         bool allow_early_resolve = false,
-         std::optional<DispatchPredicateInit> predicate = std::nullopt)
+         bool allow_early_resolve = false, std::optional<DispatchPredicateInit> predicate = std::nullopt)
       : Expr(std::move(span), std::move(type)),
         op_(std::move(op)),
         args_(std::move(args)),
@@ -1115,8 +1114,9 @@ class Submit : public Expr {
   void ValidatePredicate() const {
     if (predicate_op_ < static_cast<int64_t>(DispatchPredicateOp::None) ||
         predicate_op_ > static_cast<int64_t>(DispatchPredicateOp::Le)) {
-      throw pypto::ValueError("Submit predicate_op is out of range (expected a DispatchPredicateOp value 0..6), got " +
-                              std::to_string(predicate_op_));
+      throw pypto::ValueError(
+          "Submit predicate_op is out of range (expected a DispatchPredicateOp value 0..6), got " +
+          std::to_string(predicate_op_));
     }
     if (!HasPredicate()) {
       return;
@@ -1239,8 +1239,8 @@ inline CallPtr SubmitToCallView(const SubmitPtr& submit) {
   // a plain submit's Call view is unchanged. The value is a DispatchPredicateInit
   // (holds live ExprPtrs). This view Call is transient (codegen-only, never
   // serialized/printed), so the std::any payload never reaches reflection.
-  if (submit->HasPredicate()) {
-    attrs.emplace_back("predicate", std::any(*submit->GetPredicateInit()));
+  if (auto pred_init = submit->GetPredicateInit(); pred_init.has_value()) {
+    attrs.emplace_back("predicate", std::any(*std::move(pred_init)));
   }
   return std::make_shared<Call>(submit->op_, submit->args_, submit->kwargs_, std::move(attrs),
                                 submit->GetType(), submit->span_);
