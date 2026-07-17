@@ -149,15 +149,28 @@ def _is_const_int(value: object) -> bool:
     return isinstance(value, ir.Neg) and isinstance(value.operand, ir.ConstInt)
 
 
-# DSL comparison spelling -> DispatchPredicateOp, for pl.dispatch_pred(...) op arg.
-# Built from the bound enum so each mapping validates the enumerator at import.
-_DISPATCH_PRED_OPS: dict[str, "ir.DispatchPredicateOp"] = {
-    "==": ir.DispatchPredicateOp.Eq,
-    "!=": ir.DispatchPredicateOp.Ne,
-    ">": ir.DispatchPredicateOp.Gt,
-    "<": ir.DispatchPredicateOp.Lt,
-    ">=": ir.DispatchPredicateOp.Ge,
-    "<=": ir.DispatchPredicateOp.Le,
+# Python comparison AST node -> DispatchPredicateOp, for the ``predicate=`` surface
+# on pl.submit / pl.spmd_submit. Built from the bound enum so each mapping validates
+# the enumerator at import. Operators outside this map (``in``, ``is``, ...) are
+# rejected: the runtime predicate is a single arithmetic comparison.
+_AST_CMP_TO_PRED_OP: dict[type, "ir.DispatchPredicateOp"] = {
+    ast.Eq: ir.DispatchPredicateOp.Eq,
+    ast.NotEq: ir.DispatchPredicateOp.Ne,
+    ast.Gt: ir.DispatchPredicateOp.Gt,
+    ast.Lt: ir.DispatchPredicateOp.Lt,
+    ast.GtE: ir.DispatchPredicateOp.Ge,
+    ast.LtE: ir.DispatchPredicateOp.Le,
+}
+
+# Operand-order flip. The runtime predicate is `operand OP target` with the tensor
+# on the left, so a mirrored ``0 < rc[e]`` normalizes to ``rc[e] > 0``.
+_FLIPPED_PRED_OP: dict["ir.DispatchPredicateOp", "ir.DispatchPredicateOp"] = {
+    ir.DispatchPredicateOp.Eq: ir.DispatchPredicateOp.Eq,
+    ir.DispatchPredicateOp.Ne: ir.DispatchPredicateOp.Ne,
+    ir.DispatchPredicateOp.Gt: ir.DispatchPredicateOp.Lt,
+    ir.DispatchPredicateOp.Lt: ir.DispatchPredicateOp.Gt,
+    ir.DispatchPredicateOp.Ge: ir.DispatchPredicateOp.Le,
+    ir.DispatchPredicateOp.Le: ir.DispatchPredicateOp.Ge,
 }
 
 
@@ -3504,7 +3517,7 @@ class ASTParser:
 
     # Integer dtypes accepted wherever the DSL requires an integer-typed scalar
     # expression: an SPMD ``core_num`` (block count, via ``pl.spmd`` and
-    # ``pl.spmd_submit``) and the ``pl.dispatch_pred`` element indices.
+    # ``pl.spmd_submit``) and the ``predicate=`` element indices.
     _INTEGER_DTYPES = frozenset(
         {
             DataType.INT4,
@@ -6173,7 +6186,7 @@ class ASTParser:
     def _parse_submit_predicate_kwarg(
         self, method_name: str, keywords: list[ast.keyword], span: ir.Span
     ) -> tuple[ir.Expr, list[ir.Expr], int, int] | None:
-        """Extract the optional ``predicate=pl.dispatch_pred(tensor, [i...], op, target)`` kwarg.
+        """Extract the optional ``predicate=<tensor>[<indices>] <op> <int>`` kwarg.
 
         Accepted on ``pl.submit(...)`` and ``pl.spmd_submit(...)``. Encodes a
         dispatch predicate the scheduler evaluates at the dispatch point
@@ -6182,60 +6195,99 @@ class ASTParser:
         fanin/fanout. Returns ``(operand, indices, op_int, target_int)`` or
         ``None`` when absent.
 
-        The predicate ``op`` is a string spelling (one of ==, !=, >, <, >=, <=);
-        ``target`` is an integer literal. The operand tensor's producer MUST be
-        one of the submit's ``deps=`` — see :meth:`_validate_predicate_deps`,
-        which the caller runs once the ``deps=`` list is also parsed.
+        The comparison is matched **syntactically and never evaluated**: in this
+        position ``rc[0, 0] > 0`` is a declarative spec (which tensor element,
+        which comparison) handed to the scheduler — NOT a ``tensor.read`` plus a
+        compare. Reading the value in orchestration is precisely what the
+        predicate exists to avoid (it would stall on ``wait_for_tensor_ready``).
+
+        Only ``tensor[indices] OP int-literal`` is expressible, mirroring the
+        runtime's single-comparison ``DispatchPredicate``: no chained
+        comparisons, no arithmetic, no boolean combination, and the right-hand
+        side must be a literal. Reduce anything richer to a single gate value in
+        a prior kernel and predicate on that.
+
+        The operand tensor's producer MUST be one of the submit's ``deps=`` —
+        see :meth:`_validate_predicate_deps`, which the caller runs once the
+        ``deps=`` list is also parsed.
         """
         kw = next((k for k in keywords if k.arg == "predicate"), None)
         if kw is None:
             return None
-        hint = 'Use predicate=pl.dispatch_pred(tensor, [i0, ...], ">", 0).'
-        if not _is_pl_call(kw.value, "dispatch_pred"):
+        hint = "Use predicate=(tensor[i0, ...] > 0) — one comparison against an integer literal."
+        node = kw.value
+        if not isinstance(node, ast.Compare):
             raise ParserSyntaxError(
-                f"'{method_name}' predicate must be a pl.dispatch_pred(...) call",
-                span=self.span_tracker.get_span(kw.value),
+                f"'{method_name}' predicate must be a comparison expression",
+                span=self.span_tracker.get_span(node),
                 hint=hint,
             )
-        pred_call = kw.value
-        if len(pred_call.args) != 4 or pred_call.keywords:
+        if len(node.ops) != 1 or len(node.comparators) != 1:
             raise ParserSyntaxError(
-                "pl.dispatch_pred(...) takes exactly 4 positional args (tensor, indices, op, target)",
-                span=self.span_tracker.get_span(pred_call),
+                f"'{method_name}' predicate must be a single comparison; chained comparisons "
+                "(e.g. 0 < t[i] < 8) are not supported — the runtime evaluates exactly one",
+                span=self.span_tracker.get_span(node),
                 hint=hint,
             )
-        operand_ast, indices_ast, op_ast, target_ast = pred_call.args
-        operand = self.parse_expression(operand_ast)
+        op_enum = _AST_CMP_TO_PRED_OP.get(type(node.ops[0]))
+        if op_enum is None:
+            raise ParserSyntaxError(
+                f"'{method_name}' predicate comparison operator is not supported; use one of "
+                "==, !=, >, <, >=, <=",
+                span=self.span_tracker.get_span(node),
+                hint=hint,
+            )
+        # Orientation: ``tensor[...] OP int``, or the mirrored ``int OP tensor[...]``
+        # normalized by flipping the operator — the runtime predicate always reads
+        # `operand OP target` with the tensor on the left.
+        left, right = node.left, node.comparators[0]
+        if isinstance(left, ast.Subscript):
+            subscript_ast, target_ast = left, right
+        elif isinstance(right, ast.Subscript):
+            subscript_ast, target_ast = right, left
+            op_enum = _FLIPPED_PRED_OP[op_enum]
+        else:
+            raise ParserSyntaxError(
+                f"'{method_name}' predicate must compare a tensor element (e.g. t[i]) against an "
+                "integer literal",
+                span=self.span_tracker.get_span(node),
+                hint=hint,
+            )
+        target_val = _ast_int_literal(target_ast)
+        if target_val is None:
+            raise ParserSyntaxError(
+                f"'{method_name}' predicate must compare against an integer literal",
+                span=self.span_tracker.get_span(target_ast),
+                hint=hint,
+            )
+        operand = self.parse_expression(subscript_ast.value)
         operand_type = operand.type
         if not isinstance(operand_type, ir.TensorType):
             raise ParserTypeError(
-                "pl.dispatch_pred(...) operand must be a tensor, got "
+                "predicate operand must be a tensor, got "
                 f"{python_print(operand_type, format=False)}",
-                span=self.span_tracker.get_span(operand_ast),
+                span=self.span_tracker.get_span(subscript_ast.value),
                 hint=hint,
             )
-        if not isinstance(indices_ast, (ast.List, ast.Tuple)):
-            raise ParserSyntaxError(
-                "pl.dispatch_pred(...) indices must be a list literal, e.g. [e] or [0, j]",
-                span=self.span_tracker.get_span(indices_ast),
-                hint=hint,
-            )
-        indices = [self.parse_expression(elt) for elt in indices_ast.elts]
+        # ``t[i]`` -> one index; ``t[i, j]`` -> an ast.Tuple slice.
+        slice_ast = subscript_ast.slice
+        index_asts = list(slice_ast.elts) if isinstance(slice_ast, ast.Tuple) else [slice_ast]
+        indices = [self.parse_expression(a) for a in index_asts]
         if not indices:
             raise ParserSyntaxError(
-                "pl.dispatch_pred(...) indices must locate a single element (non-empty)",
-                span=self.span_tracker.get_span(indices_ast),
+                "predicate indices must locate a single element (non-empty)",
+                span=self.span_tracker.get_span(subscript_ast),
                 hint=hint,
             )
         # Each index renders as a scalar C++ expression into the runtime
         # predicate index array, so it must be an integer-typed scalar (a
         # ConstInt or an int/index Var) — not, e.g., a tensor. Reject here
         # rather than emit invalid C++ at orchestration codegen.
-        for idx_expr, idx_ast in zip(indices, indices_ast.elts):
+        for idx_expr, idx_ast in zip(indices, index_asts):
             idx_type = idx_expr.type
             if not (isinstance(idx_type, ir.ScalarType) and idx_type.dtype in self._INTEGER_DTYPES):
                 raise ParserTypeError(
-                    "pl.dispatch_pred(...) indices must be integer scalars, got "
+                    "predicate indices must be integer scalars, got "
                     f"{python_print(idx_type, format=False)}",
                     span=self.span_tracker.get_span(idx_ast),
                     hint=hint,
@@ -6245,30 +6297,9 @@ class ASTParser:
         rank = len(operand_type.shape)
         if len(indices) != rank:
             raise ParserTypeError(
-                f"pl.dispatch_pred(...) needs {rank} index(es) to locate a single element of a "
+                f"predicate needs {rank} index(es) to locate a single element of a "
                 f"rank-{rank} tensor, got {len(indices)}",
-                span=self.span_tracker.get_span(indices_ast),
-                hint=hint,
-            )
-        if not isinstance(op_ast, ast.Constant) or not isinstance(op_ast.value, str):
-            raise ParserSyntaxError(
-                "pl.dispatch_pred(...) op must be a string literal (one of ==, !=, >, <, >=, <=)",
-                span=self.span_tracker.get_span(op_ast),
-                hint=hint,
-            )
-        op_enum = _DISPATCH_PRED_OPS.get(op_ast.value)
-        if op_enum is None:
-            raise ParserSyntaxError(
-                f"pl.dispatch_pred(...) op '{op_ast.value}' is not supported; use one of "
-                "==, !=, >, <, >=, <=",
-                span=self.span_tracker.get_span(op_ast),
-                hint=hint,
-            )
-        target_val = _ast_int_literal(target_ast)
-        if target_val is None:
-            raise ParserSyntaxError(
-                "pl.dispatch_pred(...) target must be an integer literal",
-                span=self.span_tracker.get_span(target_ast),
+                span=self.span_tracker.get_span(subscript_ast),
                 hint=hint,
             )
         return operand, indices, int(op_enum.value), target_val

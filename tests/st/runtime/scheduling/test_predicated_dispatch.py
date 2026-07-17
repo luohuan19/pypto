@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """End-to-end on-board test for the dispatch predicate authored through the
-pypto DSL (``pl.spmd_submit(..., predicate=pl.dispatch_pred(...))``).
+pypto DSL (``pl.spmd_submit(..., predicate=(gate[0, 0] > 0))``).
 
 This is the frontend counterpart of the runtime's own hand-written
 ``predicated_dispatch`` scene test: instead of building an ``L0TaskPredicate``
@@ -88,7 +88,7 @@ def _build_program():
                     x,
                     core_num=1,
                     deps=[xp_tid],
-                    predicate=pl.dispatch_pred(gate, [0, 0], ">", 0),
+                    predicate=(gate[0, 0] > 0),
                 )
                 # Consumer depends on the clobber TaskId even when the clobber is
                 # predicate-skipped — the retired task still settles fanout.

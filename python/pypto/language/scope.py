@@ -163,6 +163,30 @@ def submit(*args: Any, **kwargs: Any) -> Any:
     pure scheduling optimisation (no effect on results). Pays off on critical
     paths built from many short tasks; harmless otherwise.
 
+    The optional ``predicate=(...)`` kwarg attaches a **dispatch predicate** the
+    scheduler evaluates at this task's dispatch point — after its dependencies
+    are satisfied, so the value is current without an orchestration-time wait.
+    When the comparison is false the task is retired inline (never dispatched to
+    a core) while its fanin/fanout still settle, so downstream consumers still
+    unlock. Use it to skip work whose need is only known at runtime (e.g. an MoE
+    expert with an empty row count)::
+
+        out, tid = pl.spmd_submit(self.expert_ffn, tokens, out, core_num=N,
+                                  deps=[gather_tid],
+                                  predicate=(row_count[e] > 0))
+
+    The comparison is matched **syntactically, never evaluated**: in this
+    position ``row_count[e] > 0`` is a declarative spec handed to the scheduler,
+    not a ``tensor.read`` plus a compare. Only ``tensor[indices] OP
+    int-literal`` is expressible (one comparison; ``==`` ``!=`` ``>`` ``<``
+    ``>=`` ``<=``), mirroring the runtime's single-comparison predicate — no
+    chained comparisons, arithmetic, or boolean combination. Reduce anything
+    richer to a single gate value in a prior kernel and predicate on that.
+
+    **Contract:** the operand tensor's producer must be one of this submit's
+    ``deps=`` (the parser enforces this where statically provable), so the
+    dispatch-point read observes the current value.
+
     The return annotation is ``Any`` (not ``NoReturn``) because the parser
     intercepts the call and binds a 2-tuple to the LHS — downstream code
     that does ``out, tid = pl.submit(...)`` would not type-check under
@@ -198,10 +222,11 @@ def spmd_submit(*args: Any, **kwargs: Any) -> Any:
     ``core_num`` is a **required keyword argument** (a positive integer
     expression) — the positional slots are the kernel's own arguments.
     ``sync_start`` (default ``False``) requires all blocks to launch atomically.
-    ``deps=[...]`` and ``allow_early_resolve=True`` work exactly as on
-    :func:`submit` (note: a ``sync_start`` task cannot itself be block-by-block
-    pre-staged, but it can still be flagged to let its consumers pre-stage). The
-    callee may be an InCore / AIC / AIV kernel or a co-scheduled Group.
+    ``deps=[...]``, ``allow_early_resolve=True`` and ``predicate=(...)`` work
+    exactly as on :func:`submit` (note: a ``sync_start`` task cannot itself be
+    block-by-block pre-staged, but it can still be flagged to let its consumers
+    pre-stage). The callee may be an InCore / AIC / AIV kernel or a co-scheduled
+    Group.
 
     Like :func:`submit`, it works in both auto and manual scope; its primary use
     is explicit dependency wiring inside ``pl.manual_scope()``.
@@ -213,41 +238,4 @@ def spmd_submit(*args: Any, **kwargs: Any) -> Any:
     )
 
 
-def dispatch_pred(tensor: Any, indices: Any, op: str, target: int) -> Any:
-    """Build a dispatch predicate for ``pl.submit`` / ``pl.spmd_submit``.
-
-    ``pl.dispatch_pred`` is a **parser construct**, not a runtime function — the
-    DSL parser intercepts it syntactically only in the ``predicate=`` position of
-    a ``pl.submit(...)`` / ``pl.spmd_submit(...)`` call and never calls this body.
-    It is defined only so the name resolves (imports / linters).
-
-    It encodes a condition the scheduler evaluates at the task's *dispatch point*
-    (after its dependencies are satisfied, so the value is current without an
-    orchestration-time wait): ``tensor[indices] <op> target``. If the condition
-    is false the task is retired inline — never dispatched to a core — while its
-    fanin/fanout still settle so downstream consumers unlock. Use it to skip work
-    whose need is only known at runtime (e.g. an MoE expert with an empty row
-    count)::
-
-        out, tid = pl.spmd_submit(self.expert_ffn, tokens, out, core_num=N,
-                                  deps=[gather_tid],
-                                  predicate=pl.dispatch_pred(row_count, [e], ">", 0))
-
-    Args:
-        tensor: The operand tensor whose element is read at the dispatch point.
-            Its producer MUST be one of the submit's ``deps=`` (a SubmitVerifier
-            enforces this) so the read observes the current value.
-        indices: A list literal locating one element of ``tensor`` (per-axis
-            ``ConstInt`` or loop ``Var``), e.g. ``[e]`` or ``[0, j]``.
-        op: The comparison spelling — one of ``"=="``, ``"!="``, ``">"``,
-            ``"<"``, ``">="``, ``"<="``.
-        target: The integer literal the operand is compared against.
-    """
-    raise RuntimeError(
-        "pl.dispatch_pred is a DSL parser construct and cannot be called directly; "
-        "use it as the predicate= argument of pl.spmd_submit / pl.submit, e.g. "
-        'predicate=pl.dispatch_pred(row_count, [e], ">", 0).'
-    )
-
-
-__all__ = ["ScopeMode", "manual_scope", "scope", "submit", "spmd_submit", "dispatch_pred"]
+__all__ = ["ScopeMode", "manual_scope", "scope", "submit", "spmd_submit"]

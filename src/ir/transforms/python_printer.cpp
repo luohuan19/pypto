@@ -1236,23 +1236,24 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
     stream_ << ", allow_early_resolve=True";
   }
 
-  // Dispatch predicate — emitted as ``predicate=pl.dispatch_pred(operand,
-  // [indices], "<op>", target)`` so the parser recovers it via the submit
-  // ``predicate=`` kwarg path. Only present when a predicate is set.
+  // Dispatch predicate — emitted as ``predicate=(operand[indices] <op> target)``
+  // so the parser recovers it via the submit ``predicate=`` kwarg path, which
+  // matches the comparison syntactically (it is a declarative spec, never a
+  // tensor.read). Only present when a predicate is set.
   if (op->HasPredicate()) {
     INTERNAL_CHECK_SPAN(op->predicate_operand_.has_value() && *op->predicate_operand_, op->span_)
         << "Submit predicate operand is null";
-    stream_ << ", predicate=" << prefix_ << ".dispatch_pred(";
+    stream_ << ", predicate=(";
     VisitExpr(*op->predicate_operand_);
-    stream_ << ", [";
+    stream_ << "[";
     for (size_t i = 0; i < op->predicate_indices_.size(); ++i) {
       if (i > 0) stream_ << ", ";
       INTERNAL_CHECK_SPAN(op->predicate_indices_[i], op->span_)
           << "Submit predicate index at index " << i << " is null";
       VisitExpr(op->predicate_indices_[i]);
     }
-    stream_ << "], \"" << DispatchPredicateOpSpelling(op->GetPredicateOp()) << "\", " << op->predicate_target_
-            << ")";
+    stream_ << "] " << DispatchPredicateOpSpelling(op->GetPredicateOp()) << " "
+            << op->predicate_target_ << ")";
   }
 
   // Surface the machine-only ``attrs={...}`` dict the same way Call does:

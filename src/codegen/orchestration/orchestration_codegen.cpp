@@ -2289,7 +2289,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     INTERNAL_CHECK_SPAN(pred.operand, call->span_) << "Submit dispatch predicate has a null operand tensor";
     const std::string var_name = TryGetVarName(pred.operand);
     CHECK_SPAN(!var_name.empty(), call->span_)
-        << "pl.dispatch_pred operand must be a named tensor (a function parameter or a variable "
+        << "Submit dispatch-predicate operand must be a named tensor (a function parameter or a variable "
            "bound to a tensor), got an unnamed expression of kind "
         << static_cast<int>(pred.operand->GetKind())
         << ". Bind the tensor to a variable first and pass that variable.";

@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Orchestration-codegen tests for the dispatch predicate.
 
-Drives ``pl.spmd_submit(..., predicate=pl.dispatch_pred(...))`` through the full
+Drives ``pl.spmd_submit(..., predicate=(rc[0, 0] > 0))`` through the full
 Default pass pipeline and asserts the orchestration C++ emits the runtime
 ``L0TaskPredicate`` + ``Arg::set_predicate(...)`` sequence. Also proves the
 predicate operand tensor survives inlining / SSA / outlining and resolves to its
@@ -51,7 +51,7 @@ class _WithPredicate:
                 out,
                 core_num=1,
                 deps=[g_tid],
-                predicate=pl.dispatch_pred(rc, [0, 0], ">", 0),
+                predicate=(rc[0, 0] > 0),
             )
         return out
 
