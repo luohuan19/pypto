@@ -1252,8 +1252,8 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
           << "Submit predicate index at index " << i << " is null";
       VisitExpr(op->predicate_indices_[i]);
     }
-    stream_ << "] " << DispatchPredicateOpSpelling(op->GetPredicateOp()) << " "
-            << op->predicate_target_ << ")";
+    stream_ << "] " << DispatchPredicateOpSpelling(op->GetPredicateOp()) << " " << op->predicate_target_
+            << ")";
   }
 
   // Surface the machine-only ``attrs={...}`` dict the same way Call does:

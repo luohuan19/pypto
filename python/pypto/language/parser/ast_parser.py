@@ -6264,8 +6264,7 @@ class ASTParser:
         operand_type = operand.type
         if not isinstance(operand_type, ir.TensorType):
             raise ParserTypeError(
-                "predicate operand must be a tensor, got "
-                f"{python_print(operand_type, format=False)}",
+                f"predicate operand must be a tensor, got {python_print(operand_type, format=False)}",
                 span=self.span_tracker.get_span(subscript_ast.value),
                 hint=hint,
             )
@@ -6287,8 +6286,7 @@ class ASTParser:
             idx_type = idx_expr.type
             if not (isinstance(idx_type, ir.ScalarType) and idx_type.dtype in self._INTEGER_DTYPES):
                 raise ParserTypeError(
-                    "predicate indices must be integer scalars, got "
-                    f"{python_print(idx_type, format=False)}",
+                    f"predicate indices must be integer scalars, got {python_print(idx_type, format=False)}",
                     span=self.span_tracker.get_span(idx_ast),
                     hint=hint,
                 )
