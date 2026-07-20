@@ -1885,13 +1885,16 @@ class OutWindowExternalizer {
                                                                         "allow_early_resolve"};
         std::vector<std::pair<std::string, std::any>> submit_attrs;
         submit_attrs.reserve(new_attrs.size());
-        for (const auto& [k, v] : new_attrs) {
-          if (k == kAttrManualDepEdges) continue;
+        for (const auto& attr : new_attrs) {
+          // Bind the key to a plain local: capturing a structured binding in the
+          // lambda below is a C++20 extension and this target builds as C++17.
+          const std::string& key = attr.first;
+          if (key == kAttrManualDepEdges) continue;
           if (std::any_of(kViewSynthesizedKeys.begin(), kViewSynthesizedKeys.end(),
-                          [&k](const char* synth) { return k == synth; })) {
+                          [&key](const char* synth) { return key == synth; })) {
             continue;
           }
-          submit_attrs.emplace_back(k, v);
+          submit_attrs.emplace_back(attr.first, attr.second);
         }
         new_call = std::make_shared<Submit>(cloned_gvar, new_args, submit->deps_, submit->kwargs_,
                                             std::move(submit_attrs), new_return_type, submit->span_,
