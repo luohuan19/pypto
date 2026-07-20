@@ -294,10 +294,6 @@ def test_print_parse_round_trip():
     ir.assert_structural_equal(reparsed, prog)
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 # ---------------------------------------------------------------------------
 # Runtime-ABI safety: operand dtype and index range
 # ---------------------------------------------------------------------------
@@ -521,7 +517,7 @@ def test_scope_predicate_operand_producer_must_be_in_deps():
 
 def test_scope_predicate_rejected_inside_cluster():
     """A cluster-nested pl.spmd never becomes a Submit, so the predicate is lost."""
-    with pytest.raises(ParserSyntaxError, match="cannot be nested inside `pl.cluster"):
+    with pytest.raises(ParserSyntaxError, match=r"cannot be nested inside `pl\.cluster"):
         pl.parse_program(
             _SCOPE_HEAD
             + f"""
@@ -602,3 +598,43 @@ def test_scope_producer_tracking_survives_tid_rebinding():
         return out
 """
         )
+
+
+def test_scope_predicate_deps_hint_matches_the_form():
+    """The remediation hint must be reachable from the form the author wrote.
+
+    Scope-producer tracking made this case reachable: on the plain / for-forms
+    ``deps=`` is rejected outright, so a hint saying "add deps=[tid]" would send
+    the author into a second, different error. Those forms are told to switch to
+    the ``as tid`` capture form instead.
+    """
+    # as-tid form: deps= is available, so "add it" is the right advice.
+    with pytest.raises(ParserSyntaxError) as as_tid:
+        _scope_program("rc[0, 0] > 0", deps_src="")
+    assert "deps=[g_tid]" in as_tid.value.hint, as_tid.value.hint
+
+    # plain with-form: deps= is not accepted; the hint must say so and point at
+    # the capture form rather than at a kwarg that would itself be rejected.
+    plain_src = (
+        _SCOPE_HEAD
+        + f"""
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self, x: {_FP32_T}, out: pl.Out[{_FP32_T}], rc: pl.Out[{_INT32_T}]
+    ) -> {_FP32_T}:
+        with pl.spmd(1) as g_tid:
+            rc = self.gate(rc)
+        with pl.spmd(1, predicate=(rc[0, 0] > 0)):
+            out = self.expert(x, out)
+        return out
+"""
+    )
+    with pytest.raises(ParserSyntaxError) as plain:
+        pl.parse_program(plain_src)
+    hint = plain.value.hint
+    assert "does not accept deps=" in hint, hint
+    assert "as tid" in hint, hint
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

@@ -3737,7 +3737,13 @@ class ASTParser:
         # the error steers the author to the ``as tid`` form.
         if predicate is not None:
             self._validate_predicate_deps(
-                "pl.spmd()", predicate, dep_vars, self.span_tracker.get_span(anchor)
+                "pl.spmd()",
+                predicate,
+                dep_vars,
+                self.span_tracker.get_span(anchor),
+                # allow_deps is False on the plain / for-forms, where deps= is
+                # rejected outright — the hint must not tell the author to add one.
+                deps_accepted=allow_deps,
             )
         return (
             core_num,
@@ -6455,7 +6461,13 @@ class ASTParser:
             )
 
     def _validate_predicate_deps(
-        self, method_name: str, predicate: ir.Expr, dep_vars: list[ir.Var], span: ir.Span
+        self,
+        method_name: str,
+        predicate: ir.Expr,
+        dep_vars: list[ir.Var],
+        span: ir.Span,
+        *,
+        deps_accepted: bool = True,
     ) -> None:
         """Enforce that a ``predicate=`` operand's producer is one of ``deps=``.
 
@@ -6471,6 +6483,12 @@ class ASTParser:
         parameter, say) has no tracked producer, and an ``Array[N, TASK_ID]``
         dep entry does not name its producers individually — both are skipped
         rather than risk rejecting a correct program.
+
+        ``deps_accepted`` tailors the remediation hint. The plain
+        ``with pl.spmd(...):`` and ``for i in pl.spmd(...):`` forms do not take
+        ``deps=`` at all, so telling their author to add one would send them
+        into a second, different error; there the fix is to switch to the
+        ``as tid`` capture form.
         """
         if not isinstance(predicate, self._PREDICATE_CMP_TYPES):
             return
@@ -6491,14 +6509,23 @@ class ASTParser:
         if any(d is producer_tid for d in dep_vars) and current_gen == producer_gen:
             return
         tid_name = producer_tid.name_hint
+        why = (
+            "Without it the scheduler may evaluate the predicate before the producing task has "
+            "written the tensor."
+        )
+        hint = (
+            f"Add the producer to the dependency list: deps=[{tid_name}]. {why}"
+            if deps_accepted
+            else (
+                f"This form does not accept deps=. Capture the TaskId instead: "
+                f"`with pl.spmd(n, deps=[{tid_name}], predicate=...) as tid:`. {why}"
+            )
+        )
         raise ParserSyntaxError(
             f"'{method_name}' predicate reads '{operand.name_hint}', which is produced by the task "
             f"bound to '{tid_name}', but '{tid_name}' is not in deps=",
             span=span,
-            hint=(
-                f"Add the producer to the dependency list: deps=[{tid_name}]. Without it the scheduler "
-                "may evaluate the predicate before the producing task has written the tensor."
-            ),
+            hint=hint,
         )
 
     def _parse_dispatch_device_kwarg(
