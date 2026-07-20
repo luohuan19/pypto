@@ -212,7 +212,6 @@ def test_submit_single_lhs_form_round_trips():
     passes.convert_to_ssa()(program_before)
 
 
-
 # ---------------------------------------------------------------------------
 # Scope-form dispatch predicate — ``with pl.spmd(..., predicate=...)``
 # ---------------------------------------------------------------------------
@@ -282,7 +281,9 @@ def _spmd_scopes(program: ir.Program) -> list:
             elif value is not None:
                 walk(value)
 
-    walk(program.get_function("main").body)
+    main = program.get_function("main")
+    assert main is not None
+    walk(main.body)
     return found
 
 
@@ -292,7 +293,10 @@ def _predicate_operand(scope) -> ir.Var:
     operand = predicate.left
     while isinstance(operand, ir.Cast):
         operand = operand.operand
-    return operand.args[0]
+    assert isinstance(operand, ir.Call)  # tensor.read
+    tensor = operand.args[0]
+    assert isinstance(tensor, ir.Var)
+    return tensor
 
 
 def test_ssa_renames_scope_predicate_operand():
@@ -352,6 +356,7 @@ def _flatten_stmts(stmt) -> list:
     walk(stmt)
     return out
 
+
 def test_structural_hash_handles_var_and_expr_scope_attrs():
     """Scopes carrying Var-/Expr-valued attrs must be hashable.
 
@@ -369,11 +374,63 @@ def test_structural_hash_handles_var_and_expr_scope_attrs():
     assert ir.structural_hash(program) == ir.structural_hash(again)
 
     # ...and structural_equal remains the authority on the predicate itself.
-    no_predicate = pl.parse_program(
-        _SCOPE_PREDICATE_PROGRAM.replace(", predicate=(rc[0, 0] > 0)", "")
-    )
+    no_predicate = pl.parse_program(_SCOPE_PREDICATE_PROGRAM.replace(", predicate=(rc[0, 0] > 0)", ""))
     assert isinstance(ir.structural_hash(no_predicate), int)
     assert not ir.structural_equal(program, no_predicate)
+
+
+# A predicate whose index is a *computed* Var (``idx``), used nowhere else.
+# That makes the assignment feeding it dead unless DCE counts the predicate as a
+# use — see test_dce_keeps_the_predicate_operands_producer.
+_SCOPE_PREDICATE_LIVE_INDEX_PROGRAM = """
+import pypto.language as pl
+
+
+@pl.program
+class Prog:
+    @pl.function(type=pl.FunctionType.InCore)
+    def expert(
+        self, x: pl.Tensor[[512, 128], pl.FP32], out: pl.Out[pl.Tensor[[512, 128], pl.FP32]]
+    ) -> pl.Tensor[[512, 128], pl.FP32]:
+        t = pl.load(x, [0, 0], [128, 128])
+        out = pl.store(t, [0, 0], out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        x: pl.Tensor[[512, 128], pl.FP32],
+        out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+        rc: pl.Tensor[[512, 128], pl.INT32],
+        i: pl.Scalar[pl.INT32],
+    ) -> pl.Tensor[[512, 128], pl.FP32]:
+        idx = i + 1
+        with pl.spmd(1, predicate=(rc[idx, 0] > 0)):
+            out = self.expert(x, out)
+        return out
+"""
+
+
+def test_dce_keeps_the_predicate_operands_producer():
+    """A Var used *only* inside the predicate is a live use, not dead code.
+
+    ``idx`` feeds nothing but the predicate's index. Without the predicate
+    branch in DCE's scope-attr live-root collection, its assignment is deleted
+    and the attr is left referencing a free variable — the IR still prints and
+    passes structural checks, so nothing else catches it. Regression for the
+    same failure class as issue #1456.
+    """
+    program = passes.simplify()(pl.parse_program(_SCOPE_PREDICATE_LIVE_INDEX_PROGRAM))
+    main = program.get_function("main")
+    assert main is not None
+    printed = ir.python_print(main)
+
+    assert "idx" in printed, printed
+    # The tell-tale of a dropped live root: the printer renders an undefined
+    # reference with a __FREE_VAR suffix.
+    assert "__FREE_VAR" not in printed, f"predicate references a dangling Var:\n{printed}"
+    # The assignment itself survived, not just the name inside the predicate.
+    assert "idx: pl.Scalar" in printed, printed
 
 
 if __name__ == "__main__":

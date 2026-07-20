@@ -273,7 +273,9 @@ void IRVisitor::VisitStmt_(const WhileStmtPtr& op) {
 // Visit Var-typed entries in a ScopeStmt's ``attrs_``. Mirrors the Call.attrs
 // handling in VisitExpr_(CallPtr) so analyses (unused-var detection, SSA Var
 // liveness, etc.) see Var refs stashed on a ScopeStmt's ``manual_dep_edges`` /
-// ``task_id_var`` / ``arg_direction_overrides_vars`` / ``dump_vars`` attrs.
+// ``task_id_var`` / ``arg_direction_overrides_vars`` / ``dump_vars`` attrs, plus
+// the Expr-valued ``predicate`` attr. Subclasses opt a key out via
+// ShouldVisitScopeAttr rather than by overriding this walk.
 void IRVisitor::VisitScopeAttrs(const ScopeStmtPtr& op) {
   for (const auto& [k, v] : op->attrs_) {
     if (!ShouldVisitScopeAttr(k)) continue;

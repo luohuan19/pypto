@@ -3587,6 +3587,55 @@ class ASTParser:
             )
         return kw.value.value
 
+    # ``pl.spmd()`` keywords whose *value* the caller interprets. ``deps`` is
+    # conditionally legal (see _validate_spmd_kwarg_name).
+    _SPMD_KWARGS = frozenset(
+        {"core_num", "sync_start", "name_hint", "optimizations", "allow_early_resolve", "predicate"}
+    )
+
+    def _validate_spmd_kwarg_name(
+        self, kw: ast.keyword, anchor: ast.AST, *, usage_hint: str, allow_deps: bool
+    ) -> None:
+        """Reject a ``pl.spmd()`` keyword that is not legal in this context.
+
+        Split out of :meth:`_parse_spmd_kwargs` so that method handles only what
+        each keyword's *value* means, while "is this keyword name accepted here"
+        lives in one place. Covers three rejections:
+
+        * ``**kwargs`` unpacking (``kw.arg is None``) — the parser must see each
+          keyword literally.
+        * ``deps=`` outside the ``as tid`` capture form, where there is no TaskId
+          to hang the edges on.
+        * any unrecognised name, whose hint lists the keywords valid *here*.
+        """
+        if kw.arg is None:
+            # `pl.spmd(**cfg)` — ast.keyword.arg is None for **kwargs unpacking.
+            raise ParserSyntaxError(
+                "pl.spmd() does not accept **kwargs; pass core_num (positional) "
+                "and sync_start=/name_hint=/optimizations= explicitly",
+                span=self.span_tracker.get_span(kw.value),
+                hint=usage_hint,
+            )
+        if kw.arg == "deps" and not allow_deps:
+            raise ParserSyntaxError(
+                "pl.spmd() does not accept 'deps=' here",
+                span=self.span_tracker.get_span(kw.value),
+                hint="Use `with pl.spmd(n, deps=[...]) as tid:` (the with-form) to "
+                "declare explicit TaskId deps, or `out, tid = pl.spmd_submit(..., "
+                "deps=[...])` for the single-call form.",
+            )
+        if kw.arg == "deps" or kw.arg in self._SPMD_KWARGS:
+            return
+        supported = "'sync_start', 'name_hint', 'optimizations', "
+        if allow_deps:
+            supported += "'deps', "
+        supported += "'allow_early_resolve', 'predicate'"
+        raise ParserSyntaxError(
+            f"pl.spmd() got unexpected keyword argument '{kw.arg}'",
+            span=self.span_tracker.get_span(anchor),
+            hint=f"Supported keywords: {supported}",
+        )
+
     def _parse_spmd_kwargs(
         self,
         anchor: ast.AST,
@@ -3647,14 +3696,7 @@ class ASTParser:
         allow_early_resolve: bool = False
         predicate: ir.Expr | None = None
         for kw in call.keywords:
-            if kw.arg is None:
-                # `pl.spmd(**cfg)` — ast.keyword.arg is None for **kwargs unpacking.
-                raise ParserSyntaxError(
-                    "pl.spmd() does not accept **kwargs; pass core_num (positional) "
-                    "and sync_start=/name_hint=/optimizations= explicitly",
-                    span=self.span_tracker.get_span(kw.value),
-                    hint=usage_hint,
-                )
+            self._validate_spmd_kwarg_name(kw, anchor, usage_hint=usage_hint, allow_deps=allow_deps)
             if kw.arg == "name_hint":
                 name_hint = self._parse_scope_name_hint(kw.value, "pl.spmd()")
             elif kw.arg == "core_num":
@@ -3670,14 +3712,6 @@ class ASTParser:
             elif kw.arg == "optimizations":
                 split_mode, split_slot_num = self._parse_spmd_optimizations_list(kw.value)
             elif kw.arg == "deps":
-                if not allow_deps:
-                    raise ParserSyntaxError(
-                        "pl.spmd() does not accept 'deps=' here",
-                        span=self.span_tracker.get_span(kw.value),
-                        hint="Use `with pl.spmd(n, deps=[...]) as tid:` (the with-form) to "
-                        "declare explicit TaskId deps, or `out, tid = pl.spmd_submit(..., "
-                        "deps=[...])` for the single-call form.",
-                    )
                 deps_kw = kw
             elif kw.arg == "allow_early_resolve":
                 allow_early_resolve = self._parse_spmd_bool_literal_kwarg(kw, usage_hint)
@@ -3685,19 +3719,6 @@ class ASTParser:
                 # Not a bool literal — parsed as an ordinary expression and
                 # shape-validated, exactly as on pl.spmd_submit.
                 predicate = self._parse_submit_predicate_kwarg("pl.spmd()", [kw])
-            else:
-                supported = (
-                    "Supported keywords: 'sync_start', 'name_hint', 'optimizations', 'deps', "
-                    "'allow_early_resolve', 'predicate'"
-                    if allow_deps
-                    else "Supported keywords: 'sync_start', 'name_hint', 'optimizations', "
-                    "'allow_early_resolve', 'predicate'"
-                )
-                raise ParserSyntaxError(
-                    f"pl.spmd() got unexpected keyword argument '{kw.arg}'",
-                    span=self.span_tracker.get_span(anchor),
-                    hint=supported,
-                )
         if core_num is None:
             raise ParserSyntaxError(
                 "pl.spmd() requires core_num (first positional argument)",
@@ -6260,9 +6281,7 @@ class ASTParser:
             )
         return kw.value.value
 
-    def _parse_submit_predicate_kwarg(
-        self, method_name: str, keywords: list[ast.keyword]
-    ) -> ir.Expr | None:
+    def _parse_submit_predicate_kwarg(self, method_name: str, keywords: list[ast.keyword]) -> ir.Expr | None:
         """Extract the optional ``predicate=(<tensor>[<indices>] <op> <int>)`` kwarg.
 
         Accepted on ``pl.submit(...)``, ``pl.spmd_submit(...)`` and the

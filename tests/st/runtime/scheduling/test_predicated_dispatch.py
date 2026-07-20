@@ -212,9 +212,7 @@ class TestScopePredicatedDispatch:
     """``with pl.spmd(..., predicate=...)`` must behave exactly like the submit form."""
 
     @pytest.mark.parametrize("platform", PLATFORMS)
-    @pytest.mark.parametrize(
-        "gate_value", [0, 1], ids=["predicate_false_skips", "predicate_true_dispatches"]
-    )
+    @pytest.mark.parametrize("gate_value", [0, 1], ids=["predicate_false_skips", "predicate_true_dispatches"])
     def test_scope_predicated_dispatch(self, test_runner, platform, gate_value):
         result = test_runner.run(_ScopePredicatedDispatchPTO(gate_value=gate_value, platform=platform))
         assert result.passed, f"scope predicated dispatch (gate={gate_value}) failed: {result.error}"

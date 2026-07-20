@@ -12,6 +12,8 @@
 #ifndef PYPTO_IR_TRANSFORMS_BASE_VISITOR_H_
 #define PYPTO_IR_TRANSFORMS_BASE_VISITOR_H_
 
+#include <string>
+
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/memref.h"
@@ -121,10 +123,7 @@ class IRVisitor : public IRFunctor<void> {
   /// declarative comparison spec the scheduler evaluates at the dispatch
   /// point, not an expression this program evaluates, so the three-address-code
   /// invariant does not apply to it.
-  [[nodiscard]] virtual bool ShouldVisitScopeAttr(const std::string& key) const {
-    (void)key;
-    return true;
-  }
+  [[nodiscard]] virtual bool ShouldVisitScopeAttr(const std::string& /*key*/) const { return true; }
   void VisitStmt_(const SpmdScopeStmtPtr& op) override;
   void VisitStmt_(const SplitAivScopeStmtPtr& op) override;
   void VisitStmt_(const RuntimeScopeStmtPtr& op) override;

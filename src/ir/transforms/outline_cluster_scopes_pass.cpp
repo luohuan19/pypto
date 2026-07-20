@@ -60,11 +60,10 @@ FunctionPtr UnwrapNestedSpmd(const FunctionPtr& group_func) {
       // ASTParser._reject_spmd_submit_only_kwargs_in_cluster); guard here for
       // hand-built / deserialized IR so the invalid case fails loudly instead of
       // miscompiling.
-      INTERNAL_CHECK_SPAN(op->GetAttr<VarPtr>(kAttrTaskIdVar) == nullptr &&
-                              !op->HasAttr(kAttrManualDepEdges) &&
-                              !op->GetAttr<bool>("allow_early_resolve", false) &&
-                              !op->HasAttr(kAttrPredicate),
-                          op->span_)
+      INTERNAL_CHECK_SPAN(
+          op->GetAttr<VarPtr>(kAttrTaskIdVar) == nullptr && !op->HasAttr(kAttrManualDepEdges) &&
+              !op->GetAttr<bool>("allow_early_resolve", false) && !op->HasAttr(kAttrPredicate),
+          op->span_)
           << "Internal error: a pl.spmd() nested inside pl.cluster() cannot carry a producer "
              "TASK_ID (kAttrTaskIdVar), dependency edges (kAttrManualDepEdges), an "
              "allow_early_resolve hint, or a dispatch predicate (kAttrPredicate); it is unwrapped "
