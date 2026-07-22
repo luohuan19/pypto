@@ -256,9 +256,13 @@ jobs:
         # bf16/fp16 accumulation is sensitive to the host torch/BLAS build; it
         # drifts past tolerance on this CPU host, so it runs in the npu
         # system-tests job instead (it needs no device, only that environment).
+        # `python -m pytest`, not bare `pytest`: the per-job venv is layered on
+        # conda py310 with --system-site-packages, so pip leaves pytest's entry
+        # point in the base env (already satisfied) and a bare `pytest` would run
+        # under the base interpreter, which cannot see the venv-installed pypto.
         run: |
           source activate.sh
-          pytest tests/st/codegen -v --codegen-only \
+          python -m pytest tests/st/codegen -v --codegen-only \
             --ignore=tests/st/codegen/torch/test_torch_codegen_paged_attention.py
 
   system-tests:
