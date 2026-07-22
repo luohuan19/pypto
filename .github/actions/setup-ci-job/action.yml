@@ -221,17 +221,28 @@ runs:
         # aarch64, so the cache archive name is unchanged from the old literal.
         PTOAS_ARCH="$(uname -m)"
         CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-${PTOAS_ARCH}-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
+        # $PTOAS_CACHE_DIR is shared across concurrent jobs on the host (unlike the
+        # per-job pip dir), so two cache-miss jobs must not fight over one temp
+        # file: download into a per-job mktemp, verify it, then atomically rename
+        # into place (last writer wins — content is identical). A trap removes the
+        # temp if we die mid-download. CACHE_ARCHIVE therefore only ever holds a
+        # verified archive; the final sha256 re-check guards a cache hit against a
+        # partial/corrupt file left by a crashed pre-atomic-rename run.
         if [ ! -f "$CACHE_ARCHIVE" ]; then
           echo "Cache miss — downloading ptoas ${PTOAS_VERSION} for ${PTOAS_ARCH}"
           mkdir -p "$PTOAS_CACHE_DIR"
+          tmp_archive="$(mktemp "$PTOAS_CACHE_DIR/.ptoas-${PTOAS_ARCH}.XXXXXX")"
+          trap 'rm -f "$tmp_archive"' EXIT
           curl --fail --location --retry 3 --retry-all-errors \
             "https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-${PTOAS_ARCH}.tar.gz" \
-            -o "$CACHE_ARCHIVE.tmp"
-          echo "${PTOAS_SHA256}  $CACHE_ARCHIVE.tmp" | sha256sum -c -
-          mv "$CACHE_ARCHIVE.tmp" "$CACHE_ARCHIVE"
+            -o "$tmp_archive"
+          echo "${PTOAS_SHA256}  $tmp_archive" | sha256sum -c -
+          mv -f "$tmp_archive" "$CACHE_ARCHIVE"
+          trap - EXIT
         else
           echo "Cache hit — using $CACHE_ARCHIVE"
         fi
+        echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -
         mkdir -p "$PTOAS_ROOT"
         tar -xzf "$CACHE_ARCHIVE" -C "$PTOAS_ROOT"
         # Guard each chmod on existence so a packaging variation (only one of the
