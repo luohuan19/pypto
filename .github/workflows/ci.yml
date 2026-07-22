@@ -237,9 +237,14 @@ jobs:
       CCACHE_UMASK: '000'
     steps:
       - name: Fetch composite action definitions
+        # Full checkout, NOT sparse-checkout: sparse makes actions/checkout use a
+        # --filter=blob:none partial clone whose promisor remote fails to re-fetch
+        # elided blobs on this runner's flaky network (seen after a _work clean).
+        # submodules:false — action defs need none; clean:false leaves the sibling
+        # codegen-checkout tree on this persistent runner untouched.
         uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/actions
+          submodules: false
           clean: false
           persist-credentials: false
 
@@ -326,15 +331,19 @@ jobs:
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./st-checkout — sparse-fetch just
-        # the action defs at the workspace root first (clean: false leaves sibling
-        # subdir checkouts on this persistent runner untouched).
+        # but this job checks the repo out into ./st-checkout — so check the repo
+        # out at the workspace root first (clean: false leaves that sibling subdir
+        # tree on this persistent runner untouched). Full checkout, NOT
+        # sparse-checkout: sparse makes actions/checkout use a --filter=blob:none
+        # partial clone whose promisor remote fails to re-fetch elided blobs on
+        # this runner's flaky network (seen after a _work clean). submodules:false
+        # — the action defs need none.
         uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/actions
+          submodules: false
           clean: false
-          # Bootstrap only fetches the public .github/actions tree; it doesn't
-          # need the token persisted into .git/config afterward (zizmor artipacked).
+          # The reused .git/config on this persistent runner must not keep the
+          # token afterward (zizmor artipacked).
           persist-credentials: false
 
       - name: Setup CI job
@@ -436,15 +445,19 @@ jobs:
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./st-direct-checkout — sparse-fetch
-        # just the action defs at the workspace root first (clean: false leaves
-        # sibling subdir checkouts on this persistent runner untouched).
+        # but this job checks the repo out into ./st-direct-checkout — so check the
+        # repo out at the workspace root first (clean: false leaves that sibling
+        # subdir tree on this persistent runner untouched). Full checkout, NOT
+        # sparse-checkout: sparse makes actions/checkout use a --filter=blob:none
+        # partial clone whose promisor remote fails to re-fetch elided blobs on
+        # this runner's flaky network (seen after a _work clean). submodules:false
+        # — the action defs need none.
         uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/actions
+          submodules: false
           clean: false
-          # Bootstrap only fetches the public .github/actions tree; it doesn't
-          # need the token persisted into .git/config afterward (zizmor artipacked).
+          # The reused .git/config on this persistent runner must not keep the
+          # token afterward (zizmor artipacked).
           persist-credentials: false
 
       - name: Setup CI job
@@ -574,15 +587,19 @@ jobs:
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./dist-checkout — sparse-fetch just
-        # the action defs at the workspace root first (clean: false leaves sibling
-        # subdir checkouts on this persistent runner untouched).
+        # but this job checks the repo out into ./dist-checkout — so check the repo
+        # out at the workspace root first (clean: false leaves that sibling subdir
+        # tree on this persistent runner untouched). Full checkout, NOT
+        # sparse-checkout: sparse makes actions/checkout use a --filter=blob:none
+        # partial clone whose promisor remote fails to re-fetch elided blobs on
+        # this runner's flaky network (seen after a _work clean). submodules:false
+        # — the action defs need none.
         uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/actions
+          submodules: false
           clean: false
-          # Bootstrap only fetches the public .github/actions tree; it doesn't
-          # need the token persisted into .git/config afterward (zizmor artipacked).
+          # The reused .git/config on this persistent runner must not keep the
+          # token afterward (zizmor artipacked).
           persist-credentials: false
 
       - name: Setup CI job
@@ -648,15 +665,19 @@ jobs:
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./lib-checkout — sparse-fetch just
-        # the action defs at the workspace root first (clean: false leaves sibling
-        # subdir checkouts on this persistent runner untouched).
+        # but this job checks the repo out into ./lib-checkout — so check the repo
+        # out at the workspace root first (clean: false leaves that sibling subdir
+        # tree on this persistent runner untouched). Full checkout, NOT
+        # sparse-checkout: sparse makes actions/checkout use a --filter=blob:none
+        # partial clone whose promisor remote fails to re-fetch elided blobs on
+        # this runner's flaky network (seen after a _work clean). submodules:false
+        # — the action defs need none.
         uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/actions
+          submodules: false
           clean: false
-          # Bootstrap only fetches the public .github/actions tree; it doesn't
-          # need the token persisted into .git/config afterward (zizmor artipacked).
+          # The reused .git/config on this persistent runner must not keep the
+          # token afterward (zizmor artipacked).
           persist-credentials: false
 
       - name: Setup CI job

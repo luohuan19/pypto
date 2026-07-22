@@ -148,15 +148,19 @@ jobs:
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./perf-checkout — sparse-fetch just
-        # the action defs at the workspace root first (clean: false leaves sibling
-        # subdir checkouts on this persistent runner untouched).
+        # but this job checks the repo out into ./perf-checkout — so check the repo
+        # out at the workspace root first (clean: false leaves that sibling subdir
+        # tree on this persistent runner untouched). Full checkout, NOT
+        # sparse-checkout: sparse makes actions/checkout use a --filter=blob:none
+        # partial clone whose promisor remote fails to re-fetch elided blobs on
+        # this runner's flaky network (seen after a _work clean). submodules:false
+        # — the action defs need none.
         uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/actions
+          submodules: false
           clean: false
-          # Bootstrap only fetches the public .github/actions tree; it doesn't
-          # need the token persisted into .git/config afterward (zizmor artipacked).
+          # The reused .git/config on this persistent runner must not keep the
+          # token afterward (zizmor artipacked).
           persist-credentials: false
 
       - name: Setup CI job
