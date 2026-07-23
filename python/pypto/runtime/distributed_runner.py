@@ -480,6 +480,28 @@ def _make_call_config(
     return call_config
 
 
+# A dispatch's DFX artifacts live at ``<dfx_base>/<rank label>/d{k}``. The
+# producer (``_submit_chip``) and the consumers (``_clear_dfx_dispatch_dirs``,
+# ``_collect_l3_swimlane``) must agree on that scheme, and drift between them is
+# *silent* — a glob that no longer matches simply clears/converts nothing rather
+# than raising. The globs below are what the two consumers share; the label
+# builder names the producer's half of the contract in one place.
+_RANK_DIR_GLOB = "rank*"
+_DISPATCH_DIR_GLOB = "d[0-9]*"
+
+
+def _dfx_rank_label(worker: int) -> str:
+    """Directory name namespacing one card's DFX artifacts.
+
+    A rank-pinned dispatch (``worker >= 0``) is labelled by its rank; every
+    unconstrained / comm-less worker (``worker < 0``) collapses to a single
+    ``rank_local``, which has no real rank but still needs a namespace of its
+    own. Both forms match :data:`_RANK_DIR_GLOB`, so the consumers pick up
+    rank-pinned and comm-less dispatches uniformly.
+    """
+    return f"rank{worker}" if worker >= 0 else "rank_local"
+
+
 def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int) -> Any:
     """``orch.submit_next_level`` with per-dispatch DFX ``output_prefix`` isolation.
 
@@ -520,9 +542,12 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
         # Defensive: a caller that bypassed ``orch_fn`` (no reset) still gets
         # per-card isolation, just without a guaranteed two-pass match.
         idx_map = orch._dfx_dispatch_idx = {}
-    k = idx_map.get(worker, 0)
-    idx_map[worker] = k + 1
-    rank_label = f"rank{worker}" if worker >= 0 else "rank_local"
+    # Key the counter by the *label*, not the raw worker: unconstrained workers
+    # all collapse to one ``rank_local`` dir, so keying by ``worker`` would let
+    # two distinct negative values both claim ``rank_local/d0``.
+    rank_label = _dfx_rank_label(worker)
+    k = idx_map.get(rank_label, 0)
+    idx_map[rank_label] = k + 1
     config.output_prefix = f"{base}/{rank_label}/d{k}"
     try:
         return orch.submit_next_level(callable_id, task_args, config, worker=worker)
@@ -546,10 +571,10 @@ def _clear_dfx_dispatch_dirs(dfx_base: Path) -> None:
         return
     import shutil  # noqa: PLC0415
 
-    for rank_dir in dfx_base.glob("rank*"):
+    for rank_dir in dfx_base.glob(_RANK_DIR_GLOB):
         if not rank_dir.is_dir():
             continue
-        for disp_dir in rank_dir.glob("d[0-9]*"):
+        for disp_dir in rank_dir.glob(_DISPATCH_DIR_GLOB):
             if disp_dir.is_dir():
                 shutil.rmtree(disp_dir, ignore_errors=True)
 
@@ -605,12 +630,12 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
     # Both ``rank{r}`` and the comm-less ``rank_local`` match ``rank*`` (see the
     # docstring for why we glob rather than iterate a rank count). 3.10-safe dir
     # filter (``glob`` directory filtering is only reliable on 3.11+).
-    rank_dirs = sorted(d for d in dfx_base.glob("rank*") if d.is_dir())
+    rank_dirs = sorted(d for d in dfx_base.glob(_RANK_DIR_GLOB) if d.is_dir())
     for rank_dir in rank_dirs:
         # One card may have run several dispatches: ``<rank>/d0``, ``d1``, ...
         # Match only ``d`` + digits (the names ``_submit_chip`` emits) so an
         # unrelated diagnostic dir under rank_dir is never picked up.
-        dispatch_dirs = sorted(d for d in rank_dir.glob("d[0-9]*") if d.is_dir())
+        dispatch_dirs = sorted(d for d in rank_dir.glob(_DISPATCH_DIR_GLOB) if d.is_dir())
         for disp_dir in dispatch_dirs:
             records = disp_dir / "l2_swimlane_records.json"
             if not records.exists():
@@ -681,7 +706,8 @@ def _dispatch(
         # ``_submit_chip`` numbers a card's dispatches ``d0, d1, ...`` fresh each
         # pass. Two-pass swimlane reissues the same dispatch order, so pass 1
         # (deps.json) and pass 2 (records) land the same dispatch in the same
-        # ``rank{w}/d{k}`` dir — letting the converter join them.
+        # ``rank{w}/d{k}`` (or ``rank_local/d{k}``) dir — letting the converter
+        # join them.
         orch._dfx_dispatch_idx = {}
         entry_fn(
             orch,
