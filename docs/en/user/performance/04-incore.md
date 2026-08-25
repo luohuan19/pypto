@@ -17,9 +17,9 @@ NT, TR, TC = 8, 64, 128          # tiles in the loop, tile rows, tile cols
 ROWS = NT * TR
 CFG = RunConfig(platform="__PLATFORM__")
 
-# Build binary-exact values so every host architecture runs the same input.
+# Cycle through binary-exact values in a stable range on every host architecture.
 indices = torch.arange(ROWS * TC, dtype=torch.int64)
-A = (((indices * 257) % 513 - 256).to(torch.float32) / 64).reshape(ROWS, TC)
+A = (indices % 3 - 1).to(torch.float32).reshape(ROWS, TC)
 
 
 def check(kernel):
