@@ -16,6 +16,7 @@ from typing import Any
 
 from pypto.jit._artifact_manifest import BuildKind, encode_manifest
 
+from . import _vpto
 from ._extern_includes import UnsupportedArtifactInput, literal_includes
 from ._prebuilt import _encode_signature, _relative_file, chip_directories
 
@@ -125,6 +126,17 @@ def package_generated_sources(directory: Path, kind: BuildKind) -> None:
             else:
                 kernel["source"] = _local_source(chip, kernel["source"])
             kernel["signature"] = _encode_signature(kernel.get("signature", []))
+            helpers = _vpto.source_paths(kernel.get("vpto_sources"))
+            if helpers:
+                packaged: list[str] = []
+                for ordinal, source in enumerate(helpers):
+                    path = Path(source).resolve(strict=True)
+                    target = chip / "vpto" / str(index) / str(ordinal) / path.name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if path != target:
+                        target.write_bytes(path.read_bytes())
+                    packaged.append(_local_source(chip, str(target)))
+                kernel["vpto_sources"] = packaged
         orchestration = dict(config.ORCHESTRATION)
         orchestration["source"] = _local_source(chip, orchestration["source"])
         orchestration["signature"] = _encode_signature(orchestration.get("signature", []))
@@ -147,6 +159,9 @@ def package_generated_sources(directory: Path, kind: BuildKind) -> None:
             "    if 'extra_include_dirs' in _entry:\n"
             "        _entry['extra_include_dirs'] = [\n"
             "            str(_ROOT_DIR / p) for p in _entry['extra_include_dirs']]\n"
+            "    if 'vpto_sources' in _entry:\n"
+            "        _entry['vpto_sources'] = [\n"
+            "            str(_ROOT_DIR / p) for p in (_entry['vpto_sources'] or [])]\n"
         )
         (chip / "kernel_config.py").write_text(text, encoding="utf-8")
 
@@ -157,6 +172,8 @@ def validate_generated_sources(directory: Path, kind: BuildKind) -> None:
         config = read_kernel_config(chip / "kernel_config.py")
         for entry in [*config.KERNELS, config.ORCHESTRATION]:
             _local_source(chip, entry["source"])
+            for helper in _vpto.source_paths(entry.get("vpto_sources")):
+                _local_source(chip, helper)
             for include in entry.get("extra_include_dirs") or ():
                 # Empty include directories have no payload and are intentionally
                 # omitted by ArtifactStore. A missing -I directory is harmless.

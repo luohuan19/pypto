@@ -63,6 +63,52 @@ The runtime is also part of the `@pl.jit` cache key, so a `host_build_graph`
 call cannot reuse an artifact compiled for `tensormap_and_ringbuffer`, whose
 `kernel_config.py` names a runtime no matching worker would bind.
 
+## Experimental A5 VPTO helpers
+
+An A5 AIV kernel can keep its EmitC C++ body and Tensor wrapper while linking
+separately compiled VPTO functions. On a **private, unpublished** generated tree,
+add the helper dependencies to its `kernel_config.py` entry before compilation:
+
+```python
+KERNELS[0]["vpto_sources"] = [str(_ROOT_DIR / "helpers" / "helper.pto")]
+```
+
+Use the generated configuration's root variable, or resolve the path explicitly.
+The C++ body must already declare and call the helper with matching external C
+linkage and address spaces. Wrapper preprocessing preserves external function
+declarations while internalizing embedded definitions. This is a build interface;
+there is currently no DSL annotation or automatic VF outlining.
+
+The build compiles the wrapper with CCEC, lowers each helper through PTOAS VPTO
+LLVM IR, compiles that IR with the matching Bisheng, and links all device objects
+before extracting `.text`. `KernelCompiler.compile_incore(...,
+vpto_sources=[...])` exposes the same path directly. PTOAS host fatobjs are not
+inputs to this linker. The runtime still builds, loads, and dispatches the kernel.
+
+The initial contract is limited to `platform="a5"`, `core_type="aiv"`, and
+self-contained `.pto` helpers without Bridge operations or external helper
+calls. Non-intrinsic LLVM declarations are rejected. Linked images must start at
+`kernel_entry` in `.text`, with no remaining relocations, undefined symbols, or
+other allocated sections. This structural check does not prove arbitrary helper
+code position-independent. `a5sim` is a CPU simulator
+and cannot execute these device objects; CANN instruction simulation is a
+separate validation path. The caller owns UB allocation, lifetime, transfers,
+and synchronization; helper arguments must preserve their UB address spaces.
+
+Helper contents, lowering/compiler options, and compiler versions participate
+in the final binary cache identity. Published compiler versions are assumed
+immutable. Legacy source-adjacent `.o` files are not reused for these builds.
+Artifact packaging copies the helper sources and restores their paths after
+relocation. Attach dependencies before artifact publication; editing an already
+published artifact is unsupported.
+
+The opt-in fixture `tests/ut/backend/vpto_vf_validation/test_validation.py`
+checks the actual Tensor wrapper, device linking, and optional CANN simulator
+numerics. Set `PYPTO_RUN_VPTO_VF_VALIDATION=1` and `ASCEND_HOME_PATH`; additionally
+set `PYPTO_VPTO_VF_SIMULATOR=1` for simulator execution. It requires a built
+PyPTO extension and the pinned Simpler binding. It does not validate the
+persistent worker or execution on an NPU card.
+
 ## Argument Unpacking
 
 The wrapper unpacks `int64_t* args` following the standard convention:

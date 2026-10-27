@@ -37,6 +37,44 @@ output_dir/
 
 编排代码生成使用 simpler 运行时 API (`rt_submit_task`, `make_tensor_external` 等) 生成编排 C++ 代码。
 
+## 实验性 A5 VPTO helper
+
+A5 AIV kernel 可以保留 EmitC C++ 主体和 Tensor wrapper，同时链接独立编译的
+VPTO 函数。在**尚未发布的私有**生成目录中，编译前为 `kernel_config.py`
+中的对应 kernel 添加依赖：
+
+```python
+KERNELS[0]["vpto_sources"] = [str(_ROOT_DIR / "helpers" / "helper.pto")]
+```
+
+请使用生成配置中的根目录变量，或显式解析路径。C++ 主体需要预先声明并调用
+helper，外部 C 链接和地址空间必须匹配。wrapper 预处理保留外部函数声明，
+仅将嵌入的函数定义内部化。这是构建接口，尚无 DSL 注解或自动 VF outlining。
+
+构建过程使用 CCEC 编译 wrapper，使用 PTOAS 将 helper 降到 VPTO LLVM IR，
+再由匹配的 Bisheng 编译为设备对象，最后链接全部设备对象并提取 `.text`。
+`KernelCompiler.compile_incore(..., vpto_sources=[...])` 提供相同的直接调用入口。
+PTOAS 的 host fatobj 不是此链接器的输入；runtime 仍负责构建、加载和调度 kernel。
+
+首版仅支持 `platform="a5"`、`core_type="aiv"` 和自包含的 `.pto` helper，
+不支持 Bridge 操作或外部 helper 调用；非 intrinsic 的 LLVM 声明会被拒绝。
+链接后的映像必须从 `.text` 开头的 `kernel_entry` 执行，不能包含未处理的重定位、
+未定义符号或其他需要加载的 section。这种结构检查不能证明任意 helper 代码都
+具有位置无关性。
+`a5sim` 是 CPU 模拟器，不能执行这些设备对象；CANN 指令模拟属于独立验证路径。
+调用方负责 UB 分配、生命周期、搬运和同步；helper 参数必须保留 UB 地址空间。
+
+helper 内容、降级及编译选项、编译器版本均参与最终二进制缓存标识，假设已发布
+的编译器版本不可变。这类构建不复用源码旁的旧 `.o` 文件。artifact 打包会复制
+helper 源码，并在迁移后恢复路径。依赖必须在 artifact 发布前添加，不支持修改
+已经发布的 artifact。
+
+显式启用的测试 `tests/ut/backend/vpto_vf_validation/test_validation.py` 验证真实
+Tensor wrapper、设备链接，以及可选的 CANN 模拟器数值结果。设置
+`PYPTO_RUN_VPTO_VF_VALIDATION=1` 和 `ASCEND_HOME_PATH`，额外设置
+`PYPTO_VPTO_VF_SIMULATOR=1` 可运行模拟器。测试需要已构建的 PyPTO 扩展和
+匹配固定版本的 Simpler binding，不覆盖常驻 worker 或 NPU 真卡执行。
+
 ## 运行时配置 (`kernel_config.py`)
 
 `kernel_config.py` 暴露一个 `RUNTIME_CONFIG` 字典，派发路径据此启动程序。固定键：

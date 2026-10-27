@@ -4436,5 +4436,22 @@ class Program:
     assert definitions[operand].split(" loc(")[0].endswith(": index to i32")
 
 
+def test_embedded_helper_forward_declaration_matches_definition():
+    source = "AICORE void helper(int32_t);\nAICORE void helper(int32_t n) {}"
+    result = _preprocess_ptoas_output(source)
+    assert result.count("static __aicore__ void helper") == 2
+
+
+def test_external_vpto_declaration_keeps_linkage():
+    source = (
+        'extern "C" AICORE void run_vf(__ubuf__ float*, int32_t);\n'
+        'extern "C" __global__ AICORE void kernel(float* p) { run_vf(nullptr, 0); }'
+    )
+    result = _preprocess_ptoas_output(source)
+    assert 'extern "C" __aicore__ void run_vf(__ubuf__ float*, int32_t);' in result
+    assert "static __aicore__ void kernel(float* p) {" in result
+    assert "static __aicore__ void run_vf" not in result
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
