@@ -1,1 +1,1 @@
-baseline
+Verify full check record reuse after a failed-job rerun.
