@@ -1,1 +1,1 @@
-Comment gate live validation, revision 1.
+Comment gate live validation, revision 2. Old approval must not release this run.
