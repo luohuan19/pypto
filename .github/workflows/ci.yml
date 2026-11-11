@@ -4,10 +4,12 @@
 # PR revision checks, and status writes use real GitHub Actions services.
 # No self-hosted or device runner is used. The fork baseline is restored afterward.
 name: CI
-run-name: "${{ github.event_name == 'workflow_dispatch' && inputs.pr_number != ''\n    && format('CI full PR #{0} @{1} base:{2}',\
-  \ inputs.pr_number, inputs.head_sha, inputs.base_sha)\n    || github.event_name == 'pull_request'\n    && format('CI lint\
-  \ PR #{0} @{1} base:{2}', github.event.pull_request.number, github.event.pull_request.head.sha, github.event.pull_request.base.sha)\n\
-  \    || format('CI {0} {1}', github.event_name, github.ref_name) }}"
+run-name: |-
+  ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number != ''
+      && format('CI full PR #{0} @{1} base:{2}', inputs.pr_number, inputs.head_sha, inputs.base_sha)
+      || github.event_name == 'pull_request'
+      && format('CI lint PR #{0} @{1} base:{2}', github.event.pull_request.number, github.event.pull_request.head.sha, github.event.pull_request.base.sha)
+      || format('CI {0} {1}', github.event_name, github.ref_name) }}
 'on':
   pull_request:
     branches:
@@ -51,6 +53,7 @@ jobs:
       docs_changed: 'false'
       ptoas_version_changed: 'false'
       scenario: ${{ steps.scenario.outputs.mode }}
+      docs_only: 'false'
     steps:
     - uses: actions/checkout@v4
       with:
@@ -67,26 +70,28 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         TEST_HEAD: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
-      run: "message=$(gh api \"repos/$GITHUB_REPOSITORY/commits/$TEST_HEAD\" --jq '.commit.message | split(\"\\n\")[0]')\n\
-        case \"$message\" in\n  'test(ci): publication fail-once') mode=fail-once ;;\n  'test(ci): publication stale') mode=stale\
-        \ ;;\n  *) mode=success ;;\nesac\necho \"mode=$mode\" >> \"$GITHUB_OUTPUT\"\n"
+      run: |
+        message=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TEST_HEAD" --jq '.commit.message | split("\n")[0]')
+        case "$message" in
+          'test(ci): publication fail-once') mode=fail-once ;;
+          'test(ci): publication stale') mode=stale ;;
+          *) mode=success ;;
+        esac
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
   toolchain:
-    needs:
-    - changes
+    needs: changes
     runs-on: ubuntu-latest
     steps:
     - run: echo "Hosted metadata fixture"
   pre-commit:
-    needs:
-    - changes
-    if: needs.changes.outputs.full != 'true'
+    needs: changes
+    if: needs.changes.outputs.reuse_lint != 'true'
     runs-on: ubuntu-latest
     steps:
     - run: echo "Hosted lint fixture"
   clang-tidy:
-    needs:
-    - changes
-    if: needs.changes.outputs.full != 'true'
+    needs: changes
+    if: needs.changes.outputs.reuse_lint != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
     - run: echo "Hosted lint fixture"
@@ -104,15 +109,24 @@ jobs:
         DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
         PRE_COMMIT: ${{ needs.pre-commit.result }}
         CLANG_TIDY: ${{ needs.clang-tidy.result }}
-      run: "if [ \"$REUSE_LINT\" = 'true' ]; then\n  # changes verified the exact prior PR/head/base lint run via GitHub.\n\
-        \  test \"$PRE_COMMIT\" = 'skipped' && test \"$CLANG_TIDY\" = 'skipped'\nelse\n  test \"$PRE_COMMIT\" = 'success'\
-        \ && {\n    test \"$CLANG_TIDY\" = 'success' || {\n      test \"$DOCS_ONLY\" = 'true' && test \"$CLANG_TIDY\" = 'skipped'\n\
-        \    }\n  }\nfi\n"
+      run: |
+        if [ "$REUSE_LINT" = 'true' ]; then
+          # changes verified the exact prior PR/head/base lint run via GitHub.
+          test "$PRE_COMMIT" = 'skipped' && test "$CLANG_TIDY" = 'skipped'
+        else
+          test "$PRE_COMMIT" = 'success' && {
+            test "$CLANG_TIDY" = 'success' || {
+              test "$DOCS_ONLY" = 'true' && test "$CLANG_TIDY" = 'skipped'
+            }
+          }
+        fi
   codegen-tests:
     needs:
     - changes
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+    - toolchain
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -120,22 +134,31 @@ jobs:
   dist-system-tests:
     needs:
     - changes
+    - toolchain
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
     - run: echo "Hosted full-test fixture"
   docs-examples:
-    if: ${{ false }}
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_changed == ''true'''
     runs-on: ubuntu-latest
     steps:
     - run: 'true'
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
   examples-tests:
     needs:
     - changes
+    - toolchain
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -143,27 +166,40 @@ jobs:
   onboard-tests-a5:
     needs:
     - changes
+    - toolchain
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
     - run: echo "Hosted full-test fixture"
   prebuild-wheels:
-    if: ${{ false }}
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     steps:
     - run: 'true'
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
   prebuild-wheels-github:
-    if: ${{ false }}
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.changes.outputs.full
+      == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     steps:
     - run: 'true'
-  pypto-lib-compile:
     needs:
     - changes
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+  pypto-lib-compile:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -171,22 +207,32 @@ jobs:
   pypto-lib-model:
     needs:
     - changes
+    - toolchain
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
     - run: echo "Hosted full-test fixture"
   serving-guard:
-    if: ${{ false }}
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'' && needs.changes.outputs.ptoas_version_changed
+      == ''true'''
     runs-on: ubuntu-latest
     steps:
     - run: 'true'
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
   system-tests:
     needs:
     - changes
+    - toolchain
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -194,8 +240,11 @@ jobs:
   system-tests-a5sim:
     needs:
     - changes
+    - toolchain
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+    - prebuild-wheels-github
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -203,8 +252,10 @@ jobs:
   system-tests-direct:
     needs:
     - changes
+    - toolchain
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -213,7 +264,9 @@ jobs:
     needs:
     - changes
     - lint-gate
-    if: needs.changes.outputs.full == 'true'
+    - prebuild-wheels-github
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.changes.outputs.full
+      == ''true'''
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -223,12 +276,25 @@ jobs:
         SCENARIO: ${{ needs.changes.outputs.scenario }}
         SOURCE_HEAD: ${{ inputs.head_sha }}
         PR_NUMBER: ${{ inputs.pr_number }}
-      run: "if [ \"$SCENARIO\" = fail-once ] && [ \"$GITHUB_RUN_ATTEMPT\" = 1 ]; then\n  echo \"Intentional first-attempt\
-        \ failure for publication testing\" >&2\n  exit 1\nfi\nif [ \"$SCENARIO\" = stale ]; then\n  # Finish only after a\
-        \ new PR head exists, so the original success is stale.\n  for poll in {1..60}; do\n    current=$(gh api \"repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER\"\
-        \ --jq .head.sha)\n    if [ \"$current\" != \"$SOURCE_HEAD\" ]; then\n      echo \"A newer PR head exists; completing\
-        \ the old test attempt\"\n      exit 0\n    fi\n    sleep 5\n  done\n  echo \"No head update arrived within five minutes\"\
-        \ >&2\n  exit 1\nfi\necho \"Hosted full-test fixture passed\"\n"
+      run: |
+        if [ "$SCENARIO" = fail-once ] && [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then
+          echo "Intentional first-attempt failure for publication testing" >&2
+          exit 1
+        fi
+        if [ "$SCENARIO" = stale ]; then
+          # Finish only after a new PR head exists, so the original success is stale.
+          for poll in {1..60}; do
+            current=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+            if [ "$current" != "$SOURCE_HEAD" ]; then
+              echo "A newer PR head exists; completing the old test attempt"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "No head update arrived within five minutes" >&2
+          exit 1
+        fi
+        echo "Hosted full-test fixture passed"
     permissions:
       contents: read
       pull-requests: read
