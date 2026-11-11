@@ -1,0 +1,85 @@
+name: CI gate prototype
+run-name: >-
+  CI gate prototype PR #${{ github.event.pull_request.number }} @${{ github.event.pull_request.head.sha }}
+
+on:
+  pull_request:
+    branches: [ci-gate-sandbox]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-gate-prototype-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    if: github.repository == 'luohuan19/pypto'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "Lightweight lint fixture; no compiler or NPU tests"
+
+  full-gate:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Wait for a comment on this PR revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/ci_full_gate.py --wait-seconds 600 --poll-seconds 5
+
+  unit-tests:
+    needs: full-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "Lightweight downstream fixture; native PR check"
+
+  system-tests:
+    needs: full-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Optional first-attempt failure for rerun validation
+        env:
+          FAIL_ONCE: ${{ contains(github.event.pull_request.title, '[fail-once]') }}
+        run: |
+          if [ "$FAIL_ONCE" = true ] && [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then
+            echo "Intentional prototype failure"
+            exit 1
+          fi
+          echo "Lightweight system-test fixture; no NPU used"
+
+  full-result:
+    name: ci/full
+    if: always()
+    needs: [lint, full-gate, unit-tests, system-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every stage to pass
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PYTHON'
+          import json
+          import os
+          results = json.loads(os.environ["NEEDS_JSON"])
+          failed = [name for name, job in results.items() if job["result"] != "success"]
+          if failed:
+              raise SystemExit(f"Incomplete stages: {failed}")
+          print("All prototype stages passed")
+          PYTHON
