@@ -74,7 +74,9 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      issues: write
+      # The conversation belongs to a PR; an issues-only token can receive 403
+      # when listing or posting its comments, including in fork repositories.
+      pull-requests: write
     steps:
       - name: Checkout trusted command feedback
         uses: actions/checkout@v4
