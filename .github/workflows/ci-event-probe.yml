@@ -1,0 +1,17 @@
+name: CI full event probe
+on:
+  workflow_run:
+    workflows: [CI Full]
+    types: [requested, in_progress, completed]
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          ACTION: ${{ github.event.action }}
+          SOURCE_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: printf 'action=%s run=%s attempt=%s event=%s branch=%s\n' "$ACTION" "$SOURCE_ID" "$SOURCE_ATTEMPT" "$SOURCE_EVENT" "$SOURCE_BRANCH"
