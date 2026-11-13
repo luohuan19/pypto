@@ -1,1 +1,1 @@
-Fork-only merge snapshot validation.
+Exercise stale merge snapshots through /ci full.
