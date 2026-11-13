@@ -1,1 +1,1 @@
-Fork-only request recovery fixture. No NPU jobs.
+Exercise the comment dispatcher and status publishers.
