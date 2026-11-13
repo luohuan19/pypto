@@ -1,0 +1,453 @@
+name: CI Full
+run-name: "${{ github.event_name == 'workflow_dispatch' && inputs.pr_number != ''\n    && format('CI full PR #{0}\
+  \ @{1} base:{2}{3}', inputs.pr_number, inputs.head_sha, inputs.base_sha,\n              inputs.request_id && format('\
+  \ request:{0}', inputs.request_id) || '')\n    || format('CI {0} {1}', github.event_name, github.ref_name) }}"
+permissions:
+  contents: read
+cache-mode: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ inputs.pr_number && format('full-run-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: true
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      full: ${{ steps.target.outputs.full }}
+      reuse_lint: ${{ steps.target.outputs.reuse_lint }}
+      checkout_sha: ${{ steps.target.outputs.checkout_sha }}
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      docs_changed: ${{ steps.classify.outputs.docs_changed }}
+      ptoas_version_changed: ${{ steps.classify.outputs.ptoas_version_changed }}
+    steps:
+    - name: Checkout CI controller
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.workflow_sha
+          }}
+        sparse-checkout: .github/scripts
+        persist-credentials: false
+    - name: Validate and pin the test revision
+      id: target
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CI_COMMENT_TIERS_ENABLED: 'true'
+      run: python .github/scripts/ci_control.py prepare
+    - name: Classify changed paths
+      id: classify
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        PR_BASE_SHA: ${{ inputs.base_sha || github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
+        REPO: ${{ github.repository }}
+      run: "set -euo pipefail\n\n# Only a pull request has a well-defined \"files this change touches\"\n# list;\
+        \ everything else runs the full pipeline.\nif [ -z \"$PR_NUMBER\" ]; then\n  echo \"docs_only=false\" >>\
+        \ \"$GITHUB_OUTPUT\"\n  echo \"docs_changed=true\" >> \"$GITHUB_OUTPUT\"\n  # `ptoas_version_changed` gates\
+        \ the serving guard, which is opt-in\n  # on cost rather than conservative on correctness: the pin only\n\
+        \  # ever moves through a pull request, so a push to main re-running\n  # it would buy no signal. workflow_dispatch\
+        \ stays true so the guard\n  # can be forced by hand.\n  if [ \"$EVENT_NAME\" = 'workflow_dispatch' ]; then\n\
+        \    echo \"ptoas_version_changed=true\" >> \"$GITHUB_OUTPUT\"\n  else\n    echo \"ptoas_version_changed=false\"\
+        \ >> \"$GITHUB_OUTPUT\"\n  fi\n  echo \"event '$EVENT_NAME' is not a pull request -> full pipeline\"\n \
+        \ exit 0\nfi\n\n# Every failure below writes docs_only=false and exits 0 rather than\n# letting the step\
+        \ die. A *failed* `changes` job would skip every job\n# that needs it (the promised conservative path is\
+        \ the FULL pipeline,\n# not a skip), and for the matrix `unit-tests` a skip is worse still --\n# see the\
+        \ note on that job.\nfail_open() {\n  echo \"docs_only=false\" >> \"$GITHUB_OUTPUT\"\n  echo \"docs_changed=true\"\
+        \ >> \"$GITHUB_OUTPUT\"\n  # Also open for the serving guard: an unreadable file list cannot\n  # prove\
+        \ the pin did not move, and a toolchain bump reaching serving\n  # unguarded is worth more than the cards\
+        \ a spurious run costs.\n  echo \"ptoas_version_changed=true\" >> \"$GITHUB_OUTPUT\"\n  echo \"$1 -> full\
+        \ pipeline\"\n  exit 0\n}\n\n# Classify the immutable revisions selected by prepare. The mutable\n# pulls/{number}/files\
+        \ endpoint can describe another head after a push.\nif [[ ! \"$PR_BASE_SHA\" =~ ^[0-9a-f]{40}$ ]] ||\n \
+        \ [[ ! \"$PR_HEAD_SHA\" =~ ^[0-9a-f]{40}$ ]]; then\n  fail_open 'missing or invalid pinned comparison revisions'\n\
+        fi\nif ! comparison=\"$(gh api \"repos/$REPO/compare/$PR_BASE_SHA...$PR_HEAD_SHA?per_page=1\")\"; then\n\
+        \  fail_open 'pinned comparison request failed'\nfi\nif ! expected=\"$(jq -er '.files | if type == \"array\"\
+        \ then length else error(\"missing files\") end' \\\n                     <<< \"$comparison\")\"; then\n\
+        \  fail_open 'pinned comparison did not return a file list'\nfi\n\n# Compare returns files only on page\
+        \ one, capped at 300 even when the\n# commits are paginated. At the cap we cannot prove completeness, so\n\
+        # enable all checks rather than trusting a possibly truncated list.\nif [ \"$expected\" -eq 0 ] || [ \"\
+        $expected\" -ge 300 ]; then\n  fail_open 'pinned comparison file list is empty or potentially truncated'\n\
+        fi\n\n# Keep BOTH names: renaming src/foo.cpp to docs/foo.md still removes\n# a build-relevant path. TSV\
+        \ escaping keeps unusual filenames on one\n# row without interpreting repository-controlled text as shell\
+        \ code.\nif ! files=\"$(jq -er '.files[] | [.filename, (.previous_filename // \"\")] | @tsv' \\\n      \
+        \            <<< \"$comparison\")\"; then\n  fail_open 'pinned comparison files could not be decoded'\n\
+        fi\n\n# Allowlist. Every entry must be incapable of affecting a build or a\n# test result:\n#   docs/**\
+        \    the documentation tree, including docs/requirements.txt\n#              (only the docs.yml toolchain\
+        \ reads it)\n#   **/*.md    prose anywhere -- README, .claude/ rules, docs pages.\n#\n# `docs_only` means\
+        \ \"no build, no device tests\". It does NOT mean the\n# change is inert: the user manual carries runnable\
+        \ code blocks that\n# `tests/docs/run_doc_examples.py` extracts and executes, so a doc edit\n# can break\
+        \ a real check. `docs_changed` below gates the `docs-examples`\n# job, which runs those blocks on the paths\
+        \ this fast path skips.\n# The markdown lint scripts (check_docs_nav / check_docs_en_zh_parity)\n# run in\
+        \ `pre-commit`, which stays ungated.\n#   mkdocs.yml site config, consumed only by docs.yml\n# `case` globs\
+        \ are not path-aware, so `*.md` matches at any depth.\n# One full pass, no early exit: `docs_only` and `docs_changed`\
+        \ are\n# independent questions, and short-circuiting on the first\n# non-documentation path would answer\
+        \ the second by file order alone.\n# `ptoas_version_changed` is a third, independent question: did this\n\
+        # PR change the pinned PTOAS_VERSION value? The version-file path is\n# only a cheap first filter: below,\
+        \ the assignment is compared at the\n# PR base and head so comments and wheel-sha updates do not consume\n\
+        # cards for `serving-guard`.\ndocs_only=true\ndocs_changed=false\nptoas_version_changed=false\nversions_env_changed=false\n\
+        while IFS=\"$(printf '\\t')\" read -r new_path old_path; do\n  for f in \"$new_path\" \"$old_path\"; do\n\
+        \    [ -n \"$f\" ] || continue\n    case \"$f\" in\n      docs/*) docs_changed=true ;;\n    esac\n    case\
+        \ \"$f\" in\n      toolchain/versions.env)\n        versions_env_changed=true\n        ;;\n    esac\n  \
+        \  case \"$f\" in\n      docs/*|*.md|mkdocs.yml) ;;\n      *)\n        if [ \"$docs_only\" = 'true' ]; then\n\
+        \          echo \"non-documentation change: $f -> full pipeline\"\n        fi\n        docs_only=false\n\
+        \        ;;\n    esac\n  done\ndone <<< \"$files\"\n\nif [ \"$versions_env_changed\" = 'true' ]; then\n\
+        \  read_ptoas_version() {\n    gh api -H 'Accept: application/vnd.github.raw+json' \\\n      \"repos/$REPO/contents/toolchain/versions.env?ref=$1\"\
+        \ |\n      sed -nE 's/^PTOAS_VERSION=([^[:space:]]+)$/\\1/p'\n  }\n\n  is_single_version() {\n    [ -n \"\
+        $1\" ] && [ \"$(printf '%s\\n' \"$1\" | wc -l)\" -eq 1 ]\n  }\n\n  if ! base_ptoas_version=\"$(read_ptoas_version\
+        \ \"$PR_BASE_SHA\")\" ||\n    ! head_ptoas_version=\"$(read_ptoas_version \"$PR_HEAD_SHA\")\" ||\n    !\
+        \ is_single_version \"$base_ptoas_version\" ||\n    ! is_single_version \"$head_ptoas_version\"; then\n\
+        \    fail_open 'PTOAS_VERSION could not be read exactly once at both PR revisions'\n  fi\n\n  if [ \"$base_ptoas_version\"\
+        \ != \"$head_ptoas_version\" ]; then\n    ptoas_version_changed=true\n    echo \"PTOAS_VERSION changed:\
+        \ $base_ptoas_version -> $head_ptoas_version; serving guard enabled\"\n  else\n    echo \"PTOAS_VERSION\
+        \ unchanged ($head_ptoas_version); serving guard disabled\"\n  fi\nfi\n\n# Explicit full means core tests\
+        \ actually execute, even for docs-only\n# PRs. Keep docs_changed/ptoas_version_changed independently computed.\n\
+        if [ \"$EVENT_NAME\" = 'workflow_dispatch' ]; then\n  docs_only=false\nfi\necho \"docs_only=$docs_only\"\
+        \ >> \"$GITHUB_OUTPUT\"\necho \"docs_changed=$docs_changed\" >> \"$GITHUB_OUTPUT\"\necho \"ptoas_version_changed=$ptoas_version_changed\"\
+        \ >> \"$GITHUB_OUTPUT\"\nif [ \"$docs_only\" = 'true' ]; then\n  echo \"all $expected changed paths are\
+        \ documentation:\"\n  printf '%s\\n' \"$files\" | cut -f1 | sed 's/^/  /'\nfi\n"
+  toolchain:
+    needs: changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      pto_isa_commit: ${{ steps.read.outputs.PTO_ISA_COMMIT }}
+      ptoas_version: ${{ steps.read.outputs.PTOAS_VERSION }}
+      ptoas_sha256_aarch64: ${{ steps.read.outputs.PTOAS_SHA256_AARCH64 }}
+      ptoas_sha256_x86_64: ${{ steps.read.outputs.PTOAS_SHA256_X86_64 }}
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  pre-commit:
+    if: needs.changes.outputs.reuse_lint != 'true'
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  clang-tidy:
+    needs: changes
+    if: needs.changes.outputs.reuse_lint != 'true' && needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  lint-gate:
+    needs:
+    - changes
+    - pre-commit
+    - clang-tidy
+    if: always() && !cancelled() && needs.changes.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Require fresh or verified reusable lint
+      env:
+        REUSE_LINT: ${{ needs.changes.outputs.reuse_lint }}
+        DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        PRE_COMMIT: ${{ needs.pre-commit.result }}
+        CLANG_TIDY: ${{ needs.clang-tidy.result }}
+      run: "if [ \"$REUSE_LINT\" = 'true' ]; then\n  # changes verified the exact prior PR/head/base lint run via\
+        \ GitHub.\n  test \"$PRE_COMMIT\" = 'skipped' && test \"$CLANG_TIDY\" = 'skipped'\nelse\n  test \"$PRE_COMMIT\"\
+        \ = 'success' && {\n    test \"$CLANG_TIDY\" = 'success' || {\n      test \"$DOCS_ONLY\" = 'true' && test\
+        \ \"$CLANG_TIDY\" = 'skipped'\n    }\n  }\nfi\n"
+  prebuild-wheels:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+        - x64
+        - arm64
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  prebuild-wheels-github:
+    needs:
+    - changes
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.changes.outputs.full
+      == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    permissions:
+      contents: read
+      packages: read
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.wheels.outputs.artifact_name }}
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  unit-tests:
+    needs:
+    - changes
+    - lint-gate
+    - prebuild-wheels-github
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.changes.outputs.full
+      == ''true'''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+        - ubuntu-latest
+        python-version:
+        - '3.10'
+    steps:
+    - name: Controlled failure and rerun window
+      run: "if [ \"$GITHUB_RUN_ATTEMPT\" = 1 ]; then\n  echo 'Intentional fixture failure to verify terminal status\
+        \ recovery'\n  exit 1\nfi\nsleep 300\necho 'Hosted rerun fixture passed'\n"
+    timeout-minutes: 8
+  docs-examples:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_changed == ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  examples-tests:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  codegen-tests:
+    needs:
+    - changes
+    - lint-gate
+    - toolchain
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  system-tests:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted system-test placeholder'
+    timeout-minutes: 8
+  system-tests-direct:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  dist-system-tests:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  pypto-lib-compile:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - platform: a2a3
+          runner: npu
+          needs-cann: 'true'
+          runtime-targets: build_package_a2a3;build_package_sim
+        - platform: a5
+          runner: cpu
+          needs-cann: 'false'
+          runtime-targets: build_package_sim
+    steps:
+    - run: echo 'Hosted execution fixture'
+  pypto-lib-model:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  serving-guard:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'' &&
+      needs.changes.outputs.ptoas_version_changed == ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+    - run: echo 'Hosted execution fixture'
+  onboard-tests-a5:
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  onboard-tests-a5-distributed:
+    timeout-minutes: 8
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.docs_only != ''true'' && needs.changes.outputs.full == ''true'''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+  system-tests-a5sim:
+    permissions:
+      contents: read
+      packages: read
+    needs:
+    - changes
+    - toolchain
+    - lint-gate
+    - prebuild-wheels-github
+    if: '!cancelled() && needs.changes.result == ''success'' && needs.lint-gate.result == ''success'' && needs.toolchain.result
+      == ''success'' && needs.changes.outputs.full == ''true'' && needs.changes.outputs.docs_only != ''true'''
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo 'Hosted execution fixture'
+    timeout-minutes: 8
+  full-result:
+    if: always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.pr_number
+      != ''
+    needs:
+    - changes
+    - toolchain
+    - pre-commit
+    - clang-tidy
+    - lint-gate
+    - codegen-tests
+    - dist-system-tests
+    - docs-examples
+    - examples-tests
+    - onboard-tests-a5
+    - onboard-tests-a5-distributed
+    - prebuild-wheels
+    - prebuild-wheels-github
+    - pypto-lib-compile
+    - pypto-lib-model
+    - serving-guard
+    - system-tests
+    - system-tests-a5sim
+    - system-tests-direct
+    - unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+    - name: Checkout trusted result validator
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.workflow_sha }}
+        sparse-checkout: .github/scripts
+        persist-credentials: false
+    - name: Require every applicable full test
+      env:
+        CI_NEEDS: ${{ toJSON(needs) }}
+      run: python .github/scripts/ci_control.py aggregate
+    - name: Request full status publication
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh workflow run ci-full-status.yml --repo "$GITHUB_REPOSITORY" --ref main -f run_id="$GITHUB_RUN_ID"
+        -f wait_for_completion=true
+    - name: Reconcile full job checks
+      if: always()
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh workflow run ci-full-progress.yml --repo "$GITHUB_REPOSITORY" --ref main -f run_id="$GITHUB_RUN_ID"
+'on':
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number (normally supplied by /ci full; empty tests main)
+        type: string
+        default: ''
+      head_sha:
+        description: Authorized PR head SHA
+        type: string
+        default: ''
+      base_sha:
+        description: Authorized PR base SHA
+        type: string
+        default: ''
+      merge_sha:
+        description: Immutable test merge SHA with base/head parents
+        type: string
+        default: ''
+      request_id:
+        description: CI Command run ID and attempt identifying the pending request
+        type: string
+        default: ''
