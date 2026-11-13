@@ -193,10 +193,12 @@ than Vec / Mat / Acc, a runtime valid shape, or a slot carried out of an `if` or
 phi. Those are errors naming the shape, not silent fallbacks, because a fallback would
 undo the separation you declared.
 
-The default PyPTO planner is unaffected: it bakes addresses and keeps the `alloc_tile`
-form. A region at `--pto-level=level3` needs an explicit base `addr`, which codegen does
-not emit yet; ptoas itself has supported that form since 0.55
-([PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106), closed).
+With the default PyPTO planner, the default codegen still bakes addresses into
+`alloc_tile`. Opting into `enable_software_pipeline=True` allows eligible uniform
+slot allocations to become `alloc_multi_tile addr = <base>` regions at level3;
+PyPTO retains address assignment and reserves all slots. The same option lowers
+eligible Vec `pl.pipeline` loops to preload/main/drain with a prefetch distance
+of `stage - 1`; see [LowerPipelineToSlots](../passes/32-lower_pipeline_to_slots.md).
 
 A declared name lives in its own namespace — it never resolves to a Python variable that
 happens to share it. The memory space **is** required (a `TileType` always pairs a
@@ -211,7 +213,7 @@ with `pl.range` and declare one allocation per slot; leave the levels you want t
 to manage unannotated.
 
 Under `memory_planner=PTOAS` the compiler reaches for the *same* mechanism rather than a
-different one: [`LowerPipelineToSlots`](../passes/30-lower_pipeline_to_slots.md) synthesizes
+different one: [`LowerPipelineToSlots`](../passes/32-lower_pipeline_to_slots.md) synthesizes
 exactly the declaration above — `slots=F`, indexed `iv % F` — for every eligible top-level
 `tile.load` of a `pl.pipeline` body, so one body rotates through the slots instead of being
 replicated. A tile you bound yourself is left alone, and any loop that pass declines still
@@ -228,8 +230,8 @@ for stack, (out_outer,) in pl.pipeline(STACKS, stage=2, init_values=(out,)):
         pong: pl.Tile[[K, STEP], pl.BF16, l0b_pong, pl.Mem.Right] = ...
 ```
 
-See [InitMemRef](../passes/34-init_memref.md#declared-allocations) and
-[MemoryReuse](../passes/36-memory_reuse.md#declared-allocations).
+See [InitMemRef](../passes/38-init_memref.md#declared-allocations) and
+[MemoryReuse](../passes/40-memory_reuse.md#declared-allocations).
 
 ### Tile Views (TileView)
 
@@ -379,9 +381,15 @@ pl.create_tensor([64], dtype=pl.FP32)       # Promoted from tensor
 # System operations (synchronization primitives)
 pl.system.sync_src(set_pipe=pl.PipeType.MTE2, wait_pipe=pl.PipeType.V, event_id=0)
 pl.system.sync_dst(set_pipe=pl.PipeType.MTE2, wait_pipe=pl.PipeType.V, event_id=0)
-pl.system.bar_v()                        # Vector barrier
-pl.system.bar_m()                        # Matrix barrier
-pl.system.bar_all()                      # Global barrier
+pl.system.barrier(pipe=pl.PipeType.V)     # Vector pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.M)     # Matrix pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.S)     # Scalar pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.MTE1)  # L1 -> L0A/L0B operand feed
+pl.system.barrier(pipe=pl.PipeType.MTE2)  # GM -> UB/L1 load pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.MTE3)  # UB -> GM store pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.FIX)   # L0C writeback pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.ALL)   # All pipelines on the current core
+pl.system.barrier(pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)  # cube lane only
 
 # Cross-core operations (TPUSH/TPOP protocol)
 pl.tpush_to_aic(tile0, split=0, id=0)        # Vector → Cube push on pipe 0
@@ -403,6 +411,20 @@ pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=512, i
 pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf, dir_mask=2, slot_size=512, slot_num=16, local_slot_num=4)
 ```
 
+`pl.system.barrier(*, pipe, core_type=None)` requires a `pl.PipeType` member; every
+member is accepted. `core_type` (`pl.KernelType.AIC` / `.AIV`) pins the barrier to one
+lane when a mixed InCore function is expanded into an AIC and an AIV kernel — the two
+lanes own different pipelines, and an operand-free barrier is otherwise duplicated into
+both. Omit it in an already typed AIC/AIV function. A barrier is rejected inside
+`pl.pipeline`, as explicit flags are.
+It orders preceding and following work on the selected pipeline(s), without
+using an event slot. `ALL` covers the current core, not other cores; use
+`pl.system.syncall(...)` for a cross-core barrier. The old `bar_v()`,
+`bar_m()`, and `bar_all()` APIs have been removed. The Python IR
+printer always emits the corresponding `barrier(pipe=...)` spelling. Internal
+IR operator names and native barrier lowering remain unchanged. The separate
+`set_flag` / `wait_flag` calls retain their directional pipeline-event semantics.
+
 #### Cross-path arguments on unified ops
 
 A unified `pl.<op>` accepts the union of both levels' arguments, so an argument
@@ -420,7 +442,7 @@ guarding a whole call should catch both:
 
 ```python
 pl.matmul(tile_a, tile_b, b_trans=True)   # TypeError — tile transpose is a view, not a flag
-pl.rsqrt(tile, high_precision=True)       # TypeError — tile precision is selected by passing tmp
+pl.rsqrt(tile, high_precision=True)       # ValueError — high precision requires tmp=workspace
 pl.div(tile, 2.0, high_precision=True)    # TypeError — high_precision needs a Tile rhs
 pl.row_max(tile)                          # TypeError — Tile inputs require tmp_tile
 pl.slice(tile, [64, 64], [64, 0])         # ValueError — window runs off the source tile

@@ -4,9 +4,9 @@
 
 Orchestration codegen follows the same principle as [PTO codegen](00-pto_codegen.md#design-principle-strict-1-to-1-mapping): a **strict 1-to-1 translation** from IR to generated C++ code. The codegen should not perform optimization, analysis, or indirection — such work belongs in earlier passes.
 
-For example, return-to-parameter tracing (mapping callee return values back to `Out` parameters) is analysis that should be resolved by a pass before codegen sees the IR. The [`NormalizeReturnOrder`](../passes/28-normalize_return_order.md) pass now canonicalizes this before codegen, so orchestration codegen maps `return[i]` directly to `out_indices[i]` without tracing through `tile.store`/yield chains.
+For example, return-to-parameter tracing (mapping callee return values back to `Out` parameters) is analysis that should be resolved by a pass before codegen sees the IR. The [`NormalizeReturnOrder`](../passes/30-normalize_return_order.md) pass now canonicalizes this before codegen, so orchestration codegen maps `return[i]` directly to `out_indices[i]` without tracing through `tile.store`/yield chains.
 
-Likewise, deciding whether a `ForStmt` iter_arg needs a materialised carry variable used to require an alias-equivalence fixpoint over the loop body. The [`ClassifyIterArgCarry`](../passes/51-classify_iter_arg_carry.md) pass now stamps that decision (and the TaskId fence-array extent) onto `ForStmt::attrs_`, so codegen reads `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>` instead of deriving them.
+Likewise, deciding whether a `ForStmt` iter_arg needs a materialised carry variable used to require an alias-equivalence fixpoint over the loop body. The [`ClassifyIterArgCarry`](../passes/55-classify_iter_arg_carry.md) pass now stamps that decision (and the TaskId fence-array extent) onto `ForStmt::attrs_`, so codegen reads `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>` instead of deriving them.
 
 ## Overview
 
@@ -27,12 +27,12 @@ The orchestration codegen generates simpler runtime C++ code that manages task-g
 
 | Component | Purpose | Location |
 | --------- | ------- | -------- |
-| `OrchestrationInfoCollector` | IR visitor collecting metadata (tuple maps, tensor assignments) | orchestration_codegen.cpp |
-| `OrchestrationStmtCodegen` | Statement-level C++ code generator (extends CodegenBase) | orchestration_codegen.cpp |
+| `OrchestrationInfoCollector` | IR visitor collecting metadata (tuple maps, tensor assignments) | orchestration_analysis.h / .cpp |
+| `OrchestrationStmtCodegen` | Statement-level C++ code generator (extends CodegenBase) | orchestration_stmt_codegen.h / .cpp |
 | `OrchestrationOpRegistry` | Singleton registry for tensor operation codegen handlers | orchestration_op_registry.h |
 | `GenerateOrchestration()` | Main entry point combining all generation phases | orchestration_codegen.cpp |
-| `VarLineageCollector` | Traces body variables back to function params via VarPtr identity | orchestration_codegen.cpp |
-| `GetSSABaseName()` | Strips SSA/pass-pipeline suffixes for C++ name emission (not identity) | orchestration_codegen.cpp |
+| `VarLineageCollector` | Traces body variables back to function params via VarPtr identity | orchestration_analysis.h / .cpp |
+| `GetSSABaseName()` | Strips SSA/pass-pipeline suffixes for C++ name emission (not identity) | orchestration_analysis.h / .cpp |
 
 ### OrchestrationInfoCollector
 
@@ -50,6 +50,23 @@ The main code generator. Visits each IR statement and emits corresponding C++:
 - **ForStmt** → `for` loop with iter_arg initialization and yield updates
 - **IfStmt** → conditional blocks with `SIMPLER_SCOPE` per branch and return variable handling
 - **YieldStmt** → variable reassignment for loop-carried values
+
+The private `orchestration_stmt_codegen.h` declares the visitor and owns its shared
+state. Its method implementations are organized under `src/codegen/orchestration/`:
+
+| File | Responsibility |
+| ---- | -------------- |
+| `orchestration_codegen.cpp` | Entry/Graph functions, parameter unpacking, and generated-file boilerplate |
+| `orchestration_stmt_codegen.cpp` | Visitor setup, expression rendering, assignment/evaluation, and emit names |
+| `orchestration_control_flow.cpp` | Loops, branches, runtime scopes, and yield/carry handling |
+| `orchestration_task_deps.cpp` | TaskId bindings, cross-scope hoists, dependency arrays, and barriers |
+| `orchestration_task_dispatch.cpp` | Task ABI arguments, launch hints, and direct/Spmd/Group/Graph dispatch |
+| `orchestration_tensor_codegen.cpp` | Tensor allocation batching, storage lifetime checks, and return aliases |
+
+These files implement one visitor instance per emitted function. Scope snapshots,
+TaskId bindings, tensor lifetimes, and name allocation remain on that instance;
+splitting the implementation does not introduce independent state or change emission order.
+The private header is not part of the public C++ API.
 
 ### Operation Registry
 
@@ -75,6 +92,15 @@ This allows extensible operation codegen without modifying the core visitor.
 #include <stdio.h>
 #include "orchestration_api.h"
 ```
+
+The runtime SDK supplies include paths and helper sources from its `build_config.py`.
+HBG's orchestration API lives under `src/common/host_build_graph/host/orchestration/`;
+Graph code also includes `host_build_graph/host/graph_boundary_match.h`.
+Builtin entry templates access the HBG context through `current_orch_context()`
+and the TensorMap/RingBuffer context through `current_runtime()`.
+
+Both runtimes use `launch_spec.set_block_num()` on A2/A3 and A5 to set the
+per-task logical block count. This setter is independent of `PassContext.runtime`.
 
 ### Phase 2–3: Entry Points
 
@@ -109,7 +135,7 @@ const ChipTensor& tmp = alloc_0.get_ref(0);
 
 All task submission is wrapped in a top-level `SIMPLER_SCOPE()`. Codegen no longer
 decides scope placement from the `for` / `if` structure: the
-[MaterializeRuntimeScopes](../passes/50-materialize_runtime_scopes.md) pass
+[MaterializeRuntimeScopes](../passes/54-materialize_runtime_scopes.md) pass
 inserts explicit AUTO `RuntimeScopeStmt` nodes (the function body and each
 `for` / `if` body) into the IR, and codegen emits `SIMPLER_SCOPE` 1:1 from those
 nodes (manual scopes lower to `SIMPLER_SCOPE(ScopeMode::MANUAL)`):
@@ -141,6 +167,16 @@ SIMPLER_SCOPE() {
 External tensors borrow chip-resident descriptors passed through `ChipTaskArgs`. Internal tensors are pre-allocated at scope entry via `alloc_tensors()` — all `tensor.create` calls within the same scope (function body, for body, if body) are batched into a single `alloc_tensors` invocation. Pre-allocated tensors are then passed to kernels via `add_output(const ChipTensor&)` (OUTPUT_EXISTING overload).
 
 A create is only hoisted to scope entry when its size is *entry-valid*. A size that reads a value the body itself defines — a plain local, or an `if` / `for` / `while` return_var, whose C++ declaration is emitted where that statement sits — keeps the create in body order instead, so the emitted C++ never uses a name before its declaration. The same rule covers the `__gm_pipe_buffer` placeholder, whose real size is `slot_bytes * core_num` rather than its IR shape.
+
+GM pipe allocations require the consuming kernel's per-block ring footprint multiplied by its
+effective launch `core_num`; the injected `tensor.create([1])` shape is only a placeholder.
+When `LegalizeGraphBoundary` moves an allocation into the Graph's caller, sizing follows that
+specific boundary tensor parameter to its concrete kernel `Call` or `Submit`. Launch-site
+attributes take precedence over callee attributes, as they do for task submission. The Graph
+container itself has no block count: unrelated pipe buffers retain their own layouts and
+launch widths, even when their kernels reuse the same pipe IDs. Emission and allocation
+batching share the consumer lookup. Forwarding that cannot identify a compatible concrete
+consumer is rejected rather than silently allocating one block's storage.
 
 ### Parameter Direction
 
@@ -195,7 +231,7 @@ params_t1.add_input(ext_output);  // `result` -> ext_output (no alias decl)
 
 Which `Out`/`InOut` param a result aliases is a lookup, not a heuristic — and
 not an analysis either. `ReturnParamsExplicit`
-([`NormalizeReturnOrder`](../passes/28-normalize_return_order.md)) guarantees
+([`NormalizeReturnOrder`](../passes/30-normalize_return_order.md)) guarantees
 that every tensor param-writeback return value *is* the param, by pointer
 identity. Codegen therefore reads the return-position → param-index map straight
 off the callee's `ReturnStmt` via `ir::return_lineage::ExplicitReturnedParamIndices`;
@@ -231,7 +267,7 @@ The codegen determines whether to submit to AIC (CUBE) or AIV (VECTOR) based on 
 | `Vec` (default) | VECTOR (AIV) | `rt_submit_aiv_task` |
 
 **Exception — dual-AIV kernels.** An AIV kernel stamped `dual_aiv_dispatch` (any
-`split_aiv` kernel; see [`SplitVectorKernel`](../passes/26-split_vector_kernel.md))
+`split_aiv` kernel; see [`SplitVectorKernel`](../passes/28-split_vector_kernel.md))
 must run on **both** vector lanes of a cluster — a `pl.split_aiv` region hands each
 lane disjoint work selected by `aiv_id`. `rt_submit_aiv_task` fills only the AIV0
 slot, so the runtime schedules an *AIV-shape* task — one AIV core per block: the second
@@ -545,7 +581,7 @@ inside the branches instead.
 ```python
 from pypto import codegen, backend
 
-backend.set_backend_type(backend.BackendType.Ascend910B)
+backend.set_backend_type(backend.BackendType.Ascend910)
 result = codegen.generate_orchestration(MyProgram, orch_func)
 code = result.code
 
@@ -590,7 +626,7 @@ carriers of `manual_dep_edges` no longer exist — the
 ManualDepsOnSubmitOnly structural property verifies that no cross-function
 `Call` carries it; only the `system.task_dummy` barrier op keeps the attr as
 its fanin contract. Compiler-derived edges come from
-[`AutoDeriveTaskDependencies`](../passes/43-auto_derive_task_dependencies.md)
+[`AutoDeriveTaskDependencies`](../passes/47-auto_derive_task_dependencies.md)
 in `Call.attrs["compiler_manual_dep_edges"]` (a separate key, allowed on plain
 calls). That pass never analyzes a user-written MANUAL scope — inside
 `pl.manual_scope()` the explicit `deps=[...]` list stays the only source of
@@ -663,7 +699,7 @@ on scope exit. Codegen's response depends on the edge's provenance:
 Provenance is the attr key. Note that `attrs["dummy_task"]` is *not* an
 authorship marker: the parser stamps it on a user-written
 `pl.system.task_dummy(deps=[...])` exactly as
-[`ExpandManualPhaseFence`](../passes/44-expand_manual_phase_fence.md) does on the
+[`ExpandManualPhaseFence`](../passes/48-expand_manual_phase_fence.md) does on the
 barriers it synthesises, so every `manual_dep_edges` carrier is enforced. The
 synthesised barrier only ever names a TaskId live in the manual scope it
 rewrites, so its fanin always resolves.
@@ -905,3 +941,7 @@ Every task in phase `N+1` waits for **all** `N_BRANCHES` tasks of phase `N`.
 - [PTO Codegen](00-pto_codegen.md) — MLIR generation for PTO backend
 - [Pass Manager](../passes/00-pass_manager.md) — IR optimization passes applied before codegen
 - [Python syntax: manual dependency primitives](../language/02-manual_dependencies.md#manual-dependency-primitives) — the user-facing surface form
+
+## Kernel registrations
+
+Code identity and runtime tensor signatures are separate. See [DeduplicateOutlinedKernels](../passes/12-deduplicate_outlined_kernels.md#code-and-registration-identity).

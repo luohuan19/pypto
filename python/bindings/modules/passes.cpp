@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
 #include "pypto/core/error.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
@@ -141,7 +142,7 @@ void BindPass(nb::module_& m) {
       .value("AtomicAddDtypeValid", IRProperty::AtomicAddDtypeValid,
              "Every atomic-add write into GM (tile.store / tensor.assemble / pld.tensor.put / "
              "pld.tile.put / pld.tensor.remote_store / pld.tile.remote_store) targets a dtype the "
-             "backend store pipe can combine; a bf16 destination requires the Ascend910B (A2/A3) "
+             "backend store pipe can combine; a bf16 destination requires the Ascend910 (A2/A3) "
              "profile")
       .value("AccCompactValid", IRProperty::AccCompactValid,
              "Every tile.matmul_acc / tile.matmul_mx_acc accumulates into a CompactMode.normal "
@@ -171,7 +172,14 @@ void BindPass(nb::module_& m) {
       .value("TileStorageLegalized", IRProperty::TileStorageLegalized,
              "Device region boundaries use canonical, nonoverlapping allocation windows")
       .value("TileStorageAllocated", IRProperty::TileStorageAllocated,
-             "Device region storage and transfers also have nonoverlapping effective address windows");
+             "Device region storage and transfers also have nonoverlapping effective address windows")
+      .value("RegScopeValid", IRProperty::RegScopeValid, "Register region ownership and schemas")
+      .value("HardwareLoopContractValid", IRProperty::HardwareLoopContractValid,
+             "Required hardware loops retain Sequential intent")
+      .value("SimtValid", IRProperty::SimtValid, "Canonical SIMT helper and launch contracts")
+      .value("SimtOutputsMaterialized", IRProperty::SimtOutputsMaterialized,
+             "Writable SIMT Tiles have dedicated initialized output storage")
+      .value("SimtSpecialized", IRProperty::SimtSpecialized, "SIMT helper resources match their launches");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -226,7 +234,7 @@ void BindPass(nb::module_& m) {
              "Host CPU builds the whole task graph up front; required for Graph Execution");
 
   passes.def("runtime_kind_to_name", &RuntimeKindToName, nb::arg("kind"),
-             "Wire name written to RUNTIME_CONFIG[\"runtime\"], e.g. \"host_build_graph\"");
+             R"(Wire name written to RUNTIME_CONFIG["runtime"], e.g. "host_build_graph")");
   passes.def("runtime_kind_from_name", &RuntimeKindFromName, nb::arg("name"),
              "Parse a RUNTIME_CONFIG[\"runtime\"] wire name back into a RuntimeKind");
 
@@ -352,22 +360,27 @@ void BindPass(nb::module_& m) {
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
       .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
-                    MemoryPlanner, bool, RuntimeKind, bool>(),
+                    MemoryPlanner, bool, RuntimeKind, bool, bool, bool>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
            nb::arg("memory_planner") = MemoryPlanner::PyPTO,
            nb::arg("enable_pypto_l0c_double_buffer") = false, nb::arg("runtime") = kDefaultRuntimeKind,
-           nb::arg("enable_buffer_ir") = true,
+           nb::arg("enable_buffer_ir") = true, nb::arg("enable_software_pipeline") = false,
+           nb::arg("report_hardware_loops") = false,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
-           "optional disabled diagnostic checks, memory planner selection, the experimental "
-           "legacy-PyPTO chooser-emitted L0C double-buffer (dbC=2) opt-in, and the target Simpler "
-           "runtime ABI, and default-on whole-kernel Buffer IR selection")
-      .def("__enter__",
-           [](PassContext& self) -> PassContext& {
-             self.EnterContext();
-             return self;
-           })
+           "optional disabled diagnostic checks, memory planner selection, the stored legacy "
+           "L0C double-buffer compatibility flag, the target Simpler runtime ABI, and default-on "
+           "whole-kernel Buffer IR selection, plus software pipeline opt-in. Automatic dbC remains disabled "
+           "for PyPTO and DSA-RP; "
+           "PTOAS retains its existing selection regardless of the flag")
+      .def(
+          "__enter__",
+          [](PassContext& self) -> PassContext& {
+            self.EnterContext();
+            return self;
+          },
+          nb::rv_policy::reference_internal)
       .def("__exit__", [](PassContext& self, const nb::args&) { self.ExitContext(); })
       .def("get_verification_level", &PassContext::GetVerificationLevel,
            "Get the verification level for this context")
@@ -376,14 +389,25 @@ void BindPass(nb::module_& m) {
       .def("get_disabled_diagnostics", &PassContext::GetDisabledDiagnostics,
            "Get the diagnostic checks suppressed by this context")
       .def("get_instruments", &PassContext::GetInstruments, "Get the instruments registered on this context")
+      .def(
+          "get_backend", [](const PassContext& ctx) -> const backend::Backend* { return ctx.GetBackend(); },
+          nb::rv_policy::reference,
+          "Get the configured backend for operator queries; does not bind a new target")
       .def("get_memory_planner", &PassContext::GetMemoryPlanner,
            "Get the memory planner selection for this context")
       .def("get_enable_pypto_l0c_double_buffer", &PassContext::GetEnablePyptoL0cDoubleBuffer,
-           "Whether chooser-emitted L0C double-buffering (dbC=2) is enabled under the legacy PyPTO "
-           "memory planner")
+           "Return the stored legacy flag; it does not override the planner's automatic dbC policy")
       .def("get_runtime", &PassContext::GetRuntime, "Get the target Simpler runtime ABI for this context")
+      .def("get_report_hardware_loops", &PassContext::GetReportHardwareLoops,
+           "Whether optional hardware-loop reports are enabled")
+      .def("get_hardware_loop_profile", &PassContext::GetHardwareLoopProfile,
+           "Current backend profile, or unsupported for backend-independent host codegen")
+      .def("get_hardware_loop_reports", &PassContext::GetHardwareLoopReports,
+           "Latest transient codegen qualification reports; never final hardware evidence")
       .def("get_enable_buffer_ir", &PassContext::GetEnableBufferIR,
            "Whether supported whole kernels use Buffer IR")
+      .def("get_enable_software_pipeline", &PassContext::GetEnableSoftwarePipeline,
+           "Get whether eligible pipeline loops use explicit software pipelining")
       .def_static("current", &PassContext::Current, nb::rv_policy::reference,
                   "Get the currently active context, or None if no context is active");
 
@@ -396,6 +420,15 @@ void BindPass(nb::module_& m) {
       .def("get_passes", &PassPipeline::GetPasses, "Get copies of all passes in execution order");
 
   // Factory functions with snake_case names
+  passes.def("outline_simt_scopes", &pass::OutlineSimtScopes,
+             "Outline per-thread regions before SSA conversion");
+
+  passes.def("specialize_simt_helpers", &pass::SpecializeSimtHelpers,
+             "Specialize SIMT helpers by dimensions and storage ABI");
+
+  passes.def("materialize_simt_outputs", &pass::MaterializeSimtOutputs,
+             "Initialize writable SIMT Tile outputs while preserving GM reference semantics");
+
   passes.def("init_mem_ref", &pass::InitMemRef,
              "Create an init memref pass\n\n"
              "Initializes MemRef for all variables in functions.\n"
@@ -505,14 +538,13 @@ void BindPass(nb::module_& m) {
              "Output is Sequential with no pipeline marker, so lower_pipeline_loops and\n"
              "canonicalize_io_order leave it alone. Non-cross-core loops are untouched.");
   passes.def("lower_pipeline_to_slots", &pass::LowerPipelineToSlots,
-             "Rotate ``pl.pipeline`` loops through the slots of one declared allocation;\n"
-             "runs immediately before lower_pipeline_loops. Rebinds each top-level\n"
-             "``tile.load`` / ``tile.read`` whose args read the induction variable onto\n"
-             "``pl.MemRef(name, slots=F)[iv % F]`` and demotes the loop to Sequential,\n"
-             "keeping ONE body instead of F copies (no remainder dispatch needed).\n"
-             "Self-gated on ``memory_planner=PTOAS`` — the only planner under which codegen\n"
-             "emits a ptoas multi-buffer region today. Any loop it declines is left intact\n"
-             "for lower_pipeline_loops to replicate.");
+             "Lower eligible ``pl.pipeline`` loops through declared MemRef slots;\n"
+             "runs immediately before lower_pipeline_loops. With PYPTO memory planning\n"
+             "and enable_software_pipeline=True, emits preload / main / drain using\n"
+             "existing loops and tile ops, with prefetch distance stage - 1.\n"
+             "With PTOAS memory planning, preserves the existing same-iteration slot\n"
+             "rotation. Accepted loops become Sequential; declined loops remain intact\n"
+             "for lower_pipeline_loops to replicate. The default PYPTO path is unchanged.");
   passes.def("lower_pipeline_loops", &pass::LowerPipelineLoops,
              "Lower ``pl.pipeline(N, stage=F)`` loops at the tile level (triggers on F > 1):\n"
              "replicate the body F times per outer iteration with a bare-SeqStmts remainder\n"
@@ -537,6 +569,9 @@ void BindPass(nb::module_& m) {
   passes.def("convert_to_ssa", &pass::ConvertToSSA, "Create an SSA conversion pass");
   passes.def("outline_incore_scopes", &pass::OutlineIncoreScopes,
              "Create a pass that outlines InCore scopes into separate functions");
+  passes.def("deduplicate_outlined_kernels", &pass::DeduplicateOutlinedKernels,
+             "Reuse closed outlined kernel definitions while preserving all dispatches");
+
   passes.def("outline_cluster_scopes", &pass::OutlineClusterScopes,
              "Create a pass that outlines Cluster scopes into Group functions "
              "and standalone Spmd scopes into Spmd functions");
@@ -585,10 +620,10 @@ void BindPass(nb::module_& m) {
              "tail. Plain tile.matmul may also use an M/N grid with direct-GM placement or an\n"
              "on-chip Mat scratch for chained matmul consumers; compatible f32->bf16/f16 rint\n"
              "casts fold into the FIXPIPE writeback. Full-K grids support output-, A-, and\n"
-             "B-stationary schedules. dbC=2 is enabled automatically under DSA_RP and PTOAS\n"
-             "and available as a legacy-PyPTO opt-in. Under PyPTO, a canonical already-L0 stationary-panel "
-             "pipeline\n"
-             "may automatically use two L0C slots when its post-lowering Acc footprint fits.\n"
+             "B-stationary schedules. Automatic dbC is excluded before selection for PyPTO and DSA-RP;\n"
+             "PTOAS retains its existing selection, independently of the legacy opt-in flag.\n"
+             "Existing L0 pipelines are not automatically\n"
+             "marked for accumulator double buffering; explicit buffering attributes are preserved.\n"
              "Mat-resident tile.matmul_bias is supported with accumulator-typed bias, bias-once K\n"
              "reduction, and bias-capacity-bounded N-window reloads followed by Mat-to-Bias moves. Other\n"
              "already-L0-sized and unsupported regimes are left untouched;\n"
@@ -624,10 +659,8 @@ void BindPass(nb::module_& m) {
   passes.def("expand_mixed_kernel", &pass::ExpandMixedKernel,
              "Create a pass that expands mixed InCore functions into AIC + AIV + Group");
   passes.def("lower_auto_vector_split", &pass::LowerAutoVectorSplit,
-             "Create a pass that lowers AUTO pl.split mixed InCore functions into the explicit\n"
-             "split_aiv form (tile.aiv_shard at C->V, tile.aic_gather at V->C, halved vector\n"
-             "sub-region, get_subblock_idx) BEFORE ExpandMixedKernel. This is the live auto-split\n"
-             "lowering path; SplitVectorKernel then only stamps attrs for the split_aiv functions.");
+             "Preserve explicit AIV regions and localize boundary valid extents. "
+             "Reject mixed function-level AUTO splitting; keep authored shapes and offsets.");
   passes.def("inject_gm_pipe_buffer", &pass::InjectGMPipeBuffer,
              "Create a backend-gated pass that injects the __gm_pipe_buffer workspace parameter\n"
              "into functions containing cross-core initialize_pipe ops, propagating the parameter\n"
@@ -890,6 +923,9 @@ void BindPass(nb::module_& m) {
       .def_rw("M", &utils::L0TileConfig::M)
       .def_rw("N", &utils::L0TileConfig::N)
       .def_rw("K", &utils::L0TileConfig::K)
+      .def_rw("reduction_iterations", &utils::L0TileConfig::reduction_iterations)
+      .def_rw("reduction_pipeline_stages", &utils::L0TileConfig::reduction_pipeline_stages)
+      .def_rw("independent_output_tiles", &utils::L0TileConfig::independent_output_tiles)
       .def_rw("l0a_bytes", &utils::L0TileConfig::l0a_bytes)
       .def_rw("l0b_bytes", &utils::L0TileConfig::l0b_bytes)
       .def_rw("l0c_bytes", &utils::L0TileConfig::l0c_bytes)

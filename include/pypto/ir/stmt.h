@@ -60,17 +60,20 @@ enum class ForKind : uint8_t {
 };
 
 /**
- * @brief Distinguishes different scope kinds
+ * @brief Hardware-loop intent, independent of scheduling kind
  */
-enum class ScopeKind : uint8_t {
-  InCore = 0,      ///< InCore scope for AICore sub-graphs
-  Cluster = 2,     ///< Cluster scope for co-scheduled AIC + AIV groups
-  Hierarchy = 3,   ///< Distributed hierarchy scope (uses level_/role_ on ScopeStmt)
-  Spmd = 4,        ///< SPMD dispatch scope (core_num/sync_start on ScopeStmt)
-  Runtime = 5,     ///< Runtime orchestration scope (SIMPLER_SCOPE wrapper, manual on/off)
-  CommDomain = 6,  ///< CommDomain scope (with orch.allocate_domain(...) wrapper)
-  SplitAiv = 7,    ///< Explicit AIV-split region (pl.split_aiv, nestable in loops/conditionals)
-  Graph = 8        ///< Recordable orchestration region (pl.graph, outlined into a Graph function)
+enum class HardwareLoopPolicy : uint8_t { Auto = 0, Require = 1 };
+
+enum class ScopeKind : uint8_t {  // Lexical/execution scope classification.
+  InCore = 0,                     ///< InCore scope for AICore sub-graphs
+  Cluster = 2,                    ///< Cluster scope for co-scheduled AIC + AIV groups
+  Hierarchy = 3,                  ///< Distributed hierarchy scope (uses level_/role_ on ScopeStmt)
+  Spmd = 4,                       ///< SPMD dispatch scope (core_num/sync_start on ScopeStmt)
+  Runtime = 5,                    ///< Runtime orchestration scope (SIMPLER_SCOPE wrapper, manual on/off)
+  CommDomain = 6,                 ///< CommDomain scope (with orch.allocate_domain(...) wrapper)
+  SplitAiv = 7,  ///< Explicit AIV-split region (pl.split_aiv, nestable in loops/conditionals)
+  Graph = 8,     ///< Recordable orchestration region (pl.graph, outlined into a Graph function)
+  Reg = 9        ///< Lexical region for register values; no captures/results fields.
 };
 
 /**
@@ -265,6 +268,8 @@ inline std::string ScopeKindToString(ScopeKind kind) {
       return "SplitAiv";
     case ScopeKind::Graph:
       return "Graph";
+    case ScopeKind::Reg:
+      return "Reg";
   }
   throw pypto::TypeError("Unknown ScopeKind");
 }
@@ -351,6 +356,73 @@ class AssignStmt : public Stmt {
 };
 
 using AssignStmtPtr = std::shared_ptr<const AssignStmt>;
+
+/**
+ * @brief Launch a void SIMT helper and define its logical storage updates.
+ *
+ * Dimensions and arguments are uses; results are definitions, in writable
+ * parameter order. The mapping does not require physical aliasing: a live old
+ * Tile version must be preserved before the helper updates selected storage.
+ * Tensor results retain reference semantics. Signature and execution-context
+ * checks require a Program and are performed by SIMT verification.
+ */
+class SimtLaunchStmt : public Stmt {
+ public:
+  GlobalVarPtr callee_;
+  std::vector<ExprPtr> block_dims_;
+  std::vector<ExprPtr> args_;
+  std::vector<VarPtr> results_;
+  std::vector<int> result_param_indices_;
+
+  SimtLaunchStmt(GlobalVarPtr callee, std::vector<ExprPtr> block_dims, std::vector<ExprPtr> args,
+                 std::vector<VarPtr> results, std::vector<int> result_param_indices, Span span,
+                 std::vector<std::string> leading_comments = {});
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::SimtLaunchStmt; }
+  [[nodiscard]] std::string TypeName() const override { return "SimtLaunchStmt"; }
+
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Stmt::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&SimtLaunchStmt::callee_, "callee"),
+                                          reflection::UsualField(&SimtLaunchStmt::block_dims_, "block_dims"),
+                                          reflection::UsualField(&SimtLaunchStmt::args_, "args"),
+                                          reflection::DefField(&SimtLaunchStmt::results_, "results"),
+                                          reflection::UsualField(&SimtLaunchStmt::result_param_indices_,
+                                                                 "result_param_indices")));
+  }
+};
+
+using SimtLaunchStmtPtr = std::shared_ptr<const SimtLaunchStmt>;
+
+/// A transient per-thread region, eliminated by OutlineSimtScopes before SSA.
+/// This is deliberately not a ScopeStmt: flattening an execute-once scope must
+/// never move these thread-private computations into the enclosing AIV body.
+/// Captures are free binding identities in body_; stores implicitly redefine
+/// their captured storage in the caller once outlining creates launch results.
+class SimtScopeStmt : public Stmt {
+ public:
+  std::vector<ExprPtr> block_dims_;
+  StmtPtr body_;
+  // Outer scalar bindings reassigned privately by this execution domain. The
+  // metadata preserves capture identity through pre-SSA cloning and round trips.
+  std::vector<VarPtr> private_scalars_;
+
+  SimtScopeStmt(std::vector<ExprPtr> block_dims, StmtPtr body, Span span,
+                std::vector<VarPtr> private_scalars = {}, std::vector<std::string> leading_comments = {});
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::SimtScopeStmt; }
+  [[nodiscard]] std::string TypeName() const override { return "SimtScopeStmt"; }
+
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(
+        Stmt::GetFieldDescriptors(),
+        std::make_tuple(reflection::UsualField(&SimtScopeStmt::block_dims_, "block_dims"),
+                        reflection::UsualField(&SimtScopeStmt::body_, "body"),
+                        reflection::UsualField(&SimtScopeStmt::private_scalars_, "private_scalars")));
+  }
+};
+
+using SimtScopeStmtPtr = std::shared_ptr<const SimtScopeStmt>;
 
 /**
  * @brief Conditional statement
@@ -535,7 +607,8 @@ class ForStmt : public Stmt {
   ForStmt(VarPtr loop_var, ExprPtr start, ExprPtr stop, ExprPtr step, std::vector<IterArgPtr> iter_args,
           StmtPtr body, std::vector<VarPtr> return_vars, Span span, ForKind kind = ForKind::Sequential,
           std::vector<std::pair<std::string, std::any>> attrs = {},
-          std::vector<std::string> leading_comments = {})
+          std::vector<std::string> leading_comments = {},
+          HardwareLoopPolicy hardware_loop_policy = HardwareLoopPolicy::Auto)
       : Stmt(std::move(span), std::move(leading_comments)),
         loop_var_(std::move(loop_var)),
         start_(std::move(start)),
@@ -545,7 +618,14 @@ class ForStmt : public Stmt {
         body_(std::move(body)),
         return_vars_(std::move(return_vars)),
         kind_(kind),
-        attrs_(std::move(attrs)) {
+        attrs_(std::move(attrs)),
+        hardware_loop_policy_(hardware_loop_policy) {
+    CHECK_SPAN(hardware_loop_policy == HardwareLoopPolicy::Auto ||
+                   hardware_loop_policy == HardwareLoopPolicy::Require,
+               span_)
+        << "Unknown hardware_loop_policy";
+    CHECK_SPAN(hardware_loop_policy == HardwareLoopPolicy::Auto || kind == ForKind::Sequential, span_)
+        << "HardwareLoopPolicy.Require requires Sequential ForKind";
     detail::CheckValueOperand(start_, span_, "ForStmt start");
     detail::CheckValueOperand(stop_, span_, "ForStmt stop");
     detail::CheckValueOperand(step_, span_, "ForStmt step");
@@ -560,16 +640,18 @@ class ForStmt : public Stmt {
    * @return Tuple of field descriptors (loop_var as DEF field, others as USUAL fields)
    */
   static constexpr auto GetFieldDescriptors() {
-    return std::tuple_cat(Stmt::GetFieldDescriptors(),
-                          std::make_tuple(reflection::DefField(&ForStmt::loop_var_, "loop_var"),
-                                          reflection::UsualField(&ForStmt::start_, "start"),
-                                          reflection::UsualField(&ForStmt::stop_, "stop"),
-                                          reflection::UsualField(&ForStmt::step_, "step"),
-                                          reflection::DefField(&ForStmt::iter_args_, "iter_args"),
-                                          reflection::UsualField(&ForStmt::body_, "body"),
-                                          reflection::DefField(&ForStmt::return_vars_, "return_vars"),
-                                          reflection::UsualField(&ForStmt::kind_, "kind"),
-                                          reflection::UsualField(&ForStmt::attrs_, "attrs")));
+    return std::tuple_cat(
+        Stmt::GetFieldDescriptors(),
+        std::make_tuple(reflection::DefField(&ForStmt::loop_var_, "loop_var"),
+                        reflection::UsualField(&ForStmt::start_, "start"),
+                        reflection::UsualField(&ForStmt::stop_, "stop"),
+                        reflection::UsualField(&ForStmt::step_, "step"),
+                        reflection::DefField(&ForStmt::iter_args_, "iter_args"),
+                        reflection::UsualField(&ForStmt::body_, "body"),
+                        reflection::DefField(&ForStmt::return_vars_, "return_vars"),
+                        reflection::UsualField(&ForStmt::kind_, "kind"),
+                        reflection::UsualField(&ForStmt::attrs_, "attrs"),
+                        reflection::UsualField(&ForStmt::hardware_loop_policy_, "hardware_loop_policy")));
   }
 
  public:
@@ -582,6 +664,10 @@ class ForStmt : public Stmt {
   std::vector<VarPtr> return_vars_;    // Variables capturing final iteration values (accessible after loop)
   ForKind kind_;                       // Loop kind (Sequential, Parallel, or Unroll)
   std::vector<std::pair<std::string, std::any>> attrs_;  // Loop-level attributes (key-value metadata)
+
+  HardwareLoopPolicy hardware_loop_policy_;  ///< Persistent hardware-loop intent, separate from ForKind.
+
+  [[nodiscard]] HardwareLoopPolicy GetHardwareLoopPolicy() const { return hardware_loop_policy_; }
 
   /// Get a typed attribute value (returns default_value if key not found)
   template <typename T>
@@ -837,6 +923,23 @@ class ClusterScopeStmt : public ScopeStmt {
 
 using ClusterScopeStmtPtr = std::shared_ptr<const ClusterScopeStmt>;
 
+/// Register lexical scope; all metadata and body fields belong to ScopeStmt.
+class RegScopeStmt : public ScopeStmt {
+ public:
+  RegScopeStmt(std::string name_hint, StmtPtr body, Span span, std::vector<std::string> leading_comments = {},
+               std::vector<std::pair<std::string, std::any>> attrs = {})
+      : ScopeStmt(std::move(name_hint), std::move(body), std::move(span), std::move(leading_comments),
+                  std::move(attrs)) {}
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::RegScopeStmt; }
+  [[nodiscard]] ScopeKind GetScopeKind() const override { return ScopeKind::Reg; }
+  [[nodiscard]] std::string TypeName() const override { return "RegScopeStmt"; }
+
+  static constexpr auto GetFieldDescriptors() { return ScopeStmt::GetFieldDescriptors(); }
+};
+
+using RegScopeStmtPtr = std::shared_ptr<const RegScopeStmt>;
+
 /**
  * @brief Graph scope: a recordable orchestration region.
  *
@@ -1077,13 +1180,17 @@ class CommDomainScopeStmt : public ScopeStmt {
   std::vector<int64_t> devices_;        ///< Covered worker indices (ascending); empty = all devices
   std::vector<WindowBufferPtr> slots_;  ///< Allocation slots in this scope (alloc-order)
 
+  std::vector<std::string> engines_;  ///< Required async workspace engines
+
   CommDomainScopeStmt(std::vector<int64_t> devices, std::vector<WindowBufferPtr> slots, std::string name_hint,
                       StmtPtr body, Span span, std::vector<std::string> leading_comments = {},
-                      std::vector<std::pair<std::string, std::any>> attrs = {})
+                      std::vector<std::pair<std::string, std::any>> attrs = {},
+                      std::vector<std::string> engines = {})
       : ScopeStmt(std::move(name_hint), std::move(body), std::move(span), std::move(leading_comments),
                   std::move(attrs)),
         devices_(std::move(devices)),
-        slots_(std::move(slots)) {}
+        slots_(std::move(slots)),
+        engines_(std::move(engines)) {}
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::CommDomainScopeStmt; }
   [[nodiscard]] ScopeKind GetScopeKind() const override { return ScopeKind::CommDomain; }
@@ -1092,7 +1199,8 @@ class CommDomainScopeStmt : public ScopeStmt {
   static constexpr auto GetFieldDescriptors() {
     return std::tuple_cat(ScopeStmt::GetFieldDescriptors(),
                           std::make_tuple(reflection::UsualField(&CommDomainScopeStmt::devices_, "devices"),
-                                          reflection::UsualField(&CommDomainScopeStmt::slots_, "slots")));
+                                          reflection::UsualField(&CommDomainScopeStmt::slots_, "slots"),
+                                          reflection::UsualField(&CommDomainScopeStmt::engines_, "engines")));
   }
 };
 

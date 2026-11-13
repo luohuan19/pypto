@@ -12,17 +12,19 @@
 from typing import ClassVar, overload
 
 from pypto import ir
+from pypto.pypto_core.sync import IsaMacroResources, ResourceCatalog
 
 class BackendType:
     """Backend type for passes and codegen."""
 
-    Ascend910B: BackendType
+    Ascend910: BackendType
+    Ascend910B: BackendType  # Compatibility alias of Ascend910.
     Ascend950: BackendType
     __members__: ClassVar[dict[str, BackendType]]
     """Every member, keyed by name — the canonical way to enumerate the enum."""
     @property
     def name(self) -> str:
-        """The member name (e.g. ``"Ascend910B"``)."""
+        """The member name (e.g. ``"Ascend910"``)."""
         ...
     @property
     def value(self) -> int:
@@ -106,11 +108,32 @@ class BackendHandler:
     """
 
     def get_pto_target_arch(self) -> str: ...
-    def get_launch_spec_core_count_method(self) -> str: ...
+    def has_hardware_loop_evidence(self, qualification: ir.HardwareLoopQualification, artifact: str) -> bool:
+        """Check final artifact evidence; unsupported targets return false."""
+        ...
+
+    def get_hardware_loop_profile(self) -> ir.HardwareLoopProfile:
+        """Return target capabilities; eligibility does not imply final evidence."""
+        ...
+
+    def supports_reg_type(self, type: ir.RegType) -> bool:
+        """Whether the target supports this logical VMI register type."""
+        ...
+    def get_launch_spec_core_count_method(self) -> str:
+        """Return ``set_block_num`` for both supported backends and runtimes."""
+
     def get_default_sim_platform(self) -> str: ...
     def get_extra_ptoas_flags(self) -> list[str]: ...
     def honors_high_precision_algorithm(self) -> bool: ...
     def requires_gm_pipe_buffer(self) -> bool: ...
+    def supports_runtime_bound_local_software_pipeline(self) -> bool:
+        """Whether this backend enables local Vec software-pipeline lowering with runtime trip counts."""
+        ...
+    def supports_c2v_fixpipe_epilogue(self) -> bool:
+        """Whether non-split C2V pipes support explicit FP32 output conversion and ReLU."""
+        ...
+
+    def supports_local_pipe_depth(self) -> bool: ...
     def requires_split_load_tpop_workaround(self) -> bool: ...
     def requires_level3_tmp_scratch(self) -> bool: ...
     def requires_vto_c_fractal_adapt(self) -> bool: ...
@@ -120,12 +143,13 @@ class BackendHandler:
     def get_gm_access_granularity_bytes(self) -> int: ...
     def get_l2_cache_line_bytes(self) -> int: ...
     def get_recommended_innermost_dim_bytes(self) -> int: ...
-    def get_l0a_capacity_bytes(self) -> int: ...
-    def get_l0b_capacity_bytes(self) -> int: ...
-    def get_l0c_capacity_bytes(self) -> int: ...
-    def get_bias_capacity_bytes(self) -> int: ...
+    def get_capacity_bytes(self, memory_space: ir.MemorySpace) -> int:
+        """Return one SoC memory component's byte capacity, or 0 for an unmodeled space."""
+        ...
+    def get_sync_resource_catalog(self) -> ResourceCatalog:
+        """Borrow this backend's immutable resource catalog without changing the active backend."""
+        ...
     def supports_mat_to_bias_move(self, source_dtype: ir.DataType, bias_dtype: ir.DataType) -> bool: ...
-    def get_mat_capacity_bytes(self) -> int: ...
     def get_l0_fractal_alignment(self) -> int: ...
     def get_l0c_m_alignment(self, accumulator_dtype: ir.DataType) -> int: ...
     def get_min_l0_tile_dim(self) -> int: ...
@@ -139,10 +163,67 @@ def get_buffer_elementwise_recipe_names() -> list[str]:
     """
     ...
 
+class OpScratchStatus:
+    """Outcome of a registered scratch query; Unknown means missing input information."""
+
+    Required: OpScratchStatus
+    NotRequired: OpScratchStatus
+    Unknown: OpScratchStatus
+    Unsupported: OpScratchStatus
+
+class TileScratchSpec:
+    """Read-only synthesis geometry for a Vec scratch tile, in elements."""
+
+    @property
+    def dtype(self) -> ir.DataType: ...
+    @property
+    def rows(self) -> int: ...
+    @property
+    def cols(self) -> int: ...
+
+class OpScratchPlan:
+    """Read-only query result; only Required carries a scratch spec."""
+
+    @property
+    def status(self) -> OpScratchStatus: ...
+    @property
+    def spec(self) -> TileScratchSpec | None: ...
+    @property
+    def reason(self) -> str: ...
+
 class Backend:
     """Abstract backend base class."""
 
     def get_type_name(self) -> str: ...
+    def find_isa_macro_resources(self, name: str) -> IsaMacroResources | None:
+        """Return symbolic signal claims, or None for an unregistered macro.
+
+        Absence does not certify an unknown external implementation as signal-free.
+        """
+        ...
+    def get_isa_macro_names(self) -> list[str]:
+        """Sorted qualified macro names with registered signal occupancy for this target."""
+        ...
+    def plan_op_scratch(
+        self,
+        op_name: str,
+        source_dtype: ir.DataType | None = None,
+        source_cols: int | None = None,
+        *,
+        target_dtype: ir.DataType | None = None,
+        saturating: bool | None = None,
+        source_tile: ir.TileType | None = None,
+    ) -> OpScratchPlan | None:
+        """Plan compiler-created scratch without consulting the global backend.
+
+        An unregistered operator raises ValueError. None means the registered
+        operator has no scratch rule, not that it needs no scratch. Missing
+        physical dimensions can return Unknown. Cast uses source_tile for physical
+        and valid geometry, target_dtype, and effective saturating (True means ON).
+        source_dtype, when supplied, must agree with source_tile. Specs describe synthesis;
+        they are not exact-shape requirements for caller-provided scratch.
+        """
+
     def get_registered_op_names(self) -> list[str]:
         """Return registered operator names in sorted order, including target exclusions.
 

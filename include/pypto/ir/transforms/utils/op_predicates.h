@@ -22,6 +22,12 @@ namespace pypto {
 namespace ir {
 namespace op_predicates {
 
+/// Whether tile.cast must keep its result disjoint from its source. Widening
+/// casts are unsafe in place on every target. A2/A3 narrowing casts process all
+/// row heads before the tails, so later output rows can overwrite unread input.
+/// Callers without a resolved target must conservatively pass is_a2a3=true.
+bool CastRequiresDisjointSource(const CallPtr& call, bool is_a2a3);
+
 /// Index of the argument a builtin *output-side* op binds its result to.
 ///
 /// These ops do not allocate: they bind a fresh SSA var to a buffer an existing
@@ -83,7 +89,7 @@ bool IsBufferAliasingViewOp(const std::string& op_name);
 bool OutputInheritsSourceBuffer(const std::string& op_name);
 
 /// True for builtin ops whose name is namespaced `tile.` / `tensor.` /
-/// `system.` / `array.`, or for the distributed context query
+/// `system.` / `array.` / `reg.`, or for the distributed context query
 /// `pld.system.get_comm_ctx`. Builtin ops are never user Functions, so they
 /// carry no callee body and no Out/InOut params to trace.
 ///

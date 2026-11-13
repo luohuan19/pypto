@@ -19,11 +19,13 @@ TENSOR_ONLY_PASSES = [
     "OutlineGraphScopes",
     "OutlineIncoreScopes",
     "OutlineClusterScopes",
+    "DeduplicateOutlinedKernels",
     "ConvertTensorToTileOps",
     "OptimizeOrchTensors",
 ]
 
 TENSOR_OPTIMIZATION_PASSES = [
+    "OutlineSimtScopes",
     "InlineFunctions",
     "UnrollLoops",
     "CtrlFlowTransform",
@@ -53,9 +55,12 @@ TENSOR_OPTIMIZATION_PASSES = [
     "LowerPipelineLoops",
     "CanonicalizeIOOrder",
     "MaterializeTensorStrides",
+    "MaterializeSimtOutputs",
+    "SpecializeSimtHelpers",
     "InitMemRef",
     "SelectBufferIRFunctions",
     "MaterializeSemanticAliases",
+    "IRVerifier",
     "MemoryReuse",
     "VerifyTileStorage",
     "AllocateMemoryAddr",
@@ -77,6 +82,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "ClassifyIterArgCarry",
     "InsertCommFence",
     "MaterializeValidShapeSymbols",
+    "IRVerifier",
     "LowerTileToBuffer",
 ]
 
@@ -247,14 +253,12 @@ class TestPassManagerWithProgram:
 
 
 class TestPassManagerPlannerGate:
-    """The dbC=2 planner gate.
+    """Keep the construction-time pass list consistent with execution-time planning.
 
-    The pass LIST is fixed at construction (``MemoryReuse`` / ``AllocateMemoryAddr``
-    are dropped only when the construction-time context selects PTOAS), while dbC=2 is
-    selected from the *run-time* planner inside ``AutoTileMatmulL0``. If the two
-    disagree, a pipeline that still contains ``MemoryReuse`` would run while the chooser
-    picks dbC=2 -> the two co-live L0C accumulators get coalesced. ``run_passes`` must
-    fail loud instead.
+    DSA_RP omits ``MemoryReuse``; PTOAS also omits ``AllocateMemoryAddr``. The
+    run-time context must match the planner that chose those passes, rather
+    than combine one planner's recipe with another planner's storage lowering.
+    The planner also controls whether AutoTile may enumerate automatic dbC.
     """
 
     @staticmethod

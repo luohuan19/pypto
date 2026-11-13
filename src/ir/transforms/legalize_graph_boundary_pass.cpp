@@ -80,6 +80,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/alloc_batching.h"
 #include "pypto/ir/transforms/utils/graph_replay_invariant.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -96,17 +97,12 @@ constexpr size_t kMaxBoundaryTensors = 128;  ///< GRAPH_MAX_TENSOR_ARGS, host_bu
 constexpr size_t kMaxBoundaryScalars = 64;   ///< GRAPH_MAX_SCALAR_ARGS, host_build_graph/runtime/types.h
 constexpr size_t kMaxGraphNodes = 1024;      ///< GRAPH_MAX_NODES, common/host_build_graph/graph_execution.h
 
-/// Directions a Graph parameter may carry.
-///
-/// `ArgDirection::Output` means "the runtime allocates this buffer", which
-/// `rt_graph_args_cacheable` rejects outright: a recorded graph's boundary
-/// tensors must already exist so replay can patch their addresses.
-[[nodiscard]] bool IsLegalGraphParamDirection(ParamDirection dir) {
-  return dir == ParamDirection::In || dir == ParamDirection::InOut;
-}
-
 /// True when `type` is a scalar, i.e. a candidate boundary scalar.
 [[nodiscard]] bool IsScalarType(const TypePtr& type) { return As<ScalarType>(type) != nullptr; }
+
+[[nodiscard]] bool IsBoundaryScalarType(const TypePtr& type) {
+  return IsScalarType(type) || As<CommCtxType>(type) != nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // Step A — hoisting derived boundary scalars
@@ -134,6 +130,8 @@ struct HoistedValue {
 struct GraphPlan {
   std::string name;
   std::vector<HoistedValue> hoisted;
+  // Identity-only compiler proof, computed from original expressions before
+  // they become scalar parameters. Original runtime formals are never seeded.
   /// `alias = <var>` bindings, in definition order, alias -> what it names.
   ///
   /// Not hoisted — a bare reference names something that already has a binding —
@@ -146,8 +144,8 @@ struct GraphPlan {
   /// Position in the body of every hoisted and aliased variable, so the two
   /// lists can be merged back into definition order.
   std::unordered_map<const Var*, size_t> definition_index;
-  /// Scalar `alias = <name>` bindings the body rewrite deletes, alias -> target.
-  std::unordered_map<const Var*, VarPtr> scalar_aliases;
+  /// Scalar aliases the body rewrite deletes, in SSA definition order.
+  std::vector<std::pair<const Var*, VarPtr>> scalar_aliases;
 };
 
 /// Collects scalar variables a Graph body derives from its own scalar params.
@@ -161,7 +159,7 @@ class DerivedScalarCollector : public IRVisitor {
   DerivedScalarCollector(const FunctionPtr& func, ProgramPtr program)
       : func_(func), program_(std::move(program)), invariant_(func) {
     for (const auto& param : func->params_) {
-      if (IsScalarType(param->GetType())) {
+      if (IsBoundaryScalarType(param->GetType())) {
         scalar_params_.insert(param.get());
       } else {
         tensor_params_.insert(param.get());
@@ -216,18 +214,53 @@ class DerivedScalarCollector : public IRVisitor {
   /// Distinct from `passthrough()`, which also carries tensor aliases and exists
   /// to rebuild hoisted expressions at the call site. This one drives the body
   /// rewrite that deletes the copy.
-  [[nodiscard]] const std::unordered_map<const Var*, VarPtr>& scalar_alias_target() const {
-    return scalar_alias_target_;
+  [[nodiscard]] const std::vector<std::pair<const Var*, VarPtr>>& scalar_aliases() const {
+    return scalar_aliases_;
   }
 
+ private:
+  // A hoisted argument is evaluated on both paths. Without a range proof,
+  // the divisor must be a literal other than zero or minus one.
+  [[nodiscard]] static bool MayTrapWhenSpeculated(const ExprPtr& expr) {
+    if (auto binary = std::dynamic_pointer_cast<const BinaryExpr>(expr)) {
+      if (As<FloorDiv>(expr) || As<FloorMod>(expr)) {
+        auto divisor = As<ConstInt>(binary->right_);
+        if (!divisor || divisor->value_ == 0 || divisor->value_ == -1) return true;
+      }
+      return MayTrapWhenSpeculated(binary->left_) || MayTrapWhenSpeculated(binary->right_);
+    }
+    if (auto unary = std::dynamic_pointer_cast<const UnaryExpr>(expr)) {
+      return MayTrapWhenSpeculated(unary->operand_);
+    }
+    if (auto tuple = As<MakeTuple>(expr)) {
+      return std::any_of(tuple->elements_.begin(), tuple->elements_.end(), MayTrapWhenSpeculated);
+    }
+    return false;
+  }
+
+  void CheckConditionalHoist(bool may_trap, const Span& span) const {
+    CHECK_SPAN(!in_conditional_ || !may_trap, span)
+        << "Graph hoist would evaluate a guarded integer division or remainder "
+           "before the Graph conditional. Keep the division and its guard together outside the Graph.";
+  }
+
+  bool in_conditional_ = false;
+
  protected:
+  void VisitStmt_(const IfStmtPtr& op) override {
+    const bool was_conditional = std::exchange(in_conditional_, true);
+    IRVisitor::VisitStmt_(op);
+    in_conditional_ = was_conditional;
+  }
+
   void VisitStmt_(const AssignStmtPtr& op) override {
     IRVisitor::VisitStmt_(op);
     auto var = AsVarLike(op->var_);
     if (!var) return;
 
-    if (IsScalarType(var->GetType())) {
+    if (IsBoundaryScalarType(var->GetType())) {
       if (!IsDerivable(op->value_)) return;
+      if (in_conditional_) CheckConditionalHoist(MayTrapWhenSpeculated(op->value_), op->span_);
       // A bare parameter reference is already a pass-through; only a *computed*
       // value needs hoisting.
       if (auto aliased = AsVarLike(op->value_)) {
@@ -238,9 +271,12 @@ class DerivedScalarCollector : public IRVisitor {
         passthrough_order_.emplace_back(var.get(), aliased);
         // Resolve body aliases to their boundary parameter so codegen forwards
         // its InheritableScalar wrapper without an integer conversion.
-        scalar_alias_target_[var.get()] = aliased;
+        scalar_aliases_.emplace_back(var.get(), aliased);
         return;
       }
+      // Context handles are opaque. Only a rename of an existing handle
+      // has a replay origin that Step A can preserve.
+      if (!IsScalarType(var->GetType())) return;
       derived_vars_.insert(var.get());
       definition_index_[var.get()] = next_definition_++;
       derived_.emplace_back(var, op->value_);
@@ -376,7 +412,10 @@ class DerivedScalarCollector : public IRVisitor {
     }
     // A view *of* an in-place view cannot be hoisted however derivable its own
     // operands are: its source has no name at the call site either.
-    const bool hoistable = all_derivable && in_place_views_.count(source.get()) == 0;
+    // A shaped tensor.view lowers to reshape, which checks the source
+    // element count. Keep that check inside its guard, even for literal shapes.
+    const bool guarded_reshape = in_conditional_ && IsOp(call, "tensor.view") && call->args_.size() > 1;
+    const bool hoistable = all_derivable && !guarded_reshape && in_place_views_.count(source.get()) == 0;
     CHECK_SPAN(hoistable || all_invariant, call->span_)
         << "Graph function '" << func_->name_ << "' derives '" << var->name_hint_
         << "' from boundary tensor '" << source->name_hint_
@@ -413,6 +452,10 @@ class DerivedScalarCollector : public IRVisitor {
       tensor_root_[var.get()] = root;
       in_place_views_.insert(var.get());
       return;
+    }
+    if (in_conditional_) {
+      CheckConditionalHoist(std::any_of(call->args_.begin(), call->args_.end(), MayTrapWhenSpeculated),
+                            call->span_);
     }
     slice_vars_.insert(var.get());
     tensor_root_[var.get()] = root;
@@ -562,7 +605,7 @@ class DerivedScalarCollector : public IRVisitor {
   std::unordered_set<const Var*> derived_vars_;
   std::unordered_set<const Var*> passthrough_;
   std::vector<std::pair<const Var*, VarPtr>> passthrough_order_;
-  std::unordered_map<const Var*, VarPtr> scalar_alias_target_;
+  std::vector<std::pair<const Var*, VarPtr>> scalar_aliases_;
   std::unordered_map<const Var*, size_t> definition_index_;
   size_t next_definition_ = 0;
   std::vector<std::pair<VarPtr, ExprPtr>> derived_;
@@ -623,11 +666,13 @@ class DerivedScalarCollector : public IRVisitor {
 /// rewrite that did not happen, which this must report rather than wave through.
 class UnhoistableScalarChecker : public IRVisitor {
  public:
-  UnhoistableScalarChecker(const FunctionPtr& func, const std::unordered_set<const Var*>& hoistable)
-      : func_(func), hoistable_(hoistable), invariant_(func) {
+  UnhoistableScalarChecker(const FunctionPtr& func, const std::unordered_set<const Var*>& hoistable,
+                           const std::unordered_set<const Var*>& proven_fixed_scalar_params)
+      : func_(func), hoistable_(hoistable), invariant_(func, proven_fixed_scalar_params) {
     for (const auto& param : func->params_) {
       if (IsScalarType(param->GetType())) scalar_params_.insert(param.get());
     }
+    invariant_.SeedBoundaryDimensionSymbols(func);
     invariant_.Collect(func->body_);
   }
 
@@ -704,12 +749,11 @@ class HoistedValueRewriter : public IRMutator {
  public:
   explicit HoistedValueRewriter(const GraphPlan& plan) {
     for (const auto& h : plan.hoisted) replacement_[h.original.get()] = h.param;
-    // Resolved after the hoists are mapped, so an alias of a hoisted value lands
-    // on the new *parameter* rather than on a name the rewrite is about to
-    // delete. Each chain is walked to its root — `a = p; b = a;` sends both to
-    // `p` — so the result does not depend on the map's iteration order.
+    // Resolve aliases in definition order after installing every hoist.
+    // Each target is already the surviving name, or maps to it.
     for (const auto& [alias, target] : plan.scalar_aliases) {
-      replacement_[alias] = ResolveAliasRoot(target, plan);
+      auto replacement = replacement_.find(target.get());
+      replacement_.emplace(alias, replacement == replacement_.end() ? target : replacement->second);
     }
   }
 
@@ -731,27 +775,6 @@ class HoistedValueRewriter : public IRMutator {
   }
 
  private:
-  /// The surviving name for @p target: its hoisted parameter, or the end of its
-  /// alias chain.
-  ///
-  /// A chain is finite and acyclic because the body is SSA in definition order —
-  /// an alias can only name something bound before it. The step bound is a
-  /// backstop against malformed IR, not an expected exit.
-  [[nodiscard]] VarPtr ResolveAliasRoot(const VarPtr& target, const GraphPlan& plan) const {
-    VarPtr current = target;
-    for (size_t steps = 0; steps <= plan.scalar_aliases.size(); ++steps) {
-      // `replacement_` already holds every hoist, and the alias entries are
-      // added after this runs, so a hit here is always a hoisted parameter.
-      auto hoisted = replacement_.find(current.get());
-      if (hoisted != replacement_.end()) return hoisted->second;
-      auto next = plan.scalar_aliases.find(current.get());
-      if (next == plan.scalar_aliases.end()) return current;
-      current = next->second;
-    }
-    INTERNAL_CHECK(false) << "Internal error: cyclic scalar alias chain in Graph '" << plan.name << "'";
-    return current;
-  }
-
   std::unordered_map<const Var*, VarPtr> replacement_;
 };
 
@@ -887,20 +910,24 @@ class ExprSubstituter : public IRMutator {
 /// limit stricter, never miss a violation.
 class GraphNodeCounter : public IRVisitor {
  public:
-  GraphNodeCounter(FunctionPtr func, ProgramPtr program)
-      : func_(std::move(func)), program_(std::move(program)) {}
+  GraphNodeCounter(FunctionPtr func, ProgramPtr program, const std::unordered_set<const Var*>& fixed_scalars)
+      : func_(std::move(func)), program_(std::move(program)), invariant_(func_, fixed_scalars) {
+    invariant_.SeedBoundaryDimensionSymbols(func_);
+    invariant_.Collect(func_->body_);
+  }
 
-  [[nodiscard]] size_t count() const { return count_; }
+  [[nodiscard]] size_t min_count() const { return counts_.first; }
+  [[nodiscard]] size_t count() const { return counts_.second; }
 
  protected:
   void VisitExpr_(const CallPtr& op) override {
     IRVisitor::VisitExpr_(op);
-    if (IsTaskLaunch(op)) count_ = SatAdd(count_, 1);
+    if (IsTaskLaunch(op)) AddNodes(1, 1);
   }
 
   void VisitExpr_(const SubmitPtr& op) override {
     IRVisitor::VisitExpr_(op);
-    count_ = SatAdd(count_, 1);
+    AddNodes(1, 1);
   }
 
   /// Charges the allocations in a statement list the nodes codegen will emit.
@@ -923,13 +950,13 @@ class GraphNodeCounter : public IRVisitor {
       auto call = assign ? As<Call>(assign->value_) : nullptr;
       if (call && IsAllocation(call)) {
         batched_.insert(stmt.get());
-        const bool joins_batch =
-            !alloc_batching::IsInjectedGMPipeCreateVar(assign->var_) ||
-            alloc_batching::GMPipeCreateJoinsBatch(op->stmts_, i, assign->var_, program_, locally_defined);
+        const bool joins_batch = !alloc_batching::IsInjectedGMPipeCreateVar(assign->var_) ||
+                                 alloc_batching::GMPipeCreateJoinsBatch(op->stmts_, i, assign->var_, program_,
+                                                                        locally_defined, gm_pipe_consumers_);
         if (joins_batch) {
           ++batchable;
         } else {
-          count_ = SatAdd(count_, 1);
+          AddNodes(1, 1);
           locally_defined.insert(assign->var_.get());
         }
       } else if (assign && assign->var_) {
@@ -937,7 +964,8 @@ class GraphNodeCounter : public IRVisitor {
       }
       VisitStmt(stmt);
     }
-    count_ = SatAdd(count_, alloc_batching::BatchedAllocationNodes(batchable));
+    const size_t nodes = alloc_batching::BatchedAllocationNodes(batchable);
+    AddNodes(nodes, nodes);
   }
 
   /// An allocation outside any statement list — a loop body that is a single
@@ -945,12 +973,12 @@ class GraphNodeCounter : public IRVisitor {
   void VisitStmt_(const AssignStmtPtr& op) override {
     IRVisitor::VisitStmt_(op);
     auto call = As<Call>(op->value_);
-    if (call && IsAllocation(call) && batched_.count(op.get()) == 0) count_ = SatAdd(count_, 1);
+    if (call && IsAllocation(call) && batched_.count(op.get()) == 0) AddNodes(1, 1);
   }
 
   void VisitStmt_(const ForStmtPtr& op) override {
-    const size_t per_iteration = CountSubtree([&] { IRVisitor::VisitStmt_(op); });
-    if (per_iteration == 0) return;
+    const auto [minimum, maximum] = CountSubtree([&] { IRVisitor::VisitStmt_(op); });
+    if (maximum == 0) return;
     auto trips = StaticTripCount(op);
     CHECK_SPAN(trips.has_value(), op->span_)
         << "Graph function '" << func_->name_
@@ -958,12 +986,12 @@ class GraphNodeCounter : public IRVisitor {
            "recorded graph fixes the task topology on the first call and replays it unchanged, so a "
            "launch count that can differ between calls would silently replay the first call's "
            "topology. Give the loop constant bounds, or move it outside the Graph function.";
-    count_ = SatAdd(count_, SatMul(per_iteration, *trips));
+    AddNodes(SatMul(minimum, *trips), SatMul(maximum, *trips));
   }
 
   void VisitStmt_(const WhileStmtPtr& op) override {
-    const size_t launched = CountSubtree([&] { IRVisitor::VisitStmt_(op); });
-    CHECK_SPAN(launched == 0, op->span_)
+    const auto launched = CountSubtree([&] { IRVisitor::VisitStmt_(op); });
+    CHECK_SPAN(launched.second == 0, op->span_)
         << "Graph function '" << func_->name_
         << "' launches tasks inside a while loop. Its iteration count is a runtime value, so the "
            "recorded topology would be whatever the first call happened to produce. Move the loop "
@@ -971,29 +999,39 @@ class GraphNodeCounter : public IRVisitor {
   }
 
   void VisitStmt_(const IfStmtPtr& op) override {
-    const size_t launched = CountSubtree([&] { IRVisitor::VisitStmt_(op); });
-    CHECK_SPAN(launched == 0, op->span_)
+    VisitExpr(op->condition_);
+    const auto then_nodes = CountSubtree([&] { VisitStmt(op->then_body_); });
+    const auto else_nodes =
+        op->else_body_ ? CountSubtree([&] { VisitStmt(*op->else_body_); }) : std::pair<size_t, size_t>{};
+    const size_t maximum = std::max(then_nodes.second, else_nodes.second);
+    for (const auto& var : op->return_vars_) VisitExpr(var);
+    CHECK_SPAN(maximum == 0 || invariant_.IsInvariant(op->condition_), op->span_)
         << "Graph function '" << func_->name_
         << "' launches tasks inside a conditional. Which branch ran on the first call is baked into "
            "the recording and replayed for every later call, so the condition would stop having any "
            "effect. Hoist the branch to the call site and give each arm its own Graph function.";
+    AddNodes(std::min(then_nodes.first, else_nodes.first), maximum);
   }
 
  private:
-  /// Run @p walk with a fresh accumulator and return what it counted.
+  void AddNodes(size_t minimum, size_t maximum) {
+    counts_.first = SatAdd(counts_.first, minimum);
+    counts_.second = SatAdd(counts_.second, maximum);
+  }
+
+  /// Run @p walk with a fresh accumulator and return its node bounds.
   template <typename F>
-  size_t CountSubtree(F&& walk) {
-    const size_t saved = count_;
-    count_ = 0;
+  std::pair<size_t, size_t> CountSubtree(F&& walk) {
+    const auto saved = std::exchange(counts_, {});
     walk();
-    const size_t subtree = count_;
-    count_ = saved;
-    return subtree;
+    return std::exchange(counts_, saved);
   }
 
   FunctionPtr func_;
   ProgramPtr program_;
-  size_t count_ = 0;
+  graph_replay::ReplayInvariantSet invariant_;
+  std::pair<size_t, size_t> counts_{};
+  alloc_batching::GMPipeConsumerIndex gm_pipe_consumers_;
   std::unordered_set<const Stmt*> batched_;
 };
 
@@ -1160,7 +1198,7 @@ void CheckGraphSignature(const FunctionPtr& func) {
   for (size_t i = 0; i < func->params_.size(); ++i) {
     const auto& param = func->params_[i];
     const auto dir = i < func->param_directions_.size() ? func->param_directions_[i] : ParamDirection::In;
-    if (IsScalarType(param->GetType())) {
+    if (IsBoundaryScalarType(param->GetType())) {
       CHECK_SPAN(dir == ParamDirection::In, param->span_)
           << "Graph function '" << func->name_ << "' declares scalar parameter '" << param->name_hint_
           << "' as " << (dir == ParamDirection::Out ? "Out" : "InOut")
@@ -1170,11 +1208,9 @@ void CheckGraphSignature(const FunctionPtr& func) {
       continue;
     }
     ++tensor_params;
-    CHECK_SPAN(IsLegalGraphParamDirection(dir), param->span_)
-        << "Graph function '" << func->name_ << "' declares tensor parameter '" << param->name_hint_
-        << "' as Out, meaning the runtime allocates it. A recorded graph's boundary tensors must "
-           "already exist so replay can patch their addresses, so allocate it at the call site and "
-           "pass it in as InOut.";
+    // ParamDirection describes access, not allocation. An Out parameter may
+    // receive an existing tensor; call-site directions distinguish that from
+    // runtime-allocated Output, which a Graph boundary cannot represent.
   }
 
   CHECK_SPAN(tensor_params >= 1, func->span_)
@@ -1200,8 +1236,9 @@ void CheckGraphSignature(const FunctionPtr& func) {
 ///
 /// `return c` where `c` is an InOut parameter is the DSL's spelling for writing
 /// in place, and lowers to an alias rather than a value — that is fine. A
-/// genuinely new value is not: `rt_submit_graph` yields a valid task id only on
-/// a cache *hit*, so nothing downstream can depend on a graph call's result.
+/// genuinely new body value is not: the body is skipped on a cache hit, so no
+/// scalar or recorded-local TaskId it computes exists at the replay call site.
+/// A submit's outer completion id is separate from these function returns.
 ///
 /// The parameter is matched by *lineage*, not by pointer identity. By the time
 /// this pass runs, `OutlineIncoreScopes` has rewritten an in-place body into a
@@ -1226,8 +1263,9 @@ void CheckGraphReturns(const FunctionPtr& func, const ProgramPtr& program) {
     const bool writes_back_a_param = i < returned_params.size() && returned_params[i].has_value();
     CHECK_SPAN(writes_back_a_param, return_stmt->span_)
         << "Graph function '" << func->name_ << "' returns a value it computed rather than one of its "
-        << "own parameters. A graph call is a task launch whose result is a recording handle — valid "
-           "only once the graph is already cached — so nothing can depend on it. Write the result "
+        << "own parameters. The Graph body is skipped on a cache hit, so its computed return values are "
+           "unavailable. "
+           "Write the result "
            "into an InOut parameter and return that parameter instead.";
   }
 }
@@ -1244,6 +1282,7 @@ class GraphCallSiteChecker : public IRVisitor {
     auto callee = LookupGraph(op->op_);
     if (!callee) return;
     CheckArity(op->args_, callee, op->span_);
+    CheckDirections(op->GetArgDirections(), callee, op->span_);
   }
 
   void VisitExpr_(const SubmitPtr& op) override {
@@ -1251,13 +1290,15 @@ class GraphCallSiteChecker : public IRVisitor {
     auto callee = LookupGraph(op->op_);
     if (!callee) return;
     CheckArity(op->args_, callee, op->span_);
+    CheckDirections(op->GetArgDirections(), callee, op->span_);
 
-    CHECK_SPAN(op->deps_.empty(), op->span_)
+    // Explicit predecessors order the outer shell. SPMD metadata instead
+    // changes a kernel launch and has no meaning for this composite Graph.
+    CHECK_SPAN(!op->core_num_.has_value() && !op->sync_start_, op->span_)
         << "Graph function '" << callee->name_ << "' is submitted from '" << caller_->name_
-        << "' with explicit dependencies. An explicit dependency edge makes the launch uncacheable, "
-           "so the region would silently run as ordinary tasks with no graph replay. Order the graph "
-           "against its producers through its boundary tensors instead.";
-    CHECK_SPAN(op->predicate_ == nullptr, op->span_)
+        << "' with an SPMD launch specification. Graph dispatch does not support core_num or sync_start; "
+           "specify them on the kernels recorded inside the Graph instead.";
+    CHECK_SPAN(!op->HasPredicate(), op->span_)
         << "Graph function '" << callee->name_ << "' is submitted from '" << caller_->name_
         << "' with a dispatch predicate. A predicate on a graph launch is neither honoured nor "
            "rejected by the runtime — it is silently zeroed — so the region would run "
@@ -1275,14 +1316,23 @@ class GraphCallSiteChecker : public IRVisitor {
 
   void CheckArity(const std::vector<ExprPtr>& args, const FunctionPtr& callee, const Span& span) const {
     // A Submit may normally pass a prefix of the callee's parameters, letting
-    // the runtime allocate the tail Out params. A Graph has no such tail —
-    // CheckGraphSignature already rejected Out params — so every parameter must
-    // be supplied here.
+    // the runtime allocate the tail Out params. A Graph accepts Out parameters
+    // only with caller-supplied storage, so every parameter must be supplied.
     CHECK_SPAN(args.size() == callee->params_.size(), span)
         << "Graph function '" << callee->name_ << "' is called from '" << caller_->name_ << "' with "
         << args.size() << " argument(s) but declares " << callee->params_.size()
         << " parameter(s). A graph cannot leave outputs for the runtime to allocate, so every "
            "parameter must be passed at the call site.";
+  }
+
+  void CheckDirections(const std::vector<ArgDirection>& directions, const FunctionPtr& callee,
+                       const Span& span) const {
+    for (const auto direction : directions) {
+      CHECK_SPAN(direction != ArgDirection::Output, span)
+          << "Graph function '" << callee->name_
+          << "' is called with a runtime-allocated Output argument. Allocate the tensor before "
+             "the Graph and pass the existing tensor instead.";
+    }
   }
 
   FunctionPtr caller_;
@@ -1327,11 +1377,11 @@ class GraphCallSiteChecker : public IRVisitor {
   }
   // Step C: a region allocation becomes an `InOut` boundary tensor.
   //
-  // `Out` is what it would be by dataflow — nothing reads it before the region
-  // writes it — but `Out` on a Graph boundary means "the runtime allocates
-  // this", which `rt_graph_args_cacheable` refuses outright. `InOut` is the
-  // spelling for a buffer the caller owns and the region writes, and it is what
-  // `CheckGraphSignature` accepts. `In` would under-declare: codegen would emit
+  // These parameters are introduced after direction/dependency derivation,
+  // so retain conservative InOut ordering when callers reuse the allocation.
+  // Existing write-only parameters remain Out; DeriveCallDirections has already
+  // selected OutputExisting or promoted InOut for each original call argument.
+  // `In` would under-declare: codegen would emit
   // `add_input`, the launch would never register as a writer, and a caller that
   // hoisted the create out of its own loop would get no ordering between
   // successive launches over the same buffer.
@@ -1364,7 +1414,7 @@ class GraphCallSiteChecker : public IRVisitor {
   }
   plan.passthrough = collector.passthrough();
   plan.definition_index = collector.definition_index();
-  plan.scalar_aliases = collector.scalar_alias_target();
+  plan.scalar_aliases = collector.scalar_aliases();
   return plan;
 }
 
@@ -1545,6 +1595,10 @@ class CallSiteExtender : public IRMutator {
         dirs.push_back(ArgDirection::Scalar);
       } else if (h.direction == ParamDirection::InOut) {
         dirs.push_back(ArgDirection::InOut);
+      } else if (h.direction == ParamDirection::Out) {
+        // A hoisted view already exists. Its original boundary root remains an
+        // argument and retains any InOut promotion needed at this call site.
+        dirs.push_back(ArgDirection::OutputExisting);
       } else {
         dirs.push_back(ArgDirection::Input);
       }
@@ -1558,8 +1612,141 @@ class CallSiteExtender : public IRMutator {
   int next_local_ = 0;
 };
 
-[[nodiscard]] ProgramPtr TransformProgram(const ProgramPtr& program) {
-  if (!program) return program;
+// Only return-only If results are admitted here. Giving a merged name general
+// boundary provenance would also admit views of it; DerivedScalarCollector does
+// not yet prove those views' offsets. Non-return uses deliberately keep the old
+// rejection until that separate proof exists.
+class ReturnOnlyPhiCollector : public IRVisitor {
+ public:
+  std::vector<VarPtr> candidates;
+  std::unordered_set<const Var*> non_return_uses;
+
+ protected:
+  void VisitStmt_(const ReturnStmtPtr&) override {}
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    VisitExpr(op->condition_);
+    VisitStmt(op->then_body_);
+    if (op->else_body_.has_value()) VisitStmt(*op->else_body_);
+    for (const auto& var : op->return_vars_) {
+      if (var && AsTensorTypeLike(var->GetType())) candidates.push_back(var);
+    }
+    // return_vars are definitions, not reads of their result.
+  }
+
+  void VisitExpr_(const VarPtr& op) override { non_return_uses.insert(op.get()); }
+};
+
+class ReturnOnlyPhiRewriter : public IRMutator {
+ public:
+  explicit ReturnOnlyPhiRewriter(std::unordered_map<const Var*, VarPtr> aliases)
+      : aliases_(std::move(aliases)) {}
+
+ protected:
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    auto rewritten = As<IfStmt>(IRMutator::VisitStmt_(op));
+    std::vector<VarPtr> live_results;
+    std::vector<size_t> live_slots;
+    for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+      if (aliases_.count(op->return_vars_[i].get()) != 0) continue;
+      live_slots.push_back(i);
+      live_results.push_back(rewritten->return_vars_[i]);
+    }
+    if (live_slots.size() == op->return_vars_.size()) return rewritten;
+
+    // The return now uses the caller's descriptor. Remove the dead phi
+    // positions as well, leaving the branch calls and other results intact.
+    auto prune_yield = [&](const StmtPtr& branch) {
+      auto body = transform_utils::RewriteLastYieldStmt(branch, [&](const YieldStmtPtr& yield) -> StmtPtr {
+        std::vector<ExprPtr> values;
+        std::vector<StmtPtr> statements;
+        size_t live_index = 0;
+        for (size_t i = 0; i < yield->value_.size(); ++i) {
+          if (live_index < live_slots.size() && live_slots[live_index] == i) {
+            values.push_back(yield->value_[i]);
+            ++live_index;
+          } else if (As<Call>(yield->value_[i]) || As<Submit>(yield->value_[i])) {
+            statements.push_back(std::make_shared<EvalStmt>(yield->value_[i], yield->span_));
+          }
+        }
+        if (!values.empty()) {
+          statements.push_back(std::make_shared<YieldStmt>(std::move(values), yield->span_));
+        }
+        return statements.empty() ? nullptr : SeqStmts::Flatten(std::move(statements), yield->span_);
+      });
+      return body ? body : std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, branch->span_);
+    };
+    auto result = MutableCopy(rewritten);
+    result->return_vars_ = std::move(live_results);
+    result->then_body_ = prune_yield(rewritten->then_body_);
+    if (rewritten->else_body_) result->else_body_ = prune_yield(*rewritten->else_body_);
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const ReturnStmtPtr& op) override {
+    std::vector<ExprPtr> values = op->value_;
+    bool changed = false;
+    for (auto& value : values) {
+      if (auto var = AsVarLike(value)) {
+        auto it = aliases_.find(var.get());
+        if (it != aliases_.end()) {
+          value = it->second;
+          changed = true;
+        }
+      }
+    }
+    return changed ? std::make_shared<ReturnStmt>(values, op->span_) : op;
+  }
+
+ private:
+  std::unordered_map<const Var*, VarPtr> aliases_;
+};
+
+[[nodiscard]] ProgramPtr CanonicalizeReturnOnlyGraphPhis(const ProgramPtr& program) {
+  // The input program stays unchanged while every Graph queries return
+  // lineage. Share callee summaries across those queries.
+  return_lineage::ScopedTraceCache trace_cache;
+  std::map<GlobalVarPtr, FunctionPtr, GlobalVarPtrLess> functions;
+  bool changed = false;
+  for (const auto& [gvar, func] : program->functions_) {
+    functions[gvar] = func;
+    if (!func || !func->body_ || func->func_type_ != FunctionType::Graph) continue;
+    ReturnOnlyPhiCollector collector;
+    collector.VisitStmt(func->body_);
+    if (collector.candidates.empty()) continue;
+    // This API requires both branches to resolve to the same complete parameter
+    // descriptor. Views, fresh buffers and conflicting captures remain unknown;
+    // do not substitute the weaker backing-buffer identity analysis here.
+    const auto roots = return_lineage::TraceToParamIndicesForOutlining(
+        collector.candidates, func->body_, func->params_, program, /*trace_if_merges=*/true);
+    std::unordered_map<const Var*, VarPtr> aliases;
+    for (size_t i = 0; i < collector.candidates.size() && i < roots.size(); ++i) {
+      const auto& candidate = collector.candidates[i];
+      if (collector.non_return_uses.count(candidate.get()) != 0 || !roots[i].has_value()) continue;
+      const size_t index = roots[i].value();  // NOLINT(bugprone-unchecked-optional-access)
+      if (index >= func->param_directions_.size() || func->param_directions_[index] == ParamDirection::In) {
+        continue;
+      }
+      aliases.emplace(candidate.get(), func->params_[index]);
+    }
+    if (aliases.empty()) continue;
+    ReturnOnlyPhiRewriter rewriter(std::move(aliases));
+    auto body = rewriter.VisitStmt(func->body_);
+    if (body == func->body_) continue;
+    auto updated = MutableCopy(func);
+    updated->body_ = std::move(body);
+    functions[gvar] = updated;
+    changed = true;
+  }
+  if (!changed) return program;
+  auto updated_program = MutableCopy(program);
+  updated_program->functions_ = std::move(functions);
+  return updated_program;
+}
+
+[[nodiscard]] ProgramPtr TransformProgram(const ProgramPtr& input_program) {
+  if (!input_program) return input_program;
+  ProgramPtr program = input_program;
 
   bool has_graph = false;
   for (const auto& [gvar, func] : program->functions_) {
@@ -1569,6 +1756,8 @@ class CallSiteExtender : public IRMutator {
     }
   }
   if (!has_graph) return program;
+
+  program = CanonicalizeReturnOnlyGraphPhis(program);
 
   // A Graph only exists under host_build_graph. Codegen emits `GraphTaskArgs`
   // and `rt_submit_graph` unconditionally, and the tensormap_and_ringbuffer
@@ -1636,6 +1825,8 @@ class CallSiteExtender : public IRMutator {
 
   CallSiteExtender extender(with_signatures, plans);
   auto result = extender.VisitProgram(with_signatures);
+  const auto fixed_topology_scalars =
+      graph_replay::ReplayInvariantSet::IndexFixedScalarsFromCallSites(result);
 
   // Step A, part 2 and Step D, part 2: run on the *rewritten* program, so what
   // is checked is what codegen will see.
@@ -1649,7 +1840,11 @@ class CallSiteExtender : public IRMutator {
       // user's own line.
       CheckGraphSignature(func);
       std::unordered_set<const Var*> hoistable;  // all hoistable values are now params
-      UnhoistableScalarChecker checker(func, hoistable);
+      // Use facts from the rewritten call sites, which the independent
+      // verifier can also recover after the original bindings are gone.
+      const auto& fixed =
+          graph_replay::ReplayInvariantSet::FixedScalarsForGraph(fixed_topology_scalars, func);
+      UnhoistableScalarChecker checker(func, hoistable, fixed);
       checker.VisitStmt(func->body_);
       // Also after the rewrite: Step A turns a derived scalar into a parameter,
       // which does not make it replay-stable as a *launch spec* — only as an
@@ -1664,11 +1859,12 @@ class CallSiteExtender : public IRMutator {
       // re-derives the same count from this rewritten IR. The message still
       // names the user's own function: `ExtendGraphSignature` carries `name_`
       // and `span_` through unchanged.
-      GraphNodeCounter counter(func, result);
+      GraphNodeCounter counter(func, result, fixed);
       counter.VisitStmt(func->body_);
-      CHECK_SPAN(counter.count() >= 1, func->span_)
+      CHECK_SPAN(counter.min_count() >= 1, func->span_)
           << "Graph function '" << func->name_
-          << "' launches no tasks. `graph_execution_storage_layout` refuses a node count of zero, so "
+          << "' launches no tasks on at least one path. `graph_execution_storage_layout` refuses a node "
+             "count of zero, so "
              "the region would never be cached; call it directly instead of marking it a Graph.";
       CHECK_SPAN(counter.count() <= kMaxGraphNodes, func->span_)
           << "Graph function '" << func->name_ << "' launches " << counter.count()

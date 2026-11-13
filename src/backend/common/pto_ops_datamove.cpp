@@ -38,6 +38,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/storage_size.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 #include "src/backend/common/pto_ops_internal.h"
@@ -67,12 +68,12 @@ using pto_ops_detail::MakePartitionTensorViewType;
 using pto_ops_detail::mask_patterns;
 using pto_ops_detail::MaterializeSubviewOperandIfNeeded;
 
-// Helper function for tile.assemble → pto.subview + pto.tmov
+// Helper function for tile.assemble → pto.tinsert or pto.subview + pto.tmov.
 // Writes source tile into target tile at a given row/col offset.  Lowering:
 //   1. (optional) pto.tmov target → dst when buffer reuse did not merge them
 //      (preserves any data outside the insertion window).
-//   2. %dst_view = pto.subview %dst[row, col] sizes [src.rows, src.cols] : ... -> ...
-//   3. pto.tmov ins(%src) outs(%dst_view)
+//   2. pto.tinsert for supported ND Vec copies and FIXPIPE Acc->Mat writebacks;
+//      otherwise pto.subview + pto.tmov into the destination window.
 // Arguments: args[0] = target (destination base), args[1] = source, args[2] = offset MakeTuple
 static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
@@ -143,6 +144,26 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
   INTERNAL_CHECK_SPAN(fixpipe_insert || !has_epilogue, op->span_)
       << "Internal error: tile.assemble carries a FIXPIPE epilogue (pre_quant / pre_relu) but does not "
          "lower to pto.tinsert; the epilogue would be dropped";
+
+  if (source_tile_type->dtype_.IsPackedFp4()) {
+    // The type deducer admits native FP4 insertion only for matching NZ views.
+    // Its dedicated TINSERT path converts logical columns into carrier bytes;
+    // generic TMOV and the ND insert path do not, including preservation copies.
+    auto emit_insert = [&](const std::string& input, const std::string& input_type, const std::string& row,
+                           const std::string& col) {
+      codegen.Emit("pto.tinsert ins(" + input + ", " + row + ", " + col + " : " + input_type +
+                   ", index, index) outs(" + dst + " : " + dst_type + ")");
+    };
+    if (target != dst) {
+      CHECK_SPAN(target_tile_type->memory_space_ == ir::MemorySpace::Vec, op->span_)
+          << "tile.assemble: packed FP4 Mat insertion requires the result to reuse the Mat target; "
+             "a preservation copy from Mat is unsupported";
+      const std::string zero = codegen.GetOrEmitConstant(int64_t{0}, DataType::INDEX);
+      emit_insert(target, codegen.GetExprTypeAnnotation(op->args_[0]), zero, zero);
+    }
+    emit_insert(src, src_type, row_off, col_off);
+    return "";
+  }
 
   // Self-copy: the source *is* the destination window. `tile.slice` lowers to a
   // `pto.subview` and registers its (base, row, col) SSAs, so when the source
@@ -248,7 +269,35 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
   // payload: an INT32 accumulator draining into an FP16 Mat scratch is a
   // `pto.tinsert` precisely because it carries a scale. `fixpipe_insert` is
   // computed above, before the early returns that would drop an epilogue.
-  if (fixpipe_insert) {
+  //
+  // A Vec subview retains its base tile's physical row pitch. PTOAS restores
+  // that physical shape before verifying TMOV, so a [16,128] source cannot be
+  // moved into a window of a [16,512] destination even though the printed view
+  // types agree (#2717). TINSERT carries both pitches and the insertion offset
+  // explicitly and copies only the source's valid region. The existing target
+  // preservation copy above still protects the rest of a non-reused destination.
+  //
+  // Keep this path within the common A2/A3 + A5 PTOAS contract (verified on
+  // 0.65 and 0.68). A2/A3 TINSERT rejects i16/i32; the pinned ISA also rejects
+  // i8/u8 tiles with dynamic ValidCol (-1) at its two-byte alignment assertion.
+  // Keep integer copies on their existing path rather than regressing working
+  // whole-tile TMOVs.
+  const auto source_view = ir::tile_view_semantics::GetEffectiveTileView(*source_tile_type);
+  const auto dtype = source_tile_type->dtype_;
+  const bool vec_insert = source_tile_type->memory_space_ == ir::MemorySpace::Vec &&
+                          result_tile_type->memory_space_ == ir::MemorySpace::Vec &&
+                          source_view.blayout == ir::TileLayout::row_major &&
+                          source_view.slayout == ir::TileLayout::none_box &&
+                          (dtype == DataType::FP32 || dtype == DataType::FP16 || dtype == DataType::BF16);
+  if (vec_insert && codegen.GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
+    // The A2/A3 ISA checks this at runtime. Reject a known-invalid offset here
+    // instead of turning an assembler failure into a device-side assertion.
+    // Dynamic offsets retain the same alignment precondition.
+    CHECK_SPAN(!off_col_c || off_col_c->value_ % (32 / dtype.GetByte()) == 0, op->span_)
+        << "tile.assemble: A2/A3 ND Vec insertion requires a 32-byte-aligned column offset (a multiple of "
+        << 32 / dtype.GetByte() << " elements for " << dtype.ToString() << ")";
+  }
+  if (fixpipe_insert || vec_insert) {
     std::ostringstream tins;
     tins << "pto.tinsert ins(" << src << ", " << row_off << ", " << col_off;
     if (!src_type.empty()) tins << " : " << src_type << ", index, index";
@@ -443,8 +492,9 @@ static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBa
 
   std::string dst = codegen.GetCurrentResultTarget();
   std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
-  std::string row_off = codegen.GetExprAsCode(dst_off->elements_[0]);
-  std::string col_off = codegen.GetExprAsCode(dst_off->elements_[1]);
+  const auto pto_dst_offset = codegen::GetPtoTileCoordinates(*dst_tile_type, dst_off->elements_);
+  std::string row_off = codegen.GetExprAsCode(pto_dst_offset[0]);
+  std::string col_off = codegen.GetExprAsCode(pto_dst_offset[1]);
 
   // Build the destination subview type from the accumulator's tile type, with the
   // per-row shape/valid.
@@ -488,10 +538,19 @@ static std::string MakeGatherRowCodegenPTO(const CallPtr& op, codegen::CodegenBa
   // would emit a second, identical arith.index_cast into the kernel body for a
   // runtime extent.
   const std::vector<std::string> xfer_codes = GetSizeCodes(xfer_elems, codegen);
+  // Cube FP4 subview operands must use the same logical units as its type.
+  // Keep the GM partition in carrier units; non-FP4/Vec paths reuse the
+  // original SSA extents and avoid redundant casts.
+  const auto pto_valid = codegen::GetPtoTileCoordinates(*dst_tile_type, xfer_elems);
+  const auto dst_valid_codes = pto_valid == xfer_elems ? xfer_codes : GetSizeCodes(pto_valid, codegen);
+  const auto pto_shape = codegen::GetPtoTileCoordinates(
+      *dst_tile_type, {std::make_shared<ir::ConstInt>(phys_rows, DataType::INDEX, op->span_),
+                       std::make_shared<ir::ConstInt>(phys_cols, DataType::INDEX, op->span_)});
   std::string dst_view = codegen.NewNamedTemp("gather_row_view");
   std::ostringstream sv;
-  sv << dst_view << " = pto.subview " << dst << "[" << row_off << ", " << col_off << "] sizes [" << phys_rows
-     << ", " << phys_cols << "] valid [" << xfer_codes[0] << ", " << xfer_codes[1] << "]";
+  sv << dst_view << " = pto.subview " << dst << "[" << row_off << ", " << col_off << "] sizes ["
+     << ir::As<ir::ConstInt>(pto_shape[0])->value_ << ", " << ir::As<ir::ConstInt>(pto_shape[1])->value_
+     << "] valid [" << dst_valid_codes[0] << ", " << dst_valid_codes[1] << "]";
   if (!dst_type.empty() && !view_type.empty()) {
     sv << " : " << dst_type << " -> " << view_type;
   }
@@ -1012,8 +1071,8 @@ static void EmitTreshapeViewFromSsa(codegen::PTOCodegen& codegen, const std::str
   if (!result_type.empty()) {
     result_target = codegen.NewNamedTemp(temp_prefix);
     codegen.SetCurrentResultBuf(result_target);
-    codegen.RegisterTileBufType(result_target, result_type);
-    codegen.RegisterTileViewName(result_target);
+    codegen.RegisterTileBufType(result_target, result_type, codegen.GetCurrentResultTileType());
+    codegen.RegisterTileViewName(result_target, src);
   }
   std::ostringstream oss;
   oss << result_target << " = pto.treshape " << src;
@@ -1021,6 +1080,25 @@ static void EmitTreshapeViewFromSsa(codegen::PTOCodegen& codegen, const std::str
     oss << " : " << src_type << " -> " << result_type;
   }
   codegen.Emit(oss.str());
+}
+
+// A fixed-address result declaration already carries the view over the inherited
+// storage. Without addresses, only the actual source handle can stand in for it:
+// a same-typed MemRef representative may have become stale after an if-phi rebind.
+static bool TryReuseViewTarget(codegen::PTOCodegen& codegen, const std::string& source,
+                               const std::string& target, const std::string& result_type,
+                               bool result_has_memref, bool parameter_backed) {
+  const auto existing_type = codegen.GetSSATileBufType(target);
+  // Distinct handles alias only when compiler-owned addresses were emitted.
+  // PTOAS-planned and caller-backed views must follow the actual source SSA.
+  const bool reuse = result_has_memref && !existing_type.empty() && existing_type == result_type &&
+                     ((codegen.EmitTileAddr() && !parameter_backed) || source == target);
+  // An addressed declaration still represents a view even when no treshape
+  // is emitted. Preserve that provenance for consumers such as SIMT, which
+  // cannot reconstruct a sliced parent's physical pitch from the result type.
+  // An identical source handle is an identity view and needs no new marker.
+  if (reuse && source != target) codegen.RegisterTileViewName(target, source);
+  return reuse;
 }
 
 // Same, resolving the source SSA and its type from the IR operand.
@@ -1069,8 +1147,21 @@ static StaticValidTileView EmitStaticValidTileView(codegen::PTOCodegen& codegen,
       arg->span_)
       << "Internal error: grouped MX operand must carry static valid dimensions";
   const std::string view = codegen.NewNamedTemp(name_hint);
-  codegen.RegisterTileBufType(view, static_type);
-  codegen.Emit(view + " = pto.treshape " + source + " : " + source_type + " -> " + static_type);
+  codegen.RegisterTileBufType(view, static_type, tile_type);
+  if (tile_type->dtype_.IsPackedFp4()) {
+    // PTOAS cannot treshape a custom packed FP4 type. Quantization's fresh
+    // destination can instead carry static valid extents at its planned UB
+    // address, preserving both the packed carrier shape and allocation.
+    const auto memref = ir::GetDefinedMemRef(tile_type);
+    const auto offset = memref ? As<ir::ConstInt>(memref->byte_offset_) : nullptr;
+    CHECK_SPAN(codegen.EmitTileAddr() && offset, arg->span_)
+        << "MXFP4 quantization requires a static PYPTO or DSA_RP memory allocation; "
+           "PTOAS does not support packed FP4 treshape";
+    const std::string address = codegen.GetOrEmitConstant(offset->value_, DataType::INT64);
+    codegen.Emit(view + " = pto.alloc_tile addr = " + address + " : " + static_type);
+  } else {
+    codegen.Emit(view + " = pto.treshape " + source + " : " + source_type + " -> " + static_type);
+  }
   return {view, static_type};
 }
 
@@ -1088,9 +1179,8 @@ static std::string MakeTQuantMxCodegenPTO(const CallPtr& op, codegen::CodegenBas
       << "tile.tquant_mx_raw requires src, max, and scaling workspaces, but got " << op->args_.size();
 
   const DataType dtype = op->GetKwarg<DataType>("dtype", DataType::FP8E4M3FN);
-  INTERNAL_CHECK_SPAN(dtype == DataType::FP8E4M3FN, op->span_)
-      << "Internal error: tile.tquant_mx_raw reached codegen with unsupported dtype " << dtype.ToString()
-      << "; this PR only supports MXFP8 (FP8E4M3FN)";
+  INTERNAL_CHECK_SPAN(dtype == DataType::FP8E4M3FN || dtype == DataType::FP4E2M1X2, op->span_)
+      << "Internal error: tile.tquant_mx_raw reached codegen with unsupported dtype " << dtype.ToString();
 
   const auto outs = codegen.PrepareTupleOutputs(op);
 
@@ -1108,8 +1198,14 @@ static std::string MakeTQuantMxCodegenPTO(const CallPtr& op, codegen::CodegenBas
       << "Internal error: tile.tquant_mx_raw group_axis must be 0 or 1";
   oss << ") outs(" << dst_view.ssa << ", " << scale_view.ssa << ", " << max_view.ssa << ", "
       << scaling_view.ssa << " : " << dst_view.type << ", " << scale_view.type << ", " << max_view.type
-      << ", " << scaling_view.type << ") {quant_type = #pto<quant_type MXFP8"
-      << ">, grpAxis = #pto<mx_group_axis axis" << group_axis << ">}";
+      << ", " << scaling_view.type << ") {quant_type = #pto<quant_type "
+      << (dtype == DataType::FP4E2M1X2 ? "MXFP4_E2M1" : "MXFP8") << ">, grpAxis = #pto<mx_group_axis axis"
+      << group_axis << ">";
+  if (op->GetKwarg<std::string>("quant_scale_alg", "ocp") == "nv") {
+    oss << ", quantScaleAlg = #pto<quant_scale_alg nv>";
+  }
+  if (op->GetKwarg<bool>("interleave", false)) oss << ", interleave = true";
+  oss << "}";
   codegen.Emit(oss.str());
   return "";
 }
@@ -1140,12 +1236,12 @@ static std::string MakeTMovX2ZzCodegenPTO(const CallPtr& op, codegen::CodegenBas
 void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>& exclude_ops) {
   // Register ops with custom codegen logic
   auto reg = [&](const char* op_name, BackendCodegenFunc fn) {
-    if (exclude_ops.count(op_name) > 0) return;
+    if (!ShouldRegister(exclude_ops, op_name)) return;
     backend.RegisterOp(op_name).f_codegen(std::move(fn));
   };
 
   // tile.sort32 (TSORT32): all inputs and output must be row_major per ISA
-  if (exclude_ops.count("tile.sort32") == 0) {
+  if (ShouldRegister(exclude_ops, "tile.sort32")) {
     backend.RegisterOp("tile.sort32")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
           return MakeSort32CodegenPTO("pto.tsort32", op, codegen);
@@ -1180,7 +1276,7 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
   });
 
   // tile.mrgsort_format2 (TMRGSORT format2): all inputs and output must be row_major per ISA
-  if (exclude_ops.count("tile.mrgsort_format2") == 0) {
+  if (ShouldRegister(exclude_ops, "tile.mrgsort_format2")) {
     backend.RegisterOp("tile.mrgsort_format2")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
           return MakeMrgSortCodegenPTO("pto.tmrgsort", op, codegen);
@@ -1192,7 +1288,7 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
         .set_output_layout(ir::TileLayout::row_major);
   }
   // tile.mrgsort_format1 (TMRGSORT format1): src and output must be row_major per ISA
-  if (exclude_ops.count("tile.mrgsort_format1") == 0) {
+  if (ShouldRegister(exclude_ops, "tile.mrgsort_format1")) {
     backend.RegisterOp("tile.mrgsort_format1")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
           return MakeMrgSort1CodegenPTO("pto.tmrgsort", op, codegen);
@@ -1224,8 +1320,9 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     INTERNAL_CHECK_SPAN(offset_tuple->elements_.size() >= 2, op->span_)
         << "tile.slice offset tuple must have at least 2 elements (row, col), got "
         << offset_tuple->elements_.size();
-    std::string row_off = codegen.GetExprAsCode(offset_tuple->elements_[0]);
-    std::string col_off = codegen.GetExprAsCode(offset_tuple->elements_[1]);
+    const auto pto_offsets = codegen::GetPtoTileCoordinates(*source_tile_type, offset_tuple->elements_);
+    std::string row_off = codegen.GetExprAsCode(pto_offsets[0]);
+    std::string col_off = codegen.GetExprAsCode(pto_offsets[1]);
 
     auto shape_tuple = ir::As<ir::MakeTuple>(op->args_[1]);
     INTERNAL_CHECK_SPAN(shape_tuple, op->span_) << "tile.slice shape must be a literal tuple";
@@ -1235,6 +1332,7 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     auto cols_const = ir::As<ir::ConstInt>(shape_tuple->elements_[1]);
     INTERNAL_CHECK_SPAN(rows_const && cols_const, op->span_)
         << "tile.slice shape must be compile-time constant for pto.subview sizes attribute";
+    const auto pto_shape = codegen::GetPtoTileCoordinates(*source_tile_type, shape_tuple->elements_);
 
     std::string valid_row;
     std::string valid_col;
@@ -1246,8 +1344,9 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
       INTERNAL_CHECK_SPAN(valid_tuple, op->span_) << "tile.slice valid_shape must be a literal tuple";
       INTERNAL_CHECK_SPAN(valid_tuple->elements_.size() >= 2, op->span_)
           << "tile.slice valid_shape must have at least 2 elements";
-      valid_row = codegen.GetExprAsCode(valid_tuple->elements_[0]);
-      valid_col = codegen.GetExprAsCode(valid_tuple->elements_[1]);
+      const auto pto_valid = codegen::GetPtoTileCoordinates(*source_tile_type, valid_tuple->elements_);
+      valid_row = codegen.GetExprAsCode(pto_valid[0]);
+      valid_col = codegen.GetExprAsCode(pto_valid[1]);
     }
 
     std::string result_target = codegen.GetCurrentResultTarget();
@@ -1293,7 +1392,8 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     std::string view_ssa = codegen.NewNamedTemp("slice_view");
     std::ostringstream oss;
     oss << view_ssa << " = pto.subview " << src << "[" << row_off << ", " << col_off << "] sizes ["
-        << rows_const->value_ << ", " << cols_const->value_ << "]";
+        << ir::As<ir::ConstInt>(pto_shape[0])->value_ << ", " << ir::As<ir::ConstInt>(pto_shape[1])->value_
+        << "]";
     if (has_explicit_valid_shape) {
       oss << " valid [" << valid_row << ", " << valid_col << "]";
     }
@@ -1301,7 +1401,7 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
       oss << " : " << src_type << " -> " << view_type;
     }
     codegen.Emit(oss.str());
-    codegen.RegisterTileBufType(view_ssa, view_type);
+    codegen.RegisterTileBufType(view_ssa, view_type, codegen.GetCurrentResultTileType());
     codegen.RegisterTileViewName(view_ssa);
 
     // Lazy materialization fallback: a few downstream ops (e.g. pto.tcolexpandmul)
@@ -1431,8 +1531,9 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     if (!result_type.empty() && existing_type != result_type) {
       result_target = codegen.AllocNewTileBuf(result_type, "extract_buf");
       codegen.SetCurrentResultBuf(result_target);
-    } else if (!result_type.empty()) {
-      codegen.RegisterTileBufType(result_target, result_type);
+    }
+    if (!result_type.empty()) {
+      codegen.RegisterTileBufType(result_target, result_type, codegen.GetCurrentResultTileType());
     }
 
     std::ostringstream oss;
@@ -1467,22 +1568,26 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     // result type alone and a `v_row=?` would leave its valid extent at zero.
     std::string view_type;
     bool result_has_memref = false;
+    bool parameter_backed = false;
     if (auto result_var = codegen.GetCurrentResultVar()) {
       if (auto result_tile = ir::As<ir::TileType>(result_var->GetType())) {
         result_type = codegen.GetTileBufTypeStringFromTileType(result_tile);
         view_type = codegen.GetViewTileBufTypeStringFromTileType(result_tile);
         result_has_memref = result_tile->memref_.has_value();
+        parameter_backed = codegen.IsParameterBackedTile(result_tile);
       }
     }
     // The no-op check compares against the pre-declared alloc_tile, whose type is
     // always the dynamic-valid form — so it must use `result_type`, not `view_type`.
-    auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (result_has_memref && !existing_type.empty() && existing_type == result_type) {
+    const std::string src_ssa = codegen.GetExprAsCode(op->args_[0]);
+    if (TryReuseViewTarget(codegen, src_ssa, result_target, result_type, result_has_memref,
+                           parameter_backed)) {
       return std::string("");
     }
 
-    // Fallback: emit pto.treshape reading the source SSA.
-    EmitTreshapeView(codegen, op->args_[0], result_target, view_type, "reshape_buf");
+    // Fallback: emit pto.treshape reading the actual source SSA, including if-phi results.
+    EmitTreshapeViewFromSsa(codegen, src_ssa, GetViewSourceType(codegen, op->args_[0]), result_target,
+                            view_type, "reshape_buf");
     return std::string("");
   });
 
@@ -1499,15 +1604,56 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     INTERNAL_CHECK_SPAN(source_tile && result_tile, op->span_)
         << "Internal error: tile.reinterpret_view requires TileType source and result";
 
+    const bool fp4_alias = source_tile->dtype_.IsPackedFp4() || result_tile->dtype_.IsPackedFp4();
+    // PTOAS 0.65 cannot infer the packed dtype's byte width for treshape or
+    // bitcast. Only aliases declared at one verified static UB address work.
+    CHECK_SPAN(!fp4_alias || codegen.EmitTileAddr(), op->span_)
+        << "tile.reinterpret_view: FP4E2M1X2 tile aliases require PYPTO or DSA_RP addressed memory; "
+           "PTOAS 0.65 does not support FP4 tile treshape";
+
     const std::string result_type = codegen.GetTileBufTypeStringFromTileType(result_tile);
     const bool result_has_memref = result_tile->memref_.has_value();
     const std::string existing_type = codegen.GetSSATileBufType(result_target);
+
+    if (fp4_alias) {
+      CHECK_SPAN(source_tile->memref_.has_value() && result_has_memref && !existing_type.empty() &&
+                     existing_type == result_type,
+                 op->span_)
+          << "FP4E2M1X2 UB alias requires an address-backed tile; MemRef-less inputs such as "
+             "tile.tpop_from_aic are unsupported. Load a dense byte-carrier tile from GM before aliasing";
+
+      // Slice types omit the parent pitch. InitMemRef retains the touched byte
+      // envelope, including inter-row gaps, through aliases and reshapes. Only
+      // a tight carrier span can be relabeled in either direction without losing pitch.
+      const auto rows = ir::As<ir::ConstInt>(source_tile->shape_[0]);
+      const auto cols = ir::As<ir::ConstInt>(source_tile->shape_[1]);
+      const uint64_t span_bytes = (*source_tile->memref_)->size_;
+      CHECK_SPAN(
+          rows && cols && rows->value_ > 0 && cols->value_ > 0 &&
+              span_bytes / static_cast<uint64_t>(rows->value_) == static_cast<uint64_t>(cols->value_) &&
+              span_bytes % static_cast<uint64_t>(rows->value_) == 0,
+          op->span_)
+          << "FP4E2M1X2 UB alias requires a contiguous byte-carrier tile with a tight byte span; "
+             "noncontiguous UB slices are unsupported. Slice the GM tensor and load the window instead";
+      if (const auto* window = codegen.GetSubviewMaterialization(codegen.GetExprAsCode(op->args_[0]))) {
+        CHECK_SPAN(
+            window->const_offset && (window->view_rows == 1 ||
+                                     (window->source_cols > 0 && window->view_cols == window->source_cols)),
+            op->span_)
+            << "FP4E2M1X2 UB alias requires a contiguous byte-carrier tile with a static UB offset; "
+               "slice the GM tensor and load the window instead";
+      }
+    }
 
     // With baked addresses, the result's own alloc_tile at the inherited
     // address is already the typed alias. PTOAS-planner mode shares one handle,
     // so it must materialize a typed SSA view below.
     if (codegen.EmitTileAddr() && result_has_memref && !existing_type.empty() &&
         existing_type == result_type) {
+      // This is a typed view even though the inherited address avoids emitting
+      // treshape. Keep the same provenance as the SSA-view fallback below.
+      const auto source = codegen.GetExprAsCode(op->args_[0]);
+      if (source != result_target) codegen.RegisterTileViewName(result_target, source);
       return std::string("");
     }
 
@@ -1540,11 +1686,13 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     std::string result_type;
     std::string view_type;  // static valid dims — see tile.reshape above
     bool result_has_memref = false;
+    bool parameter_backed = false;
     if (auto result_var = codegen.GetCurrentResultVar()) {
       if (auto result_tile = ir::As<ir::TileType>(result_var->GetType())) {
         result_type = codegen.GetTileBufTypeStringFromTileType(result_tile);
         view_type = codegen.GetViewTileBufTypeStringFromTileType(result_tile);
         result_has_memref = result_tile->memref_.has_value();
+        parameter_backed = codegen.IsParameterBackedTile(result_tile);
       }
     }
     // A `pto.subview` source is a *strided window*, and a strided window has no
@@ -1600,10 +1748,10 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
       src_type = window->source_type;
     }
 
-    // The result's own alloc_tile already declares the transposed type: it IS
-    // the view, so emit nothing. Mirrors tile.reshape's no-op check.
-    auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (result_has_memref && !existing_type.empty() && existing_type == result_type) {
+    // A matching declaration is sufficient only at a fixed inherited address
+    // or when it is the actual source handle. Mirrors tile.reshape's no-op check.
+    if (TryReuseViewTarget(codegen, src_ssa, result_target, result_type, result_has_memref,
+                           parameter_backed)) {
       return std::string("");
     }
 
@@ -1622,17 +1770,6 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     auto tile_type = ir::As<ir::TileType>(op->args_[0]->GetType());
     INTERNAL_CHECK_SPAN(tile_type, op->span_)
         << "Internal error: tile.set_validshape input must be a TileType";
-    const auto tile_view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
-    // PTOAS special requirement (FP4 Vec physical valid_shape):
-    //   FP4 Vec tile_bufs use the f4E2M1x2 carrier, so PTOAS valid_row/valid_col
-    //   are counted in packed physical elements along the BLayout axis (logical
-    //   nibble extent / 2). PyPTO IR keeps logical nibble shapes; convert here
-    //   so pto.set_validshape matches the alloc_tile / treshape physical ABI.
-    //   Matrix spaces are excluded — TMATMUL_MX has its own logical-dim ABI.
-    const bool packed_fp4_vec =
-        tile_type->dtype_ == DataType::FP4 && tile_type->memory_space_ == ir::MemorySpace::Vec;
-    const size_t packed_dim = tile_view.blayout == ir::TileLayout::col_major ? 0 : 1;
-
     std::string tile_buf = codegen.GetExprAsCode(op->args_[0]);
     std::string tile_buf_type = codegen.GetExprTypeAnnotation(op->args_[0]);
     if (tile_buf.empty()) {
@@ -1642,15 +1779,16 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
       tile_buf_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
     }
 
-    // `pto.set_validshape` mutates the operand's `valid_row` / `valid_col`
-    // operands. A *view* — the `pto.subview` a tile.slice lowers to, or a
-    // `pto.treshape` — has none: it carries its valid extent in its own type, so
+    // `pto.set_validshape` mutates runtime validity. Most views — the
+    // `pto.subview` a tile.slice lowers to, or a static-valid `pto.treshape` —
+    // cannot support that: they carry their valid extent in their own type, so
     // ptoas rejects the runtime op against one ("expects source tile_buf to have
     // dynamic validShape (?, ?)" / "requires a locally bound tile source"). Every
-    // other handle (an alloc, an `scf.if` result, a cross-core pop slot) takes the
-    // runtime op unchanged.
+    // other handle takes the runtime op unchanged. A fillpad destination rooted
+    // in a local allocation is an explicit exception: its dynamic-valid reshape
+    // is initialized at creation, and all holders share the same mutable handle.
     //
-    // Ask whether the operand IS a view, tracked at the two emission sites above.
+    // Ask whether the operand IS a view, tracked where each view is emitted.
     // The rendered valid dims cannot answer it in either direction: a tile.slice
     // given a runtime `valid_shape` renders `v_row=?, v_col=?` just as an
     // alloc-backed handle does.
@@ -1663,24 +1801,20 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     // provenance is exactly the trap that silently shifted DeepSeek-V4-Flash
     // decode_csa numerics while this path was being developed. A view's extent is
     // already first-class at the slice, so point there instead.
-    CHECK_SPAN(!codegen.IsTileViewName(tile_buf), op->span_)
+    CHECK_SPAN(!codegen.IsTileViewName(tile_buf) || codegen.IsMutableTileName(tile_buf), op->span_)
         << "pl.set_validshape cannot narrow a tile view (a slice or reshape result): a view carries "
            "its valid extent in its type, not in the runtime operands this lowers to. Narrow at the "
            "slice itself -- pl.tile.slice(tile, shape, offset, valid_shape=[...]), which also accepts "
            "runtime extents -- or call pl.set_validshape on the source tile before taking the view";
 
-    auto emit_index_arg = [&](const ir::ExprPtr& arg, bool pack_fp4) -> std::string {
+    auto emit_index_arg = [&](const ir::ExprPtr& arg) -> std::string {
       if (auto var = ir::AsVarLike(arg)) {
-        INTERNAL_CHECK_SPAN(!pack_fp4, op->span_)
-            << "Internal error: packed FP4 valid dimension must be static before PTO codegen";
         std::string mlir_name = codegen.GetVarName(var);
         return codegen.EmitCastToIndex(var, mlir_name);
       }
       if (auto c = ir::As<ir::ConstInt>(arg)) {
-        return codegen.GetOrEmitConstant(pack_fp4 ? c->value_ / 2 : c->value_, DataType::INDEX);
+        return codegen.GetOrEmitConstant(c->value_, DataType::INDEX);
       }
-      INTERNAL_CHECK_SPAN(!pack_fp4, op->span_)
-          << "Internal error: packed FP4 valid dimension must be static before PTO codegen";
       std::string ssa = codegen.GetExprAsCode(arg);
       if (auto st = ir::As<ir::ScalarType>(arg->GetType())) {
         if (st->dtype_ != DataType::INDEX) {
@@ -1693,8 +1827,9 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
       return ssa;
     };
 
-    std::string vr = emit_index_arg(op->args_[1], packed_fp4_vec && packed_dim == 0);
-    std::string vc = emit_index_arg(op->args_[2], packed_fp4_vec && packed_dim == 1);
+    const auto valid_dims = codegen::GetPtoTileCoordinates(*tile_type, {op->args_[1], op->args_[2]});
+    std::string vr = emit_index_arg(valid_dims[0]);
+    std::string vc = emit_index_arg(valid_dims[1]);
 
     codegen.RegisterTileBufType(tile_buf, tile_buf_type);
     codegen.SetCurrentResultBuf(tile_buf);

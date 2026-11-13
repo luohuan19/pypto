@@ -23,7 +23,7 @@ from typing import overload
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import AtomicType, Call, Expr, ReduceOp, Span
+from pypto.pypto_core.ir import AtomicType, Call, CommEngine, Expr, ReduceOp, Span
 
 from ...utils import _get_span_or_capture, _normalize_expr, _to_make_tuple
 
@@ -141,7 +141,7 @@ def put(  # noqa: PLR0913
     ``atomic`` (:class:`ir.AtomicType`) selects plain-store vs atomic-add and is
     packed as an ``int`` attr; ``Add`` requires an fp32/bf16/fp16/int32/int16/int8
     destination (the hardware atomic-add dtypes), and a bf16 destination is
-    Ascend910B-only (checked by the ``AtomicAddDtypeValid`` verifier).
+    Ascend910-only (checked by the ``AtomicAddDtypeValid`` verifier).
     Side-effect only — the result is an
     ``UnknownType`` Call. The verifier requires ``dst`` to be a
     :class:`ir.DistributedTensorType`; ``src`` may be either that or a plain
@@ -250,6 +250,111 @@ def get(
     if pipeline:
         attrs["pipeline"] = True
     return _ir_core.create_op_call("pld.tensor.get", args, attrs, actual_span)
+
+
+def _normalize_async_engine(engine: object, op_name: str) -> int:
+    """Validate the enum before conversion can erase an invalid input's type."""
+    if not isinstance(engine, CommEngine):
+        raise TypeError(f"{op_name} engine must be CommEngine.URMA, got {engine!r} ({type(engine).__name__})")
+    return int(engine)
+
+
+def put_async(
+    dst: Expr,
+    peer: int | Expr,
+    src: Expr,
+    dst_offsets: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    src_offsets: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    *,
+    engine: CommEngine = CommEngine.URMA,
+    span: Span | None = None,
+) -> Call:
+    """Build a ``pld.tensor.put_async(dst, peer, src)`` Call.
+
+    Asynchronous cross-rank write: issue a URMA transfer of the local ``src``
+    into the ``peer`` rank's slice of ``dst``. The call returns ``dst`` (the
+    result aliases argument 0); returning does **not** mean the transfer has
+    completed. Completion is owned by the enclosing task and carried by the
+    producer ``InOut`` -> consumer ``In`` dependency.
+
+    ``engine`` is a compile-time kwarg; V1 accepts :attr:`CommEngine.URMA` only
+    and rejects any other engine. With no offsets/shape this transfers the full
+    local ``src`` into the full peer ``dst`` slice. Supplying ``dst_offsets``,
+    ``src_offsets`` and ``shape`` narrows the transfer to matching subregions;
+    all three must be provided together. After any leading singleton transfer
+    dimensions, every dimension after the first non-singleton must be full,
+    so the region is one contiguous flattened GM range. A constant ``peer``
+    must be non-negative; ``engine`` must be a :class:`CommEngine` member.
+    """
+    engine_value = _normalize_async_engine(engine, "pld.tensor.put_async")
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    peer_expr = _normalize_expr(peer, actual_span, int_dtype=DataType.INT32)
+    args: list[Expr] = [dst, peer_expr, src]
+    has_region = dst_offsets is not None or src_offsets is not None or shape is not None
+    if has_region and (dst_offsets is None or src_offsets is None or shape is None):
+        raise ValueError("pld.tensor.put_async dst_offsets, src_offsets, and shape must be provided together")
+    if has_region:
+        assert dst_offsets is not None
+        assert src_offsets is not None
+        assert shape is not None
+        args.extend(
+            [
+                _to_make_tuple(dst_offsets, actual_span),
+                _to_make_tuple(src_offsets, actual_span),
+                _to_make_tuple(shape, actual_span),
+            ]
+        )
+    return _ir_core.create_op_call("pld.tensor.put_async", args, {"engine": engine_value}, actual_span)
+
+
+def get_async(
+    dst: Expr,
+    peer: int | Expr,
+    src: Expr,
+    dst_offsets: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    src_offsets: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    *,
+    engine: CommEngine = CommEngine.URMA,
+    span: Span | None = None,
+) -> Call:
+    """Build a ``pld.tensor.get_async(dst, peer, src)`` Call.
+
+    Asynchronous cross-rank read: issue a URMA transfer of the ``peer`` rank's
+    slice of ``src`` into the local ``dst``. The call returns ``dst`` (the
+    result aliases argument 0); returning does **not** mean the data has
+    arrived. Completion is owned by the enclosing task and carried by the
+    producer ``InOut`` -> consumer ``In`` dependency.
+
+    ``engine`` is a compile-time kwarg; V1 accepts :attr:`CommEngine.URMA` only
+    and rejects any other engine. With no offsets/shape this reads the full
+    peer ``src`` slice into the full local ``dst``. Supplying ``dst_offsets``,
+    ``src_offsets`` and ``shape`` narrows the transfer to matching subregions;
+    all three must be provided together. After any leading singleton transfer
+    dimensions, every dimension after the first non-singleton must be full,
+    so the region is one contiguous flattened GM range. A constant ``peer``
+    must be non-negative; ``engine`` must be a :class:`CommEngine` member.
+    """
+    engine_value = _normalize_async_engine(engine, "pld.tensor.get_async")
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    peer_expr = _normalize_expr(peer, actual_span, int_dtype=DataType.INT32)
+    args: list[Expr] = [dst, peer_expr, src]
+    has_region = dst_offsets is not None or src_offsets is not None or shape is not None
+    if has_region and (dst_offsets is None or src_offsets is None or shape is None):
+        raise ValueError("pld.tensor.get_async dst_offsets, src_offsets, and shape must be provided together")
+    if has_region:
+        assert dst_offsets is not None
+        assert src_offsets is not None
+        assert shape is not None
+        args.extend(
+            [
+                _to_make_tuple(dst_offsets, actual_span),
+                _to_make_tuple(src_offsets, actual_span),
+                _to_make_tuple(shape, actual_span),
+            ]
+        )
+    return _ir_core.create_op_call("pld.tensor.get_async", args, {"engine": engine_value}, actual_span)
 
 
 @overload
@@ -479,23 +584,25 @@ def all_to_all_v(
     window (non-cacheable read; no bulk transfer, so the ``[NR]`` INT32 vector
     is all the buffer needs) and clamps the value reader-side; the builtin
     exchange is gated by a two-round credit barrier (Barrier A before the pull,
-    Barrier B before return). The InCore composite rail publishes the clamped
-    count via ``pld.system.notify``. Powered
-    by LowerCompositeOps into a 2-phase push-based decomposition (push →
-    barrier), returning the target window. Each push transfers exactly
-    ``clamp(send_counts[dest], 0, MAX_RECV)`` rows — the transfer extent is the
-    runtime ``[rows, SIZE]``, so padding up to the capacity never crosses the
+    Barrier B before return). The InCore composite rail atomically resets local
+    counts and announces readiness to all peers, then waits for each non-self
+    destination before publishing a positive clamped count with AtomicAdd and
+    pushing payload. Zero-row counts remain zero from the receiver reset,
+    without a publication or transfer. A completion barrier precedes return.
+    Each push transfers exactly ``clamp(send_counts[dest], 0, MAX_RECV)`` rows —
+    the transfer extent is the runtime ``[rows, SIZE]``, so padding never crosses the
     wire; the caller reads back from the window with ``pl.load``, using
     ``recv_counts[src, 0]`` to know how many rows arrived.
 
     ``send_counts`` is read at runtime, so the counts may be data-dependent.
     The clamp is two-sided against the per-peer capacity ``MAX_RECV =
     target.shape[0] // NR``: a count above it is capped, and a **negative**
-    count is floored at ``0`` — so a negative ``send_counts[dest]`` publishes
+    count is floored at ``0`` — so a negative ``send_counts[dest]`` leaves
     ``recv_counts = 0`` rather than the negative value. The barrier signal is
-    credit-based (reusable across sequential calls; zero-initialise once and do
-    not reset it), and calls nested in ``for``/``while`` loops remain rejected
-    by the compiler.
+    credit-based (zero-initialise once and do not reset it) and reusable across
+    sequential calls. InCore calls support rank-uniform ``for``/``while`` loops;
+    HOST orchestrators reject such loops because loop-carried comm-domain window
+    lifetime management is not modeled.
 
     .. warning::
 
@@ -525,16 +632,42 @@ def all_to_all_v(
     return _ir_core.create_op_call("pld.tensor.all_to_all_v", _args, {}, actual_span)
 
 
+def indexed_all_to_all_v(
+    input: Expr,
+    target: Expr,
+    signal: Expr,
+    send_counts: Expr,
+    recv_counts: Expr,
+    index: Expr,
+    core_num: int | Expr = 1,
+    *,
+    span: Span | None = None,
+) -> Call:
+    """Build an A5 URMA indexed row exchange for L2 orchestration."""
+    if isinstance(core_num, bool):
+        raise TypeError("indexed_all_to_all_v core_num must be a positive int, got bool")
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    return _ir_core.create_op_call(
+        "pld.tensor.indexed_all_to_all_v",
+        [input, target, signal, send_counts, recv_counts, index, _normalize_expr(core_num, actual_span)],
+        {},
+        actual_span,
+    )
+
+
 __all__ = [
     "all_to_all",
     "all_to_all_v",
+    "indexed_all_to_all_v",
     "alloc_window_buffer",
     "allgather",
     "allreduce",
     "barrier",
     "broadcast",
     "get",
+    "get_async",
     "put",
+    "put_async",
     "remote_store",
     "reduce_scatter",
     "window",

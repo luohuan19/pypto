@@ -1,5 +1,9 @@
 # Scopes and Placement
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Where work runs: marking a region as device work, grouping co-scheduled cores, and
 spreading a kernel across blocks.
 
@@ -54,7 +58,6 @@ def scale(
         out[:] = pl.mul(x, 2.0)
     return out
 
-
 out = torch.zeros(256, 128, dtype=torch.float32)
 scale(X, out, config=CFG)
 torch.testing.assert_close(out, X * 2.0, rtol=1e-4, atol=1e-4)
@@ -80,18 +83,15 @@ Two optional keywords shape that outlined kernel:
 
 | Keyword | Meaning |
 | ------- | ------- |
-| `optimizations=[pl.split(mode)]` | Cross-core split mode for the outlined kernel |
 | `optimizations=[pl.cross_core_slot(slot_num=N)]` | Ring depth of the automatic cross-core pipeline |
 | `name_hint="..."` | Name for the outlined function |
 
 Entries in `optimizations=` must be written inline at the call site — the parser reads the
-AST, so a list built up in a variable is not accepted. `pl.split` and `pl.cross_core_slot`
-are orthogonal and combine freely: one splits the work, the other sizes the channel.
+AST, so a list built up in a variable is not accepted. `pl.cross_core_slot` sizes the channel; explicit `pl.split_aiv` regions inside the scope describe per-lane work.
 
 ```python
 with pl.at(level=pl.Level.CORE_GROUP,
-           optimizations=[pl.split(pl.SplitMode.UP_DOWN),
-                          pl.cross_core_slot(slot_num=4)]):
+           optimizations=[pl.cross_core_slot(slot_num=4)]):
     ...
 ```
 
@@ -130,7 +130,6 @@ def spmd_add(
         )
     return out
 
-
 out = torch.zeros(256, 128, dtype=torch.float32)
 spmd_add(X, Y, out, config=CFG)
 torch.testing.assert_close(out, X + Y, rtol=1e-4, atol=1e-4)
@@ -156,8 +155,10 @@ the tutorials chapter covers end to end.
 
 | `mode=` | Each lane gets |
 | ------- | -------------- |
-| `pl.SplitMode.UP_DOWN` / `LEFT_RIGHT` | Half of every tile (rows / cols) — data-parallel |
+| `pl.SplitMode.UP_DOWN` / `LEFT_RIGHT` | Explicit shard/gather splits/joins rows or columns; author the body per lane |
 | `pl.SplitMode.NONE` | The **full** body; you dispatch disjoint work via `aiv_id` — task-parallel |
+
+The region never implicitly halves compute tiles or rewrites load/store offsets, even without a crossing. Use the lane ID to author disjoint slices and output addresses.
 
 **Opening one region changes the rules for the whole function.** The regions then own
 every placement decision for vector work, so vector compute has to live inside a region:
@@ -339,6 +340,125 @@ reached the call's arguments. Getting this right is the author's job.
 
 ### Cross-lane ordering is yours too
 
+For dependencies **between hardware pipelines on one core**, use
+`pl.system.set_flag(src_pipe, dst_pipe, event_id=0, *, core_type=None)` after the
+producer and `pl.system.wait_flag(src_pipe, dst_pipe, event_id=0, *, core_type=None)`
+before the consumer. For example, an AIV load on MTE2 followed by vector work
+can use:
+
+```python
+a = pl.tile.load(input_a, [0, 0], [16, 16])
+pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+b = pl.tile.load(input_b, [0, 0], [16, 16])  # Used later with its own synchronization
+pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+result = pl.tile.adds(a, 1.0)
+```
+
+MTE2 signals after loading `a`. The wait gates V, so V can compute `result`
+while the unrelated load of `b` continues. Source order alone does not imply
+completion order between these pipelines.
+
+Both calls are side-effect statements. The three identifiers must match in a
+pair. Source and destination must be different concrete `pl.PipeType` values;
+`ALL` is not an event endpoint. A literal event ID is 0 through 7. An INDEX
+scalar can select an event ID at runtime, but must evaluate to 0 through 7.
+Each flag is consumed by one wait, so loops that reuse a slot must finish its
+previous handshake first. In a mixed InCore function, pass
+`core_type=pl.KernelType.AIC` or `AIV` to keep the call on that kernel;
+otherwise it is emitted on both. These operations do not synchronize AIC with
+AIV and do not publish GM cache lines. PTOAS's current automatic sync pass
+skips a function containing static explicit flags, so the author must provide
+all required pipeline dependencies in that function. Dynamic-only flags do not
+currently trigger that skip in PTOAS; use a static flag pair when taking over
+sync placement for the whole function.
+Keep explicit flags outside `pl.pipeline` loops. Pipeline scheduling cannot yet
+preserve their authored order, so PyPTO rejects either flag in such a loop.
+Use `pl.range` when manually synchronizing work inside a loop.
+
+For a pipeline barrier, use `pl.system.barrier(*, pipe)`. The required keyword
+accepts any `pl.PipeType` member. A single-pipe barrier orders preceding and
+following work on that pipeline, which is the cheap way to order a buffer reuse
+against an in-flight transfer without spending an event slot. A barrier drains
+a *pipe*, not an operation, so pick the pipe your transfer rides: `MTE2` for
+GM → UB/L1 loads, `MTE3` for UB → GM stores (and the A5 UB → L1 route), `MTE1`
+for the L1 → L0A/L0B operand feed, `FIX` for the L0C writeback. `ALL` waits for
+preceding work
+across all pipelines on the current core. For example, an `ALL` barrier after
+both loads above would wait for `b` as well as `a` before vector computation.
+Barriers neither allocate nor consume event slots; an outstanding `set_flag`
+still requires its matching `wait_flag`.
+
+Migrate removed APIs to the unified spelling:
+
+| Removed call | Unified call |
+| ------------ | ------------ |
+| `pl.system.bar_v()` | `pl.system.barrier(pipe=pl.PipeType.V)` |
+| `pl.system.bar_m()` | `pl.system.barrier(pipe=pl.PipeType.M)` |
+| `pl.system.bar_all()` | `pl.system.barrier(pipe=pl.PipeType.ALL)` |
+
+The old wrappers are no longer available. The Python IR printer emits the unified
+spelling for all three forms, with the same internal IR and native barriers.
+`ALL` does not synchronize different cores; cross-core arrival uses
+`pl.system.syncall(...)` as described below.
+
+### Choosing a synchronization primitive
+
+`pl.system` exposes five mechanisms. They are not interchangeable — each orders a
+different thing, and only two of them cost an event slot.
+
+| Primitive | What it orders | Scope | Event slot | Use it when |
+| --------- | -------------- | ----- | ---------- | ----------- |
+| `barrier(pipe=...)` | Drains one hardware pipeline: everything already issued on that pipe completes before anything after it | One core, one pipe | No | You need a coarse "this pipe is done" fence, and the dependency you are ordering is *on that pipe* |
+| `barrier(pipe=pl.PipeType.ALL)` | Drains every pipeline on the current core | One core, all pipes | No | The phases touch several pipes and you do not want to enumerate them |
+| `set_flag` / `wait_flag` | One directed producer → consumer handoff between two pipes | One core, two pipes | Yes (0-7) | You want to order *one* dependency without stalling the whole pipe — strictly cheaper at runtime than a barrier, strictly more expensive in slots |
+| `sync_set` / `sync_wait` | A directed event between the cube and vector **cores** | Cross-core, one direction | Yes | Two lanes must hand off explicitly and you are writing the protocol yourself |
+| `syncall(...)` | Arrival of every participating core | Cross-core, all participants | No | All cores must reach the same point; note it orders *arrival only*, not data visibility |
+| `fence()` | Makes global-memory writes visible | One core, GM | No | A GM buffer is written by one lane and read by another; pair it with cache maintenance |
+
+Two distinctions are worth keeping straight:
+
+- **Barrier vs. flag pair — not interchangeable.** A barrier drains *one pipe*; a flag
+  pair orders *one producer → consumer dependency between two pipes*. A barrier is
+  therefore **not** a drop-in replacement for a flag pair on a cross-pipeline handoff:
+  draining MTE3 says the stores issued so far have completed, it does not by itself gate
+  a vector consumer. Reach for a barrier at a phase boundary on a single pipe, a flag
+  pair (or `ALL`) for a cross-pipeline handoff. This matters most in a function that
+  already contains static flags, where PTOAS skips automatic synchronization and your
+  explicit ordering is the only ordering.
+- **`barrier(ALL)` vs. `syncall`.** `ALL` is *one core, every pipe*. `syncall` is *every
+  core, arrival only*. Neither implies the other, and neither makes GM writes visible —
+  that is `fence()` plus cache maintenance.
+
+`PipeType.S` is accepted for completeness but orders nothing in practice: both of
+PTOAS's synchronization allocators treat a scalar-to-scalar pair as already ordered
+on every architecture, so the scalar pipe sequences its own operations. It is
+expressible and reaches the emitted code; it just buys you nothing.
+
+Barriers are **rejected inside `pl.pipeline`**, exactly as explicit flags are: a barrier
+has no operand, so pipeline scheduling has no dependency edge to hold it in place and
+could order it before the transfer it was written to follow. Use `pl.range` when you need
+to place one inside a loop.
+
+### Barriers inside a mixed kernel
+
+A mixed InCore function is expanded into two kernels, an AIC and an AIV one, and the two
+lanes own different pipelines: FIX and MTE1 are cube-side, V is vector-side. A barrier
+carries no operand, so nothing in it says which lane it belongs to — by default it is
+duplicated into **both** kernels, and the lane that does not own the pipe executes a
+barrier for a pipe it never uses.
+
+Pin it with `core_type`, the same keyword `set_flag` / `wait_flag` take:
+
+```python
+pl.system.barrier(pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)   # cube lane only
+pl.system.barrier(pipe=pl.PipeType.V, core_type=pl.KernelType.AIV)     # vector lane only
+```
+
+Omit `core_type` in a function already typed `AIC` or `AIV`: there is only one kernel to
+land in, so there is nothing to disambiguate. `KernelType.MIX` is rejected — it names a
+participant set, which is meaningful for `syncall` but not for a single-core pipe drain;
+omitting the keyword is how a barrier reaches both lanes.
+
 AIC and AIV run **asynchronously**. A boundary op orders the one value it carries — that
 is what the transfer is — but nothing orders a cube-lane write against a vector-lane read
 of the same **GM buffer**. Publish the producer's cache lines and issue a GM fence, place a
@@ -401,5 +521,5 @@ pl.system.sync_wait(0, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)    # 
 - [Control Flow](02-control-flow.md) — the loops these scopes sit inside.
 - [Memory and Data Movement](03-memory.md) — what the placed code does with buffers.
 - [Tasks and Ordering](../tasks/index.md) — when the placed work runs relative to everything else.
-- [OutlineIncoreScopes](../../dev/passes/09-outline_incore_scopes.md) — how `pl.at` becomes a function.
-- [ExpandMixedKernel](../../dev/passes/24-expand_mixed_kernel.md) — what `pl.split` drives.
+- [OutlineIncoreScopes](../../dev/passes/10-outline_incore_scopes.md) — how `pl.at` becomes a function.
+- [ExpandMixedKernel](../../dev/passes/26-expand_mixed_kernel.md) — what `pl.split` drives.

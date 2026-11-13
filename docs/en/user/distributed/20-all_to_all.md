@@ -56,9 +56,11 @@ a wrong value, not a subtle shape issue.
 
 ## Walkthrough
 
-Both modes share one `[nr, SIZE]` window. Rank `r` writes its chunk-for-`d`
-at row `r` of destination `d`'s window, then reads row `src` of its own
-window. The hand-rolled kernel uses step 06's `put`:
+Both modes share one `[nr, SIZE]` window. Rank `r`'s chunk-for-`d` ends up at
+row `r` of destination `d`'s window, then rank `d` reads row `src` of its
+own window — in the hand-rolled kernel the caller does the write explicitly;
+in the reveal below, the push happens inside the call instead. The
+hand-rolled kernel uses step 06's `put`:
 
 ```python
 @pl.function(type=pl.FunctionType.InCore)
@@ -98,7 +100,8 @@ def hand_step(self, x, y, data, signal):
 - **Read-back completes the exchange.** After the barrier, row `src` of our
   own window holds the chunk rank `src` intended for us.
 
-The reveal replaces phases 1–3 with one call:
+The reveal replaces phases 1–2 with one call; phase 3's read-back loop
+remains in the caller:
 
 ```python
     result = pld.tensor.all_to_all(x, data, signal)
@@ -115,15 +118,26 @@ The reveal replaces phases 1–3 with one call:
 
 ### The IR diff (the teaching artifact)
 
+The interesting part isn't which bytes move — both modes move the same chunks
+to the same destinations — it's how much of the sequence the builtin writes
+for you, and where it stops.
+
 - `--mode hand` lowers to the three phases above: `P` puts (one per
-  destination), the `Set`/`Ge(1)` barrier, and the read-back loop.
-- `--mode builtin` expands into the same shape: your per-destination chunks
-  pushed via `pld.tile.put`, then the barrier, then the row read-back. Note
-  the barrier's role here — because the transfers come *first*, it is a
-  completion barrier telling you every peer's push has landed, not a
-  readiness barrier gating a read. The composite also appends a self-clearing
-  epilogue, so the signal is reusable on the next call. (The HOST builtin adds
-  orchestration-level chunking for large transfers.)
+  destination), then the `Set`/`Ge(1)` barrier, then the read-back loop — the
+  barrier comes *after* your own pushes but *before* you trust any peer's,
+  because your reads would otherwise race their pushes.
+- `--mode builtin` expands into the same shape — your per-destination chunks
+  pushed via `pld.tile.put`, then the barrier — but it stops there. The
+  barrier sits on the same side of the transfer as in the hand-rolled version,
+  so it means the same thing: a **completion** barrier confirming that every
+  peer's push has landed. What the builtin does *not* do is read the rows back
+  for you — the window **is** the result, so the read-back loop stays in your
+  code.
+- The composite appends a **self-clearing epilogue** after the barrier that
+  subtracts this call's credits back out, so the same signal is reusable by a
+  later collective ([21-putting_it_together](21-putting_it_together.md)). The
+  HOST builtin also chunks large transfers, but inside the generated AIV
+  kernel, in fixed-size tiles — not at the orchestration level.
 
 **Cost card (per rank):** every rank sends a *different* `N/P` slice to each
 peer — `(P-1)/P · N` bytes received, and no two ranks receive the same bytes.
@@ -166,3 +180,75 @@ schedule: every pair exchanges distinct data.
 - [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [21-putting_it_together](21-putting_it_together.md) — compose
   three collectives in one kernel
+
+## Indexed AllToAllV on A5 URMA
+
+```python
+target = pld.tensor.indexed_all_to_all_v(
+    input, target, signal, send_counts, recv_counts, index, core_num=2,
+)
+```
+
+The indexed variant reads original `input[Nmax,H]` rows directly, without a
+packed hidden send buffer. `index` is contiguous INT32 `[P,C]`, and
+`target` is a distinct receive window `[P*C,H]`. At destination `d`, source
+`s` writes `input_s[index_s[d,j]]` into `target_d[s*C+j]` for
+`j < send_counts_s[d]`. Repeated indices preserve repeated output slots.
+Unwritten tails retain their old contents; consume only `recv_counts[s,0]`
+rows of each source partition. MoE token-to-rank deduplication and expert
+expansion remain application operations.
+
+This API supports **A5 URMA with PER_PEER queues, L2 only**, with FP32 or
+INT8 payloads. L2 accepts
+local Tensor input/index and a local INT32 recv_counts `[P,1]` output.
+send_counts must be window-bound because peers read it. `signal`, `send_counts`
+and `recv_counts` must use pairwise distinct buffers. All views must be packed
+and full; shapes are static. HOST, InCore, remote MTE,
+and SHARED_POOL are unsupported.
+
+`core_num=B` is a positive exact launch width, subject to the runtime's AIV
+sync-start limit. For `B <= P`, AIV `b` handles destinations `b,b+B,...`.
+For `B > P`, only AIVs `0..P-1` submit URMA work, one writer per remote rank.
+All B AIVs divide local receive rows evenly. Each AIV submits its remote
+transfers, copies its local rows, then waits for the final remote completions. A hidden row is never split
+between AIVs. All B AIVs participate in the barriers, including empty local
+workers; signal is INT32 `[P,S]` with `S >= B`, initially zero. L2 requires a
+compile-time core count. All ranks must agree
+on geometry, launch width and collective order.
+
+Counts must be in `[0,C]`, and each valid index must be in `[0,Nmax)`.
+These are device-data preconditions; invalid values abort execution rather
+than being clamped into a different dispatch. Index tails are not read and
+may contain `-1`. A distributed run must be terminated as a group on failure.
+
+The kernel builds multi-SGE WRITE SQEs with SIMT: up to twelve complete rows
+per SQE, a fixed four-WQEBB slot, and NOPs in unused trailing WQEBBs. Each remote
+peer's entire transfer must fit its SQ: `ceil(send_counts[peer] / 12) * 4 <= sqDepth`;
+the kernel asserts this before posting. It rings a doorbell after each segment of
+at most 64 SQEs without waiting between segments. Only the transfer's final WRITE
+requests a strong-order fenced CQE, which is drained once after all segments are
+posted. SQ head counts WQEBBs; ISA submittedWqeCount increases once per nonempty
+remote peer transfer. All writes complete before the final barrier.
+Self uses direct TLOAD/TSTORE with an eight-stage ring of 8 KiB UB slots
+(64 KiB per local worker). Consecutive source indices are coalesced; scattered
+rows use the same pipeline across tokens. MTE2 waits only before reusing a slot,
+allowing loads of later tokens to overlap earlier MTE3 stores; all slots drain
+once at the end before publishing completion. It does not use synchronous TPUT
+per token. Remote payloads go directly through URMA. The runtime does not
+initialize a self-rank SQ/CQ for URMA loopback.
+
+This is a completion-tracked collective task, not an issue-only asynchronous
+handle. Producers of input/index/counts must precede it; consumers of target
+and recv_counts must follow it. Keep source buffers alive until task completion.
+Window reuse must also follow the previous local consumer. Callers must prevent
+concurrent exchanges from using the same URMA queues. Reusing the same signal
+creates an InOut dependency between calls, even with distinct payload windows;
+using independent signals requires an explicit task dependency. This API does
+not insert a global queue-ordering dependency.
+
+Synchronization uses SIMT global atomics for both notifications and polling,
+with backoff, rather than the scalar TNOTIFY/TWAIT implementation. The same
+signal lanes retain the two-round credit protocol. Receive counts use
+non-cacheable scalar stores, avoiding whole-cache-line writeback when control
+windows share a cache line. Persistent reuse with changed input is covered by
+the A5 system test; no full-payload cache sweep is added.

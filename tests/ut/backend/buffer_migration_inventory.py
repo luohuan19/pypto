@@ -25,7 +25,7 @@ class MigrationStatus(Enum):
     RESTRICTED = "restricted"
 
 
-_TARGETS = frozenset({backend.BackendType.Ascend910B, backend.BackendType.Ascend950})
+_TARGETS = frozenset({backend.BackendType.Ascend910, backend.BackendType.Ascend950})
 
 
 @dataclass(frozen=True)
@@ -158,6 +158,7 @@ MIGRATION_FAMILIES = (
             "tile.sel",
             "tile.sels",
         ),
+        restricted=frozenset({"tile.cmp", "tile.cmps", "tile.sel", "tile.sels"}),
     ),
     MigrationFamily(
         "G08: Vector generators",
@@ -185,6 +186,7 @@ MIGRATION_FAMILIES = (
             "tile.col_argmax",
             "tile.col_argmin",
         ),
+        restricted=frozenset({"tile.row_max", "tile.row_sum"}),
     ),
     MigrationFamily(
         "G10: Axis expansion and broadcast",
@@ -206,6 +208,7 @@ MIGRATION_FAMILIES = (
             "tile.row_expand_mul",
             "tile.row_expand_sub",
         ),
+        restricted=frozenset({"tile.row_expand_sub", "tile.row_expand_div"}),
     ),
     MigrationFamily(
         "G11: Padding",
@@ -225,7 +228,7 @@ MIGRATION_FAMILIES = (
             "tile.extract",
             "tile.assemble",
         ),
-        restricted=frozenset({"tile.move"}),
+        restricted=frozenset({"tile.move", "tile.cast"}),
     ),
     MigrationFamily(
         "G13: Views and valid metadata",
@@ -274,6 +277,7 @@ MIGRATION_FAMILIES = (
             "tile.mgather",
             "tile.mscatter",
         ),
+        restricted=frozenset({"tile.gather", "tile.scatter"}),
     ),
     MigrationFamily(
         "G17: Sorting",
@@ -304,12 +308,19 @@ MIGRATION_FAMILIES = (
         "G19: Barriers, cache and core synchronization",
         (
             "system.bar_all",
+            "system.bar_fix",
             "system.bar_m",
+            "system.bar_mte1",
+            "system.bar_mte2",
+            "system.bar_mte3",
+            "system.bar_s",
             "system.bar_v",
             "system.fence",
             "system.cacheinvalid",
             "system.sync_set",
             "system.sync_wait",
+            "system.set_flag",
+            "system.wait_flag",
             "system.set_ffts",
             "system.syncall",
         ),
@@ -334,6 +345,8 @@ MIGRATION_FAMILIES = (
         (
             "pld.tile.get",
             "pld.tile.put",
+            "pld.tensor.get_async",
+            "pld.tensor.put_async",
             "pld.tile.remote_load",
             "pld.tile.remote_store",
             "pld.system.notify",

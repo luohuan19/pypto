@@ -517,7 +517,7 @@ def test_distributed_loop_carries_fail_at_lowering_boundary(planner, kind, same_
     assert ir.serialize(program) == before
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("planner", _PLANNERS)
 @pytest.mark.parametrize(
     "dtype_name,mlir_type,operation",
@@ -589,10 +589,43 @@ class TypedTransfers:
         pytest.skip("PTOAS is not available")
     source, output = tmp_path / "typed.pto", tmp_path / "typed.cpp"
     source.write_text(text)
-    arch = "a2" if ascend_backend == BackendType.Ascend910B else "a5"
+    arch = "a2" if ascend_backend == BackendType.Ascend910 else "a5"
     level = "level2" if planner == passes.MemoryPlanner.PTOAS else "level3"
     _run_ptoas(str(source), str(output), [f"--pto-arch={arch}", f"--pto-level={level}"])
     assert output.is_file()
+
+
+@pytest.mark.parametrize(
+    "load_hint,store_hint",
+    [
+        (pl.CachePolicy.NORMAL_FIRST_VICTIM, None),
+        (pl.CachePolicy.NORMAL_PERSISTENT, None),
+        (None, pl.CachePolicy.NORMAL_FIRST_VICTIM),
+        (None, pl.CachePolicy.NORMAL_PERSISTENT),
+    ],
+)
+@pytest.mark.parametrize("force_buffer", [False, True])
+def test_buffer_selection_preserves_nondefault_cache_policy(load_hint, store_hint, force_buffer):
+    @pl.program
+    class Hinted:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self, source: pl.Tensor[[16, 32], pl.FP32], output: pl.Out[pl.Tensor[[16, 32], pl.FP32]]
+        ) -> pl.Tensor[[16, 32], pl.FP32]:
+            value = pl.load(source, [0, 0], [16, 32], cache=load_hint)
+            out = pl.store(value, [0, 0], output, cache=store_hint)
+            return out
+
+    if force_buffer:
+        with pytest.raises(ValueError, match="non-default cache requires a Buffer transfer recipe"):
+            _lower(passes.MemoryPlanner.PYPTO, program=Hinted)
+    else:
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+            result = PassManager(OptimizationStrategy.Default).run_passes(Hinted)
+        kernel = result.get_function("kernel")
+        assert kernel is not None
+        assert kernel.attrs["buffer_ir_selected"] is False
+        assert kernel.ir_stage == ir.FunctionIRStage.Functional
 
 
 @pl.program
@@ -681,7 +714,7 @@ def test_selected_kernel_failure_is_not_retried_as_tile():
     assert seen == [True]
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("planner", _PLANNERS)
 def test_default_rollout_native_compilation(tmp_path, ascend_backend, planner):
     if find_ptoas_binary() is None:
@@ -691,16 +724,16 @@ def test_default_rollout_native_compilation(tmp_path, ascend_backend, planner):
     function = result.get_function("kernel")
     expected = (
         ir.FunctionIRStage.Buffer
-        if ascend_backend == BackendType.Ascend910B
+        if ascend_backend == BackendType.Ascend910
         else ir.FunctionIRStage.Functional
     )
     assert function is not None and function.ir_stage == expected
-    assert function.attrs["buffer_ir_selected"] == (ascend_backend == BackendType.Ascend910B)
+    assert function.attrs["buffer_ir_selected"] == (ascend_backend == BackendType.Ascend910)
     source, output = tmp_path / "default.pto", tmp_path / "default.cpp"
     source.write_text(
         codegen.PTOCodegen().generate(result, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
     )
-    arch = "a2" if ascend_backend == BackendType.Ascend910B else "a5"
+    arch = "a2" if ascend_backend == BackendType.Ascend910 else "a5"
     level = "level2" if planner == passes.MemoryPlanner.PTOAS else "level3"
     _run_ptoas(str(source), str(output), [f"--pto-level={level}", f"--pto-arch={arch}"])
     assert output.is_file()
@@ -747,6 +780,43 @@ class Transfer:
     assert function is not None
     assert function.attrs["buffer_ir_selected"] is selected
     assert function.ir_stage == (ir.FunctionIRStage.Buffer if selected else ir.FunctionIRStage.Functional)
+
+
+@pytest.mark.parametrize("planner", _PLANNERS)
+@pytest.mark.parametrize("dtype_name", ["FP32", "INT32"])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+def test_explicit_store_partition_keeps_whole_kernel_on_tile(planner, dtype_name, dynamic):
+    """Route packing must retain its fourth store operand through selection.
+
+    Buffer selection previously accepted this valid rank-2 store, then lowering
+    asserted that it had only three operands. Exercise the model's narrowed
+    output partition with both constant and runtime row counts.
+    """
+    rows = "count" if dynamic else "8"
+    before = pl.parse_program(f"""
+@pl.program
+class PartitionedStore:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.{dtype_name}],
+               output: pl.Out[pl.Tensor[[16, 16], pl.{dtype_name}]],
+               count: pl.Scalar[pl.INDEX]) -> pl.Tensor[[16, 16], pl.{dtype_name}]:
+        value = pl.load(source, [0, 0], [16, 32], valid_shape=[{rows}, 16])
+        pl.store(value, [0, 0], output, shapes=[{rows}, 16])
+        return output
+""")
+    outputs = []
+    for enabled in (False, True):
+        with passes.PassContext([], memory_planner=planner, enable_buffer_ir=enabled):
+            after = PassManager(OptimizationStrategy.Default).run_passes(before)
+        function = after.get_function("kernel")
+        assert function is not None
+        if enabled:
+            assert function.attrs["buffer_ir_selected"] is False
+        assert function.ir_stage == ir.FunctionIRStage.Functional
+        outputs.append(function.body)
+        source = codegen.PTOCodegen().generate(after, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
+        assert "pto.tstore" in source
+    ir.assert_structural_equal(*outputs, enable_auto_mapping=True)
 
 
 @pytest.mark.parametrize("planner", _PLANNERS)

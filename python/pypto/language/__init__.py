@@ -51,7 +51,9 @@ from pypto.pypto_core.ir import (
     MemorySpace,
     PadValue,
     PipeType,
+    RegKind,
     Role,
+    SimtAxis,
     SplitMode,
     STPhase,
     TensorLayout,
@@ -68,6 +70,7 @@ from .dsl_api import (
     const,
     func_attr,
     graph,
+    hardware_loop,
     parallel,
     pipeline,
     range,
@@ -81,6 +84,8 @@ from .dsl_api import (
 )
 from .op import array_ops as array
 from .op import prefetch_ops as prefetch
+from .op import reg_ops as reg
+from .op import simt_ops as simt
 from .op import system_ops as system
 from .op import tensor_ops as tensor
 from .op import tile_ops as tile
@@ -251,7 +256,7 @@ from .op.unified_ops import (
 from .optimizations import cross_core_slot, split
 from .parser.decorator import InlineFunction, function, inline, program
 from .parser.text_parser import loads, loads_program, parse, parse_program
-from .scope import ScopeMode, manual_scope, scope, spmd_submit, submit
+from .scope import ScopeMode, manual_scope, reg_scope, scope, simt_scope, spmd_submit, submit
 from .typing import (
     RUNTIME,
     Array,
@@ -265,6 +270,7 @@ from .typing import (
     Out,
     PrefetchAsyncContext,
     Ptr,
+    Reg,
     Scalar,
     Tensor,
     Tile,
@@ -284,8 +290,11 @@ MX_A_ZZ = TensorLayout.MX_A_ZZ
 MX_B_NN = TensorLayout.MX_B_NN
 
 # Re-export DataType constants for convenience
-FP4 = DataType.FP4
 FP4E2M1X2 = DataType.FP4E2M1X2  # packed carrier (PTOAS / Torch)
+FP4E1M2X2 = DataType.FP4E1M2X2  # packed carrier (PTOAS)
+# Match the PTOAS packed-format spelling while preserving the established aliases.
+fp4e2m1x2 = FP4E2M1X2
+fp4e1m2x2 = FP4E1M2X2
 FP8E4M3FN = DataType.FP8E4M3FN
 FP8E5M2 = DataType.FP8E5M2
 FP8E8M0 = DataType.FP8E8M0
@@ -338,6 +347,7 @@ __all__ = [
     "RUNTIME",
     "dynamic",
     "const",
+    "hardware_loop",
     "range",
     "parallel",
     "unroll",
@@ -525,12 +535,19 @@ __all__ = [
     "SyncAllMode",
     "Level",
     "MemRef",
+    "Reg",
+    "reg",
+    "reg_scope",
+    "simt_scope",
+    "simt",
+    "RegKind",
     "Role",
     "SplitMode",
     "STPhase",
     "Mem",
     "MemRefType",
     "MemorySpace",
+    "SimtAxis",
     "PipeType",
     "Ptr",
     "PrefetchAsyncContext",
@@ -547,8 +564,10 @@ __all__ = [
     "NZ",
     "MX_A_ZZ",
     "MX_B_NN",
-    "FP4",
     "FP4E2M1X2",
+    "FP4E1M2X2",
+    "fp4e2m1x2",
+    "fp4e1m2x2",
     "FP8E4M3FN",
     "FP8E5M2",
     "FP8E8M0",

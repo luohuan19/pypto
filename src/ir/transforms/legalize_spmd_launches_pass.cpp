@@ -40,6 +40,7 @@
 #include "pypto/ir/transforms/utils/normalize_stmt_structure.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/spmd_launch_utils.h"
+#include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 #include "pypto/ir/type.h"
 
@@ -62,6 +63,64 @@ struct CalleeInfo {
   std::vector<ParamDirection> directions;
   std::vector<std::optional<size_t>> returned_params;
   size_t required_params = 0;
+};
+
+// Tuple projections/aliases introduced by outlining need not escape a launch.
+// Index their uses once and propagate liveness with a worklist, rather than
+// rescanning the body to a fixed point. Calls and scheduling channels stay live.
+class LaunchResultLiveness : public var_collectors::VarDefUseCollector {
+ public:
+  std::unordered_map<const Var*, std::unordered_set<const Var*>> bindings;
+
+  explicit LaunchResultLiveness(const FunctionPtr& function) {
+    VisitFunction(function);
+    std::vector<const Var*> worklist(var_uses.begin(), var_uses.end());
+    while (!worklist.empty()) {
+      const Var* var = worklist.back();
+      worklist.pop_back();
+      auto it = bindings.find(var);
+      if (it == bindings.end()) continue;
+      for (const Var* source : it->second) {
+        if (var_uses.insert(source).second) worklist.push_back(source);
+      }
+    }
+  }
+
+  void VisitStmt(const StmtPtr& stmt) override {
+    // Binder shapes/views are uses even when their values have no readers.
+    for (const Var* var : var_collectors::CollectStmtDefinedVars(stmt)) {
+      var_collectors::VisitTypeExprFields(*this, var->GetType());
+    }
+    VarDefUseCollector::VisitStmt(stmt);
+  }
+
+ protected:
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    const bool tensor_or_tuple = AsTensorTypeLike(op->var_->GetType()) || As<TupleType>(op->var_->GetType());
+    if (tensor_or_tuple && IsTupleBinding(op->value_)) {
+      var_collectors::VarDefUseCollector uses;
+      uses.VisitExpr(op->value_);
+      bindings.emplace(op->var_.get(), std::move(uses.var_uses));
+    } else {
+      // A Submit result carries the scheduling handle even without a direct
+      // reader. Keep its existing result/TaskId legalization contract.
+      if (As<Submit>(op->value_)) var_uses.insert(op->var_.get());
+      VarDefUseCollector::VisitStmt_(op);
+    }
+  }
+
+ private:
+  static bool IsTupleBinding(const ExprPtr& expr) {
+    if (AsVarLike(expr)) return true;
+    if (auto item = As<TupleGetItemExpr>(expr)) return IsTupleBinding(item->tuple_);
+    if (auto tuple = As<MakeTuple>(expr)) {
+      for (const auto& element : tuple->elements_) {
+        if (!IsTupleBinding(element)) return false;
+      }
+      return true;
+    }
+    return false;
+  }
 };
 
 class ScratchUses : public IRVisitor {
@@ -94,8 +153,13 @@ class RemoveMovedScratch : public IRMutator {
 class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
  public:
   LaunchLegalizer(arith::Analyzer* analyzer, const std::unordered_map<std::string, CalleeInfo>& callees,
-                  const ScratchUses& scratch, bool verify_only = false)
-      : IRMutatorWithAnalyzer(analyzer), callees_(callees), scratch_(scratch), verify_only_(verify_only) {}
+                  const ScratchUses& scratch, bool verify_only = false,
+                  const LaunchResultLiveness* liveness = nullptr)
+      : IRMutatorWithAnalyzer(analyzer),
+        callees_(callees),
+        scratch_(scratch),
+        verify_only_(verify_only),
+        liveness_(liveness) {}
 
   RemoveMovedScratch scratch_cleanup;
 
@@ -148,8 +212,12 @@ class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    const bool unused = liveness_ && !liveness_->var_uses.count(op->var_.get());
+    if (unused && liveness_->bindings.count(op->var_.get())) {
+      return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
+    }
     auto value = VisitExpr(op->value_);
-    if (auto guarded = Guard(value, op->var_, op->leading_comments_)) return guarded;
+    if (auto guarded = Guard(value, unused ? nullptr : op->var_, op->leading_comments_)) return guarded;
     if (auto scalar = As<ScalarType>(op->var_->GetType());
         scalar && scalar->dtype_ != DataType::TASK_ID && IsScalarArithmetic(value)) {
       // Match Simplify's scalar binding policy. Substituting a symbolic RHS
@@ -178,6 +246,7 @@ class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
   const std::unordered_map<std::string, CalleeInfo>& callees_;
   const ScratchUses& scratch_;
   bool verify_only_;
+  const LaunchResultLiveness* liveness_;
   std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_results_;
   std::unordered_map<const Var*, VarPtr> scalar_results_;
   std::vector<VarPtr> bindings_;
@@ -196,6 +265,17 @@ class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
     return result;
   }
 
+  /// Guard a potentially non-positive SPMD launch with an If on the core count.
+  ///
+  /// A count that range analysis proves positive is left alone. Otherwise the
+  /// launch is emitted inside `if (count > 0)`, and the empty path must produce
+  /// the same SSA values as the non-empty one: tensor results alias the
+  /// caller's preallocated Out/InOut buffers, while a TaskId result becomes a
+  /// dummy task carrying the launch's dependencies. A launch that is provably
+  /// empty is emitted as its empty path only.
+  ///
+  /// Returns nullptr when the expression is not a launch of a known callee or
+  /// carries no core count.
   StmtPtr Guard(const ExprPtr& expr, const VarPtr& lhs, const std::vector<std::string>& comments) {
     auto call = As<Call>(expr);
     auto submit = As<Submit>(expr);
@@ -223,7 +303,8 @@ class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
         << "Internal error: invalid SPMD argument coverage";
     // Match the parser's optional Out/InOut binding: reserve arguments for
     // every remaining required input, including a trailing CommCtx suffix.
-    // An omitted output need not be a trailing parameter.
+    // An omitted output need not be a trailing parameter — but the empty path
+    // must still name a preallocated buffer for every output.
     std::vector<ExprPtr> arguments(params.size());
     size_t arg_index = 0;
     size_t remaining_required = info.required_params;
@@ -249,6 +330,8 @@ class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
         << "' may have a non-positive core_num; output tensors" << missing.str()
         << " are not preallocated. Allocate and pass every Out/InOut tensor before this launch.";
 
+    // Pin a compound count expression so the If condition and the launch read
+    // one SSA value.
     std::vector<StmtPtr> prefix;
     if (!AsVarLike(count) && !As<ConstInt>(count)) {
       auto count_var = std::make_shared<Var>("spmd_core_num", count->GetType(), count->span_);
@@ -273,6 +356,8 @@ class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
       launch = copy;
     }
 
+    // Move compiler GM-pipe allocations next to the launch; the empty path
+    // must not allocate a zero-sized workspace.
     std::vector<StmtPtr> then_stmts, else_stmts;
     for (const auto& arg : args) {
       auto var = AsVarLike(arg);
@@ -287,6 +372,8 @@ class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
       then_stmts.push_back(MutableCopy(create->second));
       scratch_cleanup.moved.insert(create->second.get());
     }
+    // One then/else value per declared return; this is where both paths are
+    // forced to agree on SSA types.
     std::vector<ExprPtr> then_values, else_values;
     std::vector<VarPtr> results;
     if (lhs) {
@@ -321,6 +408,9 @@ class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
       }
       auto local = std::make_shared<Var>(lhs->name_hint_ + "_nonempty", result_type, lhs->span_);
       then_stmts.push_back(std::make_shared<AssignStmt>(local, launch, expr->span_));
+      // One then/else pair per declared result: the non-empty path defines
+      // fresh SSA names from the launch; the empty path reuses the caller's
+      // buffer (tensors) or a dependency-carrying dummy task (TaskIds).
       for (size_t i = 0; i < types.size(); ++i) {
         VarPtr true_value = local;
         VarPtr result = lhs;
@@ -378,6 +468,8 @@ class LaunchLegalizer : public arith::IRMutatorWithAnalyzer {
       }
       return SeqStmts::Flatten(prefix, expr->span_);
     }
+    // Emit the guard: the non-empty branch runs the launch, the empty branch
+    // yields the preallocated outputs.
     else_stmts.push_back(std::make_shared<YieldStmt>(else_values, expr->span_));
     auto condition =
         MakeGt(count, std::make_shared<ConstInt>(0, As<ScalarType>(count->GetType())->dtype_, expr->span_),
@@ -429,7 +521,8 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
     auto analyzer = std::make_shared<arith::Analyzer>();
     ScratchUses scratch;
     scratch.VisitStmt(func->body_);
-    LaunchLegalizer legalizer(analyzer.get(), callees, scratch);
+    LaunchResultLiveness liveness(func);
+    LaunchLegalizer legalizer(analyzer.get(), callees, scratch, /*verify_only=*/false, &liveness);
     auto result = legalizer.VisitFunction(func);
     result = NormalizeStmtStructure(legalizer.scratch_cleanup.VisitFunction(result));
     VerifyOrchestrationSSA(result);

@@ -19,6 +19,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -31,9 +32,13 @@
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/op_rules.h"
 #include "pypto/backend/common/soc.h"
+#include "pypto/core/dtype.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/pipe.h"
+#include "pypto/ir/type.h"
+#include "pypto/sync/resource_catalog.h"
 
 namespace nb = nanobind;
 
@@ -61,10 +66,16 @@ void BindBackend(nb::module_& m) {
                   "each recipe still restricts physical forms");
 
   // ========== BackendType enum ==========
-  nb::enum_<BackendType>(backend_mod, "BackendType",
-                         "Backend type for passes and codegen (use Instance internally)")
-      .value("Ascend910B", BackendType::Ascend910B, "910B backend (PTO assembly codegen)")
-      .value("Ascend950", BackendType::Ascend950, "950 PTO backend");
+  auto backend_type =
+      nb::enum_<BackendType>(backend_mod, "BackendType",
+                             "Backend type for passes and codegen (use Instance internally)")
+          .value("Ascend910", BackendType::Ascend910, "910 backend (A2/A3 PTO assembly codegen)")
+          .value("Ascend950", BackendType::Ascend950, "950 PTO backend");
+
+  // Register the old spelling as the same Python object. A second .value()
+  // creates a distinct nanobind enum member and breaks Python identity/equality.
+  backend_type.attr("Ascend910B") = backend_type.attr("Ascend910");
+  backend_type.attr("_member_map_")["Ascend910B"] = backend_type.attr("Ascend910");
 
   // ========== Mem class ==========
   nb::class_<Mem>(backend_mod, "Mem", "Memory component")
@@ -135,18 +146,31 @@ void BindBackend(nb::module_& m) {
   nb::class_<BackendHandler>(backend_mod, "BackendHandler", "Per-backend behaviour dispatch interface")
       .def("get_pto_target_arch", &BackendHandler::GetPtoTargetArch,
            "PTO MLIR target arch attribute string (e.g. 'a2a3', 'a5')")
+      .def("has_hardware_loop_evidence", &BackendHandler::HasHardwareLoopEvidence, nb::arg("qualification"),
+           nb::arg("artifact"), "Check final artifact evidence; unsupported backends always return false")
+      .def("get_hardware_loop_profile", &BackendHandler::GetHardwareLoopProfile,
+           "Versioned hardware-loop capability profile; unsupported by default")
+      .def("supports_reg_type", &BackendHandler::SupportsRegType, nb::arg("type"),
+           "Whether this target supports the logical VMI register type")
       .def("get_launch_spec_core_count_method", &BackendHandler::GetLaunchSpecCoreCountMethod,
-           "Method name on launch_spec for setting core count "
-           "('set_block_num' on Ascend910B, 'set_core_num' on Ascend950)")
+           "Method name on launch_spec for setting the logical block count "
+           "('set_block_num' on both backends and runtimes)")
       .def("get_default_sim_platform", &BackendHandler::GetDefaultSimPlatform,
            "Default simulator platform name (e.g. 'a2a3sim', 'a5sim')")
       .def("get_extra_ptoas_flags", &BackendHandler::GetExtraPtoasFlags,
            "Extra flags appended to ptoas invocation for this backend")
       .def("honors_high_precision_algorithm", &BackendHandler::HonorsHighPrecisionAlgorithm,
            "Whether PTO-ISA selects a distinct algorithm from the precisionType attribute that "
-           "high_precision=True emits (ignored on Ascend910B)")
+           "high_precision=True emits (ignored on Ascend910)")
       .def("requires_gm_pipe_buffer", &BackendHandler::RequiresGMPipeBuffer,
            "Whether ExpandMixedKernel must inject the GM-backed pipe slot buffer")
+      .def("supports_runtime_bound_local_software_pipeline",
+           &BackendHandler::SupportsRuntimeBoundLocalSoftwarePipeline,
+           "Whether this backend enables local Vec software-pipeline lowering with runtime trip counts")
+      .def("supports_c2v_fixpipe_epilogue", &BackendHandler::SupportsC2VFixpipeEpilogue,
+           "Whether non-split C2V pipes support explicit FP32 output conversion and ReLU")
+      .def("supports_local_pipe_depth", &BackendHandler::SupportsLocalPipeDepth,
+           "Whether cross-core pipes support a local consumer depth independent of the transport ring")
       .def("requires_split_load_tpop_workaround", &BackendHandler::RequiresSplitLoadTpopWorkaround,
            "Whether MemoryReuse must apply the load + tpop_from_aic in-place hazard guard")
       .def("requires_level3_tmp_scratch", &BackendHandler::RequiresLevel3TmpScratch,
@@ -165,18 +189,13 @@ void BindBackend(nb::module_& m) {
       .def("get_l2_cache_line_bytes", &BackendHandler::GetL2CacheLineBytes, "L2 cache line size in bytes")
       .def("get_recommended_innermost_dim_bytes", &BackendHandler::GetRecommendedInnermostDimBytes,
            "Recommended minimum innermost-dim size, in bytes, for tile ops touching GM")
-      .def("get_l0a_capacity_bytes", &BackendHandler::GetL0aCapacityBytes,
-           "L0a (Left) on-chip SRAM capacity in bytes")
-      .def("get_l0b_capacity_bytes", &BackendHandler::GetL0bCapacityBytes,
-           "L0b (Right) on-chip SRAM capacity in bytes")
-      .def("get_l0c_capacity_bytes", &BackendHandler::GetL0cCapacityBytes,
-           "L0c (Acc) on-chip SRAM capacity in bytes")
-      .def("get_bias_capacity_bytes", &BackendHandler::GetBiasCapacityBytes,
-           "Bias-table on-chip SRAM capacity in bytes")
+      .def("get_capacity_bytes", &BackendHandler::GetCapacityBytes, nb::arg("memory_space"),
+           "Capacity of one memory component in the owning SoC, in bytes; 0 for an unmodeled space")
+      .def("get_sync_resource_catalog", &BackendHandler::GetSyncResourceCatalog, nb::rv_policy::reference,
+           "Borrow this backend's process-lifetime synchronization resource catalog without changing "
+           "the active backend")
       .def("supports_mat_to_bias_move", &BackendHandler::SupportsMatToBiasMove, nb::arg("source_dtype"),
            nb::arg("bias_dtype"), "Whether the backend supports this Mat-to-Bias tile.move dtype pair")
-      .def("get_mat_capacity_bytes", &BackendHandler::GetMatCapacityBytes,
-           "Mat (L1) on-chip SRAM capacity in bytes")
       .def("get_l0_fractal_alignment", &BackendHandler::GetL0FractalAlignment,
            "Cube fractal alignment in elements for L0 tile dimensions m, n, k")
       .def("get_l0c_m_alignment", &BackendHandler::GetL0cMAlignment, nb::arg("accumulator_dtype"),
@@ -184,11 +203,41 @@ void BindBackend(nb::module_& m) {
       .def("get_min_l0_tile_dim", &BackendHandler::GetMinL0TileDim,
            "Minimum legal value for L0 tile dimensions m, n, k");
 
+  nb::enum_<backend::OpScratchStatus>(backend_mod, "OpScratchStatus")
+      .value("Required", backend::OpScratchStatus::Required)
+      .value("NotRequired", backend::OpScratchStatus::NotRequired)
+      .value("Unknown", backend::OpScratchStatus::Unknown)
+      .value("Unsupported", backend::OpScratchStatus::Unsupported);
+  nb::class_<backend::TileScratchSpec>(backend_mod, "TileScratchSpec")
+      .def_ro("dtype", &backend::TileScratchSpec::dtype)
+      .def_ro("rows", &backend::TileScratchSpec::rows)
+      .def_ro("cols", &backend::TileScratchSpec::cols);
+  nb::class_<backend::OpScratchPlan>(backend_mod, "OpScratchPlan")
+      .def_ro("status", &backend::OpScratchPlan::status)
+      .def_ro("spec", &backend::OpScratchPlan::spec)
+      .def_ro("reason", &backend::OpScratchPlan::reason);
+
   // ========== Backend abstract base class ==========
   nb::class_<Backend>(backend_mod, "Backend", "Abstract backend base class")
       .def("get_type_name", &Backend::GetTypeName, "Get backend type name")
       .def("get_registered_op_names", &Backend::GetRegisteredOpNames,
            "Get a sorted snapshot of this backend's registered operator names")
+      .def("find_isa_macro_resources", &Backend::FindIsaMacroResources, nb::arg("name"),
+           "Return symbolic signal claims for a qualified ISA macro, or None if unregistered")
+      .def("get_isa_macro_names", &Backend::GetIsaMacroNames,
+           "Return sorted qualified ISA macro names with registered signal occupancy")
+      .def(
+          "plan_op_scratch",
+          [](const Backend& target, const std::string& op_name, std::optional<DataType> source_dtype,
+             std::optional<int64_t> source_cols, std::optional<DataType> target_dtype,
+             std::optional<bool> saturating, const ir::TileTypePtr& source_tile) {
+            return target.PlanOpScratch(op_name,
+                                        {source_dtype, source_cols, target_dtype, saturating, source_tile});
+          },
+          nb::arg("op_name"), nb::arg("source_dtype") = nb::none(), nb::arg("source_cols") = nb::none(),
+          nb::kw_only(), nb::arg("target_dtype") = nb::none(), nb::arg("saturating") = nb::none(),
+          nb::arg("source_tile") = nb::none(),
+          "Plan compiler-created scratch using this backend's registered rule; None means no rule")
       .def("get_handler", &Backend::GetHandler, nb::rv_policy::reference,
            "Get the per-backend BackendHandler singleton")
       .def("export_to_file", &Backend::ExportToFile, nb::arg("path"), "Export backend to msgpack file")

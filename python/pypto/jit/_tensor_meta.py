@@ -1,0 +1,3009 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Source-ordered local tensor metadata inference for JIT specialization.
+
+Branch joins, rebinding, and recursive dependency returns share one analysis.
+The caller supplies dependency discovery so this module never imports the
+decorator at runtime; recursive walks preserve that resolver and request snapshot."""
+
+import ast
+import copy
+import functools
+import importlib
+import inspect
+import math
+import types
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
+
+from pypto.arith import Analyzer
+from pypto.language.distributed.typing.distributed_tensor import DistributedTensor
+from pypto.pypto_core import DataType
+from pypto.pypto_core import ir as _ir
+
+from . import _arguments, _ast_analysis, _call_binding
+from ._call_syntax import dependency_call
+from ._call_syntax import writeback_return_operand as _writeback_return_operand
+from ._scalar_meta import ScalarTypes
+from ._specialize_body import BodyTransformer
+from .specializer import (
+    DynDim,
+    ShapeDim,
+    TensorMeta,
+    _classify_params,
+    _implicit_entry_output_name,
+    _LangDynVar,
+    _LangTensor,
+    _LangTuple,
+    _legacy_inout_return_params,
+    _tuple_annotation_elements,
+    func_name_lookup,
+)
+
+if TYPE_CHECKING:
+    from .decorator import JITFunction
+
+
+# Prefix for the dynamic symbols ``@pl.jit`` invents when a local tensor's
+# extent is only known at runtime. Reserved: user DSL code must not declare
+# ``pl.dynamic()`` symbols starting with it.
+_SYNTHESIZED_DYN_PREFIX = "_jitdyn_"
+
+
+def synthesized_dyn_dim(owner: str, base: str, dim_idx: int) -> DynDim:
+    """Build the placeholder ``DynDim`` for an extent only known at runtime.
+
+    A local tensor sized by a runtime expression — ``pld.world_size()``,
+    ``pl.tensor.read(cfg, [0])``, arithmetic over a ``DynDim`` — has no static
+    extent to record. Rather than dropping the whole meta (which surfaces as
+    ``_build_params``' "missing inferred tensor metadata" the moment the local
+    crosses a dep call boundary), stamp a fresh symbol on that dim. The
+    generated program then declares it via ``pl.dynamic`` and the kernel binds
+    it from the actual argument's descriptor, exactly as a hand-written
+    ``@pl.program`` would.
+
+    The symbol is qualified by the function that owns the local. Two functions
+    each holding a runtime-sized local named ``tmp`` would otherwise land on one
+    name for unrelated extents. That is not *wrong* — a dynamic symbol carries no
+    cross-function equality constraint, and each function emits its own
+    "read dim k of the declaring argument" binding — but one name on two
+    unrelated tensors makes a dumped program much harder to read.
+
+    Args:
+        owner: Name of the function whose body declares the local
+        base: Name of the local the meta describes, for a readable symbol
+        dim_idx: Index of the unresolved dim within that local's shape
+
+    Returns:
+        A ``synthesized=True`` DynDim named ``_jitdyn_<owner>_<base>_d<dim_idx>``
+    """
+    name = f"{_SYNTHESIZED_DYN_PREFIX}{owner}_{base}_d{dim_idx}"
+    # ``static_bound=1`` matches the placeholder extent ``signature_tensor_meta``
+    # uses for annotation-declared dynamic dims: the specialized program is
+    # extent-independent, so no concrete value is available or needed here.
+    return DynDim(name=name, literal=name, static_bound=1, synthesized=True)
+
+
+def _build_dynvar_anchor_index(
+    seed_meta: dict[str, TensorMeta],
+) -> dict[str, list[tuple[str, int]]]:
+    """Inverse map ``DynVar name → list of (param, dim_idx) anchor sites``.
+
+    Lets ``[M, HIDDEN]`` (where ``M`` is a DynVar bound to a seeded param's
+    dim) resolve via ``extract_local_tensor_metas`` to the parent dim's
+    ``DynDim``.
+    """
+    anchors: dict[str, list[tuple[str, int]]] = {}
+    for pname, meta in seed_meta.items():
+        for i, dim in enumerate(meta.shape):
+            if isinstance(dim, DynDim):
+                anchors.setdefault(dim.name, []).append((pname, i))
+    return anchors
+
+
+def scan_dep_io(
+    func: Any, caller_func_type: str = "orchestration", *, discover_deps: _call_binding.DiscoverDeps
+) -> dict[str, tuple[list[str], list[str]]]:
+    """Return ``call_name → (param_names, output_param_names)`` for every @pl.jit
+    dep called from ``func``'s body.
+
+    Keyed by the name the body *calls* the dep by, so an aliased import
+    (``from mod import kernel as kern``) still matches the ``ast.Name`` at the
+    call site.
+
+    Used by ``extract_local_tensor_metas`` to propagate metas through
+    ``v1, ..., vk = dep(args)`` assignments (each ``vi`` inherits the meta of
+    the caller arg bound to the i-th output-like parameter). A dep with no
+    output-like params is still recorded: ``_dep_return_metas`` needs
+    ``param_names`` to bind the call site's args when it descends into the
+    callee's body.
+
+    ``output_param_names`` covers both ``pl.Out[...]`` and ``pl.InOut[...]``
+    params — a caller can capture either from ``v = dep(...)`` — and is kept in
+    declaration order for the ordinary positional output convention in
+    ``_dep_out_metas``. Explicit extern aliases bypass that convention and
+    propagate metadata from their returned parameter names instead.
+
+    ``caller_func_type`` mirrors ``_discover_deps``'s gating: a host
+    orchestrator also admits ``orchestration`` deps (its chip orchestrators).
+    """
+    out: dict[str, tuple[list[str], list[str]]] = {}
+    for call_name, dep in discover_deps(func, caller_func_type):
+        try:
+            func_def = _ast_analysis.get_func_def(dep._func)
+            out_params, inout_params, _, _, _ = _classify_params(func_def)
+        except OSError:
+            continue
+        param_names = dep._param_names()
+        output_set = set(out_params) | set(inout_params)
+        output_params = [p for p in param_names if p in output_set]
+        # Match the generated no-return entry ABI, rather than treating an
+        # earlier unreturned InOut state as an additional result position.
+        implicit_out = _implicit_entry_output_name(func_def, dep._func_type, out_params)
+        if implicit_out is not None:
+            output_params = [implicit_out]
+        out[call_name] = (param_names, output_params)
+    return out
+
+
+_TupleMeta = tuple[TensorMeta | None, ...]
+_TensorSeedKey = tuple[
+    tuple[int | tuple[int, DynDim], ...],
+    DataType,
+    _ir.TensorLayout | None,
+    frozenset[int],
+    tuple[tuple[int, int, DynDim], ...],
+    bool,
+]
+
+
+class _DepResults(NamedTuple):
+    metas: _TupleMeta
+    stale_positions: frozenset[int]
+
+
+class _DepSummaryKey(NamedTuple):
+    dep_id: int
+    track_returns: bool
+    seed: tuple[tuple[str, _TensorSeedKey], ...]
+    constexpr: tuple[tuple[str, str], ...]
+
+
+@dataclass
+class _DepSummaries:
+    values: dict[_DepSummaryKey, _DepResults | None]
+    cycles: int = 0
+
+
+class _DepAnalysis(NamedTuple):
+    seen: frozenset[int]
+    summaries: _DepSummaries
+
+
+def _tensor_seed_key(meta: TensorMeta) -> _TensorSeedKey:
+    # Retain the dimension object so its identity cannot be reused during
+    # this metadata walk. An equal-valued but unrelated DynDim is distinct.
+    shape = tuple((id(dim), dim) if isinstance(dim, DynDim) else dim for dim in meta.shape)
+    runtime = tuple((axis, id(dim), dim) for axis, dim in sorted(meta.runtime_dims.items()))
+    return shape, meta.dtype, meta.layout, meta.inexact_axes, runtime, meta.is_distributed
+
+
+@dataclass
+class _DepScan:
+    """Everything the local-meta walk needs to know about one caller's deps.
+
+    ``io`` and ``funcs`` are both keyed by the name the caller's *source*
+    calls the dep by (see :class:`DepBinding`). ``analysis`` carries the
+    recursion guard, keyed by JIT wrapper identity (or raw callable for
+    standalone extraction), and completed return summaries for this metadata
+    walk. ``constexpr`` and
+    ``scope`` are the caller's own ``pl.constexpr`` binding and namespace, from
+    which that descent resolves the binding each call site gives its callee.
+    """
+
+    io: dict[str, tuple[list[str], list[str]]]
+    funcs: "dict[str, JITFunction]"
+    analysis: _DepAnalysis
+    constexpr: Mapping[str, str]
+    scope: "_StaticScope"
+    owner: str
+    # Keep runtime JIT recognition at the decorator boundary, also for callee returns.
+    discover_deps: _call_binding.DiscoverDeps
+    resolve_expr: Callable[[ast.expr], TensorMeta | None] | None = None
+
+
+def _target_names(target: ast.expr) -> list[str]:
+    """Return the bound names of ``v = ...`` / ``v1, ..., vk = ...``.
+
+    Empty for any other target shape (a subscript, an attribute, a nested
+    unpack) — those are not local tensor rebindings this extractor models.
+    """
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Tuple) and all(isinstance(e, ast.Name) for e in target.elts):
+        return [e.id for e in target.elts if isinstance(e, ast.Name)]
+    return []
+
+
+@dataclass
+class _ReturnMeta:
+    """Track local tuple metadata and, when requested, one return site."""
+
+    site: ast.Return | None
+    elements: list[ast.expr]
+    metas: dict[ast.expr, TensorMeta | None] = field(default_factory=dict[ast.expr, TensorMeta | None])
+    tuples: dict[str, _TupleMeta] = field(default_factory=dict[str, _TupleMeta])
+    tuple_result: _TupleMeta | None = None
+
+    def read_tuple(
+        self, value: ast.expr | None, resolve_expr: Callable[[ast.expr], TensorMeta | None]
+    ) -> _TupleMeta | None:
+        if isinstance(value, ast.Name):
+            return self.tuples.get(value.id)
+        if isinstance(value, ast.Tuple):
+            return tuple(resolve_expr(elt) for elt in value.elts)
+        return None
+
+    def assign(self, targets: list[ast.expr], items: _TupleMeta | None, local: dict[str, TensorMeta]) -> None:
+        for target in targets:
+            for name in _target_names(target):
+                self.tuples.pop(name, None)
+            if items is None:
+                continue
+            if isinstance(target, ast.Name):
+                self.tuples[target.id] = items
+            elif isinstance(target, ast.Tuple):
+                names = _target_names(target)
+                if len(names) != len(items):
+                    continue
+                for name, meta in zip(names, items, strict=True):
+                    if meta is None:
+                        local.pop(name, None)
+                    else:
+                        local[name] = meta
+
+
+def _return_site(tree: ast.AST) -> ast.Return | None:
+    """Find the first value-carrying return."""
+    return next(
+        (node for node in ast.walk(tree) if isinstance(node, ast.Return) and node.value is not None),
+        None,
+    )
+
+
+def _returned_element_name(value: ast.expr) -> str:
+    if isinstance(value, ast.Name):
+        return value.id
+    target = _writeback_return_operand(value) if isinstance(value, ast.Call) else None
+    return target.id if isinstance(target, ast.Name) else ""
+
+
+def _dep_annotation_namespace(dep: "JITFunction", binding: Mapping[str, str]) -> dict[str, Any]:
+    namespace = {**func_name_lookup(dep._func), "pl": importlib.import_module("pypto.language")}
+    for name, text in binding.items():
+        namespace[name] = _arguments.resolve_annotation(text, namespace)
+    return namespace
+
+
+def _omitted_output_metas(
+    dep: "JITFunction", call: ast.Call, binding: Mapping[str, str]
+) -> dict[str, TensorMeta]:
+    """Read only truly omitted Out slots; never repair an unknown supplied operand."""
+    supplied = _call_binding.build_param_mapping(dep._param_names(), _call_binding.call_arg_refs(call))
+    definition = _ast_analysis.get_func_def(dep._func)
+    outputs = _classify_params(definition)[0]
+    outputs = [name for name in outputs if name not in supplied]
+    if not outputs:
+        return {}
+    signature = inspect.signature(dep._func)
+    source_annotations = {arg.arg: arg.annotation for arg in definition.args.args}
+    namespace = _dep_annotation_namespace(dep, binding)
+    dyn_map = _ast_analysis.build_dyndim_map_for_func(dep._func, tuple(outputs), include_annotations=False)
+    result: dict[str, TensorMeta] = {}
+    for name in outputs:
+        eager = signature.parameters[name].annotation
+        annotation = _arguments.resolve_call_annotation(
+            source_annotations.get(name), eager, namespace, binding
+        )
+        if (
+            isinstance(annotation, _LangTensor)
+            and annotation.shape is not None
+            and annotation.dtype is not None
+        ):
+            result[name] = _arguments.signature_tensor_meta(
+                annotation,
+                annotation.dtype,
+                dyn_map.get(name, {}),
+                _LangDynVar,
+                param_name=name,
+                func_name=dep.__name__,
+            )
+    return result
+
+
+def _dep_out_metas(
+    call: ast.Call,
+    dep_name: str,
+    target: ast.expr,
+    deps: _DepScan,
+    local: Mapping[str, TensorMeta],
+    *,
+    submitted: bool = False,
+) -> dict[str, TensorMeta]:
+    """For ``v1, ..., vk = dep(args)`` where ``dep`` has ``k`` ``Out`` params,
+    return each ``vi``'s meta from the caller arg passed to the matching ``Out``
+    parameter.
+
+    Mapping handles both positional and keyword args. No-op when the dep has
+    no ``Out`` params or when target/arity don't match — ``_dep_return_metas``
+    then covers the callee-allocated case.
+    """
+    dep_params, out_params = deps.io[dep_name]
+    names = _target_names(target)
+    dep = deps.funcs.get(dep_name)
+    if dep is not None and dep._func_type == "extern" and len(names) == 1:
+        definition = _ast_analysis.get_func_def(dep._func)
+        outputs, inouts, _, _, _ = _classify_params(definition)
+        if outputs:
+            # A signature-only single-result extern exposes its first Out.
+            out_params = outputs[:1]
+        else:
+            out_params = (
+                _legacy_inout_return_params(definition, inouts, func_name_lookup(dep._func)) or out_params
+            )
+    if not names or not out_params or len(names) != len(out_params):
+        return {}
+    argument_metas = _call_tensor_metas(call, dep_params, local, deps.resolve_expr)
+    constexpr = _call_site_constexpr(dep, call, deps) if dep is not None else {}
+    if submitted and dep is not None:
+        argument_metas.update(_omitted_output_metas(dep, call, constexpr))
+    output_metas = {name: argument_metas[name] for name in out_params if name in argument_metas}
+    if dep is not None:
+        # A returned Out buffer must retain the callee's declared packed format.
+        _validate_dep_packed_fp4_dtypes(dep, output_metas, constexpr)
+    return {
+        vname: output_metas[out_param]
+        for vname, out_param in zip(names, out_params, strict=True)
+        if out_param in output_metas
+    }
+
+
+class _DepReturn(NamedTuple):
+    """What descending into a callee's ``return`` statement established.
+
+    ``metas`` are the targets the descent typed. ``stale`` are the targets it
+    proved it *cannot* type: the callee returns a named local its own extractor
+    declined, so whatever the caller knew about that name before the call no
+    longer describes it. Both are empty when the descent did not happen at all,
+    which leaves the caller's pre-call fallback in charge.
+    """
+
+    metas: dict[str, TensorMeta]
+    stale: frozenset[str]
+
+
+_DEP_RETURN_DECLINED = _DepReturn({}, frozenset())
+
+
+def _dep_return_metas(
+    call: ast.Call,
+    dep_name: str,
+    target: ast.expr,
+    deps: _DepScan,
+    local: Mapping[str, TensorMeta],
+) -> _DepReturn:
+    """Resolve each ``vi`` in ``v1, ..., vk = dep(args)`` from the callee's return.
+
+    This also handles explicit extern aliases before the positional output
+    convention, retaining metadata for reordered and readonly parameters.
+
+    ``_dep_out_metas`` covers the in-place convention, where every returned
+    tensor is also an ``Out`` parameter the *caller* allocated, so its meta is
+    already in the caller's pool. A helper may instead ``pl.create_tensor`` its
+    results and hand them back — the classic ``a, b = make_pair(x)`` inline
+    preparation step — and then the shape and dtype exist only inside the
+    callee. Re-run the extractor over the callee's body, seeded with the params
+    this call site binds, and read the returned names' metas off that.
+
+    A returned element that is a *named* callee local the descent could not type
+    comes back in ``stale`` rather than silently absent. The caller would
+    otherwise keep the meta the target carried before the call — demonstrably
+    the wrong tensor, since the callee rebinds it — and hand that shape to the
+    next dep. For a CHIP entry, direct calls are resolved with the same
+    metadata rules as assigned calls. Other expressions leave
+    the position unresolved.
+
+    Returns :data:`_DEP_RETURN_DECLINED` when the callee's source is
+    unavailable, its return arity doesn't match the target, or it is already on
+    the extraction stack.
+    """
+    names = _target_names(target)
+    if not names:
+        return _DEP_RETURN_DECLINED
+    results = _dep_result_metas(call, dep_name, deps, local, len(names))
+    if results is None:
+        return _DEP_RETURN_DECLINED
+    return _DepReturn(
+        {name: meta for name, meta in zip(names, results.metas, strict=True) if meta is not None},
+        frozenset(names[index] for index in results.stale_positions),
+    )
+
+
+def _dep_result_metas(
+    call: ast.Call,
+    dep_name: str,
+    deps: _DepScan,
+    local: Mapping[str, TensorMeta],
+    arity: int | None,
+    *,
+    submitted: bool = False,
+) -> _DepResults | None:
+    """Read a dependency's results in return order, independent of caller target syntax.
+
+    An unknown arity requests a tuple result. The same local metadata walk
+    resolves both a literal multi-result return and a returned tuple variable.
+    """
+    dep = deps.funcs.get(dep_name)
+    if dep is None:
+        return None
+    summaries = deps.analysis.summaries
+    # One callable can have distinct JIT wrappers with different configurations.
+    if id(dep) in deps.analysis.seen:
+        summaries.cycles += 1
+        return None
+    dep_params, _ = deps.io[dep_name]
+    seed_meta = _call_tensor_metas(call, dep_params, local, deps.resolve_expr)
+    constexpr = _call_site_constexpr(dep, call, deps)
+    seed_meta.update(_omitted_output_metas(dep, call, constexpr))
+    # Inline helpers can directly return a call/view without binding a name.
+    # Resolve that expression just as for multi-result and entry summaries.
+    track_returns = arity is None or dep._func_type in {"inline", "orchestration", "graph"}
+    key = _DepSummaryKey(
+        id(dep),
+        track_returns,
+        tuple((name, _tensor_seed_key(seed_meta[name])) for name in sorted(seed_meta)),
+        tuple(sorted(constexpr.items())),
+    )
+    if key in summaries.values:
+        summary = summaries.values[key]
+    else:
+        cycles = summaries.cycles
+        summary = _summarize_dep_results(
+            dep, seed_meta, constexpr, deps.discover_deps, track_returns=track_returns, analysis=deps.analysis
+        )
+        # A result affected by a recursion cutoff is specific to its active
+        # call stack. Cache only completed, context-independent summaries.
+        if summaries.cycles == cycles:
+            summaries.values[key] = summary
+    if summary is None:
+        return None
+    count = len(summary.metas)
+    if (arity is None and count < 2 and not submitted) or (arity is not None and count != arity):
+        return None
+    return _instantiate_dep_results(summary, call, deps.owner, seed_meta)
+
+
+def _summarize_dep_results(
+    dep: "JITFunction",
+    seed_meta: dict[str, TensorMeta],
+    constexpr: Mapping[str, str],
+    discover_deps: _call_binding.DiscoverDeps,
+    *,
+    track_returns: bool,
+    analysis: _DepAnalysis | None = None,
+) -> _DepResults | None:
+    """Walk the callee once for one set of input metadata and constexpr values."""
+    try:
+        func_def = _ast_analysis.get_func_def(dep._func)
+    except OSError:
+        return None
+    preview = _preview_static_expressions(
+        func_def, seed_meta, _StaticScope.of(dep._func, constexpr), constexpr, summarize_return=True
+    )
+    if preview.selected_arms:
+        # Use the emitted return's position to identify the original node.
+        # Metadata and helper call bindings still refer to the original AST.
+        site = next(
+            (
+                node
+                for node in ast.walk(func_def)
+                if isinstance(node, ast.Return) and (node.lineno, node.col_offset) == preview.return_position
+            ),
+            None,
+        )
+    else:
+        site = _return_site(func_def)
+    out_params, _, tensors, _, distributed = _classify_params(func_def)
+    if site is None or site.value is None:
+        implicit_out = _implicit_entry_output_name(func_def, dep._func_type, out_params)
+        if implicit_out is not None and (meta := seed_meta.get(implicit_out)) is not None:
+            return _DepResults((replace(meta, is_distributed=implicit_out in distributed),), frozenset())
+        return None if dep._func_type == "extern" else _DepResults((), frozenset())
+    elements = site.value.elts if isinstance(site.value, ast.Tuple) else [site.value]
+    return_meta = _ReturnMeta(site, elements) if track_returns or preview.selected_arms else None
+    _validate_dep_packed_fp4_dtypes(dep, seed_meta, constexpr)
+    seed_meta = {
+        name: replace(meta, is_distributed=name in distributed)
+        if name in tensors and meta.is_distributed != (name in distributed)
+        else meta
+        for name, meta in seed_meta.items()
+    }
+    callee_metas = extract_local_tensor_metas(
+        dep._func,
+        seed_meta=seed_meta,
+        caller_func_type=dep._func_type,
+        dep_analysis=(
+            _DepAnalysis(analysis.seen | {id(dep)}, analysis.summaries)
+            if analysis is not None
+            else _DepAnalysis(frozenset({id(dep)}), _DepSummaries({}))
+        ),
+        constexpr_values=constexpr,
+        discover_deps=discover_deps,
+        visible_only=True,
+        scan=LocalMetaScan(return_meta=return_meta, preview=preview),
+    )
+    tuple_result = return_meta.tuple_result if return_meta is not None else None
+    if tuple_result is not None:
+        metas: Sequence[TensorMeta | None] = tuple_result
+        stale_positions = set(range(len(tuple_result)))
+    else:
+        names = [_returned_element_name(expr) for expr in elements]
+        metas = (
+            [return_meta.metas.get(expr) for expr in elements]
+            if return_meta is not None
+            else [callee_metas.get(name) if name else None for name in names]
+        )
+        stale_positions = {index for index, name in enumerate(names) if name}
+    return _DepResults(
+        tuple(metas),
+        frozenset(index for index in stale_positions if metas[index] is None),
+    )
+
+
+def specialized_return_metas(
+    dep: "JITFunction",
+    seed_meta: dict[str, TensorMeta],
+    constexpr_values: Mapping[str, str],
+    discover_deps: _call_binding.DiscoverDeps,
+) -> _TupleMeta | None:
+    """Read result metadata at the return using this variant's parameter metadata."""
+    summary = _summarize_dep_results(dep, seed_meta, constexpr_values, discover_deps, track_returns=True)
+    return summary.metas if summary is not None else None
+
+
+def _instantiate_dep_results(
+    summary: _DepResults, call: ast.Call, owner: str, seed_meta: Mapping[str, TensorMeta]
+) -> _DepResults:
+    """Give each call site its own synthesized dimensions while retaining aliases."""
+    inherited_dims = {
+        id(dim)
+        for meta in seed_meta.values()
+        for dim in (*meta.shape, *meta.runtime_dims.values())
+        if isinstance(dim, DynDim)
+    }
+    instance_dims: dict[int, DynDim] = {}
+
+    def instantiate_dim(dim: ShapeDim, result_index: int, axis: int) -> ShapeDim:
+        if isinstance(dim, DynDim) and dim.synthesized and id(dim) not in inherited_dims:
+            # A helper's independent call sites need distinct extent identities,
+            # including hidden runtime extents retained alongside fallback bounds.
+            key = id(dim)
+            if key not in instance_dims:
+                result = f"return_l{call.lineno}_c{call.col_offset}_r{result_index}"
+                instance_dims[key] = synthesized_dyn_dim(owner, result, axis)
+            return instance_dims[key]
+        return dim
+
+    def instantiate(meta: TensorMeta, result_index: int) -> TensorMeta:
+        return replace(
+            meta,
+            shape=tuple(instantiate_dim(dim, result_index, axis) for axis, dim in enumerate(meta.shape)),
+            runtime_dims={
+                axis: cast(DynDim, instantiate_dim(dim, result_index, axis))
+                for axis, dim in meta.runtime_dims.items()
+            },
+        )
+
+    return _DepResults(
+        tuple(
+            instantiate(meta, index) if meta is not None else None for index, meta in enumerate(summary.metas)
+        ),
+        summary.stale_positions,
+    )
+
+
+def _call_site_constexpr(dep: "JITFunction", call: ast.Call, deps: _DepScan) -> dict[str, str]:
+    """The ``pl.constexpr`` binding ``call`` gives ``dep``; empty when there is none.
+
+    A call site that cannot bind is reported, by name, when the variant plan
+    resolves it for compilation. This descent only reads metadata, so it binds
+    nothing rather than raising first with less context.
+    """
+    constexpr_names = _arguments.constexpr_params(dep._func)
+    if not constexpr_names:
+        return {}
+    try:
+        return _call_binding.resolve_call_site_constexpr(
+            dep.__name__,
+            (constexpr_names, dep._param_names()),
+            call,
+            "<caller>",
+            deps.constexpr,
+            deps.scope.namespace,
+            deps.scope.shadowed,
+        )
+    except TypeError:
+        return {}
+
+
+def _dep_out_metas_or_return(
+    call: ast.Call,
+    dep_name: str,
+    target: ast.expr,
+    deps: _DepScan,
+    local: Mapping[str, TensorMeta],
+) -> _DepReturn:
+    """Resolve one ``v1, ..., vk = dep(args)`` target from its return contract.
+
+    Explicit extern and CHIP orchestration returns may reorder, repeat, or select readonly parameters,
+    so their aliases take precedence over the positional Out/InOut convention.
+    Signature-only externs and ordinary kernels retain the existing Out rule,
+    which also validates the caller's buffer against the callee's packed format.
+    """
+    dep = deps.funcs.get(dep_name)
+    if dep is not None and dep._func_type in {"extern", "orchestration"}:
+        returned = _dep_return_metas(call, dep_name, target, deps, local)
+        # A stale target is a real result of the descent and must not take an
+        # unrelated Out type. An empty CHIP result, such as return kernel(out),
+        # still needs the existing Out inference.
+        if returned is not _DEP_RETURN_DECLINED and (
+            dep._func_type == "extern" or returned.metas or returned.stale
+        ):
+            return returned
+    out_metas = _dep_out_metas(call, dep_name, target, deps, local)
+    if out_metas:
+        return _DepReturn(out_metas, frozenset())
+    return _dep_return_metas(call, dep_name, target, deps, local)
+
+
+def _dep_tuple_meta(call: ast.Call, deps: _DepScan, local: Mapping[str, TensorMeta]) -> _TupleMeta | None:
+    """Infer the elements of a tuple-valued dependency call in result order."""
+    if not isinstance(call.func, ast.Name):
+        return None
+    result = _dep_result_metas(call, call.func.id, deps, local, arity=None)
+    return result.metas if result is not None else None
+
+
+def _apply_dep_return(local: dict[str, TensorMeta], dep_return: _DepReturn) -> None:
+    """Fold one dep-call target's resolution into the source-ordered pool.
+
+    Resolved names land; names the descent proved stale are dropped, so the
+    caller's pre-call fallback cannot hand a replaced tensor's shape onward.
+    """
+    local.update(dep_return.metas)
+    for name in dep_return.stale:
+        local.pop(name, None)
+
+
+def _fold_int_arith(op: ast.operator, lhs: int, rhs: int) -> int | None:
+    """Fold a binary arithmetic op over two Python ints, or return None.
+
+    Used by ``extract_local_tensor_metas._resolve_shape_elt`` to keep the
+    shape-element resolver under the per-function branch limit. Dynamic
+    operands are handled by the caller; this helper only sees ``int·int``.
+    """
+    if isinstance(op, ast.Add):
+        return lhs + rhs
+    if isinstance(op, ast.Sub):
+        return lhs - rhs
+    if isinstance(op, ast.Mult):
+        return lhs * rhs
+    if isinstance(op, ast.FloorDiv) and rhs != 0:
+        return lhs // rhs
+    if isinstance(op, ast.Mod) and rhs != 0:
+        return lhs % rhs
+    if isinstance(op, ast.Pow) and rhs >= 0:
+        return lhs**rhs
+    return None
+
+
+def _constant_slice_extent(
+    lower: ast.expr | None,
+    upper: ast.expr,
+    resolve_int: Callable[[ast.expr], int | None],
+) -> int | None:
+    """Prove a slice width without assigning sample values to runtime bounds.
+
+    Static bounds keep their existing integer resolution. Otherwise translate
+    integer arithmetic promoted by constants into INDEX expressions and use the
+    same arithmetic analyzer as the parser. Symbols belong to this pair of bounds
+    only: repeated names refer to the same current binding, never an earlier
+    assignment's value.
+    Unresolved calls/reads and nonlinear arithmetic are deliberately not atoms:
+    treating two identical calls as one symbol could cancel different results.
+    """
+    start = 0 if lower is None else resolve_int(lower)
+    stop = resolve_int(upper)
+    if isinstance(start, int) and isinstance(stop, int):
+        return stop - start
+
+    span = _ir.Span.unknown()
+    symbols: dict[str, _ir.Var] = {}
+    operations: dict[type[ast.operator], Callable[[_ir.Expr, _ir.Expr], _ir.Expr]] = {
+        ast.Add: _ir.add,
+        ast.Sub: _ir.sub,
+        ast.Mult: _ir.mul,
+    }
+
+    def as_index(value: int | _ir.Expr) -> _ir.Expr | None:
+        if isinstance(value, _ir.Expr):
+            return value
+        # Python constant folding uses unbounded integers; the analyzer's INDEX
+        # constants have an int64 payload. Decline rather than truncate a bound.
+        if not -(1 << 63) <= value < (1 << 63):
+            return None
+        return _ir.ConstInt(value, DataType.INDEX, span)
+
+    def convert(node: ast.expr | None) -> int | _ir.Expr | None:
+        if node is None:
+            return 0
+        if isinstance(node, ast.BinOp):
+            lhs, rhs = convert(node.left), convert(node.right)
+            if lhs is None or rhs is None:
+                return None
+            if isinstance(lhs, int) and isinstance(rhs, int):
+                return _fold_int_arith(node.op, lhs, rhs)
+            # Scalar dtypes are unavailable here. A constant operand promotes
+            # the parser's arithmetic to INDEX; two runtime operands may instead
+            # overflow in a narrower dtype before a later INDEX promotion.
+            # Do not reassociate across that unknown promotion boundary.
+            if not (isinstance(lhs, int) or isinstance(rhs, int)):
+                return None
+            operation = operations.get(type(node.op))
+            left, right = as_index(lhs), as_index(rhs)
+            if operation is None or left is None or right is None:
+                return None
+            return operation(left, right)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            operand = convert(node.operand)
+            if isinstance(operand, int):
+                return -operand if isinstance(node.op, ast.USub) else operand
+            # Runtime negation retains the operand dtype in the parser; it is
+            # not equivalent to INDEX subtraction for a narrow signed minimum.
+            return None
+
+        # Resolve only leaves here, not each recursively visited arithmetic
+        # subtree, so long expressions do not repeatedly scan the same nodes.
+        value = resolve_int(node)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(node, ast.Name):
+            if node.id not in symbols:
+                symbols[node.id] = _ir.Var(node.id, _ir.ScalarType(DataType.INDEX), span)
+            return symbols[node.id]
+        return None
+
+    lhs, rhs = convert(upper), convert(lower)
+    if lhs is None or rhs is None:
+        return None
+    upper_expr, lower_expr = as_index(lhs), as_index(rhs)
+    if upper_expr is None or lower_expr is None:
+        return None
+    extent = Analyzer().simplify(_ir.sub(upper_expr, lower_expr))
+    return extent.value if isinstance(extent, _ir.ConstInt) else None
+
+
+def _subscript_slice_meta(
+    sub: ast.Subscript,
+    local: Mapping[str, TensorMeta],
+    resolve_int: Callable[[ast.expr], int | None],
+    resolve_dim: "Callable[[ast.expr], _DimValue] | None" = None,
+) -> TensorMeta | None:
+    """Infer the ``TensorMeta`` of ``var = src[a:b, i, ...]`` subscript-slice sugar.
+
+    The documented equivalent of ``pl.slice`` (see ``extract_local_tensor_metas``
+    form 2): dtype is inherited from ``src``; each slice dim resolves to
+    ``stop - start`` (``start`` defaults to 0), and an open upper bound ``a:``
+    resolves to ``parent_dim - start`` — mirroring the parser's
+    ``_build_subscript_slice_args``. Constant differences of runtime bounds
+    (``base:base + width``) retain their static width. A dim falls back to the
+    parent extent when the width cannot be proved, marking the axis inexact
+    unless the slice preserves the full extent; a scalar index drops its dim
+    (numpy-style rank reduction); dims past the supplied indices are implicit
+    ``:`` and keep the parent extent.
+    Returns ``None`` (skipped, leaving the clear ``_build_params`` error) when
+    ``src`` is unknown, a step slice is used, or the index count exceeds
+    ``src``'s rank.
+    """
+    src = sub.value
+    if not isinstance(src, ast.Name) or src.id not in local:
+        return None
+    src_meta = local[src.id]
+    slc = sub.slice
+    indices = list(slc.elts) if isinstance(slc, ast.Tuple) else [slc]
+    if len(indices) > len(src_meta.shape):
+        return None
+    dims: list[ShapeDim] = []
+    inexact_axes: set[int] = set()
+    runtime_dims: dict[int, DynDim] = {}
+    for dim_idx, idx in enumerate(indices):
+        if not isinstance(idx, ast.Slice):
+            continue  # scalar index → rank-reducing, dim dropped
+        if idx.step is not None:
+            return None
+        parent = src_meta.shape[dim_idx]
+        start = 0 if idx.lower is None else resolve_int(idx.lower)
+        if idx.upper is None:
+            # Open upper bound ``a:`` — the parser bounds it at ``parent - start``
+            # (see ``_build_subscript_slice_args``), so mirror that here instead
+            # of falling back to the full parent extent for a nonzero ``start``.
+            extent = parent - start if isinstance(parent, int) and isinstance(start, int) else None
+        else:
+            extent = _constant_slice_extent(idx.lower, idx.upper, resolve_int)
+        # A fallback DynDim is only a placeholder for a shortened/runtime slice,
+        # not proof that the view and parent have equal extents. Full slices
+        # (including 0:) preserve equality unless the parent is already inexact.
+        upper_dim = (
+            resolve_dim(idx.upper)
+            if resolve_dim is not None and idx.upper is not None
+            else _alias_dim(_extract_dim_alias(idx.upper, resolve_int), local)
+        )
+        actual_parent = src_meta.actual_dim(dim_idx)
+        shared_dynamic_bound = (
+            isinstance(actual_parent, DynDim)
+            and isinstance(upper_dim, DynDim)
+            and (
+                upper_dim is actual_parent
+                or (
+                    not actual_parent.synthesized
+                    and not upper_dim.synthesized
+                    and upper_dim.literal == actual_parent.literal
+                )
+            )
+        )
+        # Descriptor reads and their live aliases also prove a full slice.
+        # Use the source-ordered resolver so rebinding cannot leave stale proofs.
+        # Synthesized dimensions require the same instance, just
+        # as they do at the provider boundary; names alone are insufficient.
+        full_extent = start == 0 and (idx.upper is None or shared_dynamic_bound)
+        if (extent is None and not full_extent) or (
+            (idx.upper is None or full_extent) and dim_idx in src_meta.inexact_axes
+        ):
+            inexact_axes.add(len(dims))
+            runtime_dims[len(dims)] = (
+                actual_parent
+                if full_extent and isinstance(actual_parent, DynDim)
+                else synthesized_dyn_dim("slice", f"{src.id}_l{sub.lineno}_c{sub.col_offset}", dim_idx)
+            )
+        dims.append(extent if extent is not None else parent)
+    inexact_axes.update(
+        len(dims) + axis - len(indices) for axis in src_meta.inexact_axes if axis >= len(indices)
+    )
+    runtime_dims.update(
+        (len(dims) + axis - len(indices), dim)
+        for axis, dim in src_meta.runtime_dims.items()
+        if axis >= len(indices)
+    )
+    dims.extend(src_meta.shape[len(indices) :])  # trailing implicit ``:``
+    return replace(
+        src_meta, shape=tuple(dims), inexact_axes=frozenset(inexact_axes), runtime_dims=runtime_dims
+    )
+
+
+def _call_operand(call: ast.Call, index: int | None, name: str) -> ast.expr | None:
+    """The argument ``call`` binds to parameter ``name``.
+
+    Args:
+        call: The operator call
+        index: The parameter's positional slot, or None when it is keyword-only
+        name: The parameter's keyword name
+
+    Returns:
+        The argument expression, or None when the call does not supply it
+    """
+    if index is not None and len(call.args) > index:
+        return call.args[index]
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
+
+
+def _tensor_or_input_operand(call: ast.Call) -> ast.expr | None:
+    """The first positional operand of ``pl.slice``/``pl.reshape`` or their
+    ``pl.tensor.*`` siblings — two real spellings, two real parameter names
+    for the same slot (``tensor_ops.py``'s ``tensor`` vs ``unified_ops.py``'s
+    ``input``). A positional call is unaffected either way; only an
+    explicit-keyword one needs both names checked.
+    """
+    operand = _call_operand(call, 0, "tensor")
+    if operand is None:
+        operand = _call_operand(call, 0, "input")
+    return operand
+
+
+def _shape_attr_source(node: ast.expr) -> str | None:
+    """The tensor name ``node`` reads the shape of (``src.shape`` → ``"src"``), or None."""
+    if isinstance(node, ast.Attribute) and node.attr == "shape" and isinstance(node.value, ast.Name):
+        return node.value.id
+    return None
+
+
+def _constant_shape_alias(value: ast.Subscript) -> tuple[str, int] | None:
+    """Shape indexing syntax the body transformer can replace directly."""
+    src = _shape_attr_source(value.value)
+    axis = value.slice
+    if (
+        src is not None
+        and isinstance(axis, ast.Constant)
+        and isinstance(axis.value, int)
+        and not isinstance(axis.value, bool)
+    ):
+        return src, axis.value
+    return None
+
+
+def _extract_dim_alias(
+    value: ast.expr | None, resolve_axis: Callable[[ast.expr], int | None]
+) -> tuple[str, int] | None:
+    """Return the source and axis for ``pl.tensor.dim(source, axis)`` or ``source.shape[axis]``.
+
+    The specializer folds ``source.shape[axis]`` to the same dim ``pl.tensor.dim``
+    names — the static extent, or ``pl.tensor.dim(source, axis)`` when dynamic.
+    """
+    if isinstance(value, ast.Subscript):
+        return _constant_shape_alias(value)
+    if not isinstance(value, ast.Call):
+        return None
+    if _flatten_dotted_call(value.func) != ("pl", "tensor", "dim") or len(value.args) > 2:
+        return None
+    if any(isinstance(arg, ast.Starred) for arg in value.args):
+        return None
+    # Bind the real ``dim(tensor, axis)`` signature before reading either
+    # operand. Invalid duplicates or extra keywords must not invent metadata.
+    bound = dict(zip(("tensor", "axis"), value.args))
+    for keyword in value.keywords:
+        if keyword.arg is None or keyword.arg not in ("tensor", "axis") or keyword.arg in bound:
+            return None
+        bound[keyword.arg] = keyword.value
+    src_arg, dim_arg = bound.get("tensor"), bound.get("axis")
+    if isinstance(src_arg, ast.Name) and dim_arg is not None:
+        axis = resolve_axis(dim_arg)
+        if axis is not None:
+            return src_arg.id, axis
+    return None
+
+
+def _flatten_dotted_call(fn: ast.expr) -> tuple[str, ...] | None:
+    """Full dotted path of a plain attribute/name chain, e.g. ``pld.tensor.all_to_all_v``
+    -> ``("pld", "tensor", "all_to_all_v")``, or None if ``fn`` isn't a pure chain of
+    ``Attribute`` nodes rooted at a ``Name`` (so this walker cannot reason about it at all —
+    for example the callee of a higher-order call, or an attribute on a subscript)."""
+    segments: list[str] = []
+    node = fn
+    while isinstance(node, ast.Attribute):
+        segments.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    segments.append(node.id)
+    segments.reverse()
+    return tuple(segments)
+
+
+# Qualified (3+-segment) call dispatch: full dotted path -> a handler that
+# computes the result's TensorMeta, or None for an op documented as
+# returning its own rebind target's type unchanged (#2638).
+_QualifiedCallHandlers = dict[tuple[str, ...], Callable[[ast.Call, str | None], TensorMeta | None] | None]
+
+
+def _qualified_call_meta(
+    fn: ast.expr,
+    value: ast.Call,
+    named_target: str | None,
+    qualified_call_handlers: _QualifiedCallHandlers,
+) -> tuple[TensorMeta | None, bool]:
+    """Metadata effect of a qualified call: ``(meta, preserve_existing)``.
+
+    Unlisted paths return ``(None, False)`` — the caller then falls through to
+    ``local.pop()``, exactly like any other unrecognized call.
+    """
+    path = _flatten_dotted_call(fn)
+    if path is None or path not in qualified_call_handlers:
+        return None, False
+    handler = qualified_call_handlers[path]
+    if handler is not None:
+        return handler(value, named_target), False
+    return None, True
+
+
+def _builtin_call_meta(
+    call: ast.Call,
+    target: str | None,
+    pl_attr_handlers: Mapping[str, Callable[[ast.Call, str | None], TensorMeta | None]],
+    qualified_call_handlers: _QualifiedCallHandlers,
+) -> tuple[TensorMeta | None, bool]:
+    """Use the same builtin metadata rules for assignments and returns."""
+    fn = call.func
+    if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
+        handler = pl_attr_handlers.get(fn.attr)
+        # Keep the existing assignment behavior for unmodeled pl operations.
+        return (handler(call, target), False) if handler is not None else (None, True)
+    return _qualified_call_meta(fn, call, target, qualified_call_handlers)
+
+
+def _tensor_expr_meta(
+    expr: ast.expr,
+    return_meta: _ReturnMeta,
+    deps: _DepScan,
+    local: Mapping[str, TensorMeta],
+    resolve_int: Callable[[ast.expr], int | None],
+    pl_attr_handlers: Mapping[str, Callable[[ast.Call, str | None], TensorMeta | None]],
+    qualified_call_handlers: _QualifiedCallHandlers,
+    resolve_dim: "Callable[[ast.expr], _DimValue]",
+) -> TensorMeta | None:
+    """Resolve one tensor expression in a return or a tuple construction."""
+    if isinstance(expr, ast.Name):
+        return local.get(expr.id)
+    if isinstance(expr, ast.Subscript):
+        if isinstance(expr.value, ast.Tuple):
+            index = resolve_int(expr.slice)
+            if index is None or not -len(expr.value.elts) <= index < len(expr.value.elts):
+                return None
+            return _tensor_expr_meta(
+                expr.value.elts[index],
+                return_meta,
+                deps,
+                local,
+                resolve_int,
+                pl_attr_handlers,
+                qualified_call_handlers,
+                resolve_dim,
+            )
+        return _subscript_meta(expr, local, resolve_int, return_meta, deps, resolve_dim)
+    if isinstance(expr, ast.Call):
+        target_name = f"return_l{expr.lineno}_c{expr.col_offset}"
+        if isinstance(expr.func, ast.Name) and expr.func.id in deps.io:
+            if return_meta.site is not None and deps.funcs[expr.func.id]._func_type != "extern":
+                summary = _dep_result_metas(expr, expr.func.id, deps, local, arity=None, submitted=True)
+                return summary.metas[0] if summary is not None and len(summary.metas) == 1 else None
+            target = ast.Name(id=target_name, ctx=ast.Store())
+            result = _dep_out_metas_or_return(expr, expr.func.id, target, deps, local)
+            return result.metas.get(target_name)
+        if isinstance(expr.func, ast.Attribute):
+            meta, _ = _builtin_call_meta(expr, target_name, pl_attr_handlers, qualified_call_handlers)
+            return meta
+    return None
+
+
+def _resolve_returned_exprs(
+    site: ast.Return,
+    return_meta: _ReturnMeta,
+    resolve_expr: Callable[[ast.expr], TensorMeta | None],
+    deps: _DepScan,
+    local: Mapping[str, TensorMeta],
+) -> None:
+    """Snapshot the return at its original point in the local metadata walk."""
+    if isinstance(site.value, ast.Name):
+        return_meta.tuple_result = return_meta.tuples.get(site.value.id)
+    elif isinstance(site.value, ast.Call):
+        return_meta.tuple_result = _submit_result_meta(site.value, deps, local) or _dep_tuple_meta(
+            site.value, deps, local
+        )
+    if return_meta.tuple_result is None:
+        return_meta.metas.update((expr, resolve_expr(expr)) for expr in return_meta.elements)
+
+
+def _same_operand_meta(
+    local: Mapping[str, TensorMeta], operand_index: int, operand_name: str
+) -> Callable[[ast.Call, str | None], TensorMeta | None]:
+    """Handler factory for a collective documented as returning a specific
+    argument's own type unchanged (e.g. ``broadcast``'s ``target``,
+    ``barrier``'s ``signal``). Reads that argument's tracked metadata
+    directly rather than assuming the call's LHS name is the same name as
+    the operand: ``old = pld.tensor.broadcast(window, signal, root=0)`` must
+    get ``window``'s metadata, not whatever ``old`` already held — a blind
+    ``preserve_existing`` would silently serve stale metadata when the two
+    names differ (#2638 review). When the two names *are* the same (the
+    documented self-rebind idiom), this reads ``local[operand.id]`` before
+    the assignment takes effect, which is exactly what preserving would
+    have returned anyway — so the self-rebind case is unaffected.
+    """
+
+    def handler(call: ast.Call, target: str | None = None) -> TensorMeta | None:
+        operand = _call_operand(call, operand_index, operand_name)
+        if not isinstance(operand, ast.Name) or operand.id not in local:
+            return None
+        return local[operand.id]
+
+    return handler
+
+
+def _alias_dim(alias: tuple[str, int] | None, local: Mapping[str, TensorMeta]) -> ShapeDim | None:
+    """Dim ``k`` of tensor ``P`` for a ``(P, k)`` dim alias, or None when ``P`` is untracked."""
+    if alias is None:
+        return None
+    src, axis = alias
+    src_meta = local.get(src)
+    if src_meta is None:
+        return None
+    rank = len(src_meta.shape)
+    if axis < 0:
+        axis += rank
+    return src_meta.actual_dim(axis) if 0 <= axis < rank else None
+
+
+def _assignment_parts(stmt: ast.stmt) -> tuple[list[ast.expr], ast.expr | None] | None:
+    """Return all targets and the value for a supported assignment."""
+    if isinstance(stmt, ast.Assign):
+        return stmt.targets, stmt.value
+    if isinstance(stmt, ast.AnnAssign):
+        return [stmt.target], stmt.value
+    return None
+
+
+_ScalarExpr = tuple[type[ast.operator | ast.unaryop], tuple["_DimValue", ...]]
+_DimValue = ShapeDim | _ScalarExpr | None
+
+
+@dataclass
+class _RuntimeDim:
+    """Snapshot and identity of one runtime scalar binding used as a slice extent."""
+
+    value: _DimValue = None
+    extent: DynDim | None = None
+
+
+_DimBinding = _DimValue | _RuntimeDim
+_BoundShapeDims = dict[int, tuple[_ScalarExpr, DynDim]]
+
+
+def _bind_scalar_shape_dim(
+    value: _DimValue, bound_dim: DynDim | None, bound_dims: _BoundShapeDims | None
+) -> ShapeDim | None:
+    """Give a scalar expression an axis symbol, shared only within one result shape."""
+    if not isinstance(value, tuple):
+        return value
+    if bound_dim is None or bound_dims is None:
+        return bound_dim
+    # Keep the snapshot alive so a later inline expression cannot reuse its id.
+    return bound_dims.setdefault(id(value), (value, bound_dim))[1]
+
+
+def _declared_dim_values(
+    func_def: ast.FunctionDef, seed_meta: Mapping[str, TensorMeta]
+) -> dict[ast.expr, DynDim]:
+    """Recognize body DynVar declarations by their assigned seed-anchor name."""
+    anchors = {dim.name: dim for meta in seed_meta.values() for dim in meta.shape if isinstance(dim, DynDim)}
+    declarations: dict[ast.expr, DynDim] = {}
+    for stmt in ast.walk(func_def):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            continue
+        if _flatten_dotted_call(stmt.value.func) not in (("pl", "dynamic"), ("dynamic",)):
+            continue
+        for target in stmt.targets:
+            if isinstance(target, ast.Name) and target.id in anchors:
+                declarations[stmt.value] = anchors[target.id]
+    return declarations
+
+
+def _merge_tensor_metas(lhs: TensorMeta | None, rhs: TensorMeta | None) -> TensorMeta | None:
+    """Merge equal tensor types without losing known layout or dynamic-axis identity."""
+    if (
+        lhs is None
+        or rhs is None
+        or lhs.shape != rhs.shape
+        or lhs.dtype != rhs.dtype
+        or lhs.is_distributed != rhs.is_distributed
+    ):
+        return None
+    # An omitted annotation layout spells ND, not an arbitrary layout wildcard.
+    lhs_layout = _ir.TensorLayout.ND if lhs.layout is None else lhs.layout
+    rhs_layout = _ir.TensorLayout.ND if rhs.layout is None else rhs.layout
+    if lhs_layout != rhs_layout:
+        return None
+    if any(
+        isinstance(old, DynDim) and old.synthesized and old is not new
+        for old, new in zip(lhs.shape, rhs.shape, strict=True)
+    ):
+        return None
+    # Keep explicit ND so a later helper annotation cannot overwrite it as unspecified.
+    result = rhs if lhs.layout is None and rhs.layout is not None else lhs
+    # A branch join retains only extent identities proved by both arms.
+    runtime_dims = {axis: dim for axis, dim in lhs.runtime_dims.items() if rhs.runtime_dims.get(axis) is dim}
+    return replace(result, inexact_axes=lhs.inexact_axes | rhs.inexact_axes, runtime_dims=runtime_dims)
+
+
+def _resolve_dim_binop(elt: ast.BinOp, resolve: Callable[[ast.expr], _DimValue]) -> _DimValue:
+    lhs = resolve(elt.left)
+    rhs = resolve(elt.right)
+    if isinstance(lhs, int) and isinstance(rhs, int):
+        return _fold_int_arith(elt.op, lhs, rhs)
+    # Keep the operation and operand snapshots, not a sample dimension value.
+    # Unknown or invalid subexpressions still invalidate the whole expression.
+    if (
+        lhs is not None
+        and rhs is not None
+        and isinstance(elt.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv))
+        and not (isinstance(elt.op, ast.FloorDiv) and rhs == 0)
+    ):
+        return type(elt.op), (lhs, rhs)
+    return None
+
+
+def _stmt_calls_dep(stmt: ast.stmt, dep_name: str | None, stop_at_call: ast.Call | None = None) -> bool:
+    """Check expression fields on ``stmt`` without searching nested bodies.
+
+    ``stop_at_call`` narrows the match from "any call to ``dep_name``" to one
+    specific call node. A dep reached with two different ``pl.constexpr``
+    bindings is compiled once per binding, and each of those compilations must
+    read the metadata live at *its own* call site — stopping at the first call
+    to the name would hand every later binding the first site's tensors.
+    """
+    if stop_at_call is None and dep_name is None:
+        return False
+
+    def matches(node: ast.AST) -> bool:
+        if stop_at_call is not None:
+            return node is stop_at_call
+        view = dependency_call(node)
+        return view is not None and isinstance(view.func, ast.Name) and view.func.id == dep_name
+
+    # Nested bodies are skipped here and walked by the caller one statement at a
+    # time, so the metadata a scope defines before the call is still collected.
+    nested_stmt_fields = {"body", "orelse", "finalbody", "handlers"}
+    for field_name, value in ast.iter_fields(stmt):
+        if field_name in nested_stmt_fields:
+            continue
+        items = cast("list[Any]", value) if isinstance(value, list) else [value]
+        for item in items:
+            if not isinstance(item, ast.AST):
+                continue
+            if any(matches(node) for node in ast.walk(item)):
+                return True
+    return False
+
+
+def _annotated_submit_metas(annotations: Sequence[Any], call: ast.Call, owner: str) -> _TupleMeta:
+    """Treat declared dynamic axes as descriptor reads of this call's result."""
+    result: list[TensorMeta | None] = []
+    dynamic: dict[str, DynDim] = {}
+    for index, annotation in enumerate(annotations):
+        if not (
+            isinstance(annotation, _LangTensor)
+            and annotation.shape is not None
+            and annotation.dtype is not None
+        ):
+            result.append(None)
+            continue
+        meta = _arguments.signature_tensor_meta(annotation, annotation.dtype, {}, _LangDynVar)
+        shape: list[ShapeDim] = []
+        for axis, dim in enumerate(meta.shape):
+            if isinstance(dim, DynDim):
+                if dim.literal not in dynamic:
+                    label = f"return_l{call.lineno}_c{call.col_offset}_r{index}"
+                    dynamic[dim.literal] = synthesized_dyn_dim(owner, label, axis)
+                dim = dynamic[dim.literal]
+            shape.append(dim)
+        result.append(
+            replace(meta, shape=tuple(shape), is_distributed=isinstance(annotation, DistributedTensor))
+        )
+    return tuple(result)
+
+
+def _submitted_value_metas(
+    call: ast.Call, dep_name: str, deps: _DepScan, local: Mapping[str, TensorMeta]
+) -> _TupleMeta:
+    """Describe the callee values in the parser's flat Submit tuple."""
+    dep = deps.funcs.get(dep_name)
+    if dep is None:
+        return ()
+    definition = _ast_analysis.get_func_def(dep._func)
+    binding = _call_site_constexpr(dep, call, deps)
+    eager = inspect.signature(dep._func).return_annotation
+    namespace = _dep_annotation_namespace(dep, binding)
+    # A DSL Tuple is one result. Python tuple[...] declares separate values.
+    if isinstance(_arguments.resolve_annotation(eager, namespace), _LangTuple):
+        return (None,)
+    results = _dep_result_metas(call, dep_name, deps, local, arity=None, submitted=True)
+    if results is not None and all(meta is not None for meta in results.metas):
+        return results.metas
+
+    annotation = _arguments.resolve_call_annotation(definition.returns, eager, namespace, binding)
+    if isinstance(annotation, _LangTuple):
+        return (None,)
+    declared = _tuple_annotation_elements(annotation)
+    if declared is None and (isinstance(annotation, _LangTensor) or annotation is _LangTensor):
+        declared = (annotation,)
+    if results is not None:
+        slots = results.metas
+        if declared is not None and len(declared) == len(slots):
+            fallback = _annotated_submit_metas(declared, call, deps.owner)
+            return tuple(
+                meta if meta is not None else other for meta, other in zip(slots, fallback, strict=True)
+            )
+        return slots
+    if dep._func_type != "extern":
+        return _annotated_submit_metas(declared, call, deps.owner) if declared is not None else ()
+
+    # Signature-only externs use their public writable aliases, including
+    # trailing Out storage that the parser will allocate for this launch.
+    outputs, inouts, _, _, _ = _classify_params(definition)
+    legacy_single = bool(outputs) or bool(
+        _legacy_inout_return_params(definition, inouts, func_name_lookup(dep._func))
+    )
+    count = len(declared) if declared is not None else int(legacy_single)
+    names = [f"_submit_value_{index}" for index in range(count)]
+    target = ast.Tuple(elts=[ast.Name(id=name, ctx=ast.Store()) for name in names], ctx=ast.Store())
+    inferred = _dep_out_metas(call, dep_name, target, deps, local, submitted=True)
+    return tuple(inferred.get(name) for name in names)
+
+
+def _submit_result_meta(
+    value: ast.Call, deps: _DepScan, local: Mapping[str, TensorMeta]
+) -> _TupleMeta | None:
+    """Return the flat value slots followed by the Submit TaskId slot."""
+    call = dependency_call(value)
+    if call is None or call is value or not isinstance(call.func, ast.Name) or call.func.id not in deps.io:
+        return None
+    return (*_submitted_value_metas(call, call.func.id, deps, local), None)
+
+
+def _bind_submit_assignment(
+    targets: list[ast.expr],
+    slots: _TupleMeta,
+    return_meta: _ReturnMeta,
+    local: dict[str, TensorMeta],
+    dim_values: dict[str, _DimBinding],
+) -> None:
+    # The caller resolves all RHS operands before discarding the LHS bindings.
+    for target in targets:
+        _forget_names(target, dim_values)
+        if isinstance(target, ast.Name):
+            return_meta.tuples[target.id] = slots
+            local.pop(target.id, None)
+        elif isinstance(target, ast.Tuple) and len(target.elts) == 2:
+            result_target, task_target = target.elts
+            names = _target_names(result_target)
+            for name in (*names, *_target_names(task_target)):
+                return_meta.tuples.pop(name, None)
+                local.pop(name, None)
+            if len(names) == len(slots) - 1:
+                for name, meta in zip(names, slots[:-1], strict=True):
+                    if meta is not None:
+                        local[name] = meta
+
+
+def _subscript_meta(
+    value: ast.Subscript,
+    local: Mapping[str, TensorMeta],
+    resolve_int: Callable[[ast.expr], int | None],
+    return_meta: _ReturnMeta | None,
+    deps: _DepScan,
+    resolve_dim: Callable[[ast.expr], _DimValue],
+) -> TensorMeta | None:
+    items = None
+    if return_meta is not None:
+        if isinstance(value.value, ast.Name):
+            items = return_meta.tuples.get(value.value.id)
+        elif isinstance(value.value, ast.Call):
+            items = _submit_result_meta(value.value, deps, local) or _dep_tuple_meta(value.value, deps, local)
+    if items is not None:
+        index = resolve_int(value.slice)
+        return items[index] if index is not None and -len(items) <= index < len(items) else None
+    return _subscript_slice_meta(value, local, resolve_int, resolve_dim)
+
+
+def _dependency_assignment_returns(
+    call: ast.Call,
+    callee: str,
+    targets: list[ast.expr],
+    deps: _DepScan,
+    local: Mapping[str, TensorMeta],
+) -> list[_DepReturn]:
+    """Infer the RHS once, then relabel a chained assignment's result aliases."""
+    if len(targets) > 1 and all(isinstance(target, ast.Name) for target in targets):
+        names = [target.id for target in targets if isinstance(target, ast.Name)]
+        result = _dep_out_metas_or_return(call, callee, targets[0], deps, local)
+        shared_meta = result.metas.get(names[0])
+        shared_stale = names[0] in result.stale
+        # A chain evaluates one call; preserve its derived dimensions for
+        # every alias rather than inferring fresh symbols for each target.
+        return [
+            _DepReturn(
+                {} if shared_meta is None else {name: shared_meta},
+                frozenset({name}) if shared_stale else frozenset(),
+            )
+            for name in names
+        ]
+    return [_dep_out_metas_or_return(call, callee, target, deps, local) for target in targets]
+
+
+def _update_local_tensor_meta(
+    stmt: ast.stmt,
+    local: dict[str, TensorMeta],
+    dim_values: dict[str, _DimBinding],
+    deps: _DepScan,
+    resolve_int: Callable[[ast.expr], int | None],
+    pl_attr_handlers: dict[str, Callable[[ast.Call, str | None], TensorMeta | None]],
+    qualified_call_handlers: _QualifiedCallHandlers,
+    resolve_dim: Callable[[ast.expr], _DimValue],
+    return_meta: _ReturnMeta | None = None,
+) -> None:
+    """Apply one assignment's metadata effects to the source-ordered state."""
+    parts = _assignment_parts(stmt)
+    value = parts[1] if parts is not None else None
+    items = None
+    submit_slots = _submit_result_meta(value, deps, local) if isinstance(value, ast.Call) else None
+    resolve_expr: Callable[[ast.expr], TensorMeta | None] | None = None
+    if return_meta is not None and submit_slots is not None and parts is not None:
+        _bind_submit_assignment(parts[0], submit_slots, return_meta, local, dim_values)
+        return
+    if return_meta is not None:
+        resolve_expr = functools.partial(
+            _tensor_expr_meta,
+            return_meta=return_meta,
+            deps=deps,
+            local=local,
+            resolve_int=resolve_int,
+            pl_attr_handlers=pl_attr_handlers,
+            qualified_call_handlers=qualified_call_handlers,
+            resolve_dim=resolve_dim,
+        )
+        if isinstance(stmt, ast.Return) and stmt is return_meta.site:
+            _resolve_returned_exprs(stmt, return_meta, resolve_expr, deps, local)
+        items = (
+            _dep_tuple_meta(value, deps, local)
+            if isinstance(value, ast.Call)
+            else return_meta.read_tuple(value, resolve_expr)
+        )
+    if parts is None:
+        _forget_rebound_dims(stmt, dim_values)
+        return
+    targets, value = parts
+    named_target = next((t.id for t in targets if isinstance(t, ast.Name)), None)
+    has_named_target = named_target is not None
+    meta: TensorMeta | None = None
+    preserve_existing = False
+    dep_returns: list[_DepReturn] = [_DEP_RETURN_DECLINED for _ in targets]
+
+    # Python evaluates the RHS once before assigning any target. Infer all RHS
+    # effects from the same pre-assignment state so a self-referential chained
+    # assignment cannot affect the metadata applied to later targets.
+    if isinstance(value, ast.Subscript) and has_named_target:
+        meta = (
+            resolve_expr(value)
+            if resolve_expr is not None
+            else _subscript_meta(value, local, resolve_int, return_meta, deps, resolve_dim)
+        )
+    elif isinstance(value, ast.Name) and has_named_target:
+        meta = local.get(value.id)
+    elif isinstance(value, ast.Call) and items is None:
+        fn = value.func
+        if isinstance(fn, ast.Attribute) and has_named_target:
+            meta, preserve_existing = _builtin_call_meta(
+                value, named_target, pl_attr_handlers, qualified_call_handlers
+            )
+        elif isinstance(fn, ast.Name) and fn.id in deps.io:
+            # Ordinary call metadata keeps the legacy writable-operand convention.
+            exact_result = (
+                return_meta is not None
+                and return_meta.site is not None
+                and has_named_target
+                and deps.funcs[fn.id]._func_type != "extern"
+            )
+            meta = resolve_expr(value) if exact_result and resolve_expr is not None else None
+            dep_returns = (
+                dep_returns
+                if exact_result
+                else _dependency_assignment_returns(value, fn.id, targets, deps, local)
+            )
+            preserve_existing = not exact_result
+
+    _update_dim_values(targets, value, dim_values, local, resolve_dim)
+    if return_meta is not None and value is not None:
+        return_meta.assign(targets, items, local)
+    for target, dep_return in zip(targets, dep_returns, strict=True):
+        _apply_dep_return(local, dep_return)
+        named = target if isinstance(target, ast.Name) else None
+
+        if named is None:
+            continue
+        if meta is not None:
+            local[named.id] = meta
+        elif value is not None and not preserve_existing:
+            # Any unsupported rebinding shadows an older parameter or local tensor
+            # rather than leaving stale metadata visible.
+            local.pop(named.id, None)
+
+
+def _slice_runtime_extent(expr: ast.expr, bindings: Mapping[str, _DimBinding], fallback: DynDim) -> DynDim:
+    """Share slice lengths only when they read the same unchanged scalar binding."""
+    binding = bindings.get(expr.id) if isinstance(expr, ast.Name) else None
+    if not isinstance(binding, _RuntimeDim):
+        return fallback
+    # Rebindings and control-flow joins replace this identity. Its extent can
+    # be shared across source tensors without claiming equality to their bounds.
+    if binding.extent is None:
+        binding.extent = fallback
+    return binding.extent
+
+
+def _update_dim_values(
+    targets: list[ast.expr],
+    value: ast.expr | None,
+    dim_values: dict[str, _DimBinding],
+    local: Mapping[str, TensorMeta],
+    resolve_dim: Callable[[ast.expr], _DimValue],
+) -> None:
+    """Snapshot dimension/integer arithmetic before rebinding any target.
+
+    ``d = pl.tensor.dim(src, k)`` and ``d = src.shape[k]`` bind ``d`` to dim
+    ``k`` of ``src``; ``M, N = src.shape`` binds each name to its position. The
+    dim is read from ``local`` as it stands before the assignment, so a later
+    rebinding of ``src`` cannot change what ``d`` already holds. Arithmetic
+    aliases retain an abstract derived value, not a lazily evaluated expression.
+    Unknown assignments leave a tombstone, preventing fallback to an older
+    DynVar anchor. A starred unpack shifts positions, so it binds none.
+    """
+    if value is None:
+        return
+    dim = resolve_dim(value)
+    unpack_src = _shape_attr_source(value)
+    unpack_meta = None if unpack_src is None else local.get(unpack_src)
+    for target in targets:
+        if isinstance(target, ast.Name):
+            # A known arithmetic expression still names one runtime scalar.
+            # Preserve its snapshot for algebra and its binding identity for
+            # multiple views sized from that unchanged local.
+            dim_values[target.id] = _RuntimeDim(dim)
+            continue
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            continue
+        starred = any(isinstance(elt, ast.Starred) for elt in target.elts)
+        for axis, elt in enumerate(target.elts):
+            if (
+                unpack_meta is not None
+                and not starred
+                and isinstance(elt, ast.Name)
+                and axis < len(unpack_meta.shape)
+            ):
+                dim_values[elt.id] = unpack_meta.actual_dim(axis)
+                continue
+            _forget_names(elt, dim_values)
+
+
+def _forget_rebound_dims(stmt: ast.stmt, dim_values: dict[str, _DimBinding]) -> None:
+    """A ``for`` or ``with ... as`` target rebinds its names, so the dims they held are gone."""
+    if isinstance(stmt, ast.For):
+        _forget_names(stmt.target, dim_values)
+    elif isinstance(stmt, ast.With):
+        for item in stmt.items:
+            if item.optional_vars is not None:
+                _forget_names(item.optional_vars, dim_values)
+    elif isinstance(stmt, ast.Delete):
+        for target in stmt.targets:
+            _forget_names(target, dim_values)
+    elif isinstance(stmt, ast.AugAssign):
+        # The parser rejects augmented assignments. Do not infer their result
+        # or leave a previous dimension binding visible to later reshapes.
+        _forget_names(stmt.target, dim_values)
+
+
+def _forget_names(target: ast.expr, dim_values: dict[str, _DimBinding]) -> None:
+    for node in ast.walk(target):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            dim_values[node.id] = _RuntimeDim()
+
+
+def _stmt_binding_names(stmt: ast.stmt) -> set[str]:
+    """Names whose bindings one statement can update, excluding nested bodies."""
+    parts = _assignment_parts(stmt)
+    if parts is not None:
+        targets, value = parts
+        if value is None:
+            return set()
+    elif isinstance(stmt, (ast.For, ast.AugAssign)):
+        targets = [stmt.target]
+    elif isinstance(stmt, ast.Delete):
+        targets = stmt.targets
+    elif isinstance(stmt, ast.With):
+        targets = [item.optional_vars for item in stmt.items if item.optional_vars is not None]
+    else:
+        return set()
+    return {
+        node.id
+        for target in targets
+        for node in ast.walk(target)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+    }
+
+
+def _body_binding_names(stmts: list[ast.stmt]) -> set[str]:
+    """Find possible scalar writes before analyzing a loop iteration."""
+    return {
+        node.id
+        for stmt in stmts
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+    }
+
+
+class _MetaWalkOptions(NamedTuple):
+    tuple_values: dict[str, _TupleMeta] | None
+    before_stmt: Callable[[ast.stmt, Mapping[str, TensorMeta]], None] | None
+    scalar_types: ScalarTypes | None
+    selected_arms: Mapping[tuple[int, int], bool]
+
+
+def _rewind_tuple_bindings(
+    tuples: dict[str, _TupleMeta], undo: list[tuple[str, _TupleMeta | None]], mark: int
+) -> dict[str, _TupleMeta | None]:
+    values = {name: tuples.get(name) for name, _ in undo[mark:]}
+    for name, value in reversed(undo[mark:]):
+        if value is None:
+            tuples.pop(name, None)
+        else:
+            tuples[name] = value
+    del undo[mark:]
+    return values
+
+
+def _assignment_with_value(stmt: ast.stmt, value: ast.expr | None) -> ast.stmt:
+    """Use a rewritten RHS without changing the source AST seen by observers."""
+    if value is None:
+        return stmt
+    assert isinstance(stmt, (ast.Assign, ast.AnnAssign))
+    assignment = copy.copy(stmt)
+    assignment.value = value
+    return assignment
+
+
+def _walk_local_tensor_meta_stmts(
+    stmts: list[ast.stmt],
+    stop_at_dep: str | None,
+    local: dict[str, TensorMeta],
+    dim_values: dict[str, _DimBinding],
+    collected: dict[str, TensorMeta],
+    update: Callable[[ast.stmt], None],
+    stop_at_call: ast.Call | None = None,
+    *,
+    options: _MetaWalkOptions,
+) -> bool:
+    """Walk source order with plain binding tables and branch undo journals.
+
+    Each arm rewinds only names it wrote, never copies the whole environment.
+    Scalar writes become unknown at joins; tensor metadata survives only when
+    both paths agree, including synthesized-dimension identity. Nested joins
+    revisit their changed names; unrelated bindings remain untouched. For N AST nodes
+    and nesting depth D, joins and loop-write scans take O(N * D) worst-case
+    work; branch entry never copies the complete binding tables.
+    """
+    tuple_values, before_stmt, scalar_types, selected_arms = options
+    selected_yields: dict[ast.stmt, ast.expr] = {}
+    dim_undo: list[tuple[str, _DimBinding]] = []
+    tensor_undo: list[tuple[str, TensorMeta | None]] = []
+    scalar_types = scalar_types or ScalarTypes()
+
+    tuples = {} if tuple_values is None else tuple_values
+    tuple_undo: list[tuple[str, _TupleMeta | None]] = []
+
+    def forget_tuples(names: set[str]) -> None:
+        for name in names:
+            if name in tuples:
+                tuple_undo.append((name, tuples.pop(name)))
+
+    def forget_dims(names: set[str]) -> None:
+        for name in names:
+            dim_undo.append((name, dim_values.get(name)))
+            dim_values[name] = _RuntimeDim()
+
+    def rewind(
+        dim_mark: int, tensor_mark: int
+    ) -> tuple[dict[str, _DimBinding], dict[str, TensorMeta | None]]:
+        dims = {name: dim_values.get(name) for name, _ in dim_undo[dim_mark:]}
+        tensors = {name: local.get(name) for name, _ in tensor_undo[tensor_mark:]}
+        for name, value in reversed(dim_undo[dim_mark:]):
+            dim_values[name] = value
+        for name, meta in reversed(tensor_undo[tensor_mark:]):
+            if meta is None:
+                local.pop(name, None)
+            else:
+                local[name] = meta
+        del dim_undo[dim_mark:]
+        del tensor_undo[tensor_mark:]
+        return dims, tensors
+
+    def join_tuple(name: str, left: _TupleMeta | None, right: _TupleMeta | None) -> None:
+        tuple_undo.append((name, tuples.get(name)))
+        if left is not None and right is not None and len(left) == len(right):
+            tuples[name] = tuple(_merge_tensor_metas(x, y) for x, y in zip(left, right, strict=True))
+        else:
+            tuples.pop(name, None)
+
+    def walk_loop_body(body: list[ast.stmt], written: set[str]) -> bool:
+        # Forget incoming tuple facts while analyzing an arbitrary iteration.
+        # After the loop, keep only facts valid on both zero trips and the
+        # post-iteration path, just like a branch join.
+        initial = {name: tuples[name] for name in written if name in tuples}
+        scalar_mark = len(scalar_types.undo)
+        forget_dims(written)
+        forget_tuples(written)
+        if walk(body):
+            return True
+        scalar_types.join({}, scalar_types.rewind(scalar_mark))
+        forget_dims(written)
+        for name in written:
+            join_tuple(name, initial.get(name), tuples.get(name))
+        return False
+
+    def walk_if(stmt: ast.If) -> bool:
+        if (
+            selected := selected_arms.get((getattr(stmt, "lineno", -1), getattr(stmt, "col_offset", -1)))
+        ) is not None:
+            body = stmt.body if selected else stmt.orelse
+            selected_yields.update(BodyTransformer.selected_yield_assignments(body))
+            return walk(body)
+        dim_mark, tensor_mark, tuple_mark = len(dim_undo), len(tensor_undo), len(tuple_undo)
+        scalar_mark = len(scalar_types.undo)
+        if walk(stmt.body):
+            return True
+        true_dims, true_tensors = rewind(dim_mark, tensor_mark)
+        true_tuples = _rewind_tuple_bindings(tuples, tuple_undo, tuple_mark)
+        true_scalars = scalar_types.rewind(scalar_mark)
+        if walk(stmt.orelse):
+            return True
+        false_dims, false_tensors = rewind(dim_mark, tensor_mark)
+        false_tuples = _rewind_tuple_bindings(tuples, tuple_undo, tuple_mark)
+        scalar_types.join(true_scalars, scalar_types.rewind(scalar_mark))
+        forget_dims(true_dims.keys() | false_dims.keys())
+        for name in true_tensors.keys() | false_tensors.keys():
+            lhs = true_tensors.get(name, local.get(name))
+            rhs = false_tensors.get(name, local.get(name))
+            tensor_undo.append((name, local.get(name)))
+            merged = _merge_tensor_metas(lhs, rhs)
+            if merged is not None:
+                local[name] = merged
+            else:
+                local.pop(name, None)
+        for name in true_tuples.keys() | false_tuples.keys():
+            previous = tuples.get(name)
+            join_tuple(name, true_tuples.get(name, previous), false_tuples.get(name, previous))
+        return False
+
+    def record_tuple_writes(stmt: ast.stmt, names: set[str]) -> None:
+        if tuple_values is None:
+            return
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            tuple_undo.extend((name, tuples.get(name)) for name in names)
+        else:
+            forget_tuples(names)
+
+    def walk(body: list[ast.stmt]) -> bool:
+        for stmt in body:
+            if before_stmt is not None:
+                before_stmt(stmt, local)
+            if _stmt_calls_dep(stmt, stop_at_dep, stop_at_call):
+                return True
+            names = _stmt_binding_names(stmt)
+            for name in names:
+                dim_undo.append((name, dim_values.get(name)))
+                tensor_undo.append((name, local.get(name)))
+            record_tuple_writes(stmt, names)
+            update(_assignment_with_value(stmt, selected_yields.get(stmt)))
+            for name in names:
+                if name in local:
+                    collected[name] = local[name]
+                else:
+                    collected.pop(name, None)
+
+            if isinstance(stmt, ast.If):
+                if walk_if(stmt):
+                    return True
+                continue
+
+            if isinstance(stmt, (ast.For, ast.While)):
+                written = _body_binding_names(stmt.body)
+                if isinstance(stmt, ast.For):
+                    written.update(_stmt_binding_names(stmt))
+                # A value from outside a loop cannot describe every iteration
+                # when any path writes it. Definite body assignments can still
+                # establish useful dimensions later in this iteration.
+                if walk_loop_body(stmt.body, written):
+                    return True
+                if walk(stmt.orelse):
+                    return True
+                else_writes = _body_binding_names(stmt.orelse)
+                forget_dims(else_writes)
+                forget_tuples(else_writes)
+                continue
+
+            for attr in ("body", "orelse", "finalbody"):
+                nested = getattr(stmt, attr, None)
+                if isinstance(nested, list) and walk(cast("list[ast.stmt]", nested)):
+                    return True
+        return False
+
+    return walk(stmts)
+
+
+@dataclass(frozen=True)
+class _StaticScope:
+    """Resolves an operand to the compile-time value it names in a function.
+
+    Resolution mirrors the specializer's folding: the same namespace, the same
+    shadowing, the same ``pl.constexpr`` binding. It may accept a spelling the
+    generated program then rejects (``Cfg.DT`` on a module-level class); the
+    parser reports that one by name, which is still clearer than a dropped meta.
+
+    Attributes:
+        namespace: The function's globals plus closure cells
+        shadowed: Its parameters and assignment targets, which hide a same-named
+            global here exactly as they do in the specializer's free-name folding
+        constexpr: Its ``pl.constexpr`` binding, each value parsed back to an
+            expression
+    """
+
+    namespace: Mapping[str, Any]
+    shadowed: frozenset[str]
+    constexpr: Mapping[str, ast.expr]
+
+    @classmethod
+    def of(cls, func: Any, constexpr_values: Mapping[str, str] | None) -> "_StaticScope":
+        """The scope of ``func``, under its ``pl.constexpr`` binding (name → folded source text)."""
+        return cls(
+            namespace=func_name_lookup(func),
+            shadowed=frozenset(_ast_analysis.body_local_names(func)),
+            constexpr={
+                name: ast.parse(text, mode="eval").body for name, text in (constexpr_values or {}).items()
+            },
+        )
+
+    def fold(self, node: ast.expr | None) -> ast.expr | None:
+        """The folded value's expression for a ``pl.constexpr`` parameter, else ``node``."""
+        if isinstance(node, ast.Name) and node.id in self.constexpr:
+            return self.constexpr[node.id]
+        return node
+
+    def value(self, node: ast.expr) -> Any:
+        """The value a constant name or attribute chain is bound to, else None.
+
+        Covers a module-level or closure constant and an attribute chain rooted
+        at a module or class (``pl.FP32``, ``pl.TensorLayout.NZ``). Attributes
+        are read only off modules and classes, so resolving an operand never
+        runs an instance property.
+        """
+        if isinstance(node, ast.Name):
+            return None if node.id in self.shadowed else self.namespace.get(node.id)
+        if isinstance(node, ast.Attribute):
+            base = self.value(node.value)
+            if isinstance(base, (types.ModuleType, type)):
+                return getattr(base, node.attr, None)
+        return None
+
+    def int_shape(self, node: ast.expr) -> tuple[int, ...] | None:
+        """A shape constant: a name bound to a list or tuple of ints."""
+        value = self.value(node) if isinstance(node, ast.Name) else None
+        if not isinstance(value, (list, tuple)):
+            return None
+        seq = cast("Sequence[Any]", value)
+        return tuple(seq) if all(isinstance(d, int) and not isinstance(d, bool) for d in seq) else None
+
+
+def _resolve_dim_axis(node: ast.expr, scope: _StaticScope) -> int | None:
+    """Fold a dimension axis from static values, never from runtime scalar aliases."""
+    folded = scope.fold(node)
+    if isinstance(folded, ast.Constant):
+        return folded.value if isinstance(folded.value, int) and not isinstance(folded.value, bool) else None
+    if isinstance(folded, (ast.Name, ast.Attribute)):
+        value = scope.value(folded)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    if isinstance(folded, ast.UnaryOp):
+        value = _resolve_dim_axis(folded.operand, scope)
+        if value is not None:
+            if isinstance(folded.op, ast.USub):
+                return -value
+            if isinstance(folded.op, ast.UAdd):
+                return value
+    if isinstance(folded, ast.BinOp):
+        lhs = _resolve_dim_axis(folded.left, scope)
+        rhs = _resolve_dim_axis(folded.right, scope)
+        if lhs is not None and rhs is not None:
+            return _fold_int_arith(folded.op, lhs, rhs)
+    return None
+
+
+class _StaticPreview(NamedTuple):
+    """Folded scalar source locations from one body rewrite."""
+
+    unary_plus: dict[tuple[int, int], int]
+    constants: dict[tuple[int, int], int]
+    selected_arms: dict[tuple[int, int], bool]
+    return_position: tuple[int, int] | None
+
+
+def _preview_static_expressions(
+    func_def: ast.FunctionDef,
+    seed_meta: Mapping[str, TensorMeta],
+    scope: _StaticScope,
+    constexpr_values: Mapping[str, str] | None,
+    *,
+    summarize_return: bool = False,
+) -> _StaticPreview:
+    """Preview the real body rewrite once, recording expressions emitted as constants.
+
+    Runtime names left by alpha-renaming must never resolve through globals.
+    Shape aliases are constants only where the real transformer inlines them;
+    ordinary and annotated scalar assignments remain variables even if their
+    initializer is known. Source positions associate the copy with the input AST.
+    Memoizing the pure constant fold keeps nested unary expressions linear.
+    """
+    interesting = (ast.UAdd, ast.Subscript, ast.If) if summarize_return else (ast.UAdd, ast.Subscript)
+    if not any(isinstance(node, interesting) for node in ast.walk(func_def)):
+        return _StaticPreview({}, {}, {}, None)
+    values: dict[tuple[int, int], int] = {}
+    constants: dict[tuple[int, int], int] = {}
+    selected_arms: dict[tuple[int, int], bool] = {}
+
+    @functools.cache
+    def static_int(node: ast.expr) -> int | None:
+        if isinstance(node, ast.Constant):
+            return node.value if isinstance(node.value, int) and not isinstance(node.value, bool) else None
+        if isinstance(node, ast.UnaryOp):
+            value = static_int(node.operand)
+            if value is not None:
+                if isinstance(node.op, ast.USub):
+                    return -value
+                if isinstance(node.op, ast.UAdd):
+                    return value
+        if isinstance(node, ast.BinOp):
+            lhs, rhs = static_int(node.left), static_int(node.right)
+            if lhs is not None and rhs is not None:
+                return _fold_int_arith(node.op, lhs, rhs)
+        return None
+
+    class Preview(BodyTransformer):
+        def _visit_literal_if(self, node: ast.If, condition: bool) -> list[ast.stmt]:
+            if summarize_return and hasattr(node, "lineno") and hasattr(node, "col_offset"):
+                selected_arms[node.lineno, node.col_offset] = condition
+            return super()._visit_literal_if(node, condition)
+
+        def visit_Name(self, node: ast.Name) -> ast.expr:
+            transformed = super().visit_Name(node)
+            value = static_int(transformed)
+            if value is not None and hasattr(node, "lineno") and hasattr(node, "col_offset"):
+                constants[node.lineno, node.col_offset] = value
+            return transformed
+
+        def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
+            position = (getattr(node, "lineno", -1), getattr(node, "col_offset", -1))
+            transformed = super().visit_Subscript(node)
+            value = static_int(transformed)
+            if value is not None:
+                constants[position] = value
+            return transformed
+
+        def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.UnaryOp:
+            position = (node.lineno, node.col_offset)
+            transformed = cast("ast.UnaryOp", self.generic_visit(node))
+            if isinstance(transformed.op, ast.UAdd):
+                value = static_int(transformed.operand)
+                if value is not None:
+                    values[position] = value
+            return transformed
+
+    transformer = Preview(
+        tensor_meta={
+            name: replace(
+                meta,
+                shape=tuple(
+                    synthesized_dyn_dim(func_def.name, name, axis) if axis in meta.inexact_axes else dim
+                    for axis, dim in enumerate(meta.shape)
+                ),
+            )
+            for name, meta in seed_meta.items()
+        },
+        dep_names=set(),
+        param_names=[
+            arg.arg
+            for arg in func_def.args.args
+            if arg.arg != "self" and arg.arg not in (constexpr_values or {})
+        ],
+        initial_used_names={
+            node.id
+            for node in ast.walk(func_def)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        },
+        py_globals=scope.namespace,
+        constexpr_values=constexpr_values,
+    )
+    emitted: list[ast.stmt] = []
+    try:
+        for stmt in copy.deepcopy(func_def.body):
+            rewritten = transformer.visit(stmt)
+            if summarize_return and rewritten is not None:
+                emitted.extend(
+                    cast("list[ast.stmt]", rewritten) if isinstance(rewritten, list) else [rewritten]
+                )
+    except (IndexError, KeyError, TypeError, ValueError):
+        # Invalid source still belongs to the normal specializer/parser path.
+        return _StaticPreview({}, {}, {}, None)
+    site = _return_site(ast.Module(body=emitted, type_ignores=[])) if selected_arms else None
+    return _StaticPreview(values, constants, selected_arms, (site.lineno, site.col_offset) if site else None)
+
+
+def _matching_static_unary_plus(value: int | None, operand: _DimValue) -> int | None:
+    """Accept the preview only when the current binding independently agrees."""
+    return value if value is not None and isinstance(operand, int) and operand == value else None
+
+
+def _resolve_slice_int(
+    elt: ast.expr,
+    scope: _StaticScope,
+    constants: Mapping[tuple[int, int], int],
+    local: Mapping[str, TensorMeta],
+) -> int | None:
+    """Resolve literal-foldable constants, never known-valued runtime locals.
+
+    The dimension table also records ``width = 128`` and annotated scalar
+    assignments. Those names survive specialization as Vars, preserving
+    their declared dtypes; replacing them with INDEX literals would prove
+    extents the parser cannot prove. Shape aliases require literal emission
+    by the body transformer. Direct shape reads can also fold in the parser
+    from the current tensor type, including tensors allocated in this body.
+    Other constants use the static scope's constexpr and shadowing rules.
+    """
+    if isinstance(elt, ast.Subscript):
+        alias = _constant_shape_alias(elt)
+        if alias is not None and alias[0] in local:
+            # The preview can retain one arm's alias at a runtime join. Live
+            # metadata carries the union of both arms' fallback dimensions.
+            dim = _alias_dim(alias, local)
+            return dim if isinstance(dim, int) else None
+    if isinstance(elt, (ast.Name, ast.Subscript)):
+        value = constants.get((elt.lineno, elt.col_offset))
+        if value is not None:
+            return value
+    if isinstance(elt, ast.BinOp):
+        lhs = _resolve_slice_int(elt.left, scope, constants, local)
+        rhs = _resolve_slice_int(elt.right, scope, constants, local)
+        return _fold_int_arith(elt.op, lhs, rhs) if lhs is not None and rhs is not None else None
+    if isinstance(elt, ast.UnaryOp):
+        value = _resolve_slice_int(elt.operand, scope, constants, local)
+        if value is not None:
+            if isinstance(elt.op, ast.USub):
+                return -value
+            if isinstance(elt.op, ast.UAdd):
+                return value
+    return _resolve_dim_axis(elt, scope)
+
+
+def _drop_dims_is_noop(drop_dims_node: ast.expr | None, scope: _StaticScope) -> bool:
+    """True when ``drop_dims`` is a no-op: omitted, ``None``, an empty
+    list/tuple literal, or a ``Name`` bound to one of those. ``scope.fold()``
+    resolves a ``pl.constexpr`` parameter binding first (its own, narrower
+    mechanism — a name outside ``constexpr`` passes through unchanged); what
+    remains is then resolved as a module-level or closure constant
+    (e.g. ``EMPTY = []`` or ``NONE_DIMS = None``) if it's still a ``Name`` —
+    read directly off ``scope.namespace``/``scope.shadowed`` rather than
+    through ``scope.value()``, whose bare ``None`` return is ambiguous
+    between "genuinely bound to None" and "a local parameter, unresolvable
+    here" (e.g. ``def body(src, drop_dims): ... drop_dims=drop_dims``) — the
+    latter must never be assumed empty, or a real non-empty runtime value
+    would advertise the wrong, pre-drop rank.
+    """
+    node = scope.fold(drop_dims_node)
+    if isinstance(node, ast.Name):
+        if node.id in scope.shadowed or node.id not in scope.namespace:
+            return False
+        resolved = scope.namespace[node.id]
+        return resolved is None or (isinstance(resolved, (list, tuple)) and not resolved)
+    return (
+        node is None
+        or (isinstance(node, ast.Constant) and node.value is None)
+        or (isinstance(node, (ast.List, ast.Tuple)) and len(node.elts) == 0)
+    )
+
+
+def _resolve_whole_shape(
+    node: ast.expr | None, local: Mapping[str, TensorMeta], scope: _StaticScope
+) -> tuple[ShapeDim, ...] | None:
+    """Resolve a whole tensor shape or a global/closure shape constant.
+
+    Fallback bounds do not establish the actual shape of a derived tensor.
+    """
+    if node is None:
+        return None
+    src = _shape_attr_source(node)
+    if src is not None:
+        meta = local.get(src)
+        if meta is None:
+            return None
+        shape = tuple(meta.actual_dim(axis) for axis in range(len(meta.shape)))
+        return cast(tuple[ShapeDim, ...], shape) if all(dim is not None for dim in shape) else None
+    return scope.int_shape(node)
+
+
+def _shape_inexact_axes(
+    node: ast.expr | None, shape: tuple[ShapeDim, ...], resolve: Callable[[ast.expr], int | None]
+) -> frozenset[int]:
+    """Distinguish inferred scalar values from literal dimensions in a shape list."""
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return frozenset()
+    return frozenset(
+        axis
+        for axis, (elt, dim) in enumerate(zip(node.elts, shape, strict=True))
+        if isinstance(dim, int) and resolve(elt) is None
+    )
+
+
+def _independent_view_shape(
+    shape: tuple[ShapeDim, ...], owner: str, base: str, parameter_dims: set[int]
+) -> tuple[ShapeDim, ...]:
+    # A synthesized local extent can name an earlier scalar or descriptor read.
+    # The parser cannot equate it with a new tensor.dim(view, axis) read. Bind
+    # those axes independently; signature dimensions remain provably shared.
+    dimensions: dict[int, DynDim] = {}
+    result: list[ShapeDim] = []
+    for axis, dim in enumerate(shape):
+        if isinstance(dim, DynDim) and dim.synthesized and id(dim) not in parameter_dims:
+            # Repeated expressions inside this result still prove equal axes.
+            dimensions.setdefault(
+                id(dim), replace(synthesized_dyn_dim(owner, base, axis), static_bound=dim.static_bound)
+            )
+            dim = dimensions[id(dim)]
+        result.append(dim)
+    return tuple(result)
+
+
+_MetaObserver = Callable[
+    [
+        ast.stmt,
+        Mapping[str, TensorMeta],
+        Callable[[ast.expr], TensorMeta | None],
+        Callable[[ast.expr], DataType | None],
+    ],
+    None,
+]
+
+
+@dataclass
+class LocalMetaScan:
+    return_meta: _ReturnMeta | None = None
+    before_stmt: _MetaObserver | None = None
+    scalar_dtypes: Mapping[str, DataType] = field(default_factory=dict[str, DataType])
+    preview: _StaticPreview | None = None
+
+
+@dataclass
+class CallSiteMetadata:
+    call: ast.Call
+    tensors: Mapping[str, TensorMeta]
+    resolve_expr: Callable[[ast.expr], TensorMeta | None]
+    resolve_scalar: Callable[[ast.expr], DataType | None] | None = None
+
+
+class _ExpressionMetas:
+    """Share expression identities across specialization and result inference per statement."""
+
+    def __init__(
+        self,
+        resolve: Callable[[ast.expr], TensorMeta | None],
+        scan: LocalMetaScan | None,
+        scope: _StaticScope,
+        deps: _DepScan,
+    ):
+        deps.resolve_expr = self.resolve
+        self.resolver = resolve
+        self.observer = scan.before_stmt if scan is not None else None
+        self.metas: dict[ast.expr, TensorMeta | None] = {}
+        self.scalars: ScalarTypes | None = None
+        if scan is not None and scan.before_stmt is not None:
+            self.scalars = ScalarTypes(scan.scalar_dtypes, scope.fold, scope.value, self.tensor_dtype)
+
+    def tensor_dtype(self, expr: ast.expr) -> DataType | None:
+        meta = self.resolve(expr)
+        return meta.dtype if meta is not None else None
+
+    def resolve(self, expr: ast.expr) -> TensorMeta | None:
+        if expr not in self.metas:
+            self.metas[expr] = self.resolver(expr)
+        return self.metas[expr]
+
+    def before_stmt(self, statement: ast.stmt, live: Mapping[str, TensorMeta]) -> None:
+        # A later statement can rebind names used by the cached expressions.
+        self.metas.clear()
+        if self.observer is not None:
+            assert self.scalars is not None
+            self.observer(statement, live, self.resolve, self.scalars.dtype)
+            self.scalars.update(statement)
+
+
+def extract_local_tensor_metas(
+    func: Any,
+    seed_meta: dict[str, TensorMeta] | None = None,
+    caller_func_type: str = "orchestration",
+    stop_at_dep: str | None = None,
+    dep_analysis: _DepAnalysis | None = None,
+    stop_at_call: ast.Call | None = None,
+    constexpr_values: Mapping[str, str] | None = None,
+    visible_only: bool = False,
+    *,
+    discover_deps: _call_binding.DiscoverDeps,
+    scan: LocalMetaScan | None = None,
+) -> dict[str, TensorMeta]:
+    """Infer ``TensorMeta`` for the local tensor variables in ``func``'s body.
+
+    Walks the body in source order, tracking the three ways a local tensor can
+    be produced inside a JIT function:
+
+    1. ``var = pl.create_tensor([shape], dtype=pl.XXX)`` — each operand by
+       position or keyword. Shape from a list or tuple literal (literal ints,
+       ``Name`` refs to int globals, ``M`` from ``M, N = src.shape`` /
+       ``src.shape[k]``, and simple int arithmetic over those), or whole from
+       ``src.shape`` or a module-level shape constant. Dtype from ``pl.XXX``, a
+       module-level or closure constant bound to one, or ``src.dtype``; a
+       non-ND ``layout`` the same way.
+       A shape element that resolves through a dynamic alias — either
+       ``tokens = pl.tensor.dim(P, k)`` for a seeded param ``P`` whose dim
+       ``k`` is ``DynDim``-bound, or a direct reference to a DynVar
+       declared in the seed metas — stamps the matching ``DynDim`` onto the
+       local's shape so the dynamic chain keeps flowing through subsequent
+       deps.
+    2. ``var = pl.slice(src, [shape], [...])`` — dtype inherited from ``src`` (a
+       parameter or earlier local); each shape dim that is a static int is used
+       as-is, and a non-static dim (e.g. a runtime ``valid_len``) falls back to
+       ``src``'s corresponding dim, since a slice is bounded above by its
+       parent. ``src`` dims that are themselves ``DynDim`` flow through
+       transparently. The subscript-slice sugar ``var = src[a:b, i, ...]`` (an
+       ``ast.Subscript``) is the documented equivalent and is tracked the same
+       way: each slice dim resolves to ``stop - start`` (parent-dim fallback
+       when not static), a scalar index drops its dim, and trailing implicit
+       ``:`` dims keep the parent extent.
+    3. ``v1, ..., vk = jit_dep(args)`` where ``jit_dep`` is an
+       ``@pl.jit.incore`` / ``inline`` / ``opaque`` callee with ``k``
+       ``pl.Out[...]`` parameters — each ``vi`` inherits the meta of the caller
+       argument bound to the i-th ``Out`` parameter (the in-place-output
+       convention every such kernel follows, and the same heuristic
+       ``_infer_return_type`` uses on the callee side).
+    4. ``v1, ..., vk = jit_dep(args)`` where ``jit_dep`` instead allocates its
+       own results (``a = pl.create_tensor(...); ...; return a, b``) — the
+       extractor descends into the callee's body, seeded with the params this
+       call site binds, and each ``vi`` takes the meta of the i-th returned
+       name (see :func:`_dep_return_metas`). ``dep_analysis`` carries the ``id()``
+       of every wrapper already on that stack so the descent cannot loop.
+       Standalone raw-callable extraction uses the callable's identity until
+       descending into a JIT wrapper.
+
+    ``seed_meta`` pre-populates the table with the caller's parameter metas
+    (including any ``DynDim`` entries those carry) so a ``pl.slice`` of a
+    parameter, a dep call passing a parameter through, or a local
+    ``pl.create_tensor`` sized off a dynamic dim of a parameter all resolve.
+
+    A *scalar parameter* is a runtime value and therefore never resolves a
+    shape dim statically; a dim sized off one becomes a synthesized ``DynDim``
+    like any other runtime extent. Size a local off a module-level or closure
+    constant, a ``pl.constexpr`` parameter, or a static dim of another tensor
+    when the shape has to be static.
+
+    A ``pl.create_tensor`` / ``pld.window`` dim that no static rule resolves —
+    a runtime extent such as ``pld.world_size()``, ``pl.tensor.read(cfg, [0])``,
+    or arithmetic over a ``DynDim`` — becomes a synthesized ``DynDim`` (see
+    :func:`synthesized_dyn_dim`) rather than voiding the whole meta. Reshape
+    dimensions composed of known tensor dimensions and integer arithmetic use
+    the same descriptor-bound symbols, preserving their expressions in IR.
+    Other unresolved reshape dimensions are still skipped, and the clear
+    ``ValueError`` in ``Specializer._build_params`` fires for that variable.
+    When ``stop_at_dep`` is provided, extraction stops
+    immediately before the first source-ordered call to that dependency. This
+    produces the point-in-time metadata visible to that call and ignores later
+    rebindings. ``stop_at_call`` selects one specific call node instead, which
+    is what a dep reached with several ``pl.constexpr`` bindings needs: each
+    binding is a separate compilation and must see the tensors live at its own
+    call site, not at the first call to the same name.
+
+    ``constexpr_values`` is ``func``'s own ``pl.constexpr`` binding (parameter
+    name → folded source text). A shape or dtype operand naming one resolves to
+    that value, as the specializer folds it, instead of to a runtime extent.
+
+    The default result collects observed metadata, including branch locals.
+    Dependency consumers request ``visible_only`` so only bindings valid at
+    their selected call or at the end of a callee can type a dependency.
+    When supplied, ``scan.preview`` restricts a return summary to emitted arms.
+    ``scan.return_meta`` receives metadata for the requested return
+    expressions, using the callee's locals and tuple construction snapshots.
+    ``scan.before_stmt`` reads the live metadata and expression resolver at
+    each statement without copying or replaying the caller environment.
+    """
+    func_def = _ast_analysis.get_func_def(func)
+    return_meta = (scan.return_meta if scan is not None else None) or (
+        _ReturnMeta(None, [])
+        if caller_func_type == "host"
+        or (scan and scan.before_stmt)
+        or any(
+            isinstance(node, ast.Call) and (view := dependency_call(node)) is not None and view is not node
+            for node in ast.walk(func_def)
+        )
+        else None
+    )
+    scope = _StaticScope.of(func, constexpr_values)
+    dim_values: dict[str, _DimBinding] = {name: _RuntimeDim() for name in scope.shadowed}
+    local = dict(seed_meta or {})
+    parameter_dims = {id(meta.actual_dim(axis)) for meta in local.values() for axis in range(len(meta.shape))}
+    collected = dict(local)
+    dynvar_anchors = _build_dynvar_anchor_index(seed_meta or {})
+    declared_dims = _declared_dim_values(func_def, seed_meta or {})
+    static_preview = (
+        scan.preview
+        if scan is not None and scan.preview is not None
+        else _preview_static_expressions(func_def, seed_meta or {}, scope, constexpr_values)
+    )
+    resolve_slice_int = functools.partial(
+        _resolve_slice_int, scope=scope, constants=static_preview.constants, local=local
+    )
+
+    def _resolve_dim_value(elt: ast.expr) -> _DimValue:
+        """Resolve a scalar to a snapshot of known dimension/integer arithmetic.
+
+        Dynamic resolution paths (added on top of the original static integer
+        resolver):
+
+        - ``Name`` bound to dim ``k`` of ``P`` (``pl.tensor.dim(P, k)``,
+          ``P.shape[k]``, or ``M, N = P.shape``) → that dim as it was when the
+          name was bound, a ``DynDim`` flowing through as-is.
+        - ``Name`` that's a DynVar declared on a seeded param → returns the
+          DynDim of the (first) anchor site.
+        - ``P.shape[k]`` / ``pl.tensor.dim(P, k)`` written inline → dim ``k``
+          of ``P``, the same as through a named alias.
+
+        Falls back to integer resolution for literal ints, int globals,
+        ``pl.constexpr`` parameters, and arithmetic over those.
+        A derived value never replaces an unknown operand or uses a sample
+        bound. It acquires a descriptor-bound symbol only when used in a shape.
+        """
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
+            return elt.value
+        if isinstance(elt, (ast.Subscript, ast.Call)):
+            return declared_dims.get(elt) or _alias_dim(
+                _extract_dim_alias(elt, lambda axis: _resolve_dim_axis(axis, scope)), local
+            )
+        if isinstance(elt, ast.Name):
+            if elt.id in scope.constexpr:
+                return _resolve_dim_value(scope.constexpr[elt.id])
+            # A name bound to a dim: pl.tensor.dim(P, k) / P.shape[k] / k-th of P.shape
+            if elt.id in dim_values:
+                value = dim_values[elt.id]
+                return value.value if isinstance(value, _RuntimeDim) else value
+            # Direct DynVar reference (e.g. M used as a shape entry).
+            anchors = dynvar_anchors.get(elt.id)
+            dim = _alias_dim(anchors[0] if anchors else None, local)
+            if isinstance(dim, DynDim):
+                return dim
+            # Static int via globals (module-level or closure constants).
+            value = scope.value(elt)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+            return None
+        if isinstance(elt, ast.BinOp):
+            return _resolve_dim_binop(elt, _resolve_dim_value)
+        if isinstance(elt, ast.UnaryOp):
+            if isinstance(elt.op, ast.UAdd):
+                return _matching_static_unary_plus(
+                    static_preview.unary_plus.get((elt.lineno, elt.col_offset)),
+                    _resolve_dim_value(elt.operand),
+                )
+            v = _resolve_dim_value(elt.operand)
+            if isinstance(v, (DynDim, tuple)) and isinstance(elt.op, ast.USub):
+                return type(elt.op), (v,)
+            if not isinstance(v, int):
+                return None
+            if isinstance(elt.op, ast.USub):
+                return -v
+            return None
+        return None
+
+    def _resolve_shape_elt(
+        elt: ast.expr, bound_dim: DynDim | None = None, bound_dims: _BoundShapeDims | None = None
+    ) -> ShapeDim | None:
+        return _bind_scalar_shape_dim(_resolve_dim_value(elt), bound_dim, bound_dims)
+
+    def _resolve_shape(
+        node: ast.expr | None, dyn_base: str | None = None, *, dimension_arithmetic: bool = False
+    ) -> tuple[ShapeDim, ...] | None:
+        """Resolve a shape operand, optionally synthesizing runtime-only dims.
+
+        A list or tuple literal resolves element by element; ``src.shape`` or a
+        shape constant resolves whole (see :func:`_resolve_whole_shape`).
+
+        ``dyn_base`` is the name of the local being assigned. When given, a dim
+        that no static rule resolves becomes a synthesized ``DynDim`` instead of
+        failing the whole shape (see :func:`synthesized_dyn_dim`). Callers that
+        pass ``None`` keep the strict all-or-nothing behaviour.
+        ``dimension_arithmetic`` limits synthesis to arithmetic whose operands
+        are known dimensions or integers; arbitrary runtime values are rejected.
+        """
+        node = scope.fold(node)
+        whole = _resolve_whole_shape(node, local, scope)
+        if whole is not None:
+            return whole
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            return None
+        dims: list[ShapeDim] = []
+        bound_dims: _BoundShapeDims = {}
+        for i, elt in enumerate(node.elts):
+            bound_dim = (
+                synthesized_dyn_dim(func_def.name, dyn_base, i)
+                if dyn_base is not None and dimension_arithmetic
+                else None
+            )
+            v = _resolve_shape_elt(elt, bound_dim, bound_dims)
+            if v is None:
+                if dyn_base is None or dimension_arithmetic:
+                    return None
+                v = synthesized_dyn_dim(func_def.name, dyn_base, i)
+            dims.append(v)
+        return tuple(dims)
+
+    def _resolve_dtype(node: ast.expr | None) -> DataType | None:
+        """Resolve a ``dtype`` operand to the ``DataType`` it evaluates to.
+
+        Resolves by value, not by spelling, so the inferred meta agrees with
+        what the specializer folds into the generated source: ``WDT`` bound to
+        ``pl.FP32`` at module or closure scope is ``FP32`` exactly as the
+        literal ``pl.FP32`` is, a ``pl.constexpr`` parameter is its folded
+        value, and ``src.dtype`` is the dtype of the tensor ``src`` holds at
+        this point of the walk.
+        """
+        node = scope.fold(node)
+        if node is None:
+            return None
+        if isinstance(node, ast.Attribute) and node.attr == "dtype" and isinstance(node.value, ast.Name):
+            src_meta = local.get(node.value.id)
+            if src_meta is not None:
+                return src_meta.dtype
+        value = scope.value(node)
+        return value if isinstance(value, DataType) else None
+
+    def _create_tensor_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
+        # pl.create_tensor(shape, dtype, layout, ...) — each by position or keyword.
+        # A runtime-sized extent (``pl.create_tensor([n, 128], ...)`` where ``n``
+        # is read from a tensor) synthesizes a dynamic dim rather than dropping
+        # the meta -- the allocation itself is runtime-sized either way.
+        shape = _resolve_shape(_call_operand(call, 0, "shape"), target)
+        dtype_val = _resolve_dtype(_call_operand(call, 1, "dtype"))
+        # An omitted layout is ND. One that does not resolve declines the meta:
+        # claiming ND for it would silently mis-declare every dep it reaches.
+        layout_node = scope.fold(_call_operand(call, 2, "layout"))
+        layout = _ir.TensorLayout.ND if layout_node is None else scope.value(layout_node)
+        if shape is None or dtype_val is None or not isinstance(layout, _ir.TensorLayout):
+            return None
+        # Allocations have a known layout, including default ND. A downstream
+        # annotation may fill omitted parameter layouts, but cannot change storage.
+        return TensorMeta(
+            shape=shape,
+            dtype=dtype_val,
+            layout=layout,
+            inexact_axes=_shape_inexact_axes(
+                scope.fold(_call_operand(call, 0, "shape")), shape, resolve_slice_int
+            ),
+        )
+
+    def _window_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
+        # pld.window(buffer, shape, *, dtype) — a distributed window view over a
+        # window buffer. Lets a host orchestrator's per-rank window locals
+        # propagate their meta into the ``pld.DistributedTensor`` parameters of
+        # the chip orchestrator it calls. A runtime-sized dim
+        # (``[pld.world_size(), 1]``) synthesizes a dynamic dim, the same way
+        # create_tensor does.
+        shape = _resolve_shape(_call_operand(call, 1, "shape"), target)
+        dtype_val = _resolve_dtype(_call_operand(call, None, "dtype"))
+        if shape is None or dtype_val is None:
+            return None
+        return TensorMeta(
+            shape=shape,
+            dtype=dtype_val,
+            is_distributed=True,
+            inexact_axes=_shape_inexact_axes(
+                scope.fold(_call_operand(call, 1, "shape")), shape, resolve_slice_int
+            ),
+        )
+
+    def _reshape_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
+        # pl.reshape(input, shape) / pl.tensor.reshape(tensor, shape) — dtype
+        # inherited from source tensor.
+        src = _tensor_or_input_operand(call)
+        src_meta = expressions.resolve(src) if src is not None else None
+        if src_meta is None:
+            return None
+        shape_node = _call_operand(call, 1, "shape")
+        # Type descriptor-derived extents without evaluating dynamic arithmetic.
+        # The original reshape expression stays in IR and its validation is
+        # unchanged; dependency parameters bind these symbols from the result's
+        # real descriptor. Unknown scalars must not acquire a placeholder here.
+        # Rebinding the same Python name must not equate unrelated result
+        # descriptors. Source coordinates also distinguish same-line calls and
+        # stay deterministic across extractions and sample bounds.
+        result_name = f"{target}_l{call.lineno}_c{call.col_offset}" if target is not None else None
+        shape = _resolve_shape(shape_node, result_name, dimension_arithmetic=True)
+        if shape is None:
+            return None
+        # Other non-ND reshapes reinterpret layout coordinates, so claiming ND
+        # would mis-declare the result. The whole static NZ buffer is the one
+        # exception: its rank-1 physical view needs no coordinate rewrite.
+        # Match BlockNzTensorViews::IsWholeTensorFlatten; symbolic bounds do
+        # not prove the runtime element count. The reshape result is ND.
+        if src_meta.layout not in (None, _ir.TensorLayout.ND):
+            whole_nz_flatten = (
+                src_meta.layout == _ir.TensorLayout.NZ
+                and len(shape) == 1
+                and type(shape[0]) is int
+                and all(type(dim) is int for dim in src_meta.shape)
+                and math.prod(cast(tuple[int, ...], src_meta.shape)) == shape[0]
+            )
+            if not whole_nz_flatten:
+                return None
+        # Unlike an omitted parameter layout, a reshape result is known ND.
+        # Keep it explicit so a dependency's annotation cannot overwrite it.
+        return TensorMeta(
+            shape=_independent_view_shape(shape, func_def.name, result_name or "reshape", parameter_dims),
+            dtype=src_meta.dtype,
+            layout=_ir.TensorLayout.ND,
+            inexact_axes=_shape_inexact_axes(scope.fold(shape_node), shape, resolve_slice_int),
+        )
+
+    def _slice_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
+        # pl.slice(input, shape, offset, ...) / pl.tensor.slice(tensor, shape,
+        # offset, ...) — shape/offset/drop_dims/etc. share the same names in
+        # both real spellings; only the first param's name differs.
+        #
+        # drop_dims rank-reduces the result; this handler doesn't model that,
+        # so decline rather than advertise the pre-drop shape at the wrong
+        # rank — UNLESS drop_dims is a no-op (see _drop_dims_is_noop).
+        # Pre-existing gap for the 2-segment spelling too, not introduced by
+        # qualified dispatch — just newly reachable through it.
+        if not _drop_dims_is_noop(_call_operand(call, 4, "drop_dims"), scope):
+            return None
+        src = _tensor_or_input_operand(call)
+        src_meta = expressions.resolve(src) if src is not None else None
+        if src_meta is None:
+            return None
+        shape_node = scope.fold(_call_operand(call, 1, "shape"))
+        whole = _resolve_whole_shape(shape_node, local, scope)
+        if whole is not None:
+            if len(whole) != len(src_meta.shape):
+                return None
+            return TensorMeta(
+                shape=_independent_view_shape(
+                    whole, func_def.name, f"{target}_l{call.lineno}_c{call.col_offset}", parameter_dims
+                ),
+                dtype=src_meta.dtype,
+                layout=src_meta.layout,
+                is_distributed=src_meta.is_distributed,
+            )
+        if not isinstance(shape_node, (ast.List, ast.Tuple)) or len(shape_node.elts) != len(src_meta.shape):
+            return None
+        dims: list[ShapeDim] = []
+        inexact_axes: set[int] = set()
+        runtime_dims: dict[int, DynDim] = {}
+        for elt, parent_dim in zip(shape_node.elts, src_meta.shape, strict=True):
+            v = _resolve_shape_elt(elt)
+            # A non-static slice dim (e.g. a runtime ``valid_len = pl.min(...)``)
+            # is bounded above by the parent dim — advertise that static bound,
+            # the way hand-written @pl.program code annotates a kernel that
+            # consumes a narrowed view (see examples/models/04_paged_attention.py).
+            # A fallback DynDim is also inexact: a runtime length need not equal
+            # the parent's dimension. Only a directly resolved DynDim proves
+            # symbolic equality; numeric values still need a literal proof.
+            if v is None or (isinstance(v, int) and resolve_slice_int(elt) is None):
+                inexact_axes.add(len(dims))
+                runtime_dims[len(dims)] = _slice_runtime_extent(
+                    elt,
+                    dim_values,
+                    synthesized_dyn_dim(
+                        func_def.name, f"{target}_l{call.lineno}_c{call.col_offset}", len(dims)
+                    ),
+                )
+            dims.append(v if v is not None else parent_dim)
+        return replace(
+            src_meta,
+            shape=_independent_view_shape(
+                tuple(dims), func_def.name, f"{target}_l{call.lineno}_c{call.col_offset}", parameter_dims
+            ),
+            inexact_axes=frozenset(inexact_axes),
+            runtime_dims=runtime_dims,
+        )
+
+    deps = _DepScan(
+        io=scan_dep_io(func, caller_func_type, discover_deps=discover_deps),
+        funcs={b.call_name: b.dep for b in discover_deps(func, caller_func_type)},
+        analysis=dep_analysis
+        if dep_analysis is not None
+        else _DepAnalysis(frozenset({id(func)}), _DepSummaries({})),
+        constexpr=dict(constexpr_values or {}),
+        scope=scope,
+        owner=func_def.name,
+        discover_deps=discover_deps,
+    )
+
+    # Dispatch table: pl.<attr>(...) → meta extraction function.
+    # Replaces sequential if-chains, reducing branch and statement counts.
+    store_meta = _same_operand_meta(local, 2, "output_tensor")
+    _pl_attr_handlers = {
+        "create_tensor": _create_tensor_meta,
+        "slice": _slice_meta,
+        "window": _window_meta,
+        "reshape": _reshape_meta,
+        "assemble": _same_operand_meta(local, 0, "target"),
+        "write": _same_operand_meta(local, 0, "tensor"),
+        "store": store_meta,
+    }
+
+    # 3-segment spellings this walker also understands, keyed by the FULL
+    # dotted path so a match can never collide across namespaces the way
+    # attr-name-only dispatch could. The pl.tensor.* / pld.tensor.window
+    # entries are DERIVED from _pl_attr_handlers above rather than
+    # hand-duplicated, so a new entry added there is automatically covered
+    # under its 3-segment spelling too — the two tables can't drift apart
+    # for that half. The managed collectives have no 2-segment sugar to
+    # derive from (3-segment-only), so they're listed explicitly, each with
+    # _same_operand_meta reading the real operand its own docstring names as
+    # the rebind target — not a bare `preserve_existing`, which would trust
+    # the LHS name instead of the operand when the two differ (review
+    # finding: `old = pld.tensor.broadcast(window, ...)` must get `window`'s
+    # metadata, not `old`'s stale one). None stays available in the type for
+    # a future op with no derivable operand at all; nothing currently uses
+    # it. Anything NOT listed here safely falls through to local.pop(),
+    # exactly like today's behavior for any other unrecognized call: a new
+    # op starts safe by default and must be added here deliberately, never
+    # silently assumed same-shape (#2638).
+    _qualified_call_handlers: _QualifiedCallHandlers = {
+        **{("pl", "tensor", attr): handler for attr, handler in _pl_attr_handlers.items()},
+        ("pl", "tile", "store"): store_meta,
+        ("pld", "tensor", "window"): _pl_attr_handlers["window"],
+        ("pld", "tensor", "all_to_all_v"): _same_operand_meta(local, 1, "target"),
+        ("pld", "tensor", "indexed_all_to_all_v"): _same_operand_meta(local, 1, "target"),
+        ("pld", "tensor", "all_to_all"): _same_operand_meta(local, 1, "target"),
+        ("pld", "tensor", "allreduce"): _same_operand_meta(local, 0, "target"),
+        ("pld", "tensor", "reduce_scatter"): _same_operand_meta(local, 0, "target"),
+        ("pld", "tensor", "broadcast"): _same_operand_meta(local, 0, "target"),
+        ("pld", "tensor", "allgather"): _same_operand_meta(local, 1, "target"),
+        ("pld", "tensor", "barrier"): _same_operand_meta(local, 0, "signal"),
+    }
+
+    expressions = _ExpressionMetas(
+        functools.partial(
+            _tensor_expr_meta,
+            return_meta=return_meta if return_meta is not None else _ReturnMeta(None, []),
+            deps=deps,
+            local=local,
+            resolve_int=resolve_slice_int,
+            pl_attr_handlers=_pl_attr_handlers,
+            qualified_call_handlers=_qualified_call_handlers,
+            resolve_dim=_resolve_dim_value,
+        ),
+        scan,
+        scope,
+        deps,
+    )
+
+    _walk_local_tensor_meta_stmts(
+        func_def.body,
+        stop_at_dep,
+        local,
+        dim_values,
+        collected,
+        functools.partial(
+            _update_local_tensor_meta,
+            local=local,
+            dim_values=dim_values,
+            deps=deps,
+            resolve_int=resolve_slice_int,
+            pl_attr_handlers=_pl_attr_handlers,
+            qualified_call_handlers=_qualified_call_handlers,
+            resolve_dim=_resolve_dim_value,
+            return_meta=return_meta,
+        ),
+        stop_at_call,
+        options=_MetaWalkOptions(
+            return_meta.tuples if return_meta is not None else None,
+            expressions.before_stmt,
+            expressions.scalars,
+            static_preview.selected_arms,
+        ),
+    )
+    return local if visible_only or stop_at_dep is not None or stop_at_call is not None else collected
+
+
+def _call_tensor_metas(
+    call: ast.Call,
+    parameters: list[str],
+    local: Mapping[str, TensorMeta],
+    resolve_expr: Callable[[ast.expr], TensorMeta | None] | None,
+) -> dict[str, TensorMeta]:
+    """Bind named and expression arguments using the same point-in-time metadata."""
+    expressions = _call_binding.build_param_mapping(parameters, _call_binding.call_arg_nodes(call))
+    metas: dict[str, TensorMeta] = {}
+    for name, expr in expressions.items():
+        meta = (
+            local.get(expr.id) if isinstance(expr, ast.Name) else resolve_expr(expr) if resolve_expr else None
+        )
+        if meta is not None:
+            metas[name] = meta
+    return metas
+
+
+def resolve_dep_call_metadata(  # noqa: PLR0913 — carries the caller's wrapper identity and source context
+    dep: "JITFunction",
+    caller_func: Any,
+    caller_tensor_meta: dict[str, TensorMeta],
+    caller_scalar_dtypes: dict[str, DataType],
+    dep_dyn_map: dict[str, dict[int, DynDim]],
+    caller_func_type: str = "orchestration",
+    dep_call_name: str | None = None,
+    call_node: ast.Call | CallSiteMetadata | None = None,
+    caller_constexpr: Mapping[str, str] | None = None,
+    *,
+    discover_deps: _call_binding.DiscoverDeps,
+    caller_identity: int | None = None,
+) -> tuple[
+    dict[str, TensorMeta],
+    dict[str, DataType],
+]:
+    """Map ``dep``'s parameter names to TensorMeta / scalar dtypes using
+    ``caller_func``'s call-site arguments.
+
+    The caller may be the entry function or another dep (transitive case);
+    in either case we look up the (first) ``dep(...)`` call site in
+    ``caller_func``'s body and apply the positional-or-keyword mapping.
+    Intermediate tensors produced in the caller — ``pl.create_tensor``,
+    ``pl.slice`` views, and the return values of other ``@pl.jit`` deps — are
+    folded into the metadata pool (see ``extract_local_tensor_metas``).
+    Falls back to name-based matching when call-site extraction fails.
+
+    ``caller_func_type`` is forwarded to ``extract_local_tensor_metas``
+    so a host orchestrator's body can also recognise chip-orchestrator deps
+    when walking ``v = chip_orch(...)`` return-capture assignments.
+
+    ``dep_call_name`` is the name ``caller_func``'s source calls the dep by;
+    it differs from ``dep.__name__`` under an aliased import or any other
+    rebinding. Defaults to ``dep.__name__`` for callers that resolve a dep
+    reached under its own name.
+
+    ``call_node`` pins resolution to one specific call site instead of the
+    first one bearing that name. A dep called with two different
+    ``pl.constexpr`` bindings is compiled once per binding, and each of those
+    compilations reads the arguments and the point-in-time metadata of the call
+    site that produced it.
+
+    ``caller_constexpr`` is the caller's own ``pl.constexpr`` binding, so a
+    local the caller sizes off one of its compile-time parameters reaches the
+    dep with that static extent.
+    """
+    call_tensor_meta = call_node.tensors if isinstance(call_node, CallSiteMetadata) else None
+    resolve_expr = call_node.resolve_expr if isinstance(call_node, CallSiteMetadata) else None
+    resolve_scalar = call_node.resolve_scalar if isinstance(call_node, CallSiteMetadata) else None
+    call_node = call_node.call if isinstance(call_node, CallSiteMetadata) else call_node
+    dep_param_names = dep._param_names()
+    call_name = dep_call_name or dep.__name__
+    call_args = (
+        _call_binding.call_arg_refs(call_node)
+        if call_node is not None
+        else _call_binding.extract_call_args_for_dep(caller_func, call_name)
+    )
+
+    def remember_call(
+        statement: ast.stmt,
+        _live: Mapping[str, TensorMeta],
+        resolve: Callable[[ast.expr], TensorMeta | None],
+        _scalar: Callable[[ast.expr], DataType | None],
+    ) -> None:
+        nonlocal resolve_expr
+        if _stmt_calls_dep(statement, call_name if call_node is None else None, call_node):
+            resolve_expr = resolve
+
+    intermediate_metas = (
+        call_tensor_meta
+        if call_tensor_meta is not None
+        else extract_local_tensor_metas(
+            caller_func,
+            seed_meta=caller_tensor_meta,
+            caller_func_type=caller_func_type,
+            stop_at_dep=call_name if call_args is not None and call_node is None else None,
+            stop_at_call=call_node,
+            constexpr_values=caller_constexpr,
+            discover_deps=discover_deps,
+            visible_only=True,
+            dep_analysis=(
+                _DepAnalysis(frozenset({caller_identity}), _DepSummaries({}))
+                if caller_identity is not None
+                else None
+            ),
+            scan=LocalMetaScan(before_stmt=remember_call),
+        )
+    )
+    # The extractor starts from caller_tensor_meta, then applies source-ordered
+    # rebindings. Its result is therefore the authoritative state at the call.
+    all_tensor_meta = intermediate_metas
+
+    dep_tensor_meta: dict[str, TensorMeta] = {}
+    dep_scalar_dtypes: dict[str, DataType] = {}
+
+    if call_args is not None:
+        for dep_param, caller_arg in _call_binding.build_param_mapping(dep_param_names, call_args).items():
+            if caller_arg is None:
+                continue
+            if isinstance(caller_arg, _call_binding.SlicedArg):
+                # Per-rank dispatch ``chip_orch(x[r], ...)``: the dep parameter
+                # inherits the base tensor's meta with ``drop`` leading dims
+                # removed (the subscripted dims selected by integer indices).
+                base_meta = all_tensor_meta.get(caller_arg.base)
+                if base_meta is not None and caller_arg.drop < len(base_meta.shape):
+                    dep_tensor_meta[dep_param] = TensorMeta(
+                        shape=base_meta.shape[caller_arg.drop :],
+                        dtype=base_meta.dtype,
+                        # Layout describes the trailing dims, so dropping
+                        # leading ones leaves it intact.
+                        layout=base_meta.layout,
+                        inexact_axes=frozenset(
+                            axis - caller_arg.drop
+                            for axis in base_meta.inexact_axes
+                            if axis >= caller_arg.drop
+                        ),
+                        runtime_dims={
+                            axis - caller_arg.drop: dim
+                            for axis, dim in base_meta.runtime_dims.items()
+                            if axis >= caller_arg.drop
+                        },
+                    )
+                continue
+            if caller_arg in all_tensor_meta:
+                dep_tensor_meta[dep_param] = all_tensor_meta[caller_arg]
+            elif caller_arg in caller_scalar_dtypes:
+                # A scalar arg is a runtime value, so only its declared type
+                # crosses the call boundary.
+                dep_scalar_dtypes[dep_param] = caller_scalar_dtypes[caller_arg]
+    else:
+        # Fallback: name-based matching against the caller's metadata pool.
+        dep_tensor_meta = {n: all_tensor_meta[n] for n in dep_param_names if n in all_tensor_meta}
+        dep_scalar_dtypes = {n: caller_scalar_dtypes[n] for n in dep_param_names if n in caller_scalar_dtypes}
+
+    if resolve_expr is not None and call_node is not None:
+        dep_tensor_meta.update(_call_tensor_metas(call_node, dep_param_names, all_tensor_meta, resolve_expr))
+    if resolve_scalar is not None and call_node is not None:
+        # Live bindings supersede the entry's scalar map after reassignments.
+        arguments = _call_binding.build_param_mapping(
+            dep_param_names, _call_binding.call_arg_nodes(call_node)
+        )
+        dep_scalar_dtypes = {
+            name: dtype
+            for name, expression in arguments.items()
+            if name not in dep_tensor_meta and (dtype := resolve_scalar(expression)) is not None
+        }
+
+    # A constexpr owns a compile-time binding, even when its argument is a
+    # scalar literal. Keeping a runtime dtype too makes provider requests
+    # ambiguous. Apply this to live expression inference and legacy mapping.
+    for name in _arguments.constexpr_params(dep._func):
+        dep_scalar_dtypes.pop(name, None)
+
+    scope = _StaticScope.of(caller_func, caller_constexpr)
+    binding: dict[str, str] = {}
+    # Caller storage can acquire declared or propagated descriptor axes.
+    # An omitted Out is instead allocated from its already-specialized type.
+    _overlay_dep_declared_dyn_dims(dep_dyn_map, dep_tensor_meta)
+    _overlay_dep_declared_layouts(dep, dep_tensor_meta)
+    if call_node is not None:
+        constexpr_params = _arguments.constexpr_params(dep._func)
+        if constexpr_params:
+            binding = _call_binding.resolve_call_site_constexpr(
+                dep.__name__,
+                (constexpr_params, dep_param_names),
+                call_node,
+                caller_func.__name__,
+                caller_constexpr or {},
+                scope.namespace,
+                scope.shadowed,
+            )
+        dep_tensor_meta.update(_omitted_output_metas(dep, call_node, binding))
+
+    _validate_dep_packed_fp4_dtypes(dep, dep_tensor_meta, binding)
+
+    return dep_tensor_meta, dep_scalar_dtypes
+
+
+def _validate_dep_packed_fp4_dtypes(
+    dep: "JITFunction", dep_tensor_meta: dict[str, TensorMeta], binding: Mapping[str, str]
+) -> None:
+    """Require dependency arguments to preserve the packed format for this call."""
+    if binding:
+        namespace = _dep_annotation_namespace(dep, binding)
+        parameters = inspect.signature(dep._func).parameters
+        dtypes = {}
+        for arg in _ast_analysis.get_func_def(dep._func).args.args:
+            if arg.arg not in dep_tensor_meta:
+                continue
+            dtype = _arguments.resolve_call_tensor_dtype(
+                arg.annotation, parameters[arg.arg].annotation, namespace, binding
+            )
+            if isinstance(dtype, DataType) and dtype in (DataType.FP4E2M1X2, DataType.FP4E1M2X2):
+                dtypes[arg.arg] = dtype
+    else:
+        dtypes = _arguments.param_dtypes(dep._func)
+    for dep_param, dtype in dtypes.items():
+        meta = dep_tensor_meta.get(dep_param)
+        if meta is None or meta.dtype == dtype:
+            continue
+        dtype_name = str(dtype).upper()
+        context = f"@pl.jit function {dep.__name__!r}: parameter {dep_param!r} annotated pl.{dtype_name}"
+        raise TypeError(
+            f"{context} but got tensor metadata dtype {meta.dtype}; "
+            "pass the declared FP4 format (cast explicitly to change formats)"
+        )
+
+
+def _overlay_dep_declared_dyn_dims(
+    dep_dyn_map: dict[str, dict[int, DynDim]], dep_tensor_meta: dict[str, TensorMeta]
+) -> None:
+    """Stamp the DynDims a dep declares itself onto its parameter metas, in place.
+
+    ``dep_dyn_map`` is pre-computed by ``compute_per_func_dyndim_maps``. A
+    DynDim the caller actually derived takes precedence — its symbol is the one
+    bound at the call site — so only plain int dims and synthesized placeholders
+    are overwritten. The replacement keeps whatever ``static_bound`` the dim
+    already carried (the int extent, or a placeholder's ``1``) so cache keys stay
+    coherent.
+
+    Replacing a placeholder matters beyond naming: the dep's body may reference
+    its declared symbol (``for i in pl.range(NR)``). Keeping the invented name
+    on the parameter would leave that reference unbound in the generated
+    program, so the declaration wins whenever we only had a placeholder.
+
+    Args:
+        dep_dyn_map: Per-parameter ``dim_idx -> DynDim`` the dep declares
+        dep_tensor_meta: Per-parameter meta to update in place
+    """
+    for dep_param, dim_to_dyn in dep_dyn_map.items():
+        meta = dep_tensor_meta.get(dep_param)
+        if meta is None:
+            continue
+        new_shape: list[ShapeDim] = list(meta.shape)
+        changed = False
+        for i, dyn in dim_to_dyn.items():
+            if i >= len(new_shape):
+                continue
+            existing = new_shape[i]
+            if isinstance(existing, DynDim) and not existing.synthesized:
+                continue
+            static_bound = existing.static_bound if isinstance(existing, DynDim) else existing
+            new_shape[i] = DynDim(name=dyn.name, literal=dyn.literal, static_bound=static_bound)
+            changed = True
+        if changed:
+            # A declared dynamic axis reads the actual argument descriptor;
+            # its former integer fallback no longer limits shape inference.
+            dep_tensor_meta[dep_param] = replace(
+                meta, shape=tuple(new_shape), inexact_axes=meta.inexact_axes.difference(dim_to_dyn)
+            )
+
+
+def _overlay_dep_declared_layouts(dep: "JITFunction", dep_tensor_meta: dict[str, TensorMeta]) -> None:
+    """Fill in layouts a dep declares itself, in place.
+
+    An omitted caller layout leaves ``meta.layout`` as None, so without this a
+    dep declaring ``pl.Tensor[[...], pl.NZ]`` under a caller that declares none
+    compiles as ND, silently. Known caller layouts, including an operation's
+    inferred ND result, win on conflict; only None is filled.
+
+    Args:
+        dep: The dep whose own annotations to read
+        dep_tensor_meta: Per-parameter meta to update in place
+    """
+    for dep_param, dep_layout in _arguments.param_layouts(dep._func, dep.__name__).items():
+        meta = dep_tensor_meta.get(dep_param)
+        if meta is None or meta.layout is not None:
+            continue
+        dep_tensor_meta[dep_param] = replace(meta, layout=dep_layout)

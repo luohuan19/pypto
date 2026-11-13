@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -40,6 +41,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/utils/l0c_footprint.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "src/backend/common/pto_ops_internal.h"
@@ -61,7 +63,6 @@ using pto_ops_detail::CheckArity;
 using pto_ops_detail::EmitFlatOffsetSSAFromValues;
 using pto_ops_detail::EmitIndexOperand;
 using pto_ops_detail::EmitPartitionViewPTO;
-using pto_ops_detail::ExpandPackedFp4GmLastAxis;
 using pto_ops_detail::GetDimStrings;
 using pto_ops_detail::GetIndexOffsetCodes;
 using pto_ops_detail::GetSizeCodes;
@@ -77,6 +78,45 @@ static std::string MakeStoreFPCodegenPTO(const std::string& pto_op_name, const C
   std::string mem = codegen.GetExprAsCode(op->args_[2]);
   codegen.Emit(pto_op_name + " ins(" + src + ", " + fp + ") outs(" + mem + ")");
   return "";
+}
+
+// Select native PTO enum spellings from the semantic frontend policy after
+// choosing the target. PTOAS owns encodings, target/path checks and ISA emission.
+static std::optional<std::string> GetPtoL2Hint(const CallPtr& op, codegen::PTOCodegen& codegen, bool store) {
+  const auto policy = static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0));
+  if (policy == ir::CachePolicy::kDefault) return std::nullopt;
+  if (codegen.GetBackendHandler()->GetPtoTargetArch() != "a5") {
+    CHECK_SPAN(!store && policy == ir::CachePolicy::kBypass, op->span_)
+        << (store ? "store" : "load") << " cache policy " << ir::CachePolicyToString(policy)
+        << " is only supported on A5; A2/A3 supports load DEFAULT/BYPASS and store DEFAULT";
+    return std::nullopt;
+  }
+  // PTOAS owns the direction-specific encodings and checks the target/path.
+  // Symbolic attributes keep an explicit NormalFirstVictim distinct from omission.
+  switch (policy) {
+    case ir::CachePolicy::kNormalFirstVictim:
+      return "normal_first_victim";
+    case ir::CachePolicy::kNormalLastVictim:
+      return "normal_last_victim";
+    case ir::CachePolicy::kNormalPersistent:
+      return "normal_persistent";
+    case ir::CachePolicy::kBypass:
+      CHECK_SPAN(!store, op->span_)
+          << "CachePolicy.BYPASS is load-only; use CachePolicy.NOT_ALLOC_CLEAN for an A5 store";
+      // Preserve existing A5 BYPASS reads without using the A2/A3 offset path.
+      return "not_alloc_keep";
+    case ir::CachePolicy::kNotAllocKeep:
+      CHECK_SPAN(!store, op->span_) << "store does not support CachePolicy.NOT_ALLOC_KEEP";
+      return "not_alloc_keep";
+    case ir::CachePolicy::kNotAllocClean:
+      return "not_alloc_clean";
+    case ir::CachePolicy::kNotAllocDrop:
+      CHECK_SPAN(!store, op->span_) << "store does not support CachePolicy.NOT_ALLOC_DROP";
+      return "not_alloc_drop";
+    case ir::CachePolicy::kDefault:
+      break;
+  }
+  INTERNAL_UNREACHABLE_SPAN(op->span_) << "Internal error: invalid cache policy";
 }
 
 // tile.load: emit pto.subview + pto.tload
@@ -119,6 +159,7 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   // attribute alone declares the policy but moves no address. Both are attached
   // below, alongside the MX layout attribute when it applies.
   const auto policy = static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0));
+  const auto l2_hint = GetPtoL2Hint(op, codegen, false);
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
   std::string tile_buf = codegen.GetCurrentResultTarget();
@@ -154,14 +195,6 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::vector<std::string> partition_dims = GetDimStrings(valid_shape_tuple->elements_);
   std::vector<std::string> offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
   std::vector<std::string> size_codes = GetSizeCodes(valid_shape_tuple->elements_, codegen);
-  const ir::ExprPtr last_size =
-      valid_shape_tuple->elements_.empty() ? nullptr : valid_shape_tuple->elements_.back();
-  const ir::ExprPtr last_offset =
-      offsets_tuple->elements_.empty() ? nullptr : offsets_tuple->elements_.back();
-  const ir::TensorLayout gm_layout =
-      tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->layout : ir::TensorLayout::ND;
-  ExpandPackedFp4GmLastAxis(tensor_type->dtype_, offset_codes, size_codes, partition_dims, codegen, last_size,
-                            last_offset, gm_layout);
   std::string tensor_view = codegen.GetOrCreateTensorView(tensor);
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
 
@@ -174,10 +207,13 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   tload_line << tile_buf << " : " << tile_buf_type << ")";
 
   std::vector<std::string> attrs;
+  if (l2_hint) {
+    attrs.emplace_back("l2_hint = #pto.load_l2_hint<" + *l2_hint + ">");
+  }
   if (is_mx_load) {
     attrs.push_back("layout = #pto.layout<" + pto_layout + ">");
   }
-  if (policy == ir::CachePolicy::kBypass) {
+  if (policy == ir::CachePolicy::kBypass && !l2_hint) {
     attrs.emplace_back("cache_policy = #pto.load_cache_policy<l2_bypass>");
   }
 
@@ -193,12 +229,10 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
     tload_line << "}";
   }
 
-  // The offset operand follows the attribute dict, and PTOAS applies it only to
-  // a load that also declared l2_bypass. It is empty on an architecture with no
-  // address alias to reach, which leaves the declaration carried by the
-  // attribute alone -- and PTOAS v0.64 lowers a bare attribute to an ordinary
-  // TLOAD, so that declaration costs nothing and does nothing.
-  if (policy == ir::CachePolicy::kBypass) {
+  // A2/A3 BYPASS uses an explicit byte offset after the attribute dict. PTOAS
+  // adds it to the source address of this l2_bypass load. A5 uses the ISA hint
+  // above and does not enter this address-offset path.
+  if (policy == ir::CachePolicy::kBypass && !l2_hint) {
     const std::string l2_cache_offset = codegen.GetL2CacheOffsetArgSSA();
     if (!l2_cache_offset.empty()) {
       tload_line << " offset = " << l2_cache_offset << " : i64";
@@ -237,6 +271,89 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
   auto tensor_type = AsTensorTypeLike(output_tensor->GetType());
   INTERNAL_CHECK_SPAN(tensor_type, op->span_) << "tile.store output_tensor must have TensorType";
 
+  if (tensor_type->tensor_view_.has_value() && tensor_type->tensor_view_->layout == ir::TensorLayout::NZ) {
+    // Validate the concrete write after tiling, using the same source and
+    // destination descriptors that the ordinary rank-N emitter uses below.
+    CHECK_SPAN(tile_type->dtype_ == DataType::FP32 && tensor_type->dtype_ == DataType::FP32 &&
+                   tile_type->GetMemorySpace() == ir::MemorySpace::Acc,
+               op->span_)
+        << "NZ tile.store supports only an FP32 Acc tile into an FP32 NZ tensor. "
+        << "Use an FP32 matmul accumulator, or store to pl.ND.";
+    const auto* handler = codegen.GetBackendHandler();
+    const auto max_columns = handler ? handler->GetAccToNzGmStoreMaxCols() : 0;
+    CHECK_SPAN(handler && max_columns > 0, op->span_)
+        << "NZ tile.store is supported only on A2/A3. Store to pl.ND on this backend.";
+    CHECK_SPAN(tile_type->shape_.size() == 2, op->span_)
+        << "NZ tile.store requires a two-dimensional Acc tile.";
+    CHECK_SPAN(tile_view.blayout == ir::TileLayout::col_major &&
+                   tile_view.slayout == ir::TileLayout::row_major &&
+                   tile_view.fractal == ir::tile_view_semantics::kAccFractal,
+               op->span_)
+        << "NZ tile.store requires the ordinary NZ-boxed Acc layout.";
+    auto rows = As<ir::ConstInt>(valid_shape[0]);
+    auto cols = As<ir::ConstInt>(valid_shape[1]);
+    auto physical_rows = As<ir::ConstInt>(tile_type->shape_[0]);
+    auto physical_cols = As<ir::ConstInt>(tile_type->shape_[1]);
+    // GM FP32 C0=8 does not relax FIXPIPE's 16-column Acc requirement.
+    // Fully valid aligned tiles also give compact/null the same source pitch.
+    CHECK_SPAN(rows && cols && physical_rows && physical_cols && rows->value_ == physical_rows->value_ &&
+                   cols->value_ == physical_cols->value_ && rows->value_ > 0 && cols->value_ > 0 &&
+                   rows->value_ % 16 == 0 && cols->value_ % 16 == 0 &&
+                   rows->value_ <= std::numeric_limits<uint16_t>::max(),
+               op->span_)
+        << "NZ tile.store requires a static, fully valid Acc tile with rows and columns divisible by 16, "
+        << "and rows <= " << std::numeric_limits<uint16_t>::max()
+        << ". Partial or dynamic Acc tiles are not supported.";
+    CHECK_SPAN(op->GetKwarg<int>("atomic", 0) == static_cast<int>(ir::AtomicType::kNone) &&
+                   !ir::GetOptionalDoubleKwarg(op->kwargs_, "pre_quant").has_value() &&
+                   !op->GetKwarg<bool>("pre_relu", false),
+               op->span_)
+        << "NZ tile.store does not support atomic, pre_quant, or pre_relu. Use a plain FP32 writeback.";
+    CHECK_SPAN(ir::IsValidSTPhase(op->GetKwarg<int>("st_phase", static_cast<int>(ir::STPhase::kUnspecified))),
+               op->span_)
+        << "NZ tile.store st_phase must be STPhase.Unspecified or STPhase.Final.";
+    CHECK_SPAN(cols->value_ <= max_columns, op->span_)
+        << "NZ tile.store requires each emitted Acc tile to have columns <= " << max_columns << ". "
+        << "Use a matmul with a single direct store for automatic N tiling, tile the output columns "
+        << "explicitly, or store to pl.ND.";
+    const auto bytes = ir::utils::StaticPhysicalAllocationBytes(tile_type, ir::MemorySpace::Acc, handler);
+    INTERNAL_CHECK_SPAN(bytes.has_value(), op->span_)
+        << "Internal error: the physical footprint of a validated static NZ store source must be known";
+    const uint64_t capacity = handler->GetCapacityBytes(ir::MemorySpace::Acc);
+    CHECK_SPAN(*bytes <= capacity, op->span_)
+        << "NZ tile.store requires one Acc tile to fit L0C: the source needs " << *bytes
+        << " bytes, but this backend's L0C capacity is " << capacity
+        << " bytes. NZ writes must cover all destination rows; use a matmul with a single direct store "
+        << "for automatic N tiling, tile the output columns explicitly, or store to pl.ND.";
+
+    auto sizes = op->args_.size() == 4 ? As<ir::MakeTuple>(op->args_[3]) : nullptr;
+    INTERNAL_CHECK_SPAN(
+        ir::tensor_view_semantics::IsBlockedNzShape(tensor_type->shape_, tensor_type->dtype_) &&
+            offsets_tuple->elements_.size() == ir::tensor_view_semantics::kNzBlockedRank && sizes &&
+            sizes->elements_.size() == ir::tensor_view_semantics::kNzBlockedRank,
+        op->span_)
+        << "Internal error: NZ tile.store needs blocked rank-5 offsets and partition sizes";
+    const std::vector<int64_t> expected = {1, cols->value_ / 8, rows->value_ / 16, 16, 8};
+    for (size_t axis = 0; axis < expected.size(); ++axis) {
+      auto size = As<ir::ConstInt>(sizes->elements_[axis]);
+      CHECK_SPAN(size && size->value_ == expected[axis], op->span_)
+          << "NZ tile.store partition must describe exactly one full Acc tile in a single batch panel.";
+    }
+    auto parent_rows = As<ir::ConstInt>(tensor_type->shape_[2]);
+    auto row_offset = As<ir::ConstInt>(offsets_tuple->elements_[2]);
+    CHECK_SPAN(
+        parent_rows && parent_rows->value_ == rows->value_ / 16 && row_offset && row_offset->value_ == 0,
+        op->span_)
+        << "NZ tile.store must cover all rows of its destination at row offset 0: PTO-ISA's Acc NZ store "
+        << "uses the partition height as its column-block stride. Stack independent panels on a leading "
+        << "batch axis, or store to pl.ND.";
+    for (size_t axis = 3; axis < ir::tensor_view_semantics::kNzBlockedRank; ++axis) {
+      auto offset = As<ir::ConstInt>(offsets_tuple->elements_[axis]);
+      INTERNAL_CHECK_SPAN(offset && offset->value_ == 0, op->span_)
+          << "Internal error: NZ tile.store offsets must begin at a complete fractal";
+    }
+  }
+
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
   std::string tensor_view = codegen.GetOrCreateTensorView(output_tensor);
   std::string tile_buf = codegen.GetVarName(tile);
@@ -266,12 +383,6 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     auto partition_dims = GetDimStrings(shape_elems);
     auto offset_codes = GetIndexOffsetCodes(offset_elems, codegen);
     auto size_codes = GetSizeCodes(shape_elems, codegen);
-    const ir::ExprPtr last_size = shape_elems.empty() ? nullptr : shape_elems.back();
-    const ir::ExprPtr last_offset = offset_elems.empty() ? nullptr : offset_elems.back();
-    const ir::TensorLayout gm_layout =
-        tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->layout : ir::TensorLayout::ND;
-    ExpandPackedFp4GmLastAxis(tensor_type->dtype_, offset_codes, size_codes, partition_dims, codegen,
-                              last_size, last_offset, gm_layout);
     partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
     partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
                                           partition_type, offset_codes, size_codes, codegen);
@@ -305,13 +416,6 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     std::vector<std::string> partition_dims = {height_dim, width_dim};
     auto offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
     std::vector<std::string> size_codes = {height_code, width_code};
-    const ir::ExprPtr last_size = valid_shape.size() > 1 ? valid_shape[1] : nullptr;
-    const ir::ExprPtr last_offset =
-        offsets_tuple->elements_.empty() ? nullptr : offsets_tuple->elements_.back();
-    const ir::TensorLayout gm_layout =
-        tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->layout : ir::TensorLayout::ND;
-    ExpandPackedFp4GmLastAxis(tensor_type->dtype_, offset_codes, size_codes, partition_dims, codegen,
-                              last_size, last_offset, gm_layout);
     partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
     partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
                                           partition_type, offset_codes, size_codes, codegen);
@@ -367,6 +471,11 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     // combines) is checked by the AtomicAddDtypeValid property verifier at
     // pipeline input, where the error still carries the user's own span.
     attrs.emplace_back("atomicType = #pto<atomic_type atomic_add>");
+  }
+
+  const auto l2_hint = GetPtoL2Hint(op, codegen, true);
+  if (l2_hint) {
+    attrs.emplace_back("l2_hint = #pto.store_l2_hint<" + *l2_hint + ">");
   }
 
   // Default-valued attributes are omitted so ordinary stores keep their
@@ -824,21 +933,25 @@ static std::string MakeTensorDimCodegenPTO(const CallPtr& op, codegen::CodegenBa
   auto& codegen = AsPto(codegen_base);
   INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
       << "tensor.dim requires 2 arguments, but got " << op->args_.size();
-  auto input_tensor = ir::As<ir::TensorType>(op->args_[0]->GetType());
-  CHECK(input_tensor) << "tensor.dim need TensorType for first arg, but got "
-                      << op->args_[0]->GetType()->TypeName();
+  auto input_tensor = ir::AsTensorTypeLike(op->args_[0]->GetType());
+  INTERNAL_CHECK_SPAN(input_tensor, op->span_)
+      << "tensor.dim requires a tensor operand, got " << op->args_[0]->GetType()->TypeName();
   auto axis = codegen.GetConstIntValue(op->args_[1]);
-  CHECK(axis >= 0 && static_cast<size_t>(axis) < input_tensor->shape_.size())
+  if (axis < 0) axis += static_cast<int64_t>(input_tensor->shape_.size());
+  INTERNAL_CHECK_SPAN(axis >= 0 && static_cast<size_t>(axis) < input_tensor->shape_.size(), op->span_)
       << "tensor.dim axis " << axis << " out of range for tensor with rank " << input_tensor->shape_.size();
   auto shape = input_tensor->shape_[axis];
+  // Read the declared extent directly, including composite scalar expressions.
+  // No tensor_view needs to have been emitted for the operand yet.
   std::string shape_name;
-  if (auto dyn_shape = ir::As<ir::Var>(shape)) {
-    shape_name = codegen.GetVarName(dyn_shape);
-  } else if (auto static_shape = ir::As<ir::ConstInt>(shape)) {
-    shape_name = codegen.GetOrEmitConstant(static_shape->value_, DataType::INDEX);
+  if (auto constant = ir::As<ir::ConstInt>(shape)) {
+    // Extents are INDEX values regardless of a constant's declared signedness.
+    // arith.index_cast cannot consume the ui64 emitted for a UINT64 constant.
+    shape_name = codegen.GetOrEmitConstant(constant->value_, DataType::INDEX);
   } else {
-    INTERNAL_CHECK_SPAN(false, op->span_) << "Internal error: tensor.dim shape is neither Var nor ConstInt";
+    shape_name = codegen.EmitCastToIndex(shape, codegen.GetExprAsCode(shape));
   }
+  codegen.SetCurrentExprValue(shape_name);
   auto target_var = codegen.GetCurrentResultVar();
   if (target_var != nullptr && !shape_name.empty()) {
     codegen.RegisterVarToMlir(target_var, shape_name);
@@ -886,7 +999,7 @@ static std::string EmitLocalArrayValue(codegen::PTOCodegen& codegen, const ir::E
 void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& exclude_ops) {
   // Register ops with custom codegen logic
   auto reg = [&](const char* op_name, BackendCodegenFunc fn) {
-    if (exclude_ops.count(op_name) > 0) return;
+    if (!ShouldRegister(exclude_ops, op_name)) return;
     backend.RegisterOp(op_name).f_codegen(std::move(fn));
   };
 
@@ -1045,9 +1158,6 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
     std::vector<std::string> stride_names(rank);
     for (size_t j = 0; j < rank; ++j) stride_names[j] = emit_dim(view.stride[j]);
 
-    codegen.ExpandPackedFp4MakeTensorViewDims(lhs_type->dtype_, view.layout, lhs_type->shape_,
-                                              shape_dim_names, &view.stride, stride_names);
-
     std::string layout_str = "nd";
     switch (view.layout) {
       case ir::TensorLayout::DN:
@@ -1095,7 +1205,7 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
   });
 
   // tile.mscatter: src and idx must be row_major (MTE3 DMA reads UB linearly)
-  if (exclude_ops.count("tile.mscatter") == 0) {
+  if (ShouldRegister(exclude_ops, "tile.mscatter")) {
     backend.RegisterOp("tile.mscatter")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
           return MakeTileMscatterCodegenPTO(op, codegen);
@@ -1104,7 +1214,7 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
         .set_input_layout(1, ir::TileLayout::row_major);
   }
 
-  if (exclude_ops.count("tile.mgather") == 0) {
+  if (ShouldRegister(exclude_ops, "tile.mgather")) {
     backend.RegisterOp("tile.mgather").f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
       return MakeTileMgatherCodegenPTO(op, codegen);
     });
@@ -1185,8 +1295,13 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
       return std::string("");
     });
   };
-  register_pipe_barrier("system.bar_v", "PIPE_V");
+  register_pipe_barrier("system.bar_mte1", "PIPE_MTE1");
+  register_pipe_barrier("system.bar_mte2", "PIPE_MTE2");
+  register_pipe_barrier("system.bar_mte3", "PIPE_MTE3");
   register_pipe_barrier("system.bar_m", "PIPE_M");
+  register_pipe_barrier("system.bar_v", "PIPE_V");
+  register_pipe_barrier("system.bar_s", "PIPE_S");
+  register_pipe_barrier("system.bar_fix", "PIPE_FIX");
   register_pipe_barrier("system.bar_all", "PIPE_ALL");
 }
 }  // namespace backend

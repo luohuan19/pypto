@@ -13,7 +13,7 @@ from typing import cast
 
 import pypto.language as pl
 import pytest
-from pypto import DataType, ir, passes
+from pypto import DataType, backend, ir, passes
 
 
 class TestForStmt:
@@ -380,8 +380,8 @@ class TestForStmtEquality:
 
         ir.assert_structural_equal(for_stmt1, for_stmt2)
 
-    def test_for_stmt_different_loop_var_equal(self):
-        """Test ForStmt nodes with different loop vars are not equal."""
+    def test_for_stmt_shared_body_with_different_binder_not_equal(self):
+        """A shared body must still respect the loop-variable bijection."""
         span = ir.Span.unknown()
         dtype = DataType.INT64
         i = ir.Var("i", ir.ScalarType(dtype), span)
@@ -394,7 +394,9 @@ class TestForStmtEquality:
         for_stmt1 = ir.ForStmt(i, start, stop, step, [], assign, [], span)
         for_stmt2 = ir.ForStmt(j, start, stop, step, [], assign, [], span)
 
-        ir.assert_structural_equal(for_stmt1, for_stmt2)
+        assert not ir.structural_equal(for_stmt1, for_stmt2)
+        with pytest.raises(ValueError, match="binding:"):
+            ir.assert_structural_equal(for_stmt1, for_stmt2)
 
     def test_for_stmt_different_range_not_equal(self):
         """Test ForStmt nodes with different range values are not equal."""
@@ -752,7 +754,7 @@ class TestForKindEquality:
         assign2 = ir.AssignStmt(i2, start2, span)
         for_stmt2 = ir.ForStmt(i2, start2, stop2, step2, [], assign2, [], span, ir.ForKind.Parallel)
 
-        with pytest.raises(ValueError, match=r"ForKind mismatch"):
+        with pytest.raises(ValueError, match=r"root\.kind"):
             ir.assert_structural_equal(for_stmt1, for_stmt2)
 
 
@@ -823,6 +825,164 @@ class TestForStmtIterArgMutatorRemap:
         # This was failing before the fix (issue #517):
         # IRMutator created new IterArg pointers but body still referenced old ones
         ir.assert_structural_equal(After, Expected)
+
+
+def test_hardware_loop_policy_identity_and_mutation():
+    span = ir.Span.unknown()
+    i = ir.Var("i", ir.ScalarType(DataType.INDEX), span)
+    zero, stop, step = [ir.ConstInt(n, DataType.INDEX, span) for n in (0, 8, 1)]
+    body = ir.EvalStmt(zero, span)
+    auto = ir.ForStmt(i, zero, stop, step, [], body, [], span)
+    require = ir.ForStmt(
+        i,
+        zero,
+        stop,
+        step,
+        [],
+        body,
+        [],
+        span,
+        hardware_loop_policy=ir.HardwareLoopPolicy.Require,
+    )
+    assert auto.hardware_loop_policy == ir.HardwareLoopPolicy.Auto
+    assert require.hardware_loop_policy == ir.HardwareLoopPolicy.Require
+    assert not ir.structural_equal(auto, require)
+    assert ir.structural_hash(auto) != ir.structural_hash(require)
+    restored = ir.deserialize(ir.serialize(require))
+    ir.assert_structural_equal(require, restored)
+    assert isinstance(restored, ir.ForStmt)
+    assert restored.hardware_loop_policy == ir.HardwareLoopPolicy.Require
+
+    class ChangeBound(ir.IRMutator):
+        def visit_const_int(self, op):
+            return ir.ConstInt(op.value + 1, op.dtype, op.span)
+
+    mutated = ChangeBound().visit_stmt(require)
+    assert isinstance(mutated, ir.ForStmt)
+    assert isinstance(mutated.stop, ir.ConstInt)
+    assert mutated.stop.value == 9
+    assert mutated.hardware_loop_policy == ir.HardwareLoopPolicy.Require
+
+
+def _policy_loop():
+    span = ir.Span.unknown()
+    return ir.ForStmt(
+        ir.Var("i", ir.ScalarType(DataType.INDEX), span),
+        ir.ConstInt(0, DataType.INDEX, span),
+        ir.ConstInt(8, DataType.INDEX, span),
+        ir.ConstInt(1, DataType.INDEX, span),
+        [],
+        ir.SeqStmts([], span),
+        [],
+        span,
+    )
+
+
+def test_legacy_for_stmt_defaults_to_auto():
+    payload = bytearray(ir.serialize(_policy_loop()))
+    offset = payload.index(b"fields") + len(b"fields")
+    assert 0x80 <= payload[offset] <= 0x8F
+    entry = b"\xb4hardware_loop_policy\x00"
+    entry_offset = payload.index(entry)
+    del payload[entry_offset : entry_offset + len(entry)]
+    payload[offset] -= 1
+    restored = ir.deserialize(bytes(payload))
+    assert isinstance(restored, ir.ForStmt)
+    assert restored.hardware_loop_policy == ir.HardwareLoopPolicy.Auto
+
+
+@pytest.mark.parametrize("policy", [b"\x02", b"\xcd\x01\x00", b"\xff", b"\xc3", b"\xc0"])
+def test_for_stmt_rejects_unknown_serialized_policy(policy):
+    payload = ir.serialize(_policy_loop())
+    old = b"\xb4hardware_loop_policy\x00"
+    assert payload.count(old) == 1
+    with pytest.raises(ValueError, match="hardware_loop_policy"):
+        ir.deserialize(payload.replace(old, b"\xb4hardware_loop_policy" + policy))
+
+
+@pytest.mark.parametrize("stop", [1, 8])
+@pytest.mark.parametrize("ascend_backend", [backend.BackendType.Ascend950], indirect=True)
+def test_simplify_preserves_required_loop(stop, ascend_backend):
+    # Nonempty Require loops must survive for later qualification, even when
+    # Simplify could otherwise unfold a single trip.
+    span = ir.Span.unknown()
+    loop = _policy_loop()
+    required = ir.ForStmt(
+        loop.loop_var,
+        loop.start,
+        ir.ConstInt(stop, DataType.INDEX, span),
+        loop.step,
+        [],
+        loop.body,
+        [],
+        span,
+        hardware_loop_policy=ir.HardwareLoopPolicy.Require,
+    )
+    function = ir.Function(
+        "main", [], [], ir.RegScopeStmt("", required, span), span, type=ir.FunctionType.AIV
+    )
+    program = ir.Program([function], "Required", span)
+    # Text roundtrip support is PR2; retain property verification for this IR-only fixture.
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        changed = passes.simplify()(program)
+    result = changed.get_function("main")
+    assert result is not None
+
+    class RequiredLoops(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.policies = []
+
+        def visit_for_stmt(self, op):
+            self.policies.append(op.hardware_loop_policy)
+            super().visit_for_stmt(op)
+
+    visitor = RequiredLoops()
+    visitor.visit_stmt(result.body)
+    assert visitor.policies == [ir.HardwareLoopPolicy.Require]
+
+
+@pytest.mark.parametrize("policy", [ir.HardwareLoopPolicy.Auto, ir.HardwareLoopPolicy.Require])
+@pytest.mark.parametrize("stop", [0, -1])
+@pytest.mark.parametrize("ascend_backend", [backend.BackendType.Ascend950], indirect=True)
+def test_simplify_eliminates_empty_loop_and_preserves_initial_carry(policy, stop, ascend_backend):
+    span = ir.Span.unknown()
+    index_type = ir.ScalarType(DataType.INDEX)
+    initial = ir.Var("initial", index_type, span)
+    carry = ir.IterArg("carry", index_type, initial, span)
+    result = ir.Var("result", index_type, span)
+    loop = ir.ForStmt(
+        ir.Var("i", index_type, span),
+        ir.ConstInt(0, DataType.INDEX, span),
+        ir.ConstInt(stop, DataType.INDEX, span),
+        ir.ConstInt(1, DataType.INDEX, span),
+        [carry],
+        ir.YieldStmt([ir.ConstInt(99, DataType.INDEX, span)], span),
+        [result],
+        span,
+        hardware_loop_policy=policy,
+    )
+    function = ir.Function(
+        "main",
+        [initial],
+        [],
+        ir.RegScopeStmt("", ir.SeqStmts([loop, ir.EvalStmt(result, span)], span), span),
+        span,
+        type=ir.FunctionType.AIV,
+    )
+    expected = ir.Function(
+        "main",
+        [initial],
+        [],
+        ir.RegScopeStmt(
+            "", ir.SeqStmts([ir.AssignStmt(result, initial, span), ir.EvalStmt(result, span)], span), span
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+    )
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        changed = passes.simplify()(ir.Program([function], "Empty", span))
+    ir.assert_structural_equal(changed, ir.Program([expected], "Empty", span))
 
 
 if __name__ == "__main__":

@@ -22,10 +22,11 @@ from _task_interface import (
     CoreCallable,
     DataType,
     TaskArgs,
+    TensorArgType,
     scalar_to_uint64,
 )
 
-from .buffer import Buffer, Tensor
+from .buffer import Buffer, Tensor, TensorTransfer
 
 __all__ = [
     "ArgDirection",
@@ -38,5 +39,7 @@ __all__ = [
     "DataType",
     "TaskArgs",
     "Tensor",
+    "TensorArgType",
+    "TensorTransfer",
     "scalar_to_uint64",
 ]

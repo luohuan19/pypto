@@ -32,10 +32,13 @@ Plus regressions:
   ``allocate_domain`` wrapper.
 """
 
+import ast
+import operator
 import os
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from importlib import resources
 
 import pypto.language as pl
@@ -369,9 +372,9 @@ def test_comm_group_program_emits_domain_provider_with_block():
     # window_size is the sum of aligned physical slot sizes. Each spec keeps
     # its exact logical size in count and exposes only its physical size via
     # nbytes.
-    # Single slot → `window_size=((((64 * 4) + 31) // 32) * 32),`. The inner
+    # Single slot → `window_size=((((64 * 4) + 63) // 64) * 64),`. The inner
     # parentheses come from the Mul expression.
-    aligned_size = r"\(\(\(\(64 \* 4\) \+ 31\) // 32\) \* 32\)"
+    aligned_size = r"\(\(\(\(64 \* 4\) \+ 63\) // 64\) \* 64\)"
     assert re.search(rf"window_size=\({aligned_size}\),", code), code
     assert re.search(
         rf'CommBufferSpec\(name="data_buf", dtype="opaque", count=\(64 \* 4\), nbytes={aligned_size}\),',
@@ -408,8 +411,8 @@ def test_comm_buffer_specs_align_each_physical_allocation():
     code = _lower(Prog)
     data_logical = r"\(17 \* 2\)"
     signal_logical = r"\(2 \* 4\)"
-    data_alloc = rf"\(\(\({data_logical} \+ 31\) // 32\) \* 32\)"
-    signal_alloc = rf"\(\(\({signal_logical} \+ 31\) // 32\) \* 32\)"
+    data_alloc = rf"\(\(\({data_logical} \+ 63\) // 64\) \* 64\)"
+    signal_alloc = rf"\(\(\({signal_logical} \+ 63\) // 64\) \* 64\)"
     assert re.search(
         rf'CommBufferSpec\(name="data_buf", dtype="opaque", count={data_logical}, nbytes={data_alloc}\),',
         code,
@@ -422,6 +425,122 @@ def test_comm_buffer_specs_align_each_physical_allocation():
         code,
     ), code
     assert re.search(rf"window_size=\({data_alloc}\) \+ \({signal_alloc}\),", code), code
+
+
+def test_comm_buffer_specs_isolate_signal_and_counts_cache_lines():
+    """Scalar count writeback must not overwrite a peer's signal credits.
+
+    The L2 all_to_all_v P=2, B=4 layout places a 32-byte signal before
+    8-byte counts and recv slots. Rounding each to 32 bytes shares a 64-byte
+    cache line between signal and counts, so a counts DCCI can lose credits.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+        def chip_orch(
+            self,
+            stage: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            data: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            signal: pld.DistributedTensor[[2, 4], pl.INT32],
+            counts: pld.DistributedTensor[[2, 1], pl.INT32],
+            recv: pld.DistributedTensor[[2, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            stage_buf = pld.alloc_window_buffer(2048)
+            data_buf = pld.alloc_window_buffer(2048)
+            signal_buf = pld.alloc_window_buffer(32)
+            counts_buf = pld.alloc_window_buffer(8)
+            recv_buf = pld.alloc_window_buffer(8)
+            stage = pld.window(stage_buf, [8, SIZE], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [2, 4], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [2, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [2, 1], dtype=pl.INT32)
+            self.chip_orch(stage, data, signal, counts, recv, device=0)
+            return 0
+
+    code = _lower(Prog)
+    for name, logical_bytes in (("signal_buf", 32), ("counts_buf", 8), ("recv_buf", 8)):
+        # Each small slot gets one complete cache line; count still exposes
+        # the original logical bytes rather than the padded allocation.
+        alloc_bytes = f"((({logical_bytes} + 63) // 64) * 64)"
+        assert (
+            f'CommBufferSpec(name="{name}", dtype="opaque", count={logical_bytes}, nbytes={alloc_bytes}),'
+        ) in code, code
+
+
+@pytest.mark.parametrize("nr,stride", [(2, 1), (2, 4), (2, 17), (4, 4), (4, 17)])
+def test_comm_signal_and_counts_do_not_share_cache_lines(nr, stride):
+    """Counts staging must not flush stale signal credits from a shared line.
+
+    In the failing P=2/B=4 layout, the 32-byte signal was followed immediately
+    by send_counts. A slow rank staging counts could erase a faster peer's
+    Barrier A credits. Check the emitted sizes, including odd lane widths,
+    rather than merely checking that each start is DMA-aligned.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+        def chip_orch(
+            self,
+            signal: pld.DistributedTensor[[nr, stride], pl.INT32],
+            counts: pld.DistributedTensor[[nr, 1], pl.INT32],
+            recv: pld.DistributedTensor[[nr, 1], pl.INT32],
+        ):
+            return recv
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            signal_buf = pld.alloc_window_buffer(nr * stride * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+            signal = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(signal, counts, recv, device=r)
+            return recv
+
+    # Only constant arithmetic occurs in these generated allocation expressions.
+    # Interpret that AST directly so the test uses the allocator's emitted sizes.
+    operations: dict[type[ast.operator], Callable[[int, int], int]] = {
+        ast.Add: operator.add,
+        ast.Mult: operator.mul,
+        ast.FloorDiv: operator.floordiv,
+    }
+
+    def constant_size(node: ast.expr) -> int:
+        if isinstance(node, ast.Constant):
+            assert isinstance(node.value, int)
+            return node.value
+        assert isinstance(node, ast.BinOp), ast.dump(node)
+        return operations[type(node.op)](constant_size(node.left), constant_size(node.right))
+
+    specs = []
+    for node in ast.walk(ast.parse(_lower(Prog))):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "CommBufferSpec"
+        ):
+            fields = {kw.arg: kw.value for kw in node.keywords}
+            specs.append((constant_size(fields["count"]), constant_size(fields["nbytes"])))
+    assert [logical for logical, _ in specs] == [nr * stride * 4, nr * 4, nr * 4]
+    previous_lines = set()
+    offset = 0
+    for logical, physical in specs:
+        assert physical >= logical
+        assert offset % 32 == 0  # Preserve the existing MTE/CCU contract too.
+        lines = set(range(offset // 64, (offset + logical - 1) // 64 + 1))
+        assert previous_lines.isdisjoint(lines), "DCCI can overwrite another communication buffer"
+        previous_lines.update(lines)
+        offset += physical
+    assert offset % 64 == 0  # The last buffer's writeback must stay in the domain.
 
 
 # ---------------------------------------------------------------------------
@@ -439,18 +558,24 @@ def test_comm_less_dispatch_routes_through_submit_chip_unplaced():
     @pl.program
     class Prog:
         @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
-        def chip_worker(self, x: pl.Tensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
+        def chip_worker(
+            self, x: pl.Tensor[[SIZE], pl.FP32], out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
             y: pl.Tensor[[SIZE], pl.FP32] = pl.add(x, x)
-            return y
+            return pl.tensor.assemble(out, y, [0])
 
         @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
-        def chip_orch(self, x: pl.Tensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
-            y: pl.Tensor[[SIZE], pl.FP32] = self.chip_worker(x)
+        def chip_orch(
+            self, x: pl.Tensor[[SIZE], pl.FP32], out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
+            y: pl.Tensor[[SIZE], pl.FP32] = self.chip_worker(x, out)
             return y
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(self, x: pl.Tensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
-            y: pl.Tensor[[SIZE], pl.FP32] = self.chip_orch(x)
+        def host_orch(
+            self, x: pl.Tensor[[SIZE], pl.FP32], out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
+            y: pl.Tensor[[SIZE], pl.FP32] = self.chip_orch(x, out)
             return y
 
     code = _lower(Prog)
@@ -501,6 +626,8 @@ def test_world_size_lowers_to_kwarg_in_expression_context():
     # `world_size * 4` expression in place of a constant nbytes literal.
     assert re.search(r"window_size=\(.*\bworld_size\b.*\),", code), code
     assert re.search(r"CommBufferSpec\(.*\bworld_size\b.*\),", code), code
+    # Runtime-sized slots need the same cache-line isolation as static ones.
+    assert re.search(r"nbytes=\(\(\(.*\bworld_size\b.* \+ 63\) // 64\) \* 64\)", code), code
     # The legacy ``len(contexts)`` form must not survive.
     assert "len(contexts)" not in code, code
 
@@ -798,7 +925,7 @@ def test_host_submit_rejects_nested_tuple_return():
         _lower(Prog)
 
 
-def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
+def test_host_allreduce_builtin_codegen_uses_submit_chip_with_callable_key():
     @pl.program
     class Prog:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -820,13 +947,15 @@ def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
     generated, cg = _lower_host_collectives(Prog)
 
     assert 'callables["builtin.tensor.allreduce__sum__fp32"]' in generated, generated
-    assert "orch.submit_next_level" in generated, generated
-    assert "_ta_1_config = CallConfig()" in generated, generated
-    assert "_ta_1_config.aicpu_thread_num = config.aicpu_thread_num" in generated, generated
+    # The builtin collective must go through _submit_chip with the full run
+    # config, not a fresh CallConfig(): that wrapper is what carries the DFX
+    # output_prefix and stamps the per-dispatch program marker (plan 135).
     assert (
-        'orch.submit_next_level(callables["builtin.tensor.allreduce__sum__fp32"], _ta_1, _ta_1_config'
-        in generated
+        '_submit_chip(orch, callables["builtin.tensor.allreduce__sum__fp32"], _ta_1, config,' in generated
     ), generated
+    assert "_keep.append(_ta_1)" in generated, generated
+    assert "CallConfig()" not in generated, generated
+    assert "orch.submit_next_level" not in generated, generated
     assert ".add_scalar(__comm_d0[" in generated and "].domain_size)" in generated, generated
     assert ".add_scalar((64))" not in generated, generated
     assert "distributed_collectives" not in generated, generated
@@ -1012,7 +1141,7 @@ def test_implicit_host_allreduce_builtin_codegen_materializes_signal():
     assert 'buffers["__allreduce_signal_buf_0"]' in generated, generated
     assert 'buffers["data_buf"]' in generated, generated
     assert 'buffers["signal_buf"]' not in generated, generated
-    assert "orch.submit_next_level" in generated, generated
+    assert '_submit_chip(orch, callables["builtin.tensor.allreduce__sum__fp32"]' in generated, generated
     assert ".add_scalar(__comm_d0[" in generated and "].domain_size)" in generated, generated
     assert "data = data" not in generated, generated
 
@@ -1166,7 +1295,7 @@ def test_every_next_level_reports_the_selected_runtime(tmp_path, runtime):
 
 
 @pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
-def test_backend_950_materializes_allreduce_with_core_num_launch(tmp_path, ascend_backend):
+def test_backend_950_materializes_allreduce_with_block_num_launch(tmp_path, ascend_backend):
     @pl.program
     class Prog:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1192,7 +1321,7 @@ def test_backend_950_materializes_allreduce_with_core_num_launch(tmp_path, ascen
 
     base = "next_levels/builtin.tensor.allreduce__sum__fp32"
     entry_cpp = files[f"{base}/orchestration/builtin_tensor_allreduce__sum__fp32.cpp"]
-    assert "params.launch_spec.set_core_num(core_num)" in entry_cpp
+    assert "params.launch_spec.set_block_num(core_num)" in entry_cpp
 
 
 def test_host_allreduce_ring_builtin_codegen_uses_ring_next_level_callable_key():
@@ -1217,7 +1346,7 @@ def test_host_allreduce_ring_builtin_codegen_uses_ring_next_level_callable_key()
     generated, cg = _lower_host_collectives(Prog)
 
     assert 'callables["builtin.tensor.allreduce_ring__sum__fp32"]' in generated, generated
-    assert "orch.submit_next_level" in generated, generated
+    assert '_submit_chip(orch, callables["builtin.tensor.allreduce_ring__sum__fp32"]' in generated, generated
     assert "distributed_collectives" not in generated, generated
 
     specs = cg.get_builtin_next_level_specs()

@@ -34,6 +34,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/serialization/type_registry.h"
+#include "pypto/ir/simt.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/type.h"
 
@@ -61,10 +62,7 @@ using DeserializerContext = serialization::detail::DeserializerContext;
 /// error, not an internal invariant: fail at the boundary with the value in
 /// hand rather than letting an unknown policy reach a pass or codegen.
 static void CheckCachePolicyValue(int policy, const std::string& context) {
-  CHECK(policy == static_cast<int>(CachePolicy::kDefault) || policy == static_cast<int>(CachePolicy::kBypass))
-      << context << " has unknown CachePolicy value " << policy << "; expected "
-      << static_cast<int>(CachePolicy::kDefault) << " (default) or " << static_cast<int>(CachePolicy::kBypass)
-      << " (bypass)";
+  CHECK(IsValidCachePolicy(policy)) << context << " has unknown CachePolicy value " << policy;
 }
 
 static std::vector<std::string> DeserializeLeadingComments(const msgpack::object& fields_obj) {
@@ -136,7 +134,7 @@ DataType DeserializeDataType(const msgpack::object& fields_obj, const std::strin
   }
 
   if (is_dtype) {
-    return DataType(dtype_code);
+    return detail::DataTypeFromSerializedCode(dtype_code);
   } else {
     throw TypeError("Invalid kwarg MAP type for key: " + field_name);
   }
@@ -212,6 +210,13 @@ static std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msg
           }
         }
       }
+      // The enum/layout-valued kwargs below all carry their payload in the
+      // "value" field; keep that shape check in one place.
+      auto require_value = [&](const char* expected_type) {
+        if (value_str.empty()) {
+          throw TypeError("Missing 'value' field for " + std::string(expected_type) + " kwarg: " + key);
+        }
+      };
       if (type_name == "ArgDirection") {
         if (!has_value_obj || value_obj_inner.type != msgpack::type::POSITIVE_INTEGER) {
           throw TypeError("ArgDirection kwarg '" + key + "' must have integer value");
@@ -238,35 +243,24 @@ static std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msg
         }
         kwargs.emplace_back(key, std::move(dirs));
       } else if (type_name == "TensorLayout") {
-        if (value_str.empty()) {
-          throw TypeError("Missing 'value' field for TensorLayout kwarg: " + key);
-        }
+        require_value("TensorLayout");
         kwargs.emplace_back(key, StringToTensorLayout(value_str));
       } else if (type_name == "TileLayout") {
-        if (value_str.empty()) {
-          throw TypeError("Missing 'value' field for TileLayout kwarg: " + key);
-        }
+        require_value("TileLayout");
         kwargs.emplace_back(key, StringToTileLayout(value_str));
       } else if (type_name == "MemorySpace") {
-        if (value_str.empty()) {
-          throw TypeError("Missing 'value' field for MemorySpace kwarg: " + key);
-        }
+        require_value("MemorySpace");
         kwargs.emplace_back(key, StringToMemorySpace(value_str));
+      } else if (type_name == "SimtAxis") {
+        if (value_str.empty()) throw TypeError("Missing 'value' field for SimtAxis kwarg: " + key);
+        kwargs.emplace_back(key, StringToSimtAxis(value_str));
       } else if (type_name == "PadValue") {
-        if (value_str.empty()) {
-          throw TypeError("Missing 'value' field for PadValue kwarg: " + key);
-        }
-        if (value_str == "null") {
-          kwargs.emplace_back(key, PadValue::null);
-        } else if (value_str == "zero") {
-          kwargs.emplace_back(key, PadValue::zero);
-        } else if (value_str == "max") {
-          kwargs.emplace_back(key, PadValue::max);
-        } else if (value_str == "min") {
-          kwargs.emplace_back(key, PadValue::min);
-        } else {
+        require_value("PadValue");
+        auto pad = TryStringToPadValue(value_str);
+        if (!pad.has_value()) {
           throw TypeError("Unknown PadValue: " + value_str + " for kwarg: " + key);
         }
+        kwargs.emplace_back(key, *pad);
       } else if (type_name == "Var") {
         // Reserved Var-valued attr (kAttrTaskIdVar). Resolved through the node
         // table so it round-trips by identity. A missing 'value' field is a
@@ -804,6 +798,20 @@ static IRNodePtr DeserializeForStmt(const msgpack::object& fields_obj, msgpack::
     }
   }
 
+  // Omission alone means legacy Auto. Do not use GetOptionalFieldObj here:
+  // it conflates explicit nil with absence, hiding corrupt semantic metadata.
+  HardwareLoopPolicy policy = HardwareLoopPolicy::Auto;
+  bool seen_policy = false;
+  for (uint32_t i = 0; i < fields_obj.via.map.size; ++i) {
+    const auto& entry = fields_obj.via.map.ptr[i];
+    if (entry.key.as<std::string>() != "hardware_loop_policy") continue;
+    CHECK(!seen_policy) << "Duplicate hardware_loop_policy";
+    seen_policy = true;
+    CHECK(entry.val.type == msgpack::type::POSITIVE_INTEGER && entry.val.via.u64 <= 1)
+        << "Unknown or malformed hardware_loop_policy";
+    policy = static_cast<HardwareLoopPolicy>(entry.val.via.u64);
+  }
+
   // Deserialize kind with backward compatibility (defaults to Sequential)
   ForKind kind = ForKind::Sequential;
   auto kind_obj = GetOptionalFieldObj(fields_obj, "kind", ctx);
@@ -828,7 +836,7 @@ static IRNodePtr DeserializeForStmt(const msgpack::object& fields_obj, msgpack::
       << "version (chunked loops can be expressed with manual tiling).";
 
   return std::make_shared<ForStmt>(loop_var, start, stop, step, iter_args, body, return_vars, span, kind,
-                                   std::move(attrs), DeserializeLeadingComments(fields_obj));
+                                   std::move(attrs), DeserializeLeadingComments(fields_obj), policy);
 }
 
 // Deserialize WhileStmt
@@ -941,6 +949,16 @@ static IRNodePtr DeserializeGraphScopeStmt(const msgpack::object& fields_obj, ms
   return std::make_shared<GraphScopeStmt>(std::move(name_hint), body, span,
                                           DeserializeLeadingComments(fields_obj),
                                           DeserializeScopeAttrs(fields_obj, ctx, zone));
+}
+
+static IRNodePtr DeserializeRegScopeStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
+                                         DeserializerContext& ctx) {
+  auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
+  auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
+  auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
+  return std::make_shared<RegScopeStmt>(std::move(name_hint), body, span,
+                                        DeserializeLeadingComments(fields_obj),
+                                        DeserializeScopeAttrs(fields_obj, ctx, zone));
 }
 
 // Deserialize HierarchyScopeStmt
@@ -1068,9 +1086,12 @@ static IRNodePtr DeserializeCommDomainScopeStmt(const msgpack::object& fields_ob
     attrs = DeserializeKwargs(*attrs_opt, "attrs", ctx, zone);
   }
 
+  std::vector<std::string> engines;
+  auto engines_obj = GetOptionalFieldObj(fields_obj, "engines", ctx);
+  if (engines_obj.has_value()) engines_obj->convert(engines);
   return std::make_shared<CommDomainScopeStmt>(std::move(devices), std::move(slots), std::move(name_hint),
                                                body, span, DeserializeLeadingComments(fields_obj),
-                                               std::move(attrs));
+                                               std::move(attrs), std::move(engines));
 }
 
 // Deserialize SeqStmts
@@ -1096,6 +1117,44 @@ static IRNodePtr DeserializeEvalStmt(const msgpack::object& fields_obj, msgpack:
   auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
   auto expr = std::static_pointer_cast<const Expr>(ctx.DeserializeNode(GET_FIELD_OBJ("expr"), zone));
   return std::make_shared<EvalStmt>(expr, span, DeserializeLeadingComments(fields_obj));
+}
+
+static IRNodePtr DeserializeSimtScopeStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
+                                          DeserializerContext& ctx) {
+  auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
+  std::vector<ExprPtr> dims;
+  for (const auto& item : GET_FIELD_OBJ("block_dims").as<std::vector<msgpack::object>>()) {
+    dims.push_back(std::dynamic_pointer_cast<const Expr>(ctx.DeserializeNode(item, zone)));
+  }
+  auto body = std::dynamic_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
+  std::vector<VarPtr> private_scalars;
+  for (const auto& item : GET_FIELD_OBJ("private_scalars").as<std::vector<msgpack::object>>()) {
+    private_scalars.push_back(std::dynamic_pointer_cast<const Var>(ctx.DeserializeNode(item, zone)));
+  }
+  return std::make_shared<SimtScopeStmt>(std::move(dims), body, span, std::move(private_scalars),
+                                         DeserializeLeadingComments(fields_obj));
+}
+
+// Deserialize a launch without converting storage results into thread returns.
+static IRNodePtr DeserializeSimtLaunchStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
+                                           DeserializerContext& ctx) {
+  auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
+  auto callee = std::dynamic_pointer_cast<const GlobalVar>(ctx.DeserializeOp(GET_FIELD_OBJ("callee")));
+  std::vector<ExprPtr> dims;
+  std::vector<ExprPtr> args;
+  std::vector<VarPtr> results;
+  for (const auto& item : GET_FIELD_OBJ("block_dims").as<std::vector<msgpack::object>>()) {
+    dims.push_back(std::dynamic_pointer_cast<const Expr>(ctx.DeserializeNode(item, zone)));
+  }
+  for (const auto& item : GET_FIELD_OBJ("args").as<std::vector<msgpack::object>>()) {
+    args.push_back(std::dynamic_pointer_cast<const Expr>(ctx.DeserializeNode(item, zone)));
+  }
+  for (const auto& item : GET_FIELD_OBJ("results").as<std::vector<msgpack::object>>()) {
+    results.push_back(std::dynamic_pointer_cast<const Var>(ctx.DeserializeNode(item, zone)));
+  }
+  auto indices = GET_FIELD_OBJ("result_param_indices").as<std::vector<int>>();
+  return std::make_shared<SimtLaunchStmt>(callee, std::move(dims), std::move(args), std::move(results),
+                                          std::move(indices), span, DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize BreakStmt
@@ -1364,9 +1423,12 @@ static TypeRegistrar _spmd_scope_stmt_registrar("SpmdScopeStmt", DeserializeSpmd
 static TypeRegistrar _split_aiv_scope_stmt_registrar("SplitAivScopeStmt", DeserializeSplitAivScopeStmt);
 static TypeRegistrar _runtime_scope_stmt_registrar("RuntimeScopeStmt", DeserializeRuntimeScopeStmt);
 static TypeRegistrar _comm_domain_scope_stmt_registrar("CommDomainScopeStmt", DeserializeCommDomainScopeStmt);
+static TypeRegistrar _reg_scope_stmt_registrar("RegScopeStmt", DeserializeRegScopeStmt);
 static TypeRegistrar _graph_scope_stmt_registrar("GraphScopeStmt", DeserializeGraphScopeStmt);
 static TypeRegistrar _seq_stmts_registrar("SeqStmts", DeserializeSeqStmts);
 static TypeRegistrar _eval_stmt_registrar("EvalStmt", DeserializeEvalStmt);
+static TypeRegistrar _simt_launch_stmt_registrar("SimtLaunchStmt", DeserializeSimtLaunchStmt);
+static TypeRegistrar _simt_scope_stmt_registrar("SimtScopeStmt", DeserializeSimtScopeStmt);
 static TypeRegistrar _break_stmt_registrar("BreakStmt", DeserializeBreakStmt);
 static TypeRegistrar _continue_stmt_registrar("ContinueStmt", DeserializeContinueStmt);
 static TypeRegistrar _inline_stmt_registrar("InlineStmt", DeserializeInlineStmt);

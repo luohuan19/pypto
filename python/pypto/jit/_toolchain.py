@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Conservative Linux inventories for the compiler paths used by JIT.
+"""Linux JIT identity policy selection and legacy content inventories.
 
 Unknown launchers and compiler layouts are unavailable, never weak identities.
 Installed files are immutable until process exit; mutable application inputs
@@ -32,12 +32,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from pypto._environment import toolchain_probe_env
 from pypto._identity import (
     ComponentInputs,
     ContentRoot,
     InstallationIdentityCache,
     ToolchainIdentity,
     ToolchainInputs,
+    digest_record,
 )
 from pypto.backend._ptoas_locate import find_ptoas_binary
 
@@ -48,28 +50,33 @@ _LDD_WORKERS = 32
 _identities: dict[tuple[Any, ...], ToolchainIdentity] = {}
 
 
-# Every probe below reads its answer out of a tool's diagnostic output, and
-# those strings are translated: on a non-English host gcc prints its own
-# rendering of "#include <...> search starts here:", which no marker here
-# matches. Pin the C locale for the probes rather than teach every parser
-# every translation.
-_C_LOCALE = {"LC_ALL": "C", "LANG": "C", "LANGUAGE": ""}
-
-
-def _run(command: list[str]) -> str:
+def _run(command: list[str], *, cwd: Path | None = None) -> str:
     result = subprocess.run(
         command,
         capture_output=True,
         text=True,
         timeout=30,
         check=True,
-        env={**os.environ, **_C_LOCALE},
+        env=toolchain_probe_env(c_locale=True),
+        cwd=cwd,
     )
     return result.stdout + result.stderr
 
 
-def _executable(name: str) -> Path:
-    selected = shutil.which(name)
+def _which(name: str, cwd: Path | None = None) -> str | None:
+    """Resolve relative executable paths as a subprocess in cwd would."""
+    if cwd is None:
+        return shutil.which(name)
+    if os.path.dirname(name):
+        return shutil.which(str(cwd / name))
+    search = os.pathsep.join(
+        str(cwd / entry) for entry in os.environ.get("PATH", os.defpath).split(os.pathsep)
+    )
+    return shutil.which(name, path=search)
+
+
+def _executable(name: str, *, cwd: Path | None = None) -> Path:
+    selected = _which(name, cwd)
     if selected is None:
         raise ValueError(f"Compiler executable is unavailable: {name}")
     path = Path(selected).resolve(strict=True)
@@ -79,7 +86,7 @@ def _executable(name: str) -> Path:
     return path
 
 
-def _invocable(name: str) -> Path:
+def _invocable(name: str, *, cwd: Path | None = None) -> Path:
     """Return the compiler as the build invokes it, without resolving it.
 
     A compiler on PATH may be a wrapper that dispatches on argv[0]: ccache
@@ -95,7 +102,7 @@ def _invocable(name: str) -> Path:
     The file behind the name still has to be an ELF image; a wrapper written
     as a shell script needs its own dependency adapter, exactly as before.
     """
-    selected = shutil.which(name)
+    selected = _which(name, cwd)
     if selected is None:
         raise ValueError(f"Compiler executable is unavailable: {name}")
     path = Path(selected)
@@ -110,7 +117,7 @@ def _elf_inputs(path: Path, library_path: str | None = None) -> set[Path]:
     with path.open("rb") as stream:
         if stream.read(4) != b"\x7fELF":
             raise ValueError(f"Expected an ELF installation input: {path}")
-    environment = {**os.environ, **_C_LOCALE}
+    environment = toolchain_probe_env(c_locale=True)
     if library_path is not None:
         environment["LD_LIBRARY_PATH"] = library_path
     result = subprocess.run(
@@ -256,7 +263,7 @@ _WRAPPER_VARIABLES = tuple(sorted({name for names in _WRAPPER_SELECTION.values()
 _WRAPPER_REDIRECTS = ("compiler", "path", "prefix_command", "prefix_command_cpp")
 
 
-def _wrapper_redirects(wrapper: Path) -> list[str]:
+def _wrapper_redirects(wrapper: Path, *, cwd: Path | None = None) -> list[str]:
     """Report every configured redirect of a wrapper, with where it came from.
 
     A prefix is the case the rest of this module cannot see: it applies to
@@ -266,7 +273,8 @@ def _wrapper_redirects(wrapper: Path) -> list[str]:
     artifacts.
     """
     try:
-        output = _run([str(wrapper), "--show-config"])
+        command = [str(wrapper), "--show-config"]
+        output = _run(command) if cwd is None else _run(command, cwd=cwd)
     except (OSError, subprocess.SubprocessError) as exc:
         return [f"its configuration could not be read ({exc})"]
     redirects: list[str] = []
@@ -278,7 +286,7 @@ def _wrapper_redirects(wrapper: Path) -> list[str]:
     return redirects
 
 
-def _driver_executed(output: str, executable: Path) -> Path:
+def _driver_executed(output: str, executable: Path, *, cwd: Path | None = None) -> Path:
     """Return the compiler driver the invocation actually ran.
 
     Invoking through a wrapper reaches a different binary: ccache's shim execs
@@ -298,7 +306,10 @@ def _driver_executed(output: str, executable: Path) -> Path:
     driver = None
     for line in output.splitlines():
         if line.startswith("COLLECT_GCC="):
-            driver = Path(line.partition("=")[2].strip()).resolve(strict=True)
+            selected = line.partition("=")[2].strip()
+            if cwd is not None:
+                selected = _which(selected, cwd) or str(cwd / selected)
+            driver = Path(selected).resolve(strict=True)
             break
     if driver is None:
         raise ValueError(f"Cannot identify the compiler driver actually executed: {executable}")
@@ -310,7 +321,7 @@ def _driver_executed(output: str, executable: Path) -> Path:
             raise ValueError(
                 f"Compiler wrapper with untracked selection inputs: {invoked.name} at {executable}"
             )
-        redirects = _wrapper_redirects(invoked)
+        redirects = _wrapper_redirects(invoked) if cwd is None else _wrapper_redirects(invoked, cwd=cwd)
         if redirects:
             raise ValueError(
                 f"Compiler wrapper redirects compilation beyond this inventory: "
@@ -648,7 +659,7 @@ def _ptoas_inputs(launcher: Path, ancestors: frozenset[Path] = frozenset()) -> s
     library_path = str(root / "lib") + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
     # Query interpreter resources without loading PTOAS or running a compiler.
     # Match the launcher's PYTHONHOME removal and library search environment.
-    environment = {**os.environ, **_C_LOCALE}
+    environment = toolchain_probe_env(c_locale=True)
     environment.pop("PYTHONHOME", None)
     environment["LD_LIBRARY_PATH"] = library_path
     probe = subprocess.run(
@@ -692,6 +703,7 @@ def _unaccounted_checkout_state(checkout: Path) -> str:
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain", "--ignored"],
+            env=toolchain_probe_env(),
             cwd=checkout,
             capture_output=True,
             text=True,
@@ -917,18 +929,39 @@ def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
 
 
 @lru_cache(maxsize=32)
-def _compiler(platform: str, path: str | None, sdk: str | None, sanitizers: str) -> Any:
+def _compiler(platform: str, path: str | None, sdk: str | None, sanitizers: str, cwd: str) -> Any:
     """Cache immutable compiler metadata by effective selection inputs."""
     from pypto.runtime.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
     return KernelCompiler(platform)
 
 
+def _selected_compiler(platform: str) -> Any:
+    """Load optional SDK metadata only after a discovery miss."""
+    from pypto.runtime.kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+    compiler = _compiler(
+        platform,
+        os.environ.get("PATH"),
+        os.environ.get("ASCEND_HOME_PATH"),
+        KernelCompiler._sanitizers,
+        os.getcwd(),
+    )
+    if compiler._sanitizers:
+        raise ValueError("Sanitized compiler installations require a cache adapter")
+    return compiler
+
+
 def capture_toolchain(platform: str, runtime_name: str) -> ToolchainIdentity:
     """Resolve effective tools; return explicit unavailable evidence on failure."""
     try:
-        # These mechanisms can redirect arbitrary implicit inputs. Supporting
-        # them requires tracing their dependencies, not hashing their strings.
+        policy = os.environ.get("PYPTO_CACHE_IDENTITY", "build")
+        if policy not in ("build", "content"):
+            raise ValueError(f"PYPTO_CACHE_IDENTITY must be build or content, got {policy!r}")
+        # These mechanisms directly select compiler/header/link inputs.
+        # Supporting them requires preserving search order and dependencies,
+        # not hashing their strings. Runtime-only loader injection follows the
+        # deployment contract documented in _environment and is absent here.
         unsupported = {
             "CPATH": os.environ.get("CPATH"),
             "CPLUS_INCLUDE_PATH": os.environ.get("CPLUS_INCLUDE_PATH"),
@@ -936,31 +969,32 @@ def capture_toolchain(platform: str, runtime_name: str) -> ToolchainIdentity:
             "COMPILER_PATH": os.environ.get("COMPILER_PATH"),
             "GCC_EXEC_PREFIX": os.environ.get("GCC_EXEC_PREFIX"),
             "LIBRARY_PATH": os.environ.get("LIBRARY_PATH"),
-            "LD_PRELOAD": os.environ.get("LD_PRELOAD"),
-            "LD_AUDIT": os.environ.get("LD_AUDIT"),
         }
         for name, value in unsupported.items():
             if value:
                 raise ValueError(f"Implicit dependency override requires a cache adapter: {name}")
-        from pypto.runtime.kernel_compiler import KernelCompiler  # noqa: PLC0415
-
-        compiler = _compiler(
-            platform, os.environ.get("PATH"), os.environ.get("ASCEND_HOME_PATH"), KernelCompiler._sanitizers
-        )
-        if compiler._sanitizers:
-            raise ValueError("Sanitized compiler installations require a cache adapter")
+        compiler_module = sys.modules.get("pypto.runtime.kernel_compiler")
+        sanitizers = getattr(getattr(compiler_module, "KernelCompiler", None), "_sanitizers", "")
         # Installed paths (including launcher symlinks) are immutable for the
         # process lifetime. Re-resolve on selection changes, including cwd for
         # relative search roots; do not probe every executable on an object hit.
-        selected = (
+        loader_path = os.environ.get("LD_LIBRARY_PATH")
+        # The loader accepts both ':' and ';'; an empty entry also means cwd.
+        loader_cwd = (
+            os.getcwd()
+            if loader_path is not None and any(not os.path.isabs(p) for p in re.split("[:;]", loader_path))
+            else None
+        )
+        build_context = (
+            policy,
+            os.environ.get("PYPTO_CACHE_EPOCH"),
             platform,
             runtime_name,
-            str(compiler.project_root),
-            os.getcwd(),
-            os.environ.get("PATH"),
+            sanitizers,
             os.environ.get("ASCEND_HOME_PATH"),
             os.environ.get("PTOAS_ROOT"),
-            os.environ.get("LD_LIBRARY_PATH"),
+            loader_path,
+            loader_cwd,
             os.environ.get("PTOAS_PYTHON"),
             os.environ.get("PYTHONPATH"),
             os.environ.get("PYTHONHOME"),
@@ -981,15 +1015,27 @@ def capture_toolchain(platform: str, runtime_name: str) -> ToolchainIdentity:
             os.environ.get("CCACHE_PREFIX"),
             os.environ.get("CCACHE_PREFIX_CPP"),
         )
+        # cwd/PATH select tools and trigger rediscovery. Their raw spelling is
+        # not build evidence: unchanged effective tools may reuse disk entries.
+        # Retain other overrides conservatively (e.g. loader/interpreter flags
+        # can affect execution even when selected executable paths are equal).
+        selected = (os.getcwd(), os.environ.get("PATH"), build_context)
         with _discovery_lock:
             identity = _identities.get(selected)
             if identity is None:
                 ptoas = find_ptoas_binary()
                 if ptoas is None:
                     raise ValueError("PTOAS is unavailable")
-                inputs = _discover(compiler, ptoas, runtime_name)
+                if policy == "content":
+                    inputs = _discover(_selected_compiler(platform), ptoas, runtime_name)
+                else:
+                    from ._build_identity import discover_builds  # noqa: PLC0415
+
+                    inputs = discover_builds(lambda: _selected_compiler(platform), ptoas, runtime_name)
                 identity = _identity_cache.capture(inputs)
                 if identity.usable:
+                    if policy == "build" or os.environ.get("PYPTO_CACHE_EPOCH"):
+                        identity = replace(identity, pypto=digest_record((identity.pypto, build_context)))
                     _identities[selected] = identity
             return identity
     except Exception as exc:

@@ -143,6 +143,26 @@ The DSL wrapper returns one `TupleGetItemExpr` per output over the *same* call;
 `_unwrap_result` in `python/pypto/language/parser/_dsl_invoker.py` recognizes
 that shape generically and hands the parser back the bare `Call` to rebind.
 
+Each result's type must describe both its physical capacity and its valid region
+**before** memory planning. For `tile.gather_compare`, the per-row count output is
+one contiguous row of INT32/UINT32 values. Its physical shape is
+`[1, ceil_div(src_rows, 8) * 8]` to meet the 32-byte Vec row alignment; its valid
+shape is `[1, src_valid_rows]`. For example, nine source rows need a `[1, 16]`
+count tile with only nine valid entries. `tile.read(count, [0, i])` keeps the same
+element offsets, and `tile.store` uses the valid region rather than writing the
+padding. The tensor-level count shape remains `[1, rows]`: extra Vec capacity
+does not add logical counts or enlarge the caller's tensor.
+
+Explicit per-lane computation preserves each tuple element's operator-deduced
+type and valid region. Physical capacity and logical partition stride remain
+independent: if the author splits ten source rows into five rows per lane, each
+lane's count tile has physical shape `[1, 8]` with five valid entries. The author
+must store lane 1's counts at column five, not at the aligned capacity of eight.
+Mixed-kernel lowering preserves these authored shapes and offsets; it does not
+infer or propagate a new partition through tuple projections and consumers.
+See [LowerAutoVectorSplit](../passes/25-lower_auto_vector_split.md)
+for explicit boundary preparation.
+
 ## Codegen
 
 A multi-output op's `Call` does not carry its destinations in `args_` — the
@@ -194,5 +214,5 @@ body rescan per call.
 - [Operator System](05-operators.md) — the general registration API and argument effects
 - [Types and Examples](02-types.md) — `TupleType` and the rest of the type system
 - [Parameter Directions](08-param-directions.md) — how an undeclared write loses its dependency edge
-- [InitMemRef](../passes/34-init_memref.md) — the pass that owns tile allocation
-- [MemoryReuse](../passes/36-memory_reuse.md) — lifetime reuse across tuple elements
+- [InitMemRef](../passes/38-init_memref.md) — the pass that owns tile allocation
+- [MemoryReuse](../passes/40-memory_reuse.md) — lifetime reuse across tuple elements

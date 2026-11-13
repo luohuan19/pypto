@@ -7,12 +7,14 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Codegen smoke tests for MXFP8 matmul and explicit FP4-to-FP8 legalization."""
+"""Codegen tests for MXFP8, native FP4, and explicit FP4-to-FP8 legalization."""
 
 import pypto.language as pl
 import pytest
 from pypto import ir
-from pypto.backend import BackendType, reset_for_testing, set_backend_type
+from pypto.backend import BackendType, pto_backend, reset_for_testing, set_backend_type
+from pypto.backend._ptoas_fp4 import uses_native_fp4_mx
+from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import codegen, passes
 
@@ -46,22 +48,165 @@ def _emit_incore_mlir(program, backend_type=BackendType.Ascend950) -> str:
 
 
 class TestMxMatmulCodegen:
-    def test_fp4_set_validshape_uses_physical_packed_extent(self):
+    @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
+    @pytest.mark.parametrize("hint", [pl.CachePolicy.NORMAL_FIRST_VICTIM, pl.CachePolicy.NOT_ALLOC_KEEP])
+    def test_mx_scale_load_preserves_layout_with_explicit_l2_hint(self, tmp_path, planner, hint):
+        if find_ptoas_binary() is None:
+            pytest.skip("PTOAS is not available")
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ]):
+                _ = pl.load(a_s, [0, 0], [16, 2], target_memory=pl.Mem.Mat, cache=hint)
+
+        reset_for_testing()
+        set_backend_type(BackendType.Ascend950)
+        with passes.PassContext([], memory_planner=planner):
+            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Program)
+        mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
+        cpp = pto_backend._compile_pto_module(mlir, "mx_hinted_load", str(tmp_path), planner)
+        assert "{layout = #pto.layout<mx_a_zz>}" in mlir
+        assert "cache_policy" not in mlir
+        expected = "NormalFirstVictim" if hint == pl.CachePolicy.NORMAL_FIRST_VICTIM else "NotAllocKeep"
+        assert f"TLOAD<pto::TLoadL2Hint::{expected}>" in cpp
+        assert "__pypto_l2_hint" not in cpp
+
+    @pytest.mark.parametrize("dtype, token", [(pl.FP4E2M1X2, "f4E2M1x2"), (pl.FP4E1M2X2, "f4E1M2x2")])
+    def test_native_fp4_matmul_keeps_packed_operands(self, dtype, token, monkeypatch, tmp_path):
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[32, 64], dtype],
+                sa: pl.Tensor[[32, 4], pl.FP8E8M0, pl.MX_A_ZZ],
+                b: pl.Tensor[[64, 64], dtype],
+                sb: pl.Tensor[[4, 64], pl.FP8E8M0, pl.MX_B_NN],
+                out: pl.Tensor[[32, 64], pl.FP32],
+            ):
+                a_mat = pl.load(a, [0, 0], [32, 64], target_memory=pl.MemorySpace.Mat)
+                b_mat = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                lhs = pl.move(a_mat, pl.MemorySpace.Left)
+                rhs = pl.move(pl.tile.transpose_view(b_mat), pl.MemorySpace.Right)
+                lhs_scale = pl.move(
+                    pl.load(sa, [0, 0], [32, 4], target_memory=pl.MemorySpace.Mat), pl.MemorySpace.LeftScale
+                )
+                rhs_scale = pl.move(
+                    pl.load(sb, [0, 0], [4, 64], target_memory=pl.MemorySpace.Mat), pl.MemorySpace.RightScale
+                )
+                base = pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
+                result = pl.matmul_mx_acc(base, lhs, lhs_scale, rhs, rhs_scale)
+                pl.store(result, [0, 0], out)
+
+        mlir = _emit_incore_mlir(Program)
+        assert "pto.tcvt" not in mlir
+        assert f"loc=left, dtype=!pto.{token}, rows=32, cols=128" in mlir
+        assert f"loc=right, dtype=!pto.{token}, rows=128, cols=64" in mlir
+        assert "loc=acc, dtype=f32, rows=32, cols=64" in mlir
+        assert "pto.tmatmul.mx.acc" in mlir
+        assert mlir.count("pto.tget_scale_addr") == 2
+
+        optimized = _run_default_pipeline(Program)
+        assert uses_native_fp4_mx(optimized)
+
+        def unsupported():
+            raise RuntimeError("missing native FP4 capability")
+
+        monkeypatch.setattr(pto_backend, "check_native_fp4_mx_support", unsupported)
+
+        def generate_bundle(skip_ptoas: bool):
+            return pto_backend._generate_pto_bundle(
+                optimized,
+                skip_ptoas=skip_ptoas,
+                memory_planner=passes.MemoryPlanner.PYPTO,
+                emit_source_loc=False,
+            )
+
+        # IR inspection remains available without an assembler; executable
+        # generation must pass the capability gate before producing a bundle.
+        generate_bundle(True)
+        with pytest.raises(RuntimeError, match="missing native FP4 capability"):
+            generate_bundle(False)
+        monkeypatch.setattr(pto_backend, "check_native_fp4_mx_support", lambda: None)
+        source, _, _ = generate_bundle(False)
+        assert "pto.tmatmul.mx.acc" in source
+        if find_ptoas_binary() is not None:
+            cpp = pto_backend._compile_pto_module(source, "native_fp4", str(tmp_path))
+            cpp_dtype = "float4_e2m1x2_t" if dtype == pl.FP4E2M1X2 else "float4_e1m2x2_t"
+            assert f"Tile<TileType::Left, {cpp_dtype}, 32, 128," in cpp
+            assert f"Tile<TileType::Right, {cpp_dtype}, 128, 64," in cpp
+            assert "Tile<TileType::Acc, float, 32, 64," in cpp
+
+    @pytest.mark.parametrize(
+        "memory, physical, valid",
+        [
+            (pl.Mem.Vec, (16, 32), (8, 32)),
+            (pl.Mem.Mat, (32, 32), (16, 32)),
+            (pl.Mem.Left, (32, 32), (16, 32)),
+            (pl.Mem.Right, (32, 64), (8, 64)),
+        ],
+    )
+    def test_fp4_set_validshape_uses_memory_space_units(self, memory, physical, valid):
+        carrier_rows = 32 if memory == pl.Mem.Right else 16
+
         @pl.program
         class Program:
             @pl.function(type=pl.FunctionType.InCore)
             def main(self):
-                created = pl.tile.create([16, 32], dtype=pl.FP4E2M1X2, target_memory=pl.Mem.Vec)
+                created = pl.tile.create([carrier_rows, 32], dtype=pl.FP4E2M1X2, target_memory=memory)
                 pl.set_validshape(created, 8, 32)
 
         mlir = _emit_incore_mlir(Program)
         alloc = next(line for line in mlir.splitlines() if "pto.alloc_tile" in line and "f4E2M1x2" in line)
         set_valid = next(line for line in mlir.splitlines() if "pto.set_validshape" in line)
-        # Carrier extents are emitted as-is (no /2); logical FP4 would still /2 on Vec.
-        assert "valid_row = %c16_index valid_col = %c32_index" in alloc
+        # Vec remains packed; Cube descriptors and their mutable validity use
+        # logical units. Storage planning still uses the original IR carriers.
+        assert f"valid_row = %c{physical[0]}_index valid_col = %c{physical[1]}_index" in alloc
         assert "v_row=?, v_col=?" in alloc
-        assert ", %c8_index, %c32_index :" in set_valid
-        assert "%c64_index" not in set_valid
+        assert f", %c{valid[0]}_index, %c{valid[1]}_index :" in set_valid
+
+    def test_fp4_cube_slice_converts_offset_shape_and_validity(self, tmp_path):
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self):
+                tile = pl.tile.create([32, 128], dtype=pl.FP4E2M1X2, target_memory=pl.Mem.Mat)
+                _ = pl.tile.slice(tile, [16, 128], [16, 0], valid_shape=[8, 64])
+
+        mlir = _emit_incore_mlir(Program)
+        view = next(line for line in mlir.splitlines() if "pto.subview" in line)
+        # Mat is column-major: rows, row offsets, and valid rows all expand.
+        assert "[%c32_index, %c0_index] sizes [32, 128] valid [%c16_index, %c64_index]" in view
+        assert "rows=32, cols=128, v_row=16, v_col=64" in view
+        if find_ptoas_binary() is not None:
+            pto_backend._compile_pto_module(mlir, "fp4_cube_slice", str(tmp_path))
+
+    @pytest.mark.parametrize("dtype", [pl.FP4E2M1X2, pl.FP4E1M2X2])
+    @pytest.mark.parametrize("transpose", [False, True])
+    def test_fp4_gather_row_converts_only_cube_coordinates(self, dtype, transpose, tmp_path):
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, src: pl.Tensor[[128, 128], dtype]):
+                dst = pl.create_l1([128, 128], dtype, transpose=transpose)
+                _ = pl.gather_row(dst, src, [32, 32], [0, 0], [1, 64], transpose=transpose)
+
+        mlir = _emit_incore_mlir(Program)
+        if find_ptoas_binary() is not None:
+            # This used to fail PTOAS verification: the result type had logical
+            # validity, but the subview operands still counted carriers.
+            pto_backend._compile_pto_module(mlir, "fp4_gather", str(tmp_path))
+        subview = next(line for line in mlir.splitlines() if "pto.subview" in line)
+        partition = next(line for line in mlir.splitlines() if "pto.partition_view" in line)
+        if transpose:
+            assert "[%c32_index, %c64_index] sizes [64, 32] valid [%c64_index, %c2_index]" in subview
+            assert "v_row=64, v_col=2" in subview
+            assert "sizes = [%c64_index, %c1_index]" in partition
+        else:
+            assert "[%c64_index, %c32_index] sizes [32, 64] valid [%c2_index, %c64_index]" in subview
+            assert "v_row=2, v_col=64" in subview
+            assert "sizes = [%c1_index, %c64_index]" in partition
 
     def test_rejects_ascend910b_before_codegen(self):
         @pl.program
@@ -88,10 +233,10 @@ class TestMxMatmulCodegen:
                 pl.store(pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale), [0, 0], out)
 
         with pytest.raises(ValueError, match=r"matmul_mx.*only supported.*Ascend950.*a5.*a2a3"):
-            _run_default_pipeline(Program, BackendType.Ascend910B)
+            _run_default_pipeline(Program, BackendType.Ascend910)
 
     def test_mx_scale_load_accepts_provable_dynamic_offset(self):
-        """Provable MX offsets become FloorDiv in IR; codegen sees divsi + maxsi."""
+        """Provable MX offsets become FloorDiv in IR; codegen sees floordivsi + maxsi."""
 
         @pl.program
         class Program:
@@ -108,7 +253,7 @@ class TestMxMatmulCodegen:
         mlir = _emit_incore_mlir(Program)
         assert "cf.assert" not in mlir
         assert "arith.remui" not in mlir
-        assert "arith.divsi" in mlir or "arith.divui" in mlir
+        assert "arith.floordivsi" in mlir
         assert "pto.tload" in mlir
         assert "{layout = #pto.layout<mx_a_zz>}" in mlir
         partitions = [line for line in mlir.splitlines() if "partition_view" in line]
@@ -116,19 +261,8 @@ class TestMxMatmulCodegen:
             "sizes = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in line for line in partitions
         )
 
-    def test_mx_scale_load_joins_layout_and_cache_policy_in_one_attr_dict(self):
-        """An MX scale load declared `cache=BYPASS` carries BOTH attributes.
-
-        The MX ``layout`` and the L2-bypass ``cache_policy`` (pypto #2680) can
-        co-occur on one ``pto.tload``, and PTOAS takes all present attributes in
-        a single dict — two dicts, or a dropped attribute, would not assemble.
-        ``layout`` stays first so an MX load that declares no policy keeps its
-        byte-identical form.
-
-        Verified against a real ptoas v0.61 run of this emit (accepted; the load
-        lowers to ``TLOAD<pto::TLoadL2Hint::NotAllocKeep>``). UTs themselves run
-        with ``skip_ptoas=True``, so the assertion here is on the emitted text.
-        """
+    def test_mx_scale_load_preserves_layout_with_a5_bypass(self):
+        """A5 NOT_ALLOC_KEEP keeps the MX layout and selects an ISA hint without an offset."""
 
         @pl.program
         class Program:
@@ -137,14 +271,16 @@ class TestMxMatmulCodegen:
                 self,
                 a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ],
             ):
-                _ = pl.load(a_s, [0, 0], [16, 2], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.BYPASS)
+                _ = pl.load(
+                    a_s, [0, 0], [16, 2], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP
+                )
 
         mlir = _emit_incore_mlir(Program)
         tloads = [line for line in mlir.splitlines() if "pto.tload" in line]
         assert len(tloads) == 1, f"expected one MX scale load:\n{mlir}"
-        assert (
-            "{layout = #pto.layout<mx_a_zz>, cache_policy = #pto.load_cache_policy<l2_bypass>}" in tloads[0]
-        ), tloads[0]
+        assert "layout = #pto.layout<mx_a_zz>" in tloads[0]
+        assert "cache_policy" not in mlir
+        assert "l2_hint = #pto.load_l2_hint<not_alloc_keep>" in tloads[0]
 
     def test_mx_scale_load_rejects_unprovable_dynamic_offset(self):
         """Unaligned / unprovable dynamic MX offsets fail at BlockMxScaleTensorViews."""
@@ -333,13 +469,14 @@ class TestMxMatmulCodegen:
                 tbs = pl.load(b_s, [0, 0], [2, 64])
                 pl.store(pl.matmul_mx(ta, tas, tb, tbs), [0, 0], out)
 
+        assert not uses_native_fp4_mx(_run_default_pipeline(Program))
         mlir = _emit_incore_mlir(Program)
         assert mlir.count("pto.tcvt") == 3
         assert "dtype=!pto.f4E2M1x2, rows=128, cols=32" in mlir
         assert "pto.tmatmul.mx" in mlir
         assert mlir.count("pto.tget_scale_addr") == 2
 
-    @pytest.mark.parametrize("dtype", [pl.FP4, pl.INT4, pl.UINT4, pl.HF4])
+    @pytest.mark.parametrize("dtype", [pl.INT4, pl.UINT4, pl.HF4])
     def test_a2a3_rejects_all_four_bit_incore_abis(self, dtype):
         @pl.program
         class Program:
@@ -352,7 +489,7 @@ class TestMxMatmulCodegen:
                 pl.store(pl.load(src, [0, 0], [16, 64]), [0, 0], out)
 
         with pytest.raises(ValueError, match=r"(?:4-bit )?dtype .*not supported.*a2a3"):
-            _emit_incore_mlir(Program, BackendType.Ascend910B)
+            _emit_incore_mlir(Program, BackendType.Ascend910)
 
     @pytest.mark.parametrize("dtype", [pl.INT4, pl.UINT4, pl.HF4])
     def test_a5_rejects_non_fp4_four_bit_incore_abis(self, dtype):
@@ -366,10 +503,13 @@ class TestMxMatmulCodegen:
             ):
                 pl.store(pl.load(src, [0, 0], [16, 64]), [0, 0], out)
 
-        with pytest.raises(ValueError, match=r"4-bit dtype.*not supported.*a5.*FP4 and packed FP4E2M1X2"):
+        with pytest.raises(ValueError, match=r"4-bit dtype.*not supported.*a5.*packed FP4E2M1X2"):
             _emit_incore_mlir(Program)
 
-    def test_matmul_mx_acc_ins_equals_outs(self):
+    @pytest.mark.parametrize(
+        "compile_with_ptoas", [False, pytest.param(True, marks=pytest.mark.ptoas_compile)]
+    )
+    def test_matmul_mx_acc_ins_equals_outs(self, tmp_path, compile_with_ptoas):
         @pl.program
         class Program:
             @pl.function(type=pl.FunctionType.InCore)
@@ -400,13 +540,23 @@ class TestMxMatmulCodegen:
                 pl.store(result, [0, 0], out)
 
         mlir = _emit_incore_mlir(Program)
-        # Each consumer needs fresh LeftScale and RightScale bindings because
-        # tget_scale_addr mutates a physical buffer shared by SSA aliases.
-        assert mlir.count("pto.tget_scale_addr") == 4
+        # Reuse unchanged bindings: a second bind would hoist across the first
+        # MX consumer and is rejected by PTOAS v0.70 (PTOAS #1691).
+        assert mlir.count("pto.tget_scale_addr") == 2
         acc_line = next(line for line in mlir.splitlines() if "pto.tmatmul.mx.acc" in line)
         ins_acc = acc_line.split("ins(", 1)[1].split(",", 1)[0].strip()
         outs_acc = acc_line.split("outs(", 1)[1].split(":", 1)[0].strip()
         assert ins_acc == outs_acc
+
+        if compile_with_ptoas:
+            # PTOAS #1691: v0.70 rejects the second binding after the first MX
+            # consumer. Compile with the installed release so a toolchain bump
+            # cannot pass solely on textual IR checks or an unreleased repair.
+            if find_ptoas_binary() is None:
+                pytest.skip("PTOAS is not available")
+            cpp = pto_backend._compile_pto_module(mlir, "main", str(tmp_path))
+            # Base and accumulating forms use two overloads of TMATMUL_MX.
+            assert cpp.count("TMATMUL_MX(") == 2
 
     def test_mx_rank5_view_maps_aligned_logical_offsets(self):
         @pl.program

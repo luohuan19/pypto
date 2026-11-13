@@ -9,11 +9,10 @@
 
 """Tests for InitMemRefPass.
 
-Most tests use the Before/Expected pattern with
-``ir.assert_structural_equal(After, Expected)``.
-DefFields always auto-map, so ``enable_auto_mapping=True`` is unnecessary.
-This aligns MemRef objects consistently: if two tiles share a MemRef in
-``After``, the corresponding tiles in ``Expected`` must also share.
+Hand-written expectations normalize inferred Call result MemRefs explicitly.
+Exact comparison still checks all variable storage fields and allocation alias
+patterns. Roundtrip instruments compare the original IR without normalization.
+DefFields always alpha-map; open references retain their identity by default.
 
 Two tests are kept as raw-IR / diagnostic tests because the inputs cannot be
 expressed via the DSL:
@@ -35,9 +34,43 @@ from pypto.backend import BackendType
 from pypto.ir import MemorySpace
 from pypto.ir.op import tile as tile_ops
 
+from .storage_test_utils import without_call_memrefs
+
 
 class TestBasic:
     """Basic MemRef creation, memory space assignment, and alloc generation."""
+
+    @pytest.mark.parametrize("start, stop, scale", [(1, 3, 32), (0, 8, 1)])
+    def test_constant_normalization_preserves_unreachable_branch(self, start, stop, scale):
+        """Shape specialization can make a retained branch's scalar range empty."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, output: pl.Out[pl.Tensor[[128, 16], pl.FP32]]):
+                tile: pl.Tile[[1, 16], pl.FP32, pl.Mem.Vec] = pl.tile.full([1, 16], pl.FP32, 0.0)
+                for i in pl.range(start, stop):
+                    offset = i * scale
+                    if offset < 8:
+                        then_index = offset
+                        pl.tile.store(tile, [then_index, 0], output)
+                    else:
+                        else_index = offset
+                        pl.tile.store(tile, [else_index, 0], output)
+
+        after = passes.init_mem_ref()(Before)
+        branches = []
+
+        class Branches(ir.IRVisitor):
+            def visit_if_stmt(self, op):
+                branches.append(op)
+                super().visit_if_stmt(op)
+
+        Branches().visit_program(after)
+        # InitMemRef's constants-only simplifier must retain storage-bearing
+        # control flow while avoiding invalid bounds in its unreachable arm.
+        assert len(branches) == 1
+        assert branches[0].else_body is not None
 
     def test_simple_load_add_store(self):
         """load-add-store sequence: Vec tiles get unique MemRefs, params get DDR."""
@@ -88,7 +121,7 @@ class TestBasic:
                 return result
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_matmul_pipeline(self):
         """load→move→matmul→store: Vec/Mat/Left/Right/Acc memory spaces each get their own MemRef."""
@@ -155,13 +188,13 @@ class TestBasic:
                 return result
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     @pytest.mark.parametrize(
         ("backend_type", "expected_acc_bytes"),
         [
             pytest.param(None, 16384, id="unconfigured-safe-fallback"),
-            pytest.param(BackendType.Ascend910B, 16384, id="ascend910b"),
+            pytest.param(BackendType.Ascend910, 16384, id="ascend910b"),
             pytest.param(BackendType.Ascend950, 8192, id="ascend950"),
         ],
     )
@@ -216,7 +249,7 @@ class TestBasic:
         another — see `GetSliceAccumulatorGeometry`.
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -249,7 +282,7 @@ class TestBasic:
             printed,
         )
         view = re.search(
-            r"lower: .*pl\.MemRef\((mem_acc_\d+), (?:8192|pl\.const\(8192, pl\.INT64\)), 8192\), "
+            r"lower: .*pl\.MemRef\((mem_acc_\d+), pl\.const\(8192, pl\.INDEX\), 8192\), "
             r"pl\.Mem\.Acc",
             printed,
         )
@@ -296,7 +329,7 @@ class TestMemRefSharing:
                 return result
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_view_op_shares_memref_with_input(self):
         """tile.reshape chain shares a single MemRef (only 1 alloc needed)."""
@@ -342,7 +375,7 @@ class TestMemRefSharing:
                 return result
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_view_over_tpop_result_is_memref_less(self):
         """A cross-core tpop result and any view chained off it stay MemRef-less.
@@ -412,7 +445,7 @@ class TestMemRefSharing:
             [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
         ):
             After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_matmul_acc_shares_memref_with_accumulator(self):
         """tile.matmul_acc output shares MemRef with its accumulator input (arg[0])."""
@@ -485,12 +518,105 @@ class TestMemRefSharing:
                 return result
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
 
 class TestSliceView:
     """tile.slice is a view op: output shares the input's base Ptr with an
     accumulated byte offset and a smaller view size."""
+
+    @pytest.mark.parametrize("run_simplify", [False, True])
+    def test_nested_constant_origin_folds_without_freezing_loop_metadata(self, run_simplify):
+        """Constant SSA origins fold while loop-carried and indexed origins stay dynamic."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def main(
+                self,
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pool = pl.tile.create([128, 16], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                row: pl.Scalar[pl.INDEX] = 16
+                for iteration in pl.range(2):
+                    base: pl.Scalar[pl.INDEX] = 32
+                    fixed_row = base * 2
+                    constant_view = pl.tile.slice(pool, [16, 16], [fixed_row, 0])
+                    carried_view = pl.tile.slice(pool, [16, 16], [row, 0])
+                    indexed_view = pl.tile.slice(pool, [16, 16], [iteration * 16, 0])
+                    _first = pl.tile.store(constant_view, [0, 0], output)
+                    _second = pl.tile.store(carried_view, [0, 0], output)
+                    _third = pl.tile.store(indexed_view, [0, 0], output)
+                    row = row + 16
+                return output
+
+        after = passes.convert_to_ssa()(Before)
+        if run_simplify:
+            after = passes.simplify()(after)
+        after = passes.init_mem_ref()(after)
+        found = {}
+
+        class Origins(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                for name in ("constant_view", "carried_view", "indexed_view"):
+                    if op.var.name_hint.startswith(name):
+                        assert isinstance(op.var.type, ir.TileType)
+                        assert op.var.type.memref is not None
+                        assert isinstance(op.value, ir.Call)
+                        origins = op.value.args[2]
+                        assert isinstance(origins, ir.MakeTuple)
+                        found[name] = (op.var.type.memref.byte_offset_, origins.elements[0])
+                super().visit_assign_stmt(op)
+
+        Origins().visit_stmt(next(iter(after.functions.values())).body)
+        assert set(found) == {"constant_view", "carried_view", "indexed_view"}
+        constant_offset, constant_origin = found["constant_view"]
+        assert isinstance(constant_offset, ir.ConstInt), str(constant_offset)
+        assert constant_offset.value == 64 * 16 * 4
+        assert isinstance(constant_origin, ir.ConstInt)
+        assert constant_origin.value == 64
+        for name in ("carried_view", "indexed_view"):
+            offset, origin = found[name]
+            assert not isinstance(offset, ir.ConstInt)
+            assert not isinstance(origin, ir.ConstInt)
+
+    @pytest.mark.parametrize(
+        ("column", "expected_offset", "expected_size"), [(128, 8192, 8192), (8, 32, 15872)]
+    )
+    def test_named_origins_use_the_same_acc_layout_as_literals(self, column, expected_offset, expected_size):
+        """Constant origins must reach both NZ layout selection and byte-offset computation."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def main(self, output: pl.Out[pl.Tensor[[16, 128], pl.FP32]]):
+                pool = pl.tile.create([16, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                for _iteration in pl.range(2):
+                    zero: pl.Scalar[pl.INDEX] = 0
+                    col: pl.Scalar[pl.INDEX] = column
+                    window = pl.tile.slice(pool, [16, 128], [zero, col])
+                    _stored = pl.tile.store(window, [0, 0], output)
+
+        after = passes.init_mem_ref()(passes.convert_to_ssa()(Before))
+        windows = []
+
+        class Windows(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                if op.var.name_hint.startswith("window"):
+                    windows.append(op)
+                super().visit_assign_stmt(op)
+
+        Windows().visit_stmt(next(iter(after.functions.values())).body)
+        assert len(windows) == 1
+        memref = windows[0].var.type.memref
+        assert isinstance(memref.byte_offset_, ir.ConstInt)
+        assert memref.byte_offset_.value == expected_offset
+        assert memref.size_ == expected_size
+        origins = windows[0].value.args[2].elements
+        assert all(isinstance(origin, ir.ConstInt) for origin in origins)
+        assert [origin.value for origin in origins] == [0, column]
 
     def test_slice_nonzero_byte_offset_and_alloc_dedup(self):
         """tile.slice views share the source's base Ptr; only one alloc per base.
@@ -546,12 +672,12 @@ class TestSliceView:
                 tile_a: pl.Tile[[8, 16], pl.FP32, pl.MemRef(mem_vec_3, 0, 512), pl.Mem.Vec] = pl.tile.load(
                     input_a, [0, 0], [8, 16], [8, 16], target_memory=pl.Mem.Vec
                 )
-                s0: pl.Tile[[1, 16], pl.FP32, pl.MemRef(mem_vec_3, 0, 64), pl.Mem.Vec] = pl.tile.slice(
-                    tile_a, [1, 16], [0, 0]
+                s0: pl.Tile[[1, 16], pl.FP32, pl.MemRef(mem_vec_3, pl.const(0, pl.INDEX), 64), pl.Mem.Vec] = (
+                    pl.tile.slice(tile_a, [1, 16], [0, 0])
                 )
-                s1: pl.Tile[[1, 16], pl.FP32, pl.MemRef(mem_vec_3, 64, 64), pl.Mem.Vec] = pl.tile.slice(
-                    tile_a, [1, 16], [1, 0]
-                )
+                s1: pl.Tile[
+                    [1, 16], pl.FP32, pl.MemRef(mem_vec_3, pl.const(64, pl.INDEX), 64), pl.Mem.Vec
+                ] = pl.tile.slice(tile_a, [1, 16], [1, 0])
                 r0: pl.Tensor[[1, 16], pl.FP32, pl.MemRef("mem_ddr_1", 0, 64)] = pl.tile.store(
                     s0, [0, 0], out0
                 )
@@ -561,9 +687,9 @@ class TestSliceView:
                 return r0
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
-    @pytest.mark.parametrize("dtype", [pl.FP4, pl.INT4, pl.UINT4, pl.HF4])
+    @pytest.mark.parametrize("dtype", [pl.INT4, pl.UINT4, pl.HF4])
     def test_four_bit_dtypes_share_packed_allocation_accounting(self, dtype):
         """All semantic 4-bit dtypes occupy one byte per two logical elements."""
 
@@ -579,47 +705,51 @@ class TestSliceView:
                 return pl.store(tile_a, [0, 0], output)
 
         printed = ir.python_print(passes.init_mem_ref()(Before))
-        zero = r"(?:0|pl\.const\(0, pl\.INT64\))"
+        zero = r"pl\.const\(0, pl\.INT64\)"
         assert re.search(rf'input_a: .*pl\.MemRef\("mem_ddr_0", {zero}, 64\)', printed), printed
         assert re.search(rf'output: .*pl\.MemRef\("mem_ddr_1", {zero}, 64\)', printed), printed
         assert re.search(rf"tile_a: .*pl\.MemRef\(mem_vec_\d+, {zero}, 64\)", printed), printed
         assert "pl.tile.alloc(pl.Mem.Vec, 64)" in printed
 
-    def test_fp4_slice_uses_packed_byte_offset_and_span(self):
+    @pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+    def test_fp4_slice_uses_carrier_byte_offset_and_span(self, dtype):
         @pl.program
         class Before:
             @pl.function
             def main(
                 self,
-                input_a: pl.Tensor[[8, 16], pl.FP4],
-                output: pl.Out[pl.Tensor[[1, 16], pl.FP4]],
-            ) -> pl.Tensor[[1, 16], pl.FP4]:
+                input_a: pl.Tensor[[8, 16], dtype],
+                output: pl.Out[pl.Tensor[[1, 16], dtype]],
+            ) -> pl.Tensor[[1, 16], dtype]:
                 tile_a = pl.load(input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec)
                 row = pl.tile.slice(tile_a, [1, 16], [1, 0])
                 return pl.store(row, [0, 0], output)
 
         printed = ir.python_print(passes.init_mem_ref()(Before))
-        assert "pl.tile.alloc(pl.Mem.Vec, 64)" in printed
+        assert "pl.tile.alloc(pl.Mem.Vec, 128)" in printed
         assert re.search(
-            r"row: .*pl\.MemRef\(mem_vec_\d+, (?:8|pl\.const\(8, pl\.INT64\)), 8\)",
+            r"row: .*pl\.MemRef\(mem_vec_\d+, pl\.const\(16, pl\.INDEX\), 16\)",
             printed,
         ), printed
 
-    def test_fp4_slice_rejects_second_nibble_origin(self):
+    @pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+    def test_fp4_slice_accepts_odd_carrier_origin(self, dtype):
         @pl.program
         class Before:
             @pl.function
             def main(
                 self,
-                input_a: pl.Tensor[[8, 16], pl.FP4],
-                output: pl.Out[pl.Tensor[[1, 14], pl.FP4]],
-            ) -> pl.Tensor[[1, 14], pl.FP4]:
+                input_a: pl.Tensor[[8, 16], dtype],
+                output: pl.Out[pl.Tensor[[1, 14], dtype]],
+            ) -> pl.Tensor[[1, 14], dtype]:
                 tile_a = pl.load(input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec)
                 tail = pl.tile.slice(tile_a, [1, 14], [0, 1])
                 return pl.store(tail, [0, 0], output)
 
-        with pytest.raises(ValueError, match="Packed 4-bit slice origins must be byte-aligned"):
-            passes.init_mem_ref()(Before)
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert re.search(r"tail: .*pl\.MemRef\(mem_vec_\d+, pl\.const\(1, pl\.INDEX\), 14\)", printed), (
+            printed
+        )
 
     @staticmethod
     def _acc_column_window_program(col_offset: int, window_cols: int = 128):
@@ -670,7 +800,7 @@ class TestSliceView:
         without going through ``pto.subview``).
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         printed = ir.python_print(passes.init_mem_ref()(self._acc_column_window_program(128)))
         assert "pl.tile.alloc(pl.Mem.Acc, 16384)" in printed
@@ -679,7 +809,7 @@ class TestSliceView:
             printed,
         )
         view = re.search(
-            r"win: .*pl\.MemRef\((mem_acc_\d+), (?:8192|pl\.const\(8192, pl\.INT64\)), 8192\), "
+            r"win: .*pl\.MemRef\((mem_acc_\d+), pl\.const\(8192, pl\.INDEX\), 8192\), "
             r"pl\.Mem\.Acc",
             printed,
         )
@@ -695,11 +825,11 @@ class TestSliceView:
         column windows read as disjoint by lifetime/overlap analysis.
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         printed = ir.python_print(passes.init_mem_ref()(self._acc_column_window_program(0)))
         assert re.search(
-            r"win: .*pl\.MemRef\(mem_acc_\d+, (?:0|pl\.const\(0, pl\.INT64\)), 8192\), pl\.Mem\.Acc",
+            r"win: .*pl\.MemRef\(mem_acc_\d+, pl\.const\(0, pl\.INDEX\), 8192\), pl\.Mem\.Acc",
             printed,
         ), printed
 
@@ -713,7 +843,7 @@ class TestSliceView:
         (MemoryReuse rejects two such windows carried through one loop).
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -748,7 +878,7 @@ class TestSliceView:
         ranges = {}
         for name in ("w0", "w1"):
             match = re.search(
-                rf"{name}: .*pl\.MemRef\(mem_acc_\d+, (?:pl\.const\()?(\d+)(?:, pl\.INT64\))?, (\d+)\), "
+                rf"{name}: .*pl\.MemRef\(mem_acc_\d+, (?:pl\.const\()?(\d+)(?:, pl\.INDEX\))?, (\d+)\), "
                 r"pl\.Mem\.Acc",
                 printed,
             )
@@ -773,11 +903,11 @@ class TestSliceView:
         (0 * 256 + 8) * 4 = 32, envelope (15 * 256 + 15 + 1) * 4 = 15424.
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         printed = ir.python_print(passes.init_mem_ref()(self._acc_column_window_program(8, window_cols=16)))
         assert re.search(
-            r"win: .*pl\.MemRef\(mem_acc_\d+, (?:32|pl\.const\(32, pl\.INT64\)), 15424\), pl\.Mem\.Acc",
+            r"win: .*pl\.MemRef\(mem_acc_\d+, pl\.const\(32, pl\.INDEX\), 15424\), pl\.Mem\.Acc",
             printed,
         ), printed
 
@@ -793,7 +923,7 @@ class TestSliceView:
         ``t * 64 * 256 * 4`` — a different address for every non-zero ``t``.
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -825,7 +955,7 @@ class TestSliceView:
 
         printed = ir.python_print(passes.init_mem_ref()(Before))
         assert re.search(
-            r"win: .*pl\.MemRef\(mem_acc_\d+, t \* 64 \* 16 \* 4, 4096\), pl\.Mem\.Acc",
+            r"win: .*pl\.MemRef\(mem_acc_\d+, t \* pl\.const\(64, pl\.INDEX\) \* pl\.const\(16, pl\.INDEX\) \* pl\.const\(4, pl\.INDEX\), 4096\), pl\.Mem\.Acc",
             printed,
         ), printed
         assert "* 64 * 256 * 4" not in printed, printed
@@ -839,7 +969,7 @@ class TestSliceView:
         row-major 15872 bytes.
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -860,7 +990,7 @@ class TestSliceView:
         printed = ir.python_print(passes.init_mem_ref()(Before))
         assert "pl.tile.alloc(pl.Mem.Vec, 16384)" in printed
         assert re.search(
-            r"win: .*pl\.MemRef\(mem_vec_\d+, (?:512|pl\.const\(512, pl\.INT64\)), 15872\), "
+            r"win: .*pl\.MemRef\(mem_vec_\d+, pl\.const\(512, pl\.INDEX\), 15872\), "
             r"pl\.Mem\.Vec",
             printed,
         ), printed
@@ -870,11 +1000,10 @@ class TestYieldMemRef:
     """MemRef propagation through yield in ForStmt and IfStmt."""
 
     def test_for_loop_carry_memref_relationships(self):
-        """ForStmt: initValue/iter_arg share MemRef, yield/return_var share MemRef.
+        """ForStmt: initValue, iter_arg and return_var share the carry MemRef.
 
-        Group A (initValue↔iter_arg) uses ``mem_vec_2``; Group B (yield↔return_var)
-        uses ``mem_vec_4``. The two groups have different MemRefs — the yield-to-
-        iter_arg mismatch is resolved later by MemoryReuse.
+        The carry uses ``mem_vec_2`` and the yielded producer uses ``mem_vec_4``.
+        Downstream alias materialization resolves the yield-to-carry mismatch.
         """
 
         @pl.program
@@ -918,7 +1047,7 @@ class TestYieldMemRef:
                     acc_next: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = (
                         pl.tile.add(acc, other_tile)
                     )
-                    acc_out: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = (
+                    acc_out: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
                         pl.yield_(acc_next)
                     )
                 result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
@@ -927,7 +1056,7 @@ class TestYieldMemRef:
                 return result
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_for_multi_iter_arg_each_carry_independent_memref(self):
         """ForStmt with two iter_args: each carry group resolves independently.
@@ -998,7 +1127,7 @@ class TestYieldMemRef:
                 return result
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_if_yield_return_var_shares_memref(self):
         """IfStmt: return_var shares MemRef with the then-branch yield value."""
@@ -1072,7 +1201,7 @@ class TestYieldMemRef:
                 return result
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_tile_alias_shares_source_memref(self):
         """Tile alias (``a = b``) shares MemRef with source tile, not a fresh one."""
@@ -1133,11 +1262,117 @@ class TestYieldMemRef:
                 return result
 
         After = passes.init_mem_ref()(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
 
 class TestDynamicValidShape:
     """Regression tests for dynamic valid_shape Var handling in phi-node return vars."""
+
+    @pytest.mark.parametrize("run_simplify", [False, True])
+    def test_nested_valid_shape_propagates_through_transpose_view(self, run_simplify):
+        """Load/view metadata folds constants while retaining runtime extents and storage aliases."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[16, 32], pl.FP32],
+                runtime_rows: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[32, 16], pl.FP32]],
+            ) -> pl.Tensor[[32, 16], pl.FP32]:
+                for _iteration in pl.range(2):
+                    base: pl.Scalar[pl.INDEX] = 4
+                    valid_rows = base * 2
+                    constant_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[valid_rows, 32], target_memory=pl.Mem.Vec
+                    )
+                    constant_view = pl.tile.transpose_view(constant_tile)
+                    _constant_store = pl.tile.store(constant_view, [0, 0], output)
+                    runtime_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[runtime_rows, 32], target_memory=pl.Mem.Vec
+                    )
+                    runtime_view = pl.tile.transpose_view(runtime_tile)
+                    _runtime_store = pl.tile.store(runtime_view, [0, 0], output)
+                return output
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[16, 32], pl.FP32],
+                runtime_rows: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[32, 16], pl.FP32]],
+            ) -> pl.Tensor[[32, 16], pl.FP32]:
+                for _iteration in pl.range(2):
+                    constant_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[8, 32], target_memory=pl.Mem.Vec
+                    )
+                    constant_view = pl.tile.transpose_view(constant_tile)
+                    _constant_store = pl.tile.store(constant_view, [0, 0], output)
+                    runtime_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[runtime_rows, 32], target_memory=pl.Mem.Vec
+                    )
+                    runtime_view = pl.tile.transpose_view(runtime_tile)
+                    _runtime_store = pl.tile.store(runtime_view, [0, 0], output)
+                return output
+
+        after = passes.convert_to_ssa()(Before)
+        expected = passes.convert_to_ssa()(Expected)
+        if run_simplify:
+            after = passes.simplify()(after)
+            expected = passes.simplify()(expected)
+        after = passes.init_mem_ref()(after)
+        expected = passes.init_mem_ref()(expected)
+        ir.assert_structural_equal(without_call_memrefs(after), without_call_memrefs(expected))
+
+        function = next(iter(after.functions.values()))
+        runtime_rows = function.params[1]
+        found: dict[str, ir.AssignStmt] = {}
+        names = (
+            "constant_tile",
+            "constant_view",
+            "_constant_store",
+            "runtime_tile",
+            "runtime_view",
+            "_runtime_store",
+        )
+
+        class Assignments(ir.IRVisitor):
+            def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
+                for name in names:
+                    if op.var.name_hint.startswith(name):
+                        found[name] = op
+                super().visit_assign_stmt(op)
+
+        Assignments().visit_stmt(function.body)
+        assert set(found) == set(names)
+        for prefix, valid_rows in (("constant", 8), ("runtime", runtime_rows)):
+            loaded = found[f"{prefix}_tile"]
+            viewed = found[f"{prefix}_view"]
+            stored = found[f"_{prefix}_store"]
+            for assignment, shape, valid in (
+                (loaded, [16, 32], [valid_rows, 32]),
+                (viewed, [32, 16], [32, valid_rows]),
+            ):
+                assert isinstance(assignment.value, ir.Call)
+                for tile_type in (assignment.var.type, assignment.value.type):
+                    assert isinstance(tile_type, ir.TileType)
+                    assert all(isinstance(dim, ir.ConstInt) for dim in tile_type.shape)
+                    assert [cast(ir.ConstInt, dim).value for dim in tile_type.shape] == shape
+                    assert tile_type.tile_view is not None
+                    for extent, expected_extent in zip(tile_type.tile_view.valid_shape, valid, strict=True):
+                        if isinstance(expected_extent, int):
+                            assert isinstance(extent, ir.ConstInt) and extent.value == expected_extent
+                        else:
+                            assert extent.same_as(expected_extent), "runtime valid_shape lost its definition"
+            assert isinstance(loaded.var.type, ir.TileType)
+            assert isinstance(viewed.var.type, ir.TileType)
+            assert loaded.var.type.memref is not None
+            assert viewed.var.type.memref is loaded.var.type.memref
+            assert isinstance(viewed.value, ir.Call) and viewed.value.args[0].same_as(loaded.var)
+            assert isinstance(stored.value, ir.Call) and stored.value.args[0].same_as(viewed.var)
 
     def test_if_phi_preserves_dynamic_valid_shape_vars(self):
         """IfStmt phi return vars must not clone Vars in TileView.valid_shape (issue #870).
@@ -1273,7 +1508,7 @@ class TestPtoLevel3Scratch:
         [(pl.INT32, 192), (pl.UINT32, 192), (pl.INT16, 448), (pl.UINT16, 448)],
     )
     def test_a2a3_ci_scratch_is_allocated_by_width(self, dtype, expected_cols):
-        after = self._run(self._ci_program(dtype), BackendType.Ascend910B)
+        after = self._run(self._ci_program(dtype), BackendType.Ascend910)
         ci = self._calls(after, ir.get_op("tile.ci").name)
         assert len(ci) == 1 and len(ci[0].args) == 3
         tmp = cast(ir.TileType, ci[0].args[2].type)
@@ -1283,7 +1518,7 @@ class TestPtoLevel3Scratch:
 
     def test_a5_and_ptoas_planner_keep_ci_implicit(self):
         a5 = self._run(self._ci_program(), BackendType.Ascend950)
-        ptoas = self._run(self._ci_program(), BackendType.Ascend910B, planner=passes.MemoryPlanner.PTOAS)
+        ptoas = self._run(self._ci_program(), BackendType.Ascend910, planner=passes.MemoryPlanner.PTOAS)
         assert len(self._calls(a5, ir.get_op("tile.ci").name)[0].args) == 2
         assert len(self._calls(ptoas, ir.get_op("tile.ci").name)[0].args) == 2
 
@@ -1298,7 +1533,7 @@ class TestPtoLevel3Scratch:
                 seq: pl.Tile[[1, 64], pl.INT32, pl.Mem.Vec] = pl.tile.ci(0, [1, 64], dtype=pl.INT32, tmp=tmp)
                 return seq
 
-        after = self._run(Before, BackendType.Ascend910B)
+        after = self._run(Before, BackendType.Ascend910)
         ci = self._calls(after, ir.get_op("tile.ci").name)[0]
         creates = self._calls(after, ir.get_op("tile.create").name)
         assert len(ci.args) == 3
@@ -1335,7 +1570,7 @@ class TestPtoLevel3Scratch:
         [(pl.FP32, pl.INT16, 1024), (pl.FP16, pl.INT16, 64), (pl.FP16, pl.INT8, 160)],
     )
     def test_a2a3_narrowing_cast_scratch(self, src_dtype, dst_dtype, expected_bytes):
-        after = self._run(self._cast_program(src_dtype, dst_dtype), BackendType.Ascend910B)
+        after = self._run(self._cast_program(src_dtype, dst_dtype), BackendType.Ascend910)
         cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
         assert len(cast_call.args) == 2
         tmp = cast(ir.TileType, cast_call.args[1].type)
@@ -1343,13 +1578,28 @@ class TestPtoLevel3Scratch:
         assert tmp.dtype == ir.DataType.INT8
         assert tmp.memref is not None
 
+    @pytest.mark.parametrize(
+        "src_dtype,dst_dtype",
+        [(pl.FP32, pl.INT16), (pl.FP16, pl.INT16), (pl.FP16, pl.INT8), (pl.FP16, pl.UINT8)],
+    )
+    def test_a2a3_ptoas_cast_leaves_scratch_to_plan_memory(self, src_dtype, dst_dtype):
+        """The static-view fix must keep level-2 scratch ownership in PTOAS."""
+        after = self._run(
+            self._cast_program(src_dtype, dst_dtype),
+            BackendType.Ascend910B,
+            planner=passes.MemoryPlanner.PTOAS,
+        )
+        cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
+        assert len(cast_call.args) == 1
+        assert not self._calls(after, ir.get_op("tile.create").name)
+
     def test_non_narrowing_cast_has_no_scratch(self):
         """FP32->FP16 narrows, but natively — no helper, so opting out changes nothing.
 
-        Only the pairs `TcvtNeedsLevel3Scratch` lists get the emulated lowering;
+        Only pairs selected by the registered cast scratch rule get the emulated lowering;
         this one is a single native tcvt whichever saturation it carries.
         """
-        after = self._run(self._cast_program(pl.FP32, pl.FP16), BackendType.Ascend910B)
+        after = self._run(self._cast_program(pl.FP32, pl.FP16), BackendType.Ascend910)
         assert len(self._calls(after, ir.get_op("tile.cast").name)[0].args) == 1
 
     def test_a5_narrowing_cast_keeps_implicit_tmp_abi(self):
@@ -1358,7 +1608,7 @@ class TestPtoLevel3Scratch:
 
     def test_fp16_to_int4_has_no_level3_scratch(self):
         """FP16->INT4 uses native vconv without PTOAS level-3 tcvt tmp."""
-        after = self._run(self._cast_program(pl.FP16, pl.INT4), BackendType.Ascend910B)
+        after = self._run(self._cast_program(pl.FP16, pl.INT4), BackendType.Ascend910)
         assert len(self._calls(after, ir.get_op("tile.cast").name)[0].args) == 1
 
     @staticmethod
@@ -1415,14 +1665,14 @@ class TestPtoLevel3Scratch:
         touches. ``None`` and an explicit "on" are the same cast, so both check.
         """
         after = self._run(
-            self._saturating_cast_program(pl.FP16, pl.INT8, saturation_mode), BackendType.Ascend910B
+            self._saturating_cast_program(pl.FP16, pl.INT8, saturation_mode), BackendType.Ascend910
         )
         assert len(self._calls(after, ir.get_op("tile.cast").name)[0].args) == 1
         assert not self._calls(after, ir.get_op("tile.create").name)
 
     def test_a2a3_non_saturating_narrowing_cast_still_gets_scratch(self):
         """Opting out keeps the compiler-owned scratch the non-saturating helper needs."""
-        after = self._run(self._saturating_cast_program(pl.FP16, pl.INT8, "off"), BackendType.Ascend910B)
+        after = self._run(self._saturating_cast_program(pl.FP16, pl.INT8, "off"), BackendType.Ascend910)
         cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
         assert len(cast_call.args) == 2
         tmp = cast(ir.TileType, cast_call.args[1].type)
@@ -1433,7 +1683,7 @@ class TestPtoLevel3Scratch:
         """Only the compiler-generated scratch is dropped; an explicit tmp is the author's."""
         after = self._run(
             self._saturating_cast_program_with_tmp(pl.FP16, pl.INT8, "on"),
-            BackendType.Ascend910B,
+            BackendType.Ascend910,
         )
         cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
         assert len(cast_call.args) == 2
@@ -1466,7 +1716,7 @@ class TestPtoLevel3Scratch:
         ],
     )
     def test_a2a3_narrowing_cast_scratch_branches(self, rows, cols, expected_bytes):
-        after = self._run(self._narrowing_cast_program(rows, cols, pl.FP32, pl.INT16), BackendType.Ascend910B)
+        after = self._run(self._narrowing_cast_program(rows, cols, pl.FP32, pl.INT16), BackendType.Ascend910)
         cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
         assert len(cast_call.args) == 2
         tmp = cast(ir.TileType, cast_call.args[1].type)
@@ -1477,12 +1727,8 @@ class TestPtoLevel3Scratch:
         # FP32->INT16, cols=80 (tail-only): 32*((min(rows,255)-1)*(80/8)+ceil(16/8))
         # => 32*(254*10+2) = 81344 under PTOAS v0.60 makeTCvtTmpType.
         expected_bytes = 81344
-        after_255 = self._run(
-            self._narrowing_cast_program(255, 80, pl.FP32, pl.INT16), BackendType.Ascend910B
-        )
-        after_400 = self._run(
-            self._narrowing_cast_program(400, 80, pl.FP32, pl.INT16), BackendType.Ascend910B
-        )
+        after_255 = self._run(self._narrowing_cast_program(255, 80, pl.FP32, pl.INT16), BackendType.Ascend910)
+        after_400 = self._run(self._narrowing_cast_program(400, 80, pl.FP32, pl.INT16), BackendType.Ascend910)
 
         def scratch_bytes(prog):
             cast_call = self._calls(prog, ir.get_op("tile.cast").name)[0]
@@ -1514,7 +1760,7 @@ class TestPtoLevel3Scratch:
             ib.return_stmt(result)
         return ir.Program([f.get_result()], "sort_program", span)
 
-    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
     def test_sort32_dynamic_valid_col_gets_physical_shape_scratch(self, backend_type):
         after = self._run(self._sort_program(dynamic_valid_col=True), backend_type)
         sort32 = self._calls(after, ir.get_op("tile.sort32").name)[0]
@@ -1524,7 +1770,7 @@ class TestPtoLevel3Scratch:
         assert tmp.dtype == ir.DataType.FP32
         assert tmp.memref is not None
 
-    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
     def test_sort32_static_aligned_valid_col_needs_no_scratch(self, backend_type):
         after = self._run(self._sort_program(dynamic_valid_col=False), backend_type)
         assert len(self._calls(after, ir.get_op("tile.sort32").name)[0].args) == 2

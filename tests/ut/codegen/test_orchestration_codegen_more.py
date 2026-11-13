@@ -9,7 +9,10 @@
 
 """Unit tests for orchestration code generation (core cases, part 2)."""
 
+import os
 import re
+import shutil
+import subprocess
 
 import pypto.language as pl
 import pytest
@@ -27,44 +30,165 @@ from pypto.language.parser.diagnostics import InvalidOperationError
 from pypto.pypto_core import DataType, ir
 
 
+def _run_through_frontend_normalization(program):
+    """Run the frontend normalization prefix without changing carrier units."""
+    with passes.PassContext([]):
+        program = passes.inline_functions()(program)
+        program = passes.unroll_loops()(program)
+        program = passes.ctrl_flow_transform()(program)
+        program = passes.convert_to_ssa()(program)
+        program = passes.simplify()(program)
+        program = passes.normalize_stmt_structure()(program)
+        program = passes.flatten_call_expr()(program)
+        return program
+
+
 class TestOrchestrationMore:
     """Orchestration codegen — additional core cases (continued)."""
 
-    def test_fp4_runtime_shapes_use_x2_carrier_only_at_abi_boundary(self):
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
+    def test_runtime_scalar_or_in_orchestration_if(self, backend_type):
+        """Issue #2984: a runtime OR must generate both orchestration task paths."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend950)
-        logical_k = pl.dynamic("FP4_LOGICAL_K")
+        backend.set_backend_type(backend_type)
 
         @pl.program
-        class Fp4CarrierProgram:
-            @pl.function(type=pl.FunctionType.InCore)
+        class RuntimeOrProgram:
+            @pl.function(type=pl.FunctionType.AIV)
             def copy(
                 self,
-                src: pl.Tensor[[8, logical_k], pl.FP4],
-                out: pl.Out[pl.Tensor[[8, logical_k], pl.FP4]],
-            ) -> pl.Tensor[[8, logical_k], pl.FP4]:
-                tile = pl.load(src, [0, 0], [8, logical_k])
-                return pl.store(tile, [0, 0], out)
+                output: pl.InOut[pl.Tensor[[1, 16], pl.BF16]],
+            ) -> pl.Tensor[[1, 16], pl.BF16]:
+                value = pl.load(output, [0, 0], [1, 16])
+                return pl.store(value, [0, 0], output)
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(
                 self,
-                src: pl.Tensor[[8, logical_k], pl.FP4],
-            ) -> pl.Tensor[[8, logical_k], pl.FP4]:
-                width = pl.tensor.dim(src, 1)
-                out = pl.create_tensor([8, width], dtype=pl.FP4)
-                return self.copy(src, out)
+                output: pl.InOut[pl.Tensor[[1, 16], pl.BF16]],
+                active: pl.Scalar[pl.INT32],
+                cache_rows: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[1, 16], pl.BF16]:
+                if active < 32 or cache_rows > active * 128:
+                    output = self.copy(output)
+                else:
+                    output = self.copy(output)
+                return output
 
-        code = _generate_orch_code(Fp4CarrierProgram)
-        assert "const int64_t fp4_carrier_dim = (int64_t)orch_args.tensor(0).ref().shapes[1];" in code
-        assert "always_assert(fp4_carrier_dim > 0);" in code
-        assert "const int64_t fp4_logical_dim = static_cast<int64_t>" in code
-        assert "always_assert(fp4_logical_dim > 0 && (fp4_logical_dim & 1u) == 0u);" in code
-        assert "static_cast<uint32_t>(fp4_logical_dim / 2)" in code
-        assert "DataType::FP4E2M1" in code
+        code = _generate_orch_code(RuntimeOrProgram)
+        assert "orch_args.scalar<int32_t>(0)" in code
+        assert "orch_args.scalar<int32_t>(1)" in code
+        assert "if (" in code
+        assert code.count("rt_submit_aiv_task(") == 2
 
-    def test_fp4_slice_uses_x2_carrier_shape_and_offset(self):
-        """FP4 slice metadata passed to runtime Tensor::view is in carrier units."""
+    @pytest.mark.parametrize("operator", ["and", "or", "xor", "not", "nested"])
+    def test_logical_scalar_cpp_semantics(self, operator, tmp_path):
+        """Generated expressions have bool type, correct truth values, and eager operands."""
+        candidates = (os.environ.get("CXX"), "c++", "g++", "clang++")
+        compiler = next(
+            (found for name in candidates if name and (found := shutil.which(name))),
+            None,
+        )
+        if compiler is None:
+            pytest.skip("no C++ compiler available")
+
+        span = ir.Span.unknown()
+        ib = IRBuilder()
+        with ib.function("logical_scalar", type=ir.FunctionType.Orchestration) as function:
+            lhs = function.param("lhs", ir.ScalarType(DataType.INT32))
+            rhs = function.param("rhs", ir.ScalarType(DataType.INT32))
+            zero = ir.ConstInt(0, DataType.INT32, span)
+            left = ir.ne(lhs, zero)
+            right = ir.ne(rhs, zero)
+            expressions = {
+                "and": ir.and_(left, right),
+                "or": ir.or_(left, right),
+                "xor": ir.Xor(left, right, DataType.BOOL, span),
+                "not": ir.not_(left),
+                "nested": ir.or_(ir.and_(left, right), ir.not_(left)),
+            }
+            predicate = ib.let("predicate", expressions[operator])
+            function.return_type(ir.ScalarType(DataType.BOOL))
+            ib.return_stmt(predicate)
+        program = ir.Program([function.get_result()], "logical_scalar", span)
+        # Hand-built Xor IR is not round-trippable through the Python printer.
+        with passes.PassContext([]):
+            code = _generate_orch_code(program)
+        assignment = re.search(r"\bbool predicate = (.+);", code)
+        assert assignment is not None, code
+        expression = assignment[1]
+
+        expected = {
+            "and": "(lhs_value != 0) && (rhs_value != 0)",
+            "or": "(lhs_value != 0) || (rhs_value != 0)",
+            "xor": "(lhs_value != 0) != (rhs_value != 0)",
+            "not": "lhs_value == 0",
+            "nested": "((lhs_value != 0) && (rhs_value != 0)) || (lhs_value == 0)",
+        }[operator]
+        source = f"""
+#include <cassert>
+#include <cstdint>
+#include <type_traits>
+
+struct CountingScalar {{
+    int32_t value;
+    int* reads;
+    operator int32_t() const {{ ++*reads; return value; }}
+}};
+
+int main() {{
+    const int32_t values[] = {{-2, 0, 3}};
+    for (int32_t lhs_value : values) {{
+        for (int32_t rhs_value : values) {{
+            int lhs_reads = 0;
+            int rhs_reads = 0;
+            const CountingScalar lhs{{lhs_value, &lhs_reads}};
+            const CountingScalar rhs{{rhs_value, &rhs_reads}};
+            static_assert(std::is_same_v<decltype({expression}), bool>);
+            const bool actual = {expression};
+            assert(actual == ({expected}));
+            assert(lhs_reads == {2 if operator == "nested" else 1});
+            assert(rhs_reads == {0 if operator == "not" else 1});
+        }}
+    }}
+}}
+"""
+        executable = tmp_path / "logical_scalar"
+        compiled = subprocess.run(
+            [compiler, "-std=c++17", "-x", "c++", "-", "-o", str(executable)],
+            input=source,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert compiled.returncode == 0, compiled.stderr
+        executed = subprocess.run([str(executable)], capture_output=True, text=True, timeout=30, check=False)
+        assert executed.returncode == 0, executed.stderr
+
+    @pytest.mark.parametrize(("dtype", "runtime_dtype"), [(pl.fp4e2m1x2, "FP4E2M1"), (pl.fp4e1m2x2, "UINT8")])
+    def test_fp4_runtime_shapes_preserve_carrier_units(self, dtype, runtime_dtype):
+        """Orchestration allocation preserves the declared byte-carrier extents."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Fp4CarrierProgram:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                src: pl.Tensor[[8, 32], dtype],
+            ) -> pl.Tensor[[8, 32], dtype]:
+                out = pl.create_tensor([8, 32], dtype=dtype)
+                return out
+
+        code = _generate_orch_code(_run_through_frontend_normalization(Fp4CarrierProgram))
+        assert "uint32_t out_ci_shapes[2] = {8, 32};" in code
+        assert f"DataType::{runtime_dtype}" in code
+
+    @pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+    def test_fp4_slice_and_view_use_carrier_units(self, dtype):
+        """Odd carrier widths/offsets are legal bytes and must never be halved."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend950)
 
@@ -73,57 +197,33 @@ class TestOrchestrationMore:
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(
                 self,
-                data: pl.Tensor[[8, 16], pl.FP4],
-            ) -> pl.Tensor[[1, 8], pl.FP4]:
-                chunk: pl.Tensor[[1, 8], pl.FP4] = pl.slice(data, [1, 8], [0, 8])
+                data: pl.Tensor[[8, 16], dtype],
+            ) -> pl.Tensor[[1, 7], dtype]:
+                chunk: pl.Tensor[[1, 7], dtype] = pl.slice(data, [1, 7], [0, 3])
                 return chunk
 
-        code = _generate_orch_code(Fp4SliceProgram)
-        assert "uint32_t chunk_offsets[2] = {0, 4};" in code
-        assert "std::min<uint32_t>(4, ext_data.shapes[1] - chunk_offsets[1])" in code
+        code = _generate_orch_code(_run_through_frontend_normalization(Fp4SliceProgram))
+        assert "uint32_t chunk_offsets[2] = {0, 3};" in code
+        assert "std::min<uint32_t>(7, ext_data.shapes[1] - chunk_offsets[1])" in code
         assert "Tensor chunk = ext_data.view(chunk_shapes, chunk_offsets);" in code
 
-    def test_fp4_slice_dynamic_offset_checks_alignment_before_conversion(self):
-        """Dynamic packed-axis offsets are checked before conversion to carrier units."""
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend950)
-
         @pl.program
-        class Fp4DynamicSliceProgram:
+        class Fp4ViewProgram:
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(
                 self,
-                data: pl.Tensor[[8, 16], pl.FP4],
-                logical_offset: pl.Scalar[pl.INDEX],
-            ) -> pl.Tensor[[1, 8], pl.FP4]:
-                chunk: pl.Tensor[[1, 8], pl.FP4] = pl.slice(data, [1, 8], [0, logical_offset])
-                return chunk
+                data: pl.Tensor[[8, 8], dtype],
+            ) -> pl.Tensor[[2, 32], dtype]:
+                viewed: pl.Tensor[[2, 32], dtype] = pl.tensor.view(data, [2, 32])
+                return viewed
 
-        code = _generate_orch_code(Fp4DynamicSliceProgram)
-        assert "uint32_t chunk_logical_fp4_offset = static_cast<uint32_t>(logical_offset);" in code
-        assert "always_assert((chunk_logical_fp4_offset & 1u) == 0u);" in code
-        assert "uint32_t chunk_offsets[2] = {0, (chunk_logical_fp4_offset / 2)};" in code
+        view_code = _generate_orch_code(_run_through_frontend_normalization(Fp4ViewProgram))
+        assert "uint32_t viewed_shapes[2] = {2, 32};" in view_code
+        assert "Tensor viewed = ext_data.reshape(viewed_shapes, 2);" in view_code
 
-    def test_fp4_slice_rejects_odd_packed_axis_offset(self):
-        """A constant odd offset starts on the unrepresentable second nibble."""
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend950)
-
-        @pl.program
-        class Fp4OddSliceProgram:
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(
-                self,
-                data: pl.Tensor[[8, 16], pl.FP4],
-            ) -> pl.Tensor[[1, 8], pl.FP4]:
-                chunk: pl.Tensor[[1, 8], pl.FP4] = pl.slice(data, [1, 8], [0, 7])
-                return chunk
-
-        with pytest.raises(ValueError, match="packed FP4 last-axis offset must be byte-aligned"):
-            _generate_orch_code(Fp4OddSliceProgram)
-
-    def test_fp4_reshape_and_transpose_are_rejected(self):
-        """FP4-family reshape/transpose are unsupported without PackFp4."""
+    @pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+    def test_fp4_reshape_and_transpose_are_rejected(self, dtype):
+        """Direct packed-FP4 reshape/transpose retain their native support guards."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend950)
 
@@ -134,9 +234,9 @@ class TestOrchestrationMore:
                 @pl.function(type=pl.FunctionType.Orchestration)
                 def main(
                     self,
-                    data: pl.Tensor[[8, 16], pl.FP4],
-                ) -> pl.Tensor[[4, 32], pl.FP4]:
-                    return pl.reshape(data, [4, 32])
+                    data: pl.Tensor[[8, 8], dtype],
+                ) -> pl.Tensor[[4, 16], dtype]:
+                    return pl.reshape(data, [4, 16])
 
         with pytest.raises(InvalidOperationError, match="tensor.transpose is not supported for FP4"):
 
@@ -145,30 +245,28 @@ class TestOrchestrationMore:
                 @pl.function(type=pl.FunctionType.Orchestration)
                 def main(
                     self,
-                    data: pl.Tensor[[2, 4, 16], pl.FP4],
-                ) -> pl.Tensor[[4, 2, 16], pl.FP4]:
+                    data: pl.Tensor[[2, 4, 8], dtype],
+                ) -> pl.Tensor[[4, 2, 8], dtype]:
                     return pl.transpose(data, axis1=0, axis2=1)
 
-    @pytest.mark.parametrize("dtype", [DataType.FP4, DataType.FP4E2M1X2])
-    def test_fp4_view_rejects_layout_flip_across_packed_axis(self, dtype):
-        """ND/DN layout flips are rejected for FP4 family (IR or orch codegen)."""
+    @pytest.mark.parametrize("dtype", [DataType.FP4E2M1X2, DataType.FP4E1M2X2])
+    def test_fp4_view_layout_flip_is_rejected_in_orchestration(self, dtype):
+        """A carrier layout flip requires the in-core PTO descriptor contract."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend950)
 
         ib = IRBuilder()
         with ib.function("orch_fp4_view", type=ir.FunctionType.Orchestration) as f:
             data = f.param("data", ir.TensorType([8, 16], dtype))
-            if dtype == DataType.FP4E2M1X2:
-                with pytest.raises(ValueError, match=r"FP4E2M1X2 supports ND layout only"):
-                    ib.let("data_dn", tensor_ops.view(data, layout=ir.TensorLayout.DN))
-                return
             data_dn = ib.let("data_dn", tensor_ops.view(data, layout=ir.TensorLayout.DN))
             f.return_type(data_dn.type)
             ib.return_stmt(data_dn)
         program = ir.Program([f.get_result()], "test_fp4_view_layout_flip", ir.Span.unknown())
 
-        with pytest.raises(ValueError, match="cannot move the packed FP4 last axis"):
-            _generate_orch_code(program)
+        normalized = _run_through_frontend_normalization(program)
+        ir.assert_structural_equal(normalized, program)
+        with pytest.raises(ValueError, match="tensor.view cannot move the packed FP4 last axis"):
+            _generate_orch_code(normalized)
 
     def test_dynamic_gm_pipe_buffer_alloc_follows_its_size_local(self):
         """A dynamically-sized injected GM pipe buffer must not be hoisted above
@@ -184,7 +282,7 @@ class TestOrchestrationMore:
         (which produced ``'m' was not declared in this scope``).
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         K = 64
         SPMD_N = 16
@@ -247,7 +345,7 @@ class TestOrchestrationMore:
         declaration (``'m_clamped' was not declared in this scope``).
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         K = 64
         SPMD_N = 16
@@ -304,7 +402,7 @@ class TestOrchestrationMore:
         allocation sized from a clamped scalar breaks the same way.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         N = 16
         CAP = 128
@@ -355,7 +453,7 @@ class TestOrchestrationMore:
         kernel calls inside loop body.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class ForViewProgram:
@@ -420,7 +518,7 @@ class TestOrchestrationMore:
     def test_tensor_slice_with_valid_shape(self):
         """tensor.slice(valid_shape=...) should still emit a runtime tensor view."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class ValidShapeSliceProgram:
@@ -449,7 +547,7 @@ class TestOrchestrationMore:
     def test_tensor_slice_with_drop_dims(self):
         """A scalar-indexed tensor slice emits a view followed by rank reduction."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class DropDimSliceProgram:
@@ -476,7 +574,7 @@ class TestOrchestrationMore:
     def test_tensor_slice_drop_dims_preserves_dynamic_empty_view(self):
         """An out-of-bounds scalar index remains empty after its axis is removed."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class DynamicDropDimSliceProgram:
@@ -505,7 +603,7 @@ class TestOrchestrationMore:
     def test_tensor_reshape_external_input(self):
         """tensor.reshape on an external orchestration input emits Tensor::reshape on ext_<name>."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class ReshapeExternalProgram:
@@ -527,7 +625,7 @@ class TestOrchestrationMore:
     def test_tensor_reshape_after_slice(self):
         """slice -> reshape chain: reshape input is a local Tensor (no ext_ prefix)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class ReshapeAfterSliceProgram:
@@ -558,7 +656,7 @@ class TestOrchestrationMore:
     def test_tensor_transpose_external_input(self):
         """tensor.transpose on an external orchestration input emits Tensor::transpose on ext_<name>."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class TransposeExternalProgram:
@@ -578,7 +676,7 @@ class TestOrchestrationMore:
     def test_tensor_transpose_negative_axis(self):
         """tensor.transpose with negative axis indices is normalized at codegen time."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class TransposeNegativeProgram:
@@ -598,7 +696,7 @@ class TestOrchestrationMore:
     def test_tensor_transpose_after_slice(self):
         """slice -> transpose chain: transpose input is a local Tensor (no ext_ prefix)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class TransposeAfterSliceProgram:
@@ -622,7 +720,7 @@ class TestOrchestrationMore:
         """Cross-layout flip (ND→DN) lowers to runtime Tensor::transpose on the
         trailing pair (shapes + strides swapped, start_offset preserved)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         ib = IRBuilder()
         with ib.function("orch_view", type=ir.FunctionType.Orchestration) as f:
@@ -645,7 +743,7 @@ class TestOrchestrationMore:
     def test_tensor_view_identity_flip_aliases(self):
         """tensor.view with target == source layout emits a plain alias, not a transpose."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         ib = IRBuilder()
         with ib.function("orch_view_id", type=ir.FunctionType.Orchestration) as f:
@@ -664,7 +762,7 @@ class TestOrchestrationMore:
     def test_tensor_view_shape_reinterpret_runs_through_default_pipeline(self):
         """ND shape-only views survive the default pipeline and emit reshape."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class ShapeViewProgram:
@@ -698,7 +796,7 @@ class TestOrchestrationMore:
         passes / lowering use ``CHECK`` / ``CHECK_SPAN``.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         ib = IRBuilder()
         with ib.function("orch_view_bad", type=ir.FunctionType.Orchestration) as f:
@@ -758,7 +856,7 @@ class TestOrchestrationMore:
         preserve a DN physical stride.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         span = ir.Span.unknown()
         dn_view = ir.TensorView(
@@ -785,7 +883,7 @@ class TestOrchestrationMore:
     def test_if_statement(self):
         """Test if/else codegen with conditional scalar values."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class IfProgram:
@@ -835,7 +933,7 @@ class TestOrchestrationMore:
         tuple_var_to_elements_ (all _tuple_tmp_N collapsed to _tuple_tmp).
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class MultipleTupleProgram:
@@ -928,7 +1026,7 @@ class TestOrchestrationMore:
         `oi = oi;` (NOP). The codegen should skip these.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class TupleForLoopProgram:
@@ -1007,7 +1105,7 @@ class TestOrchestrationMore:
         """Loop-carried internal tensors should remain consumable after the loop."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class LoopCarriedStateProgram:
@@ -1063,7 +1161,7 @@ class TestOrchestrationMore:
         inplace detection (2 arg slots, not 3).
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class ChunkedInplaceProgram:
@@ -1106,7 +1204,7 @@ class TestOrchestrationMore:
         """tensor.assemble should lower to a pre-generated target view, not a host copy."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class AssembleViewProgram:
@@ -1148,7 +1246,7 @@ class TestOrchestrationMore:
         """A source buffer assembled more than once must keep its standalone allocation."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class DuplicateAssembleProgram:
@@ -1190,7 +1288,7 @@ class TestOrchestrationMore:
         """tensor.assemble should stay codegenable when the source is not a rewritten tensor.create."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SliceAssembleProgram:
@@ -1222,7 +1320,7 @@ class TestOrchestrationMore:
         its distinct identity regardless of name patterns.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class NumericSuffixProgram:
@@ -1275,7 +1373,7 @@ class TestOrchestrationMore:
         """Repeated auto-generated output buffers should keep distinct emitted names."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class RepeatedAutoOutputProgram:
@@ -1322,7 +1420,7 @@ class TestOrchestrationMore:
         """Alias for a kernel result that is never consumed downstream should be omitted."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class UnusedAliasProgram:
@@ -1356,7 +1454,7 @@ class TestOrchestrationMore:
         """Each scope (function body, for body) batches its own alloc_tensors independently."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class MultiScopeAllocProgram:
@@ -1413,7 +1511,7 @@ class TestOrchestrationMore:
         """More than 16 create_tensor in one scope are split into multiple alloc_tensors calls."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class ManyCreateProgram:
@@ -1498,7 +1596,7 @@ class TestOrchestrationMore:
         in-place (its own alloc_tensors) rather than batched at scope entry.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         span = ir.Span.unknown()
         INDEX = DataType.INDEX
@@ -1573,7 +1671,7 @@ class TestOrchestrationMore:
     def test_scalar_taskarg(self):
         """Scalar params read ChipTaskArgs scalar slots (0-indexed) via scalar<T>()."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class MultiScalarProgram:
@@ -1621,7 +1719,7 @@ class TestOrchestrationMore:
         so both tasks should dump ``ext_a`` and neither should dump ``ext_b``.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class DumpTagProgram:
@@ -1673,7 +1771,7 @@ class TestOrchestrationMore:
         (partial) dumps only ``.dump(...)``-marked tensors (here: none).
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class NoDumpTagProgram:
@@ -1712,7 +1810,7 @@ class TestOrchestrationMore:
         falls back to whatever the runtime dump level dictates.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class StrayTagProgram:
@@ -1755,7 +1853,7 @@ class TestOrchestrationMore:
         inlined call site. Codegen then emits the per-task ``.dump(...)``.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class InlineDumpTagProgram:
@@ -1811,7 +1909,7 @@ class TestOrchestrationMore:
         the dump is still emitted for the right slot after inlining.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class InlineBodyVarDumpTagProgram:
@@ -1876,7 +1974,7 @@ class TestOrchestrationMore:
         per-task dump still emits for the right slot.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class StackedInlineProgram:
@@ -1960,7 +2058,7 @@ class TestOrchestrationMore:
         dump still emits at the orchestration entry.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class TwoLevelInlineDumpTagProgram:
@@ -2025,11 +2123,11 @@ class TestOrchestrationMore:
         Guards against unintentional reorder in ``TaskDispatchPlan::Emit``.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class MixedOrderProgram:
-            @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+            @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
                 a: pl.Tensor[[64, 64], pl.FP32],
@@ -2089,7 +2187,7 @@ class TestOrchestrationMore:
         ``TaskDispatchPlan::Emit`` cannot silently reorder it.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class DepsOrderProgram:
@@ -2129,7 +2227,7 @@ class TestOrchestrationMore:
         compile.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         m = pl.dynamic("M")
         n = pl.dynamic("N")
@@ -2192,7 +2290,7 @@ class TestOrchestrationMore:
         runtime schedules as a full cluster with sub_block_id 0 / 1 per lane.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SplitAivNoneProgram:

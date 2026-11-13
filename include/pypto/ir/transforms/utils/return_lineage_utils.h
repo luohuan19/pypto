@@ -20,12 +20,31 @@
 #include "pypto/ir/function.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/type.h"
 
 namespace pypto {
 namespace ir {
 namespace return_lineage {
 
-/// Trace the first value of @p func's topmost ReturnStmt back to a Param.
+/// Share callee return maps across queries into one unchanged Program.
+///
+/// Nesting is allowed; the outermost scope clears the cache on exit. End the
+/// scope before changing callee bodies or querying a different Program, since
+/// a function's lineage can depend on other functions in that Program.
+class ScopedTraceCache {
+ public:
+  /// HOST helpers require normalized returns; non-strict queries keep ambiguous identities unknown.
+  /// Device writebacks require unanimous parameter identities across returning core branches.
+  explicit ScopedTraceCache(bool require_terminal_returns = false);
+  ~ScopedTraceCache();
+  ScopedTraceCache(const ScopedTraceCache&) = delete;
+  ScopedTraceCache& operator=(const ScopedTraceCache&) = delete;
+
+ private:
+  bool previous_require_terminal_returns_;
+};
+
+/// Trace the first returned value back to a Param, requiring consensus across device branches.
 ///
 /// Follows SSA rebinds (var-to-var assigns, For/While iter args and
 /// return_vars), tensor IfStmt merges whose branches resolve to the same
@@ -46,28 +65,59 @@ namespace return_lineage {
 std::optional<size_t> ReturnedParamIndex(const FunctionPtr& func, const ProgramPtr& program);
 
 /// Per-position generalization of ReturnedParamIndex over all return values.
+/// External declarations resolve through their validated returned-parameter contract.
 ///
-/// @return empty vector when @p func has no traceable top-level ReturnStmt
-///         and is not a wrapper resolvable through its inner call; otherwise
+/// @return empty vector when @p func has no traceable top-level ReturnStmt,
+///         external contract, or wrapper returning through its inner call; otherwise
 ///         one entry per return position (nullopt = not a param writeback).
 std::vector<std::optional<size_t>> ReturnedParamIndices(const FunctionPtr& func, const ProgramPtr& program);
 
-/// Read the return->param map straight off @p func's ReturnStmt.
+/// Strict HOST-only map for the elements of one returned tuple value.
+/// The ordinary return map continues to treat the tuple as one result.
+std::vector<std::optional<size_t>> ReturnedTupleElementParamIndices(const FunctionPtr& func,
+                                                                    const ProgramPtr& program);
+
+/// One declared return position, retaining its value independently of storage lineage.
+struct ReturnedValueBinding {
+  /// Callee-scoped source expression, or nullptr when its source is unknown.
+  /// May be an analysis-only tuple projection. Never substitute this expression
+  /// directly into another function: resolve its storage or materialize an output first.
+  ExprPtr value;
+  /// Declared return type, retained even when the source or storage is unknown.
+  TypePtr type;
+  /// Complete-parameter writeback, if known; nullopt does not erase the returned value.
+  std::optional<size_t> param_index;
+};
+
+/// Preserve every declared return slot before classifying parameter writebacks.
 ///
-/// `NormalizeReturnOrder` rewrites every tensor param-writeback return value to
-/// reference its param directly, and `IRProperty::ReturnParamsExplicit` verifies
-/// it. Once that property holds the map is a *local structural fact*: return
-/// position `j` writes back param `i` exactly when `ReturnStmt->value_[j]` is
-/// `func->params_[i]` by pointer identity. No SSA walk, no callee recursion, no
-/// `Program`.
+/// Retains original ReturnStmt expressions, expanding a single forwarded tuple
+/// only for multiple flat declared returns. A single declared TupleType stays
+/// one slot. Wrappers without an explicit return use their unique returning
+/// inner call when recognizable; otherwise their typed slots remain unknown.
+std::vector<ReturnedValueBinding> AnalyzeReturnedValues(const FunctionPtr& func, const ProgramPtr& program);
+
+/// Read the return->param map from @p func's explicit return contract.
 ///
-/// Every consumer at or after `NormalizeReturnOrder` — orchestration codegen,
+/// External declarations use kAttrExternalReturnParams instead of a ReturnStmt.
+/// Both this structural reader and the general tracer validate that contract;
+/// absent metadata permits only the complete ordered Out/InOut parameter list.
+/// Ambiguous or malformed external contracts raise a user-facing error.
+///
+/// For InCore/Group/Spmd/Graph/Orchestration, `NormalizeReturnOrder` rewrites each tensor param-writeback
+/// return to reference its param directly, and `IRProperty::ReturnParamsExplicit` verifies it. Once that
+/// property holds the map is a *local structural fact*: return position `j` writes back param `i` exactly
+/// when `ReturnStmt->value_[j]` is `func->params_[i]` by pointer identity. No SSA walk, no callee recursion,
+/// no `Program`.
+///
+/// Consumers of those function kinds after `NormalizeReturnOrder` — orchestration codegen,
 /// `ClassifyIterArgCarry` — must use this rather than `ReturnedParamIndices`:
 /// it is a 1-to-1 read of the IR, so it cannot silently disagree with what the
 /// IR actually says. Reserve `ReturnedParamIndices` for callers that run
 /// *before* the property is established (`ExpandMixedKernel`, the scope
 /// outliner), for `NormalizeReturnOrder` itself, and for the property verifier,
-/// which must re-derive independently to have anything to check.
+/// which must re-derive independently to have anything to check. Raw Opaque
+/// level/role callees remain outside this property and require lineage analysis.
 ///
 /// Scalar return positions are never canonicalized, so they resolve here only
 /// when the value literally *is* a scalar param. That is deliberate: propagating
@@ -75,7 +125,7 @@ std::vector<std::optional<size_t>> ReturnedParamIndices(const FunctionPtr& func,
 /// an `int64_t` (issue #1580).
 ///
 /// @return one entry per return position (nullopt = not a param writeback);
-///         empty when @p func has no ReturnStmt.
+///         empty when @p func has neither a ReturnStmt nor an external return contract.
 std::vector<std::optional<size_t>> ExplicitReturnedParamIndices(const FunctionPtr& func);
 
 /// First-position convenience wrapper over ExplicitReturnedParamIndices.
@@ -93,6 +143,41 @@ std::optional<size_t> ExplicitReturnedParamIndex(const FunctionPtr& func);
 /// both a nested and a trailing ReturnStmt would make "topmost" ambiguous — the
 /// fast path would pick the trailing one, a pre-order walk the nested one.
 ReturnStmtPtr FindFirstReturn(const StmtPtr& body);
+
+/// Collect every return site in statement traversal order.
+std::vector<ReturnStmtPtr> CollectReturns(const StmtPtr& body);
+
+/// Trace multiple Vars in @p body back to complete parameter writebacks.
+///
+/// The body is indexed once, and variable roots and callee return maps are
+/// memoized across all Vars. Follows SSA and call/writeback lineage without
+/// IfStmt merges. Tensor results must retain the parameter's full type/view;
+/// slices, views, fresh buffers, and untraceable values remain nullopt.
+///
+/// @return one entry per Var containing its matching param index, or nullopt.
+std::vector<std::optional<size_t>> TraceToParamIndices(const std::vector<VarPtr>& vars, const StmtPtr& body,
+                                                       const std::vector<VarPtr>& params,
+                                                       const ProgramPtr& program);
+
+/// Expression generalization of TraceToParamIndices.
+///
+/// Also follows direct tuple projections, tuple-variable aliases, and nested
+/// MakeTuple projections. User-call projections use the callee's flat return
+/// positions. The body index, variable roots, tuple sources, and callee return
+/// maps are shared across the batch; unknown or partial-buffer values remain
+/// nullopt under the same full-parameter type/view checks.
+///
+/// When storage roots include local definitions, formal_param_count identifies
+/// the leading actual parameters. Trailing designated roots may have defining
+/// assignments; rebinding validation still applies to every actual parameter.
+/// The default treats all roots as formals. With trace_if_merges, all arms
+/// of a tensor IfStmt merge must agree on the parameter and final type/view.
+///
+/// @return one entry per expression containing its matching param index, or nullopt.
+std::vector<std::optional<size_t>> TraceExprsToParamIndices(
+    const std::vector<ExprPtr>& exprs, const StmtPtr& body, const std::vector<VarPtr>& params,
+    const ProgramPtr& program, std::optional<size_t> formal_param_count = std::nullopt,
+    bool trace_if_merges = false);
 
 /// Trace multiple Vars in @p body back to @p params for scope outlining.
 ///
@@ -112,7 +197,8 @@ std::vector<std::optional<size_t>> TraceToParamIndicesForOutlining(const std::ve
 /// Trace @p var defined in @p body back to one of @p params (pointer identity).
 ///
 /// Follows SSA and call/writeback lineage without IfStmt merges, scoped to an
-/// arbitrary body/param-set. Use TraceToParamIndicesForOutlining for multiple Vars.
+/// arbitrary body/param-set. Use TraceToParamIndices for multiple Vars that
+/// must retain the parameter's full type/view.
 ///
 /// @return the matching param, or nullptr when untraceable.
 VarPtr TraceToParam(const VarPtr& var, const StmtPtr& body, const std::vector<VarPtr>& params,

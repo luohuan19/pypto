@@ -23,7 +23,7 @@ Compilation is :func:`pypto.ir.compile`'s job; nothing here compiles for you.
     from pypto import ir
     from pypto.runtime import RunConfig
 
-    config = RunConfig(platform="a2a3sim")
+    config = RunConfig()
     compiled = ir.compile(MyProgram, **config.compile_kwargs())
 
     a = torch.full((128, 128), 2.0)
@@ -45,16 +45,21 @@ from collections.abc import Callable
 from ctypes import _SimpleCData
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
 from pypto._cache_config import CacheConfig
+from pypto._target import (
+    ExecutionMode,
+    _parse_platform,
+    _platform_string,
+    _resolve_target,
+    _warn_deprecated_platform,
+)
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassDumpLevel
-from pypto.pypto_core import backend as _backend_core
 from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase, MemoryPlanner
 
 from .device_tensor import DeviceTensor
@@ -117,56 +122,10 @@ _SWIMLANE_CLI_HELP = (
 )
 
 
-class ExecutionMode(Enum):
-    """Whether a run reaches real silicon or the simulator.
-
-    One of the two axes a ``platform`` string packs. It decides how kernels are
-    assembled (``.so`` for the simulator, ``.o`` plus a text-section extract for
-    silicon) and whether the two-pass swimlane capture applies; it never reaches
-    codegen, which sees only the architecture.
-    """
-
-    ONBOARD = auto()
-    SIM = auto()
-
-
-_ARCHES: tuple[BackendType, ...] = (BackendType.Ascend910B, BackendType.Ascend950)
-
-
-def _arch_name(arch: BackendType) -> str:
-    """Return the wire name of an architecture (``"a2a3"`` / ``"a5"``).
-
-    Asks the backend handler rather than mapping it here: the C++ side already
-    owns this string — it is what codegen stamps as ``pto.target_arch`` — and a
-    second copy in Python is a second thing to keep in step.
-    """
-    return _backend_core.get_backend_instance(arch).get_handler().get_pto_target_arch()
-
-
-def _platform_string(arch: BackendType, execution_mode: ExecutionMode) -> str:
-    """Join the two axes into the wire spelling the runtime and CLI take."""
-    return f"{_arch_name(arch)}{'sim' if execution_mode is ExecutionMode.SIM else ''}"
-
-
-def _parse_platform(platform: str) -> tuple[BackendType, ExecutionMode]:
-    """Split a wire platform string back into its two axes.
-
-    The single place that sniffs the string. Everything else asks the axes.
-    """
-    for arch in _ARCHES:
-        name = _arch_name(arch)
-        if platform == name:
-            return arch, ExecutionMode.ONBOARD
-        if platform == f"{name}sim":
-            return arch, ExecutionMode.SIM
-    expected = ", ".join(f"{_arch_name(a)!r}, {_arch_name(a) + 'sim'!r}" for a in _ARCHES)
-    raise ValueError(f"Invalid platform {platform!r}. Expected {expected}.")
-
-
 _BACKEND_TYPE_DEPRECATION = (
-    "RunConfig(backend_type=...) is deprecated and has never taken effect: the backend is "
-    "derived from platform, which wins. Drop the argument, or pass the platform that implies "
-    "the backend you want. Reading RunConfig.backend_type still reports what platform selected."
+    "RunConfig(backend_type=...) is deprecated when it contradicts platform: the legacy "
+    "platform wins. Use backend_type with execution_mode and omit platform to select "
+    "the architecture explicitly."
 )
 
 
@@ -233,15 +192,16 @@ class RunConfig:
     Attributes:
         cache_config: Complete per-call persistent-cache policy. None uses process or environment defaults.
         arch: Target architecture, as the codegen backend that names it —
-            ``BackendType.Ascend910B`` (a2a3) or ``BackendType.Ascend950`` (a5).
+            ``BackendType.Ascend910`` (a2a3) or ``BackendType.Ascend950`` (a5).
         execution_mode: :class:`ExecutionMode.SIM` or ``ONBOARD``.
         platform: **Not a field** — the wire spelling of the two axes above
             (``"a2a3sim"`` / ``"a2a3"`` / ``"a5sim"`` / ``"a5"``), derived on
-            read. Accepted as a constructor keyword, where it sets both axes.
+            read. Deprecated as a constructor keyword; use backend_type and execution_mode.
         device_id: Hardware device index (ignored for simulator).
-        backend_type: **Not a field** — a read-only property derived from
-            ``platform``. Accepted as a deprecated constructor keyword, which
-            warns and is discarded when it contradicts the platform.
+        backend_type: Preferred constructor keyword for the architecture.
+            Stored in the compatibility ``arch`` field and readable as a property.
+            A legacy ``platform`` still wins if both are supplied; a conflicting
+            backend emits the existing deprecation warning.
         rtol: Relative tolerance for result comparison.
         atol: Absolute tolerance for result comparison.
         strategy: PyPTO optimisation strategy applied during compilation.
@@ -397,11 +357,15 @@ class RunConfig:
             ``PassContext``, or to ``PYPTO`` when none is active.
             Forwarded to ``ir.compile()``, which rejects it when a
             ``PassContext`` is already active — set it on that context instead.
+        enable_software_pipeline: Use explicit prefetch and rotating slots for
+            eligible pipeline loops. ``None`` inherits the active ``PassContext``
+            or defaults to ``False``. Requires ``PYPTO`` memory planning. Set it
+            on the context when a ``PassContext`` is already active.
     """
 
     __test__ = False  # Not a pytest test class
 
-    arch: BackendType = field(default_factory=lambda: BackendType.Ascend910B)
+    arch: BackendType = field(default_factory=lambda: BackendType.Ascend910)
     execution_mode: ExecutionMode = ExecutionMode.SIM
     device_id: int = 0
     rtol: float = 1e-5
@@ -437,6 +401,7 @@ class RunConfig:
     analyze_auto_scopes_for_deps: bool = False
     memory_planner: MemoryPlanner | None = None
     dump_ptoas_passes: bool = False
+    enable_software_pipeline: bool | None = None
 
     if TYPE_CHECKING:
         # The runtime ``__init__`` wrapper installed at the bottom of this
@@ -448,13 +413,14 @@ class RunConfig:
         # Declare the extended surface here. The field list mirrors the
         # dataclass body above and must stay in sync: a field added there
         # without a line here fails every static call site of it, so drift
-        # fails loud instead of silent. The deprecated keywords
-        # (``backend_type``, ``enable_l2_swimlane``) are deliberately absent
-        # — accepted for compatibility, not offered.
+        # fails loud instead of silent. The backend_type constructor alias is
+        # supported alongside arch. The deprecated enable_l2_swimlane keyword
+        # is deliberately absent — accepted for compatibility, not offered.
         def __init__(  # noqa: PLR0913 — mirrors the dataclass surface
             self,
             *,
             arch: BackendType = ...,
+            backend_type: BackendType = ...,
             execution_mode: ExecutionMode = ...,
             platform: str | None = ...,
             device_id: int = ...,
@@ -483,6 +449,7 @@ class RunConfig:
             analyze_auto_scopes_for_deps: bool = ...,
             memory_planner: MemoryPlanner | None = ...,
             dump_ptoas_passes: bool = ...,
+            enable_software_pipeline: bool | None = ...,
         ) -> None: ...
 
     def __post_init__(self) -> None:
@@ -495,7 +462,7 @@ class RunConfig:
         if type(self.arch) is not BackendType:
             raise TypeError(
                 f"RunConfig.arch must be a BackendType, got {type(self.arch).__name__} "
-                f"({self.arch!r}). Pass BackendType.Ascend910B / Ascend950, or use "
+                f"({self.arch!r}). Pass BackendType.Ascend910 / Ascend950, or use "
                 f"platform='a2a3sim' to set both axes from the wire spelling."
             )
         if type(self.execution_mode) is not ExecutionMode:
@@ -607,7 +574,8 @@ class RunConfig:
         and ``golden_data_dir`` reach neither phase: only the system-test
         harness reads them, to compare a dispatch against its golden.
 
-        ``output_dir``, ``distributed_config`` and ``memory_planner`` are
+        ``output_dir``, ``distributed_config``, ``memory_planner`` and
+        ``enable_software_pipeline`` are
         forwarded only when set, so an unset value defers to ``ir.compile()``'s
         own default. That matters for ``memory_planner`` in particular:
         ``ir.compile()`` rejects an explicit planner while a ``PassContext`` is
@@ -626,7 +594,8 @@ class RunConfig:
         ``compile_profiling`` is its ``profiling``.
         """
         return CompileOptions(
-            platform=self.platform,
+            backend_type=self.backend_type,
+            execution_mode=self.execution_mode,
             strategy=self.strategy,
             dump_passes=self.dump_passes,
             dump_ptoas_passes=self.dump_ptoas_passes,
@@ -636,6 +605,7 @@ class RunConfig:
             analyze_auto_scopes_for_deps=self.analyze_auto_scopes_for_deps,
             output_dir=self.save_kernels_dir,
             memory_planner=self.memory_planner,
+            enable_software_pipeline=self.enable_software_pipeline,
             distributed_config=self.distributed_config,
         )
 
@@ -680,8 +650,8 @@ class RunConfig:
     def backend_type(self) -> BackendType:
         """The codegen backend, which is :attr:`arch` under the compiler's name.
 
-        Kept as a read accessor because the artifact metadata and downstream
-        callers read it; :attr:`arch` is the field to set.
+        Use backend_type at construction. The arch storage field and alias
+        remain during the downstream migration.
         """
         return self.arch
 
@@ -720,13 +690,9 @@ class RunConfig:
 # leaves ``replace``, ``fields()``, ``asdict()`` and ``repr()`` clean, and routes
 # the old name through an ``__init__`` wrapper plus a property instead.
 #
-# ``backend_type`` is off the field list for the same reason, plus one of its
-# own. It is derived from ``platform``, so a caller-supplied value has never
-# taken effect. As a field it would come back through ``replace()``:
-# ``replace(cfg, platform="a5")`` re-supplies the *old* platform's backend, and
-# nothing can tell that echo from a caller who typed a contradicting value —
-# so a plain platform switch would warn, and fail outright under
-# warnings-as-errors.
+# ``backend_type`` remains a constructor alias over arch during migration.
+# This retains dataclass field/reflection compatibility and lets platform-based
+# replace() keep overriding both axes without replaying a conflicting alias.
 
 _RUN_CONFIG_INIT = RunConfig.__init__
 
@@ -734,7 +700,9 @@ _RUN_CONFIG_INIT = RunConfig.__init__
 @functools.wraps(_RUN_CONFIG_INIT)
 def _run_config_init(self: RunConfig, *args: Any, **kwargs: Any) -> None:
     """``RunConfig.__init__`` that also accepts ``platform=`` and the deprecated keywords."""
-    if "platform" in kwargs:
+    has_platform = "platform" in kwargs
+    if has_platform:
+        _warn_deprecated_platform("RunConfig")
         # ``platform=`` is the wire spelling of the two axes, and setting it
         # sets both. It deliberately wins over an ``arch=`` / ``execution_mode=``
         # in the same call rather than reporting a conflict -- the class is
@@ -748,8 +716,14 @@ def _run_config_init(self: RunConfig, *args: Any, **kwargs: Any) -> None:
 
     if "backend_type" in kwargs:
         supplied = kwargs.pop("backend_type")
-        if supplied is not None and supplied != kwargs.get("arch", BackendType.Ascend910B):
-            warnings.warn(_BACKEND_TYPE_DEPRECATION, DeprecationWarning, stacklevel=2)
+        if supplied is not None:
+            if has_platform:
+                if supplied != kwargs["arch"]:
+                    warnings.warn(_BACKEND_TYPE_DEPRECATION, DeprecationWarning, stacklevel=2)
+            else:
+                # Also handles replace(cfg, backend_type=...): the old arch
+                # field is echoed by dataclasses, so the explicit alias wins.
+                kwargs["arch"] = supplied
 
     alias = kwargs.pop("enable_l2_swimlane", None)
     if alias is not None:
@@ -768,13 +742,18 @@ RunConfig.__init__ = _run_config_init
 # ``functools.wraps`` copies the dataclass-generated signature, which lists the
 # two axes but not the ``platform=`` spelling the wrapper accepts -- so
 # ``inspect.signature(RunConfig)``, and every doc tool and IDE reading it, would
-# report a keyword the overwhelming majority of call sites use as unsupported.
-# Advertise it. The deprecated keywords stay out on purpose: they are accepted
-# for compatibility, not offered.
+# report accepted keywords as unsupported. Advertise the preferred backend_type
+# spelling and the legacy platform spelling; the DFX alias stays hidden.
 _RUN_CONFIG_SIGNATURE = inspect.signature(_RUN_CONFIG_INIT)
 RunConfig.__signature__ = _RUN_CONFIG_SIGNATURE.replace(  # type: ignore[attr-defined]
     parameters=[
         *(p for name, p in _RUN_CONFIG_SIGNATURE.parameters.items() if name != "self"),
+        inspect.Parameter(
+            "backend_type",
+            inspect.Parameter.KEYWORD_ONLY,
+            default=None,
+            annotation="BackendType | None",
+        ),
         inspect.Parameter(
             "platform",
             inspect.Parameter.KEYWORD_ONLY,
@@ -912,24 +891,24 @@ class CompileOptions:
     compiles needs this and not a :class:`RunConfig`::
 
         from pypto import ir
-        from pypto.runtime import CompileOptions
+        from pypto.runtime import CompileOptions, ExecutionMode
 
-        compiled = ir.compile(program, **CompileOptions(platform="a2a3").as_compile_kwargs())
+        options = CompileOptions(execution_mode=ExecutionMode.ONBOARD)
+        compiled = ir.compile(program, **options.as_compile_kwargs())
 
     Field names are ``ir.compile``'s, not ``RunConfig``'s: what ``RunConfig``
     spells ``save_kernels_dir`` and ``compile_profiling`` are ``output_dir`` and
     ``profiling`` here, because this object exists to name the compile side as
     the compiler names it.
 
-    ``platform`` is the only way to name the target. ``ir.compile`` also takes a
-    ``backend_type``, but derives it from ``platform`` whenever one is given, so
-    carrying both here would offer a pairing that cannot take effect: set them
-    to disagree and the platform silently wins. ``ir.compile`` keeps its
-    parameter for callers that pass no platform at all; this object always
-    passes one.
+    ``backend_type`` and ``execution_mode`` select the target. The legacy
+    ``platform`` constructor keyword is deprecated; it still sets both and wins over echoed
+    fields from ``dataclasses.replace``. The compiler mapping forwards the
+    explicit target axes; caches and artifact metadata retain canonical platform strings.
     """
 
-    platform: str = "a2a3sim"
+    backend_type: BackendType = field(default_factory=lambda: BackendType.Ascend910, kw_only=True)
+    execution_mode: ExecutionMode = field(default=ExecutionMode.SIM, kw_only=True)
     strategy: OptimizationStrategy = field(default_factory=lambda: OptimizationStrategy.Default)
     dump_passes: bool | PassDumpLevel = False
     dump_ptoas_passes: bool = False
@@ -939,16 +918,30 @@ class CompileOptions:
     analyze_auto_scopes_for_deps: bool = False
     # Absent rather than ``None`` in ``as_compile_kwargs`` when unset, so
     # ``ir.compile``'s own default applies. That is load-bearing for
-    # ``memory_planner``: an explicit one is rejected while a ``PassContext`` is
-    # active, so an unset planner has to defer to that context.
+    # ``memory_planner`` and ``enable_software_pipeline``: explicit values are
+    # rejected while a ``PassContext`` is active, so unset values defer to it.
     output_dir: str | None = None
     memory_planner: MemoryPlanner | None = None
     distributed_config: "DistributedConfig | None" = None
+    enable_software_pipeline: bool | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.execution_mode) is not ExecutionMode:
+            raise TypeError(
+                f"CompileOptions.execution_mode must be an ExecutionMode, got {self.execution_mode!r}"
+            )
+        _resolve_target(self.backend_type, self.execution_mode)
+
+    @property
+    def platform(self) -> str:
+        """Compatibility encoding derived from the two target fields."""
+        return _platform_string(self.backend_type, self.execution_mode)
 
     def as_compile_kwargs(self) -> dict[str, Any]:
         """Return these options as :func:`pypto.ir.compile` keyword arguments."""
         kwargs: dict[str, Any] = {
-            "platform": self.platform,
+            "backend_type": self.backend_type,
+            "execution_mode": self.execution_mode,
             "strategy": self.strategy,
             "dump_passes": self.dump_passes,
             "dump_ptoas_passes": self.dump_ptoas_passes,
@@ -957,11 +950,42 @@ class CompileOptions:
             "disabled_diagnostics": self.disabled_diagnostics,
             "analyze_auto_scopes_for_deps": self.analyze_auto_scopes_for_deps,
         }
-        for name in ("output_dir", "memory_planner", "distributed_config"):
+        for name in ("output_dir", "memory_planner", "distributed_config", "enable_software_pipeline"):
             value = getattr(self, name)
             if value is not None:
                 kwargs[name] = value
         return kwargs
+
+
+_COMPILE_OPTIONS_INIT = CompileOptions.__init__
+
+
+@functools.wraps(_COMPILE_OPTIONS_INIT)
+def _compile_options_init(self: CompileOptions, *args: Any, **kwargs: Any) -> None:
+    """Retain legacy platform construction while storing only target axes."""
+    if args:
+        if "platform" in kwargs:
+            raise TypeError("CompileOptions received platform both positionally and by keyword")
+        kwargs["platform"], args = args[0], args[1:]
+    if "platform" in kwargs:
+        _warn_deprecated_platform("CompileOptions")
+        kwargs["backend_type"], kwargs["execution_mode"] = _parse_platform(kwargs.pop("platform"))
+    _COMPILE_OPTIONS_INIT(self, *args, **kwargs)
+
+
+CompileOptions.__init__ = _compile_options_init
+setattr(
+    CompileOptions,
+    "__signature__",
+    inspect.signature(_COMPILE_OPTIONS_INIT).replace(
+        parameters=[
+            inspect.Parameter(
+                "platform", inspect.Parameter.POSITIONAL_OR_KEYWORD, default="a2a3sim", annotation="str"
+            ),
+            *(p for name, p in inspect.signature(_COMPILE_OPTIONS_INIT).parameters.items() if name != "self"),
+        ]
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1033,12 @@ def _execute_dfx_passes(
         dfx: The DFX toggles the caller requested.
         platform: Target execution platform (used only to detect ``*sim``).
     """
+    from ._execution_mode import claim_program_mode  # noqa: PLC0415
+
+    # The graph-capture child has independent mode state. Claim in the parent
+    # before either pass can execute, so kernel ownership cannot be bypassed
+    # by capture or acquired concurrently while the child is running.
+    claim_program_mode()
     if not dfx.enable_chip_swimlane or platform.endswith("sim"):
         run_pass(dfx)
         return
@@ -1145,6 +1175,7 @@ def _capture_deps_subprocess(spec: dict[str, Any], dfx_dir: Path, run_id: str = 
 def _coerced_to_orch_args(  # pyright: ignore[reportUnusedFunction]
     coerced: "list[torch.Tensor | DeviceTensor | _SimpleCData[Any]]",
     worker: Any,
+    host_tensor_indices: tuple[int, ...] | list[int] = (),
 ) -> Any:
     """Pack coerced values into address-free simpler ``TaskArgs``.
 
@@ -1164,6 +1195,8 @@ def _coerced_to_orch_args(  # pyright: ignore[reportUnusedFunction]
     from .tensor_arg import make_tensor_arg  # noqa: PLC0415
 
     orch_args = TaskArgs()
+    host_slots = set(host_tensor_indices)
+    tensor_slot = 0
     for i, arg in enumerate(coerced):
         if isinstance(arg, torch.Tensor):
             if not arg.is_contiguous():
@@ -1176,8 +1209,20 @@ def _coerced_to_orch_args(  # pyright: ignore[reportUnusedFunction]
                     f"Tensor at position {i} is on {arg.device}, expected CPU. "
                     f"Call .cpu() before packing into orch_args."
                 )
-            orch_args.add_tensor(make_tensor_arg(worker, arg))
+            tensor = make_tensor_arg(worker, arg)
+            if tensor_slot in host_slots:
+                from simpler.buffer import TensorTransfer  # noqa: PLC0415
+
+                orch_args.add_tensor(tensor, transfer=TensorTransfer.NONE)
+            else:
+                orch_args.add_tensor(tensor)
+            tensor_slot += 1
         elif isinstance(arg, DeviceTensor):
+            if tensor_slot in host_slots:
+                raise ValueError(
+                    f"Tensor at position {i} is used by HBG host control flow; pass a CPU tensor"
+                )
+            tensor_slot += 1
             try:
                 orch_args.add_tensor(make_tensor_arg(worker, arg))
             except (TypeError, ValueError) as e:
@@ -1191,6 +1236,8 @@ def _coerced_to_orch_args(  # pyright: ignore[reportUnusedFunction]
                 f"Argument at position {i} must be torch.Tensor, DeviceTensor or "
                 f"ctypes scalar, got {type(arg).__name__}"
             )
+    if any(type(slot) is not int or slot < 0 or slot >= tensor_slot for slot in host_slots):
+        raise ValueError("Invalid host_tensor_indices in runtime configuration")
     for arg in coerced:
         if isinstance(arg, _SimpleCData):
             orch_args.add_scalar(scalar_to_uint64(arg))
@@ -1312,6 +1359,13 @@ def _execute_golden_case(  # pyright: ignore[reportUnusedFunction]
         validate_golden,
     )
 
+    host_tensor_indices: list[int] = []
+    if runtime_name == "host_build_graph":
+        from ._artifact_sources import read_kernel_config  # noqa: PLC0415
+
+        kernel_config = read_kernel_config(work_dir / "kernel_config.py")
+        host_tensor_indices = kernel_config.RUNTIME_CONFIG.get("host_tensor_indices", ())
+
     # Load golden.py to get generate_inputs and compute_golden
     golden_module = _load_golden_module(golden_path)
 
@@ -1344,6 +1398,7 @@ def _execute_golden_case(  # pyright: ignore[reportUnusedFunction]
             runtime_name,
             device_id,
             enable_sdma=enable_sdma,
+            host_tensor_indices=host_tensor_indices,
             output_prefix=str(dfx_dir) if dfx_dir is not None else None,
             enable_chip_swimlane=pass_dfx.enable_chip_swimlane,
             enable_dump_args=pass_dfx.enable_dump_args,
@@ -1763,6 +1818,7 @@ def _execute_compiled(  # noqa: PLR0913
             level=level,
             aicpu_thread_num=effective_aicpu_thread_num,
             enable_sdma=enable_sdma,
+            host_tensor_indices=runtime_config.get("host_tensor_indices", ()),
             output_prefix=str(dfx_dir) if dfx_dir is not None else None,
             enable_chip_swimlane=pass_dfx.enable_chip_swimlane,
             enable_dump_args=pass_dfx.enable_dump_args,
@@ -1850,13 +1906,19 @@ def execute_compiled(  # noqa: PLR0913
         execute_compiled(work_dir, args, platform="a2a3", device_id=0, config=cfg)
 
         # after -- ``cfg`` carries every execution setting
-        cfg = dataclasses.replace(cfg, platform="a2a3", device_id=0)
+        from pypto.backend import BackendType
+        from pypto.runtime import ExecutionMode
+
+        cfg = dataclasses.replace(
+            cfg, backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=0,
+        )
         ir.CompiledProgram.from_dir(work_dir)(*args, config=cfg)
 
     ``dfx`` and ``aicpu_thread_num`` have no separate spelling on that path:
     the DFX toggles and ``aicpu_thread_num`` are already ``RunConfig`` fields,
-    read fresh on every dispatch. ``from_dir(platform=...)`` still decides the
-    platform for a call made *without* a config.
+    read fresh on every dispatch. The target passed to
+    ``from_dir(backend_type=..., execution_mode=...)`` applies to a call made
+    *without* a config.
 
     Emits a :class:`DeprecationWarning` and forwards to the same implementation
     the artifact path uses. Behaviour of this function is unchanged; only the

@@ -14,6 +14,7 @@ import json
 import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -25,17 +26,21 @@ import pytest
 from pypto import CacheConfig, cache_stats, ir, passes
 from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
 from pypto._identity import ToolchainIdentity, digest_record
+from pypto.backend import BackendType
+from pypto.ir.compiled_artifact import CompiledArtifact
 from pypto.ir.compiled_program import _COMPILED_META_SCHEMA, CompiledProgram
 from pypto.ir.distributed_compiled_program import _META_SCHEMA, DistributedCompiledProgram
 from pypto.jit import _artifact_manifest
 from pypto.jit._artifact_manifest import ArtifactKey, ArtifactSpec, ArtifactState, BuildKind
+from pypto.jit._persistent import JITArtifactStore
 from pypto.jit.artifact_cache import ArtifactStore, BuildDisposition, LookupStatus
-from pypto.runtime import RunConfig, _prebuilt
+from pypto.runtime import ExecutionMode, RunConfig, _prebuilt
 from pypto.runtime._artifact_runtime import ArtifactRuntime, bind_artifact, restore_artifact
 from pypto.runtime._artifact_sources import (
     UnsupportedArtifactInput,
     package_generated_sources,
     read_kernel_config,
+    validate_generated_sources,
 )
 from pypto.runtime.distributed_runner import (
     _assemble_chip_callables,
@@ -93,9 +98,11 @@ def _generated(root: Path, kind: BuildKind) -> None:
         schema=_COMPILED_META_SCHEMA,
         supported_execution_modes=["program"],
         params=[],
+        lowered_params=[],
+        return_aliases=[],
         num_return_types=0,
         platform="a2a3sim",
-        backend_type="Ascend910B",
+        backend_type="Ascend910",
     )
     if kind is BuildKind.SINGLE_CHIP:
         _chip(root)
@@ -140,6 +147,7 @@ def fake_runtime(monkeypatch):
     monkeypatch.setitem(sys.modules, "simpler", simpler)
     monkeypatch.setitem(sys.modules, "simpler.task_interface", task_interface)
     monkeypatch.setitem(sys.modules, "pypto.runtime.task_interface", task_interface)
+    monkeypatch.setitem(sys.modules, "_task_interface", task_interface)
     runner: Any = ModuleType("pypto.runtime.device_runner")
     runner.register_callable_identity = Mock()
     monkeypatch.setattr("pypto.runtime._callable_identity.register_callable_identity", Mock())
@@ -460,15 +468,185 @@ def test_ready_diagnostic_labels_do_not_execute_config(tmp_path, fake_runtime, m
     assert not list((tmp_path / "ready").rglob("*.pyc"))
 
 
-def test_ready_spec_enumerates_all_child_binaries(tmp_path, fake_runtime):
+def test_prebuilt_preserves_editable_runtime_source_guard(tmp_path, fake_runtime, monkeypatch):
+    source = tmp_path / "runtime/python/simpler/__init__.py"
+    source.parent.mkdir(parents=True)
+    (tmp_path / "runtime/.git").write_text("gitdir: elsewhere")
+    monkeypatch.setattr(sys.modules["simpler"], "__file__", str(source), raising=False)
+    original = _prebuilt.importlib.import_module
+
+    def import_module(name):
+        if name == "simpler.task_interface":
+            raise ImportError("runtime source/binary revision mismatch")
+        return original(name)
+
+    monkeypatch.setattr(_prebuilt.importlib, "import_module", import_module)
+    with pytest.raises(ImportError, match="revision mismatch"):
+        _prebuilt._native_callable_interface()
+
+
+def test_ready_spec_uses_packaged_json_without_executing_python(tmp_path, fake_runtime, monkeypatch):
+    _generated(tmp_path, BuildKind.SINGLE_CHIP)
+    package_generated_sources(tmp_path, BuildKind.SINGLE_CHIP)
+    expected = _prebuilt.ready_spec(tmp_path, _spec(BuildKind.SINGLE_CHIP))
+    monkeypatch.setattr(
+        "pypto.runtime._artifact_sources.read_kernel_config",
+        Mock(side_effect=AssertionError("READY must not execute kernel_config.py")),
+    )
+    assert _prebuilt.ready_spec(tmp_path, _spec(BuildKind.SINGLE_CHIP)) == expected
+
+
+@pytest.mark.parametrize("hint", [b"[" * 2000 + b"0" + b"]" * 2000, b"\xff"])
+def test_invalid_ready_hint_falls_back_to_generated_lookup(tmp_path, hint):
+    store = JITArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+    key, generated = _key(), _spec()
+    slot = store._slot(key, generated)
+    slot.mkdir(parents=True)
+    (slot / "kernel_config.py").write_text("KERNELS = []\n")
+    (slot / "kernel_config.json").write_bytes(hint)
+    assert store.lookup_ready(key, generated).status is LookupStatus.MISS
+
+
+@pytest.mark.parametrize("kind", list(BuildKind))
+@pytest.mark.parametrize("damage", ["removed", "invalid_json"])
+def test_readonly_ready_hit_survives_generated_slot_loss(tmp_path, fake_runtime, kind, damage):
+    store = ArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+
+    def packaged(root):
+        _generated(root, kind)
+        package_generated_sources(root, kind)
+
+    published = store.get_or_build(_key(), _spec(kind), packaged)
+    assert published.handle is not None
+    generated = published.handle
+    runtime = ArtifactRuntime(store, generated, "a2a3sim", tmp_path / "run")
+    runtime.load()
+    assert runtime.handle.spec.state is ArtifactState.BINARY_READY
+    if damage == "removed":
+        shutil.rmtree(generated.directory)
+    else:
+        chip = (
+            generated.directory if kind is BuildKind.SINGLE_CHIP else generated.directory / "next_levels/left"
+        )
+        (chip / "kernel_config.json").write_bytes(b"\xff")
+
+    readonly = JITArtifactStore(store.root, readonly=True)
+    fake_runtime.runner._compile_and_assemble.side_effect = AssertionError("unexpected compilation")
+    hit = readonly.lookup_ready(generated.key, generated.spec)
+    assert hit.status is LookupStatus.HIT and hit.handle is not None and hit.manifest is not None
+    assert hit.handle.directory == runtime.handle.directory
+    restored = restore_artifact(
+        readonly, hit.handle, tmp_path / "readonly-run", _validated_manifest=hit.manifest
+    )
+    assert restored.program is None
+    assert restored._artifact_runtime.load()
+    assert not (tmp_path / "readonly-run").exists()
+
+
+def test_orphan_ready_rejects_ambiguous_valid_stages(tmp_path, fake_runtime):
+    store = ArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+    kind = BuildKind.DISTRIBUTED
+
+    def packaged(root):
+        _generated(root, kind)
+        package_generated_sources(root, kind)
+
+    published = store.get_or_build(_key(), _spec(kind), packaged)
+    assert published.handle is not None
+    generated = published.handle
+    runtime = ArtifactRuntime(store, generated, "a2a3sim", tmp_path / "run")
+    runtime.load()
+    first_ready = runtime.handle.directory
+    alternative = tmp_path / "alternative"
+    shutil.copytree(first_ready, alternative)
+    (alternative / "artifact_manifest.json").unlink()
+    # Binary count no longer changes the READY contract. Different chip sets
+    # still produce distinct stages under one key and must remain ambiguous.
+    shutil.copytree(alternative / "next_levels/left", alternative / "next_levels/extra")
+    metadata = json.loads((alternative / "distributed_meta.json").read_text())
+    metadata["distributed_config"]["device_ids"].append(2)
+    (alternative / "distributed_meta.json").write_text(json.dumps(metadata))
+    binary = json.loads((alternative / "binary_manifest.json").read_text())
+    binary["chips"].append("extra")
+    (alternative / "binary_manifest.json").write_text(json.dumps(binary))
+    second_spec = _prebuilt.ready_spec(alternative, generated.spec, metadata_only=True)
+    assert second_spec != runtime.handle.spec
+    second_ready = store.get_or_build(
+        generated.key, second_spec, lambda root: shutil.copytree(alternative, root, dirs_exist_ok=True)
+    )
+    assert second_ready.handle is not None
+    assert store.lookup(generated.key, second_spec).status is LookupStatus.HIT
+    shutil.rmtree(generated.directory)
+    result = JITArtifactStore(store.root, readonly=True).lookup_ready(generated.key, generated.spec)
+    assert result.status is LookupStatus.INVALID and result.handle is None
+    assert result.reason is not None and "Ambiguous READY stages" in result.reason
+
+
+def test_orphan_ready_rejects_malformed_candidate(tmp_path, fake_runtime):
+    store = ArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+
+    def packaged(root):
+        _generated(root, BuildKind.SINGLE_CHIP)
+        package_generated_sources(root, BuildKind.SINGLE_CHIP)
+
+    published = store.get_or_build(_key(), _spec(), packaged)
+    assert published.handle is not None
+    generated = published.handle
+    runtime = ArtifactRuntime(store, generated, "a2a3sim", tmp_path / "run")
+    runtime.load()
+    shutil.rmtree(generated.directory)
+    (runtime.handle.directory / "kernel_config.json").write_bytes(b"\xff")
+    result = JITArtifactStore(store.root, readonly=True).lookup_ready(generated.key, generated.spec)
+    assert result.status is LookupStatus.MISS and result.handle is None
+
+
+@pytest.mark.parametrize("count", [32, 33])
+def test_orphan_ready_candidate_limit_stops_directory_iteration(tmp_path, monkeypatch, count):
+    store = JITArtifactStore(tmp_path / "cache", readonly=True)
+    key, generated = _key(), _spec()
+    parent = store._slot(key, generated).parent.parent
+    parent.mkdir(parents=True)
+    visited = []
+    closed = []
+
+    def entries():
+        for index in range(count):
+            visited.append(index)
+            yield SimpleNamespace(name=f"{index:064x}", is_dir=lambda **kwargs: True)
+        if count > 32:
+            raise AssertionError("scanned past the first excess candidate")
+
+    @contextmanager
+    def scandir(directory):
+        assert directory == parent
+        try:
+            yield entries()
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr("pypto.jit._persistent.os.scandir", scandir)
+    result = store.lookup_ready(key, generated)
+    assert len(visited) == count and closed == [True]
+    assert result.handle is None
+    if count == 32:
+        assert result.status is LookupStatus.MISS
+    else:
+        assert result.status is LookupStatus.INVALID
+        assert result.reason is not None and "Too many READY candidates" in result.reason
+
+
+def test_ready_spec_requires_child_manifests_and_inventories_binaries(tmp_path, fake_runtime):
     store, generated = _publish(tmp_path, BuildKind.DISTRIBUTED)
     runtime = ArtifactRuntime(store, generated, "a2a3sim", tmp_path / "run")
     runtime.load()
     required = set(runtime.handle.spec.required_files)
+    inventory = _artifact_manifest.read_manifest(runtime.directory, runtime.handle.key, runtime.handle.spec)
+    files = {entry["path"] for entry in inventory["files"]}
     assert "binary_manifest.json" in required
     for name in ("left", "right"):
-        for file in ("binary_manifest.json", "prebuilt/kernel_0.bin", "prebuilt/orchestration.bin"):
+        for file in ("binary_manifest.json", "prebuilt/orchestration.bin"):
             assert f"next_levels/{name}/{file}" in required
+        assert f"next_levels/{name}/prebuilt/kernel_0.bin" in files
 
 
 def test_altered_handle_fails_before_source_execution(tmp_path, fake_runtime):
@@ -570,9 +748,10 @@ def test_ready_attachment_hashes_each_payload_once(tmp_path, fake_runtime, kind,
     handle = runtime.handle
     cls = CompiledProgram if kind is BuildKind.SINGLE_CHIP else DistributedCompiledProgram
     compiled = cls.from_dir(handle.directory) if attach == "bind" else None
+    metadata_cls = CompiledArtifact if kind is BuildKind.SINGLE_CHIP else DistributedCompiledProgram
     with (
         patch.object(_artifact_manifest, "_file_digest", wraps=_artifact_manifest._file_digest) as digest,
-        patch.object(cls, "from_dir", wraps=cls.from_dir) as from_dir,
+        patch.object(metadata_cls, "from_dir", wraps=metadata_cls.from_dir) as from_dir,
         patch.object(_prebuilt.hashlib, "sha256", wraps=_prebuilt.hashlib.sha256) as sha,
     ):
         if attach == "restore":
@@ -800,6 +979,55 @@ def automatic_jit_case(tmp_path, fake_runtime, monkeypatch):
 
     monkeypatch.setattr(kernel, "_compile", compile_)
     return kernel, builds
+
+
+def test_orphan_ready_warmup_is_a_readonly_hit(tmp_path, automatic_jit_case, fake_runtime):
+    kernel, builds = automatic_jit_case
+    root = tmp_path / "cache"
+    writable = RunConfig(platform="a2a3sim", cache_config=CacheConfig(enabled=True, root=root))
+    readonly = RunConfig(platform="a2a3sim", cache_config=CacheConfig(enabled=True, readonly=True, root=root))
+    with passes.PassContext([]):
+        kernel.warmup(config=writable)
+        generated = list((root / "artifacts").rglob("generated"))
+        assert len(generated) == 1
+        shutil.rmtree(generated[0])
+        kernel._artifact_objects.clear()
+        fake_runtime.runner._compile_and_assemble.side_effect = AssertionError("unexpected compilation")
+        before = cache_stats()
+        restored = kernel.warmup(config=readonly)
+        after = cache_stats()
+    assert restored.program is None
+    assert len(builds) == 1
+    assert after.ready_hits - before.ready_hits == 1
+    for field in ("misses", "bypasses", "generation_builds", "binary_builds"):
+        assert getattr(after, field) - getattr(before, field) == 0
+
+
+def test_ready_hit_validates_once_and_does_not_execute_generated_configuration(
+    tmp_path, automatic_jit_case, monkeypatch
+):
+    from pypto.jit import artifact_cache  # noqa: PLC0415
+
+    kernel, builds = automatic_jit_case
+    config = RunConfig(platform="a2a3sim", cache_config=CacheConfig(enabled=True, root=tmp_path / "cache"))
+    with passes.PassContext([]):
+        compiled = kernel.warmup(config=config)
+        kernel._artifact_objects.clear()
+        reads = Mock(wraps=artifact_cache.read_manifest)
+        monkeypatch.setattr(artifact_cache, "read_manifest", reads)
+        monkeypatch.setattr(
+            "pypto.runtime._artifact_runtime.read_manifest",
+            Mock(side_effect=AssertionError("must reuse the validated lookup manifest")),
+        )
+        monkeypatch.setattr(
+            "pypto.runtime._artifact_sources.read_kernel_config",
+            Mock(side_effect=AssertionError("must not execute generated Python")),
+        )
+        restored = kernel.warmup(config=config)
+    assert len(builds) == 1
+    assert restored is not compiled
+    assert reads.call_count == 1
+    assert reads.call_args.args[2].state is ArtifactState.BINARY_READY
 
 
 def test_published_artifact_is_restored_for_a_different_scalar_value(tmp_path, fake_runtime, monkeypatch):
@@ -1093,6 +1321,7 @@ def test_storage_statistics_use_typed_failure_despite_changed_message(
 
 @pytest.mark.parametrize("command", ["GROUP ( libdependency.a )", "INPUT ( -ldependency )"])
 def test_unresolved_linker_dependency_compiles_privately(tmp_path, automatic_jit_case, monkeypatch, command):
+    monkeypatch.setenv("PYPTO_CACHE_IDENTITY", "content")
     from types import SimpleNamespace  # noqa: PLC0415
 
     from pypto.jit import _persistent, _toolchain  # noqa: PLC0415
@@ -1182,9 +1411,280 @@ def test_generated_hit_checks_capabilities_of_ready_payload(tmp_path, fake_runti
         _artifact_manifest.encode_manifest(marker)
     )
     with patch("pypto.runtime._artifact_runtime.load_prebuilt") as load:
-        with pytest.raises(ValueError, match="requires 'program'"):
+        with pytest.raises(ValueError, match="capabilities do not match"):
             ArtifactRuntime(store, generated, "a2a3sim", tmp_path / "next-run").load()
     load.assert_not_called()
+
+
+def test_shared_binary_keeps_distinct_registrations(tmp_path, fake_runtime):
+    kernels = [
+        ({"func_id": 0, "name": "step", "signature": [Direction.IN]}, b"same code"),
+        ({"func_id": 1, "name": "step", "signature": [Direction.INOUT]}, b"same code"),
+    ]
+    _prebuilt.write_chip_binaries(
+        tmp_path,
+        "a2a3sim",
+        {"source": "main.cpp", "function_name": "entry"},
+        kernels,
+        b"orchestration",
+        "test_runtime",
+        {},
+    )
+    record = json.loads((tmp_path / _prebuilt.BINARY_MANIFEST).read_text())
+    assert record["kernels"][0]["binary"] == record["kernels"][1]["binary"]
+    assert len(list((tmp_path / "prebuilt").glob("kernel_*.bin"))) == 1
+    loaded = _prebuilt._read_chip(tmp_path, "a2a3sim", None)
+    assert [k["func_id"] for k in loaded["kernels"]] == [0, 1]
+    assert loaded["kernels"][0]["binary"] is loaded["kernels"][1]["binary"]
+    assert loaded["kernels"][0]["signature"] != loaded["kernels"][1]["signature"]
+    # Sharing cannot hide inconsistent integrity claims in a later reference.
+    record["kernels"][1]["binary"]["sha256"] = "0" * 64
+    (tmp_path / _prebuilt.BINARY_MANIFEST).write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="digest mismatch"):
+        _prebuilt._read_chip(tmp_path, "a2a3sim", None)
+
+
+@pytest.mark.parametrize("kind", list(BuildKind))
+@pytest.mark.parametrize("packaged", [False, True])
+def test_shared_binary_promotes_and_restores_with_distinct_signatures(
+    tmp_path, fake_runtime, monkeypatch, kind, packaged
+):
+    store = ArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+    digest = "a" * 24
+
+    def generated(root):
+        _generated(root, kind)
+        for chip in _prebuilt.chip_directories(root, kind).values():
+            config_path = chip / "kernel_config.py"
+            config_path.write_text(
+                config_path.read_text()
+                + "\nKERNELS[0]['code_name'] = 'kernel'\n"
+                + "KERNELS.append(dict(KERNELS[0], func_id=8, signature=[D.INOUT, D.OUT]))\n"
+            )
+            # Stale hashed outputs can also be inherited from GENERATED.
+            _write(chip / f"kernels/kernel_{'b' * 24}.o", "inherited raw output")
+        if packaged:
+            package_generated_sources(root, kind)
+
+    built = store.get_or_build(_key(), _spec(kind), generated)
+    assert built.handle is not None
+    compile_ = fake_runtime.runner._compile_and_assemble.side_effect
+
+    def with_hashed_outputs(root, platform, **kwargs):
+        compile_(root, platform, **kwargs)
+        for extension in ("o", "so"):
+            _write(root / f"kernels/kernel_{digest}.{extension}", "raw compiler output")
+        _write(root / "extern/input.o", "external input")
+
+    fake_runtime.runner._compile_and_assemble.side_effect = with_hashed_outputs
+    runtime = ArtifactRuntime(store, built.handle, "a2a3sim", tmp_path / "run")
+    chips = runtime.load()
+    assert runtime.handle.spec.state is ArtifactState.BINARY_READY
+    assert store.lookup(runtime.handle.key, runtime.handle.spec).status is LookupStatus.HIT
+    for chip in _prebuilt.chip_directories(runtime.directory, kind).values():
+        assert len(list((chip / "prebuilt").glob("kernel_*.bin"))) == 1
+        assert not list((chip / "kernels").glob("kernel_*.o"))
+        assert not list((chip / "kernels").glob("kernel_*.so"))
+        assert (chip / "extern/input.o").read_text() == "external input"
+    for callable_, _, _ in chips.values():
+        children = callable_["children"]
+        assert [child[0] for child in children] == [7, 8]
+        assert children[0][1]["binary"] is children[1][1]["binary"]
+        assert children[0][1]["signature"] != children[1][1]["signature"]
+
+    fake_runtime.runner._compile_and_assemble.side_effect = AssertionError("unexpected compilation")
+    monkeypatch.setattr(
+        "pypto.runtime._artifact_sources.read_kernel_config", Mock(side_effect=AssertionError)
+    )
+    readonly = ArtifactStore(store.root, readonly=True)
+    restored = restore_artifact(readonly, runtime.handle, tmp_path / "readonly")
+    assert restored._artifact_runtime.load() == chips
+    # Shared files remain protected by the READY inventory even though the
+    # pre-compilation spec cannot predict their count or filenames.
+    next(runtime.directory.rglob("kernel_0.bin")).unlink()
+    assert readonly.lookup(runtime.handle.key, runtime.handle.spec).status is LookupStatus.INVALID
+
+
+def test_hashed_sidecar_pruning_preserves_configured_and_unrelated_inputs(tmp_path):
+    source = tmp_path / "kernel[0].cpp"
+    output = tmp_path / f"kernel[0]_{'a' * 24}.o"
+    configured = tmp_path / f"kernel[0]_{'b' * 24}.so"
+    unrelated = tmp_path / "kernel[0]_notes.o"
+    external = tmp_path / "external.cpp"
+    external_binary = tmp_path / f"external_{'c' * 24}.o"
+    for path in (source, output, configured, unrelated, external, external_binary):
+        path.write_bytes(b"input or compiler output")
+    config: Any = ModuleType("_pruning_config")
+    config.KERNELS = [
+        dict(source=str(source), code_name="kernel"),
+        dict(source=str(configured), external=True),
+        dict(source=str(external), code_name="external", external=True),
+    ]
+    config.ORCHESTRATION = dict(source=str(tmp_path / "main.cpp"))
+    outputs = _prebuilt._build_outputs(config)
+    assert output in outputs
+    assert not {source, configured, unrelated, external, external_binary}.intersection(outputs)
+
+
+def test_kernel_artifact_uses_existing_cache_promotion_and_loading(tmp_path, fake_runtime):
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+    from dataclasses import replace  # noqa: PLC0415
+
+    from pypto.ir.compiled_artifact import CompiledArtifact  # noqa: PLC0415
+
+    capabilities = ExecutionCapabilities((ArtifactExecutionMode.KERNEL,))
+    store = ArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+    key = replace(_key(), contract=ArtifactExecutionMode.KERNEL)
+    spec = replace(_spec(), execution_capabilities=capabilities)
+
+    def build(root):
+        _generated(root, BuildKind.SINGLE_CHIP)
+        path = root / "compiled_meta.json"
+        record = json.loads(path.read_text())
+        record["supported_execution_modes"] = ["kernel"]
+        path.write_text(json.dumps(record))
+
+    handle = store.get_or_build(key, spec, build).handle
+    assert handle is not None
+    with pytest.raises(ValueError, match="requires 'program'"):
+        restore_artifact(store, handle, tmp_path / "invalid-consumer")
+    artifact = restore_artifact(store, handle, tmp_path / "run", consumer=ArtifactExecutionMode.KERNEL)
+    assert isinstance(artifact, CompiledArtifact)
+    assert artifact._chip_callable is None
+    source_path = artifact.output_dir
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        callables = list(pool.map(lambda _: artifact.chip_callable, range(8)))
+    assert all(cc is callables[0] for cc in callables)
+    assert artifact.output_dir == source_path
+    assert artifact._artifact_runtime is not None
+    assert artifact._artifact_runtime.handle.spec.state is ArtifactState.BINARY_READY
+    ready = artifact._artifact_runtime.handle
+    restored = restore_artifact(store, ready, tmp_path / "second-run", consumer=ArtifactExecutionMode.KERNEL)
+    assert isinstance(restored, CompiledArtifact)
+    restored.load()
+    assert restored._chip_callable is not None
+    assert restored.execution_capabilities == capabilities
+
+
+def test_vpto_sources_survive_artifact_relocation(tmp_path, fake_runtime):
+    root = tmp_path / "generated"
+    _generated(root, BuildKind.SINGLE_CHIP)
+    helper = tmp_path / "helper.pto"
+    helper.write_text("module {}")
+    with (root / "kernel_config.py").open("a") as stream:
+        stream.write(f"\nKERNELS[0]['vpto_sources'] = [{str(helper)!r}]\n")
+    package_generated_sources(root, BuildKind.SINGLE_CHIP)
+    relocated = tmp_path / "relocated"
+    shutil.copytree(root, relocated)
+    shutil.rmtree(root)
+    helper.unlink()
+    validate_generated_sources(relocated, BuildKind.SINGLE_CHIP)
+    config = read_kernel_config(relocated / "kernel_config.py")
+    sources = config.KERNELS[0]["vpto_sources"]
+    assert len(sources) == 1
+    assert Path(sources[0]).read_text() == "module {}"
+    assert Path(sources[0]).is_relative_to(relocated)
+    assert json.loads((relocated / "kernel_config.json").read_text())["kernels"][0]["vpto_sources"] == [
+        "vpto/0/0/helper.pto"
+    ]
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_private_output_base_does_not_change_persistent_artifacts(
+    tmp_path, automatic_jit_case, fake_runtime, monkeypatch, relative
+):
+    kernel, builds = automatic_jit_case
+    root = tmp_path / "cache"
+    run_base = Path("private") if relative else tmp_path / "private"
+    monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(run_base))
+    resolutions = []
+    resolve = Path.resolve
+
+    def track_resolution(path, *args, **kwargs):
+        if path in (run_base, tmp_path / "private", tmp_path / "other"):
+            resolutions.append(path)
+        return resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", track_resolution)
+    config = RunConfig(
+        backend_type=BackendType.Ascend910B,
+        execution_mode=ExecutionMode.SIM,
+        cache_config=CacheConfig(enabled=True, root=root),
+    )
+    with passes.PassContext([]):
+        fresh = kernel.warmup(config=config)
+        assert fresh._artifact_runtime.run_directory.parent == tmp_path / "private"
+        assert fresh.output_dir.is_relative_to(root)
+        assert len(builds) == 1
+        monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(tmp_path / "other"))
+        assert kernel.warmup(config=config) is fresh
+        assert fresh._artifact_runtime.run_directory.parent == tmp_path / "private"
+        files_before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        kernel._artifact_objects.clear()
+        fake_runtime.runner._compile_and_assemble.side_effect = AssertionError("unexpected rebuild")
+        before = cache_stats()
+        restored = kernel.warmup(config=config)
+        after = cache_stats()
+    assert restored._artifact_runtime.run_directory.parent == tmp_path / "other"
+    # A fresh object retains its GENERATED source directory after promotion;
+    # restoration binds READY directly. Both must consume the same binary tree.
+    assert restored._artifact_runtime.handle.directory == fresh._artifact_runtime.handle.directory
+    assert len(builds) == 1
+    assert after.ready_hits - before.ready_hits == 1
+    assert after.forced_rebuilds == before.forced_rebuilds
+    assert after.generation_builds == before.generation_builds
+    assert after.binary_builds == before.binary_builds
+    assert files_before == {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    assert not list((tmp_path / "other").rglob("*.so"))
+    # One traversal per new object, with none on an in-memory hit.
+    assert len(resolutions) == 2
+
+
+@pytest.mark.parametrize("placement", ["direct", "parent", "cache_symlink", "output_symlink"])
+def test_private_output_base_inside_cache_keeps_runtime_outside(
+    tmp_path, automatic_jit_case, fake_runtime, monkeypatch, placement
+):
+    kernel, builds = automatic_jit_case
+    root = tmp_path / "cache"
+    root.mkdir()
+    cache_location = root
+    selected = root / "runs"
+    if placement == "parent":
+        selected = root / "nested" / ".." / "runs"
+    elif placement == "cache_symlink":
+        cache_location = tmp_path / "cache-alias"
+        cache_location.symlink_to(root, target_is_directory=True)
+        selected = cache_location / "runs"
+    elif placement == "output_symlink":
+        selected = tmp_path / "run-alias"
+        selected.symlink_to(root / "runs", target_is_directory=True)
+    monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(selected))
+    config = RunConfig(
+        backend_type=BackendType.Ascend910B,
+        execution_mode=ExecutionMode.SIM,
+        cache_config=CacheConfig(enabled=True, root=cache_location),
+    )
+    readonly = RunConfig(
+        backend_type=BackendType.Ascend910B,
+        execution_mode=ExecutionMode.SIM,
+        cache_config=CacheConfig(enabled=True, readonly=True, root=cache_location),
+    )
+    with passes.PassContext([]):
+        compiled = kernel.warmup(config=config)
+        assert kernel.warmup(config=config) is compiled
+        files_before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        kernel._artifact_objects.clear()
+        fake_runtime.runner._compile_and_assemble.side_effect = AssertionError("unexpected rebuild")
+        before = cache_stats()
+        restored = kernel.warmup(config=readonly)
+        after = cache_stats()
+    assert not compiled._artifact_runtime.run_directory.is_relative_to(root)
+    assert not restored._artifact_runtime.run_directory.is_relative_to(root)
+    assert restored._artifact_runtime.handle.directory == compiled._artifact_runtime.handle.directory
+    assert after.ready_hits - before.ready_hits == 1
+    assert len(builds) == 1
+    assert files_before == {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    assert not (root / "runs").exists()
 
 
 if __name__ == "__main__":

@@ -83,6 +83,34 @@ inline TypePtr CloneTypeWithMemRef(const TypePtr& type, const std::optional<MemR
   return type;
 }
 
+/// Remove allocation annotations before comparing value descriptors. Keep
+/// window identity, layouts, and every other type field. Memoize tuple DAGs.
+inline TypePtr CloneTypeWithoutMemRef(const TypePtr& root) {
+  std::unordered_map<const Type*, TypePtr> cache;
+  auto strip = [&](auto&& self, const TypePtr& type) -> TypePtr {
+    if (!type) return type;
+    if (auto found = cache.find(type.get()); found != cache.end()) {
+      return found->second;
+    }
+    TypePtr result = type;
+    if (auto tuple = As<TupleType>(type)) {
+      std::vector<TypePtr> elements;
+      bool changed = false;
+      for (const auto& element : tuple->types_) {
+        auto next = self(self, element);
+        changed |= next != element;
+        elements.push_back(std::move(next));
+      }
+      if (changed) result = std::make_shared<TupleType>(std::move(elements));
+    } else if (auto shaped = As<ShapedType>(type); shaped && shaped->memref_) {
+      result = CloneTypeWithMemRef(type, std::nullopt);
+    }
+    cache.emplace(type.get(), result);
+    return result;
+  };
+  return strip(strip, root);
+}
+
 /// Keep newly inferred shape / dtype / view metadata, filling only missing storage metadata.
 /// Op type deduction may omit a declared MemRef or tile memory space. For a
 /// re-deduced assignment, carry them from the assigned Var's type: ConvertToSSA
@@ -473,6 +501,17 @@ inline ExprPtr AddByteOffsets(const ExprPtr& lhs, const ExprPtr& rhs) {
   return std::make_shared<Add>(lhs, rhs, DataType::INDEX, Span::unknown());
 }
 
+/// Derive an alias window from its current source, preserving allocation-slot identity.
+/// The offset is relative to the source, never the alias's previous absolute offset.
+inline MemRefPtr MakeAliasingMemRef(const MemRefPtr& source, const ExprPtr& relative_offset, uint64_t size,
+                                    const Span& span = Span::unknown()) {
+  INTERNAL_CHECK(source) << "Internal error: alias source must carry a MemRef";
+  auto zero = As<ConstInt>(relative_offset);
+  if (zero && zero->value_ == 0 && size == source->size_) return source;
+  return std::make_shared<MemRef>(source->base_, AddByteOffsets(source->byte_offset_, relative_offset), size,
+                                  span, source->is_pinned_, source->slot_count_, source->slot_index_);
+}
+
 /// Create a multiply expression: lhs * rhs.
 /// Folds ConstInt * ConstInt into a single ConstInt.
 inline ExprPtr MulByteOffsets(const ExprPtr& lhs, const ExprPtr& rhs) {
@@ -547,7 +586,7 @@ inline ExprPtr ComputeAccumulatorSliceByteOffset(const std::vector<ExprPtr>& off
 ///    parent's. A row-narrowing window has NO correct standalone base address —
 ///    its box columns are strided by the parent's `rows`, its descriptor's by its
 ///    own — so it is left on the arithmetic it has always had rather than swapped
-///    for a differently wrong number. See docs/en/dev/passes/33-init_memref.md.
+///    for a differently wrong number. See docs/en/dev/passes/37-init_memref.md.
 ///  * a non-zero row origin, which is only reachable together with a narrowed row
 ///    extent and is unrepresentable for the same reason;
 ///  * a static column origin that is not a multiple of the 16-wide box. Such a
@@ -596,8 +635,9 @@ inline std::optional<tile_view_semantics::AccumulatorTileGeometry> GetSliceAccum
 /// Compute byte offset for a slice operation.
 /// byte_offset = (o0 * s1 * ... * sN + o1 * s2 * ... * sN + ... + oN) * storage_bits / 8
 ///
-/// MemRef carries a byte offset rather than a nibble offset. Packed 4-bit
-/// slices therefore require a static, byte-aligned logical origin in v1.
+/// MemRef carries a byte offset rather than a nibble offset. INT4/UINT4/HF4
+/// slices therefore require a static, byte-aligned origin. FP4 x2 carrier
+/// offsets are already byte offsets and need no sub-byte alignment conversion.
 ///
 /// @param acc_geometry NZ box geometry, supplied by ``GetSliceAccumulatorGeometry``
 ///        for the accumulator (L0C) windows it can address exactly. Every other

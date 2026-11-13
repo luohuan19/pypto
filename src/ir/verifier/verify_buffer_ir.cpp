@@ -20,7 +20,10 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
@@ -178,6 +181,33 @@ class BufferIRVisitor : public IRVisitor {
         registry.ValidateBufferCall(op);
         valid_calls_.insert(op.get());
         if (const auto* recipe = backend::FindBufferElementwiseRecipe(name)) CheckRecipeWindows(op, *recipe);
+        if (const auto* indexed = backend::FindBufferIndexedRecipe(name)) {
+          // Flattened indexing requires dense physical rows. A subview may
+          // inherit a wider parent pitch despite its own dense descriptor.
+          for (const auto& arg : op->args_) {
+            const auto window = windows_.find(AsVarLike(arg).get());
+            const auto type = As<BufferType>(arg->GetType());
+            const auto pitch = static_cast<uint64_t>(type->shape_[1]) * (type->dtype_.GetBit() / 8);
+            if (window == windows_.end() || window->second.row_pitch != pitch) {
+              Error("Indexed Buffer operations require dense physical row pitch", op->span_);
+            }
+          }
+          for (const auto& [first, second] : backend::BufferIndexedDisjointPairs(*indexed)) {
+            CheckWindowPair(op, op->args_[first], op->args_[second], false);
+          }
+        }
+        if (const auto* conversion = backend::FindBufferConversionRecipe(name)) {
+          for (const auto& pair : backend::BufferConversionAliasPairs(*conversion)) {
+            CheckWindowPair(op, op->args_[pair.first], op->args_[pair.second], pair.exact_allowed);
+          }
+        }
+        if (const auto* row_recipe = backend::FindBufferRowRecipe(name)) {
+          // Scratch writes must not clobber the reduction input or destination.
+          // Broadcast permits exact reuse of its matrix, never its column vector.
+          CheckWindowPair(op, op->args_[0], op->args_[2], !row_recipe->reduction);
+          CheckWindowPair(op, op->args_[1], op->args_[2], false);
+          if (row_recipe->reduction) CheckWindowPair(op, op->args_[0], op->args_[1], false);
+        }
         if (IsOp(op, "buffer.copy") && (view_handles_.count(AsVarLike(op->args_[0]).get()) ||
                                         view_handles_.count(AsVarLike(op->args_[1]).get()))) {
           CheckWindowPair(op, op->args_[0], op->args_[1], true);

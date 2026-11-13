@@ -20,16 +20,16 @@ and call the returned :class:`RegistrationHandle`.
 
 Example — implicit reuse::
 
-    from pypto.runtime import ChipWorker, RunConfig
+    from pypto.runtime import ChipWorker, ExecutionMode, RunConfig
 
-    with ChipWorker(config=RunConfig(platform="a2a3")):
+    with ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD)):
         out1 = Add(*tensors1)   # uses active ChipWorker
         out2 = Mul(*tensors2)   # reuses same ChipWorker
     # close() runs once on exit
 
 Example — explicit dispatch::
 
-    w = ChipWorker(config=RunConfig(platform="a2a3"))
+    w = ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD))
     try:
         out = w.run(compiled_add, a, b)
         h = w.register(compiled_mul)        # pre-register hot path
@@ -48,6 +48,9 @@ import weakref
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
+from pypto._target import ExecutionMode
+from pypto.backend import BackendType
+from pypto.ir.param_info import collect_output_values
 from pypto.pypto_core.passes import RuntimeKind, runtime_kind_to_name
 
 from .runner import RunConfig
@@ -281,6 +284,9 @@ class ChipWorker(Worker):
         # Transcribing ``_config``'s rings here would instead build an arena no
         # dispatch asks for. A per-call RunConfig that sizes the rings differently
         # rebuilds once, as before. No-op without a prebuilt arena.
+        from ._execution_mode import claim_program_mode  # noqa: PLC0415
+
+        claim_program_mode()
         try:
             with _device_init_lock:
                 self._impl.init(prewarm_config=_get_simpler_call_config_cls()())
@@ -458,6 +464,16 @@ class ChipWorker(Worker):
         return self._level
 
     @property
+    def backend_type(self) -> BackendType:
+        """Target architecture selected by this worker's configuration."""
+        return self._config.backend_type
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Simulator or onboard execution."""
+        return self._config.execution_mode
+
+    @property
     def platform(self) -> str:
         return self._config.platform
 
@@ -539,7 +555,8 @@ class ChipWorker(Worker):
             raise ValueError(
                 f"CompiledProgram.platform={compiled.platform!r} does not match "
                 f"ChipWorker.platform={self.platform!r}. Compile for the matching "
-                f"platform, or construct ChipWorker(config=RunConfig(platform={compiled.platform!r}))."
+                "platform, or construct ChipWorker(config=RunConfig("
+                "backend_type=compiled.backend_type, execution_mode=compiled.execution_mode))."
             )
         if compiled.runtime_name != self._runtime:
             raise ValueError(
@@ -624,10 +641,7 @@ class ChipWorker(Worker):
                     dfx_dir, self.platform, rc.dfx_options(), prebuilt_directory=runtime.directory
                 )
 
-        if not return_style:
-            return None
-        outputs = [coerced[i] for i in compiled.output_indices]
-        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+        return collect_output_values(coerced, compiled.output_indices, return_style=return_style)
 
     def register(self, compiled: CompiledProgram) -> RegistrationHandle:
         """Pre-register *compiled* on this ChipWorker. Returns a callable handle.

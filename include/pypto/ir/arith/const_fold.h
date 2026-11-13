@@ -25,6 +25,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
@@ -34,6 +35,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/type.h"
 
 namespace pypto {
 namespace ir {
@@ -94,6 +96,36 @@ inline bool NegWouldOverflow(int64_t a) { return a == std::numeric_limits<int64_
 // ---------------------------------------------------------------------------
 
 namespace detail {
+
+/// Whether ``value`` is exactly representable in ``dtype``.
+inline bool ConstIntFitsDtype(int64_t value, const DataType& dtype) {
+  if (dtype == DataType::INDEX) return true;  // index is the 64-bit signed domain
+  const size_t bits = dtype.GetBit();
+  if (bits == 0 || bits > 64) return false;
+  if (dtype.IsUnsignedInt()) {
+    if (value < 0) return false;
+    if (bits >= 64) return true;
+    return static_cast<uint64_t>(value) <= ((1ULL << bits) - 1ULL);
+  }
+  if (bits >= 64) return true;
+  const int64_t limit = static_cast<int64_t>(1ULL << (bits - 1));
+  return value >= -limit && value <= limit - 1;
+}
+
+/// Floor division/modulo folds and rewrites use mathematical int64_t values.
+/// Keep literals that would wrap in their own or the operation's dtype for
+/// runtime lowering, just as cast folding does. Check this before zero and
+/// overflow validation: an out-of-range stored divisor may emit as zero or -1.
+inline bool FloorDivModOperandsFitDtype(const ExprPtr& lhs, const ExprPtr& rhs, DataType dtype) {
+  for (const auto& operand : {lhs, rhs}) {
+    auto value = As<ConstInt>(operand);
+    if (value &&
+        (!ConstIntFitsDtype(value->value_, value->dtype()) || !ConstIntFitsDtype(value->value_, dtype))) {
+      return false;
+    }
+  }
+  return true;
+}
 
 /// Bundled As<> casts for the two operands of a binary expression.
 struct BinaryConstOperands {
@@ -175,30 +207,32 @@ inline ExprPtr FoldMul(const BinaryConstOperands& c) {
   return nullptr;
 }
 
-inline ExprPtr FoldFloorDiv(const BinaryConstOperands& c) {
+inline ExprPtr FoldFloorDiv(const BinaryConstOperands& c, DataType dtype) {
+  if (!FloorDivModOperandsFitDtype(c.lhs, c.rhs, dtype)) return nullptr;
   if (c.pa && c.pb) {
     CHECK(c.pb->value_ != 0) << "Floor division by zero";
     CHECK(!(c.pa->value_ == std::numeric_limits<int64_t>::min() && c.pb->value_ == -1))
         << "Floor division overflow: INT64_MIN // -1";
-    return MakeConstInt(floordiv(c.pa->value_, c.pb->value_), c.pa->dtype());
+    return MakeConstInt(floordiv(c.pa->value_, c.pb->value_), dtype);
   }
   // NOT folding 0 // x → 0: x could be 0 at runtime, must preserve the division.
-  if (c.pb && c.pb->value_ == 1) return c.lhs;  // x // 1 → x
+  if (c.pb && c.pb->value_ == 1 && GetScalarDtype(c.lhs) == dtype) return c.lhs;  // x // 1 → x
   if (c.pb) {
     CHECK(c.pb->value_ != 0) << "Floor division by zero";
   }
   return nullptr;
 }
 
-inline ExprPtr FoldFloorMod(const BinaryConstOperands& c) {
+inline ExprPtr FoldFloorMod(const BinaryConstOperands& c, DataType dtype) {
+  if (!FloorDivModOperandsFitDtype(c.lhs, c.rhs, dtype)) return nullptr;
   if (c.pa && c.pb) {
     CHECK(c.pb->value_ != 0) << "Floor modulo by zero";
     CHECK(!(c.pa->value_ == std::numeric_limits<int64_t>::min() && c.pb->value_ == -1))
         << "Floor modulo overflow: INT64_MIN % -1";
-    return MakeConstInt(floormod(c.pa->value_, c.pb->value_), c.pa->dtype());
+    return MakeConstInt(floormod(c.pa->value_, c.pb->value_), dtype);
   }
   // NOT folding 0 % x → 0: x could be 0 at runtime, must preserve the modulo.
-  if (c.pb && c.pb->value_ == 1) return MakeConstInt(0, c.pb->dtype());  // x % 1 → 0
+  if (c.pb && c.pb->value_ == 1) return MakeConstInt(0, dtype);  // x % 1 → 0
   if (c.pb) {
     CHECK(c.pb->value_ != 0) << "Floor modulo by zero";
   }
@@ -320,7 +354,7 @@ inline ExprPtr FoldShiftRight(const BinaryConstOperands& c) {
 
 /// Try to constant-fold a binary operation.
 /// Returns nullptr if no fold applies.
-inline ExprPtr TryConstFoldBinary(ObjectKind kind, const ExprPtr& lhs, const ExprPtr& rhs) {
+inline ExprPtr TryConstFoldBinary(ObjectKind kind, const ExprPtr& lhs, const ExprPtr& rhs, DataType dtype) {
   // Logical ops use ConstBool, not ConstInt/ConstFloat — handle separately.
   switch (kind) {
     case ObjectKind::And:
@@ -345,9 +379,9 @@ inline ExprPtr TryConstFoldBinary(ObjectKind kind, const ExprPtr& lhs, const Exp
     case ObjectKind::Mul:
       return detail::FoldMul(c);
     case ObjectKind::FloorDiv:
-      return detail::FoldFloorDiv(c);
+      return detail::FoldFloorDiv(c, dtype);
     case ObjectKind::FloorMod:
-      return detail::FoldFloorMod(c);
+      return detail::FoldFloorMod(c, dtype);
     case ObjectKind::FloatDiv:
       return detail::FoldFloatDiv(c);
     case ObjectKind::Pow:
@@ -383,6 +417,11 @@ inline ExprPtr TryConstFoldBinary(ObjectKind kind, const ExprPtr& lhs, const Exp
     default:
       return nullptr;
   }
+}
+
+/// Fold a binary operation whose result has the same dtype as its lhs.
+inline ExprPtr TryConstFoldBinary(ObjectKind kind, const ExprPtr& lhs, const ExprPtr& rhs) {
+  return TryConstFoldBinary(kind, lhs, rhs, GetScalarDtype(lhs));
 }
 
 // ---------------------------------------------------------------------------
@@ -426,25 +465,6 @@ inline ExprPtr TryConstFoldUnary(ObjectKind kind, const ExprPtr& operand) {
 // TryConstFoldCast — fold a cast of a constant into a typed constant
 // ---------------------------------------------------------------------------
 
-namespace detail {
-
-/// Whether ``value`` is exactly representable in ``dtype``.
-inline bool ConstIntFitsDtype(int64_t value, const DataType& dtype) {
-  if (dtype == DataType::INDEX) return true;  // index is the 64-bit signed domain
-  const size_t bits = dtype.GetBit();
-  if (bits == 0 || bits > 64) return false;
-  if (dtype.IsUnsignedInt()) {
-    if (value < 0) return false;
-    if (bits >= 64) return true;
-    return static_cast<uint64_t>(value) <= ((1ULL << bits) - 1ULL);
-  }
-  if (bits >= 64) return true;
-  const int64_t limit = static_cast<int64_t>(1ULL << (bits - 1));
-  return value >= -limit && value <= limit - 1;
-}
-
-}  // namespace detail
-
 /// Try to fold ``cast(<integer constant>, dtype)`` into a constant of ``dtype``.
 ///
 /// Only an integer constant going to an integer (or INDEX) destination folds,
@@ -484,7 +504,7 @@ inline ExprPtr TryConstFoldCast(const ExprPtr& operand, const DataType& dtype) {
 /// Accepts any BinaryExpr or UnaryExpr; returns nullptr for non-foldable nodes.
 inline ExprPtr TryConstFold(const ExprPtr& expr) {
   if (auto bin = As<BinaryExpr>(expr)) {
-    return TryConstFoldBinary(expr->GetKind(), bin->left_, bin->right_);
+    return TryConstFoldBinary(expr->GetKind(), bin->left_, bin->right_, GetScalarDtype(expr));
   }
   // Cast before the generic unary arm: folding it needs the destination dtype,
   // which only the Cast node carries.
@@ -495,6 +515,71 @@ inline ExprPtr TryConstFold(const ExprPtr& expr) {
     return TryConstFoldUnary(expr->GetKind(), un->operand_);
   }
   return nullptr;
+}
+
+/// Evaluate a constant integer expression without rewriting the IR.
+/// Return no value when the result cannot be proved in the int64_t domain.
+inline std::optional<int64_t> TryEvaluateIntConstant(const ExprPtr& expr) {
+  const auto type = As<ScalarType>(expr->GetType());
+  if (!type || !(type->dtype_.IsInt() || type->dtype_ == DataType::INDEX)) return std::nullopt;
+  const auto dtype = type->dtype_;
+  if (auto value = As<ConstInt>(expr)) {
+    return detail::ConstIntFitsDtype(value->value_, dtype) ? std::optional<int64_t>(value->value_)
+                                                           : std::nullopt;
+  }
+  if (auto cast = As<Cast>(expr)) {
+    const auto operand = TryEvaluateIntConstant(cast->operand_);
+    if (!operand) return std::nullopt;
+    if (detail::ConstIntFitsDtype(*operand, dtype)) return operand;
+    const auto bits = dtype.GetBit();
+    if (bits == 0 || bits >= 64 ||
+        (!dtype.IsUnsignedInt() && bits > GetScalarDtype(cast->operand_).GetBit())) {
+      return std::nullopt;
+    }
+    const auto modulus = uint64_t{1} << bits;
+    const auto truncated = static_cast<uint64_t>(*operand) & (modulus - 1);
+    if (!dtype.IsUnsignedInt() && truncated >= modulus / 2) {
+      return -static_cast<int64_t>(modulus - truncated);
+    }
+    return static_cast<int64_t>(truncated);
+  }
+  ExprPtr folded;
+  if (auto binary = As<BinaryExpr>(expr)) {
+    const auto lhs = TryEvaluateIntConstant(binary->left_);
+    const auto rhs = TryEvaluateIntConstant(binary->right_);
+    if (!lhs || !rhs || !detail::ConstIntFitsDtype(*lhs, dtype) || !detail::ConstIntFitsDtype(*rhs, dtype)) {
+      return std::nullopt;
+    }
+    const auto kind = expr->GetKind();
+    if ((kind == ObjectKind::FloorDiv || kind == ObjectKind::FloorMod) &&
+        (*rhs == 0 || (*lhs == std::numeric_limits<int64_t>::min() && *rhs == -1))) {
+      return std::nullopt;
+    }
+    if (kind == ObjectKind::Pow && *rhs < 0) return std::nullopt;
+    if ((kind == ObjectKind::BitShiftLeft || kind == ObjectKind::BitShiftRight) &&
+        (*rhs < 0 || static_cast<uint64_t>(*rhs) >= dtype.GetBit())) {
+      return std::nullopt;
+    }
+    if (kind == ObjectKind::Mul && dtype.IsUnsignedInt() && dtype.GetBit() < 64) {
+      const auto mask = (uint64_t{1} << dtype.GetBit()) - 1;
+      return static_cast<int64_t>((static_cast<uint64_t>(*lhs) * static_cast<uint64_t>(*rhs)) & mask);
+    }
+    folded = TryConstFoldBinary(kind, MakeConstInt(*lhs, dtype), MakeConstInt(*rhs, dtype), dtype);
+  } else if (auto unary = As<UnaryExpr>(expr)) {
+    const auto operand = TryEvaluateIntConstant(unary->operand_);
+    if (!operand) return std::nullopt;
+    folded = TryConstFoldUnary(expr->GetKind(), MakeConstInt(*operand, dtype));
+  }
+  if (auto value = As<ConstInt>(folded)) {
+    if (detail::ConstIntFitsDtype(value->value_, dtype)) return value->value_;
+    // Unsigned arithmetic is modular. For narrow types its wrapped value
+    // fits in the signed host representation used by the constant folder.
+    if (dtype.IsUnsignedInt() && dtype.GetBit() < 64) {
+      const auto mask = (uint64_t{1} << dtype.GetBit()) - 1;
+      return static_cast<int64_t>(static_cast<uint64_t>(value->value_) & mask);
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace arith

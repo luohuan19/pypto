@@ -8,6 +8,28 @@ IR 解析器 (Parser) 使用装饰器（`@pl.function`、`@pl.program`）将 Pyt
 
 参见 [IR 构建器](06-builder.md) 了解手动 IR 构建，以及 [Python IR 语法](../language/00-python_syntax.md) 了解完整语法。
 
+## 实现结构
+
+`ASTParser` 仍是函数解析、语句/表达式分派和变量绑定的入口，通过组合专用解析器拆分职责，不使用解析混入类（Mixin）。
+
+| 模块 | 职责 |
+| ---- | ---- |
+| `control_flow_parser.py` | 循环、条件分支、yield、break 和 continue |
+| `scope_parser.py` | 作用域指令、SPMD 和 split-AIV 展开，复用公共作用域生成逻辑 |
+| `call_parser.py` | 内核、外部和内联调用；submit 结果绑定 |
+| `op_parser.py` | 算子调用、分布式操作和缓冲区元数据 |
+| `subscript_parser.py` | Tensor/Tile 索引、切片和下标赋值 |
+| `attr_parser.py` | 函数和调用属性解析 |
+| `dispatch_semantics.py` | TaskId 生产者、依赖和调度谓词 |
+| `source_comments.py` | 注释附着与块边界处理 |
+| `region_context.py` | 活跃作用域、split 和手动区域状态 |
+| `parser_state.py` | 共享服务、递归回调和状态契约 |
+| `syntax_helpers.py`、`type_semantics.py` | 共享语法识别与类型/形状辅助函数 |
+
+组件接收显式依赖和少量递归回调，不持有整个 `ASTParser`。每个解析器共享同一个构建器、作用域管理器、求值器、类型解析器和源码位置跟踪器。内联展开临时修改现有求值器和源码跟踪器，因此索引、算子和嵌套语句始终使用一致的闭包和源码坐标。
+
+函数元数据、控制流状态和内联状态分别管理。程序级缓冲区元数据保留装饰器传入的对象身份。调用和作用域共享同一个 `DispatchSemantics` 实例，以统一追踪 TaskId 生产者和绑定代次。
+
 ## 用法
 
 ### 基本函数
@@ -29,6 +51,20 @@ assert isinstance(simple_add, pypto.ir.Function)
 ```
 
 ### 类型 (Type) 标注
+
+赋值和算子参数支持 `math.nan`、`math.inf`、`-math.inf` 等 Python 数值模块属性。
+在外层 Python 作用域导入 `math` 即可，也支持导入别名。
+使用 `pl.const(math.nan, pl.FP32)`（或 `pl.FP16` / `pl.BF16`）显式指定类型。
+未使用 `pl.const` 时，类型规则与其他 Python 浮点常量相同。
+`pl.const` 要求编译期数值，不能用于转换运行时标量变量。
+`@pl.jit` 同样解析 `math.nan` 和 `math.inf`（包括模块别名），在特化源码中
+保留它们的位模式，并将其值纳入缓存键。
+算子的直接参数保留 Python 数值语义：FP16 张量与 `math.inf` 相加时，标量推导为
+FP16，`pl.full` 也可将它用作填充值。打印的 IR 对非有限操作数显式使用
+`pl.const`，以保留已有类型。数值属性求值会拒绝复合基表达式中的运行时引用，
+例如 `(x + 1.0).real`，避免用闭包中的同名值替代运行时 `x`。
+算子参数仍支持张量和 Tile 的类型属性，例如 `pl.cast(x, y.dtype)`：
+它们直接从 IR 类型元数据解析，无需进行 Python 求值。
 
 所有参数和局部变量需要类型标注：
 
@@ -101,6 +137,10 @@ else:
 因此，即使 DSL 的运行时 wrapper 没有相应的 Python 运算符，符号 shape 表达式
 仍可解析。打印后的 shape 中，带类型的常量叶子会重建算术、幂、按位及移位节点，
 不进行常量折叠。普通用户常量表达式仍可折叠；重建 IR 的化简由独立 pass 负责。
+
+Shape 维度也通过表达式解析器恢复私有 `pl._dump.call(...)` 快照，保留记录的
+结果类型、操作数绑定及元数据。这些调用必须返回整数或 INDEX 标量。当
+`tensor.dim` 的操作数携带存储信息时，可以使用这种形式，并保留未折叠的读取。
 
 嵌套 `pl.Tuple[...]` 表示递归的元组值类型。内置 `tuple[...]` 返回注解仍表示
 函数结果列表；嵌套结果列表不是元组值类型，仍会被拒绝。

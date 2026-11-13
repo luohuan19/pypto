@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <any>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,10 +37,12 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/loop_state_repair.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/split_axis_utils.h"
+#include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
@@ -65,18 +66,12 @@ bool RequiresNoSplitDualAivSync(const FunctionPtr& func) {
 // ---------------------------------------------------------------------------
 // Standalone (non-split_aiv) split lowering.
 //
-// The auto-split pipeline (pl.split mixed InCore -> LowerAutoVectorSplit ->
-// ExpandMixedKernel) reaches this pass with each split function already
-// ``split_aiv``-marked and pre-halved (handled by the split_aiv branch below).
-// But hand-written *standalone* AIV/AIC kernels — separate functions whose
-// cross-core split is signalled either by an explicit function ``split`` attr
-// or by a ``split=N`` kwarg on their tpush/tpop pipe ops — never pass through
-// LowerAutoVectorSplit (it is InCore-only) and arrive here at full shape. They
-// still need the per-lane halving + get_subblock_idx injection. This is the
-// dedicated path for them; it reuses the shared ``split_axis`` halving driver
-// (the same machinery LowerAutoVectorSplit calls), so the produced per-lane
-// body is identical. It runs ONLY for functions that are NOT ``split_aiv``
-// marked, so it can never double-halve an already-lowered auto-split function.
+// Explicit regions reach this pass with authored per-lane shapes and a
+// ``split_aiv`` marker, so their bodies pass through unchanged. Standalone
+// AIV/AIC kernels without that marker still need per-lane halving and AIV
+// subblock-index injection when their function attr or pipe ops request a split.
+// This dedicated path uses the shared ``split_axis`` halving driver only for
+// those standalone functions.
 // ---------------------------------------------------------------------------
 
 bool IsCrossCoreSplitOp(const OpPtr& op) {
@@ -174,10 +169,6 @@ std::vector<std::pair<std::string, std::any>> WithSplitAttrs(const FunctionPtr& 
   return attrs;
 }
 
-ExprPtr MakeIndexConst(int64_t value, const Span& span) {
-  return std::make_shared<ConstInt>(value, DataType::INDEX, span);
-}
-
 TypePtr WithZeroValidShape(const TypePtr& type, const Span& span) {
   auto tt = std::dynamic_pointer_cast<const TileType>(type);
   if (!tt) return type;
@@ -206,6 +197,7 @@ StmtPtr SubstituteStmtIfNeeded(const StmtPtr& stmt, const ExprReplacementMap& re
 }
 
 CallPtr RebuildLane1CallWithZeroValidShape(const CallPtr& call, const ExprReplacementMap& replacements) {
+  auto replay_type = SubstituteExprIfNeeded(call, replacements)->GetType();
   std::vector<ExprPtr> new_args;
   new_args.reserve(call->args_.size());
   bool args_changed = false;
@@ -216,7 +208,7 @@ CallPtr RebuildLane1CallWithZeroValidShape(const CallPtr& call, const ExprReplac
   }
 
   if (IsOp(call, "tile.load") && new_args.size() >= 3) {
-    auto new_type = WithZeroValidShape(call->GetType(), call->span_);
+    auto new_type = WithZeroValidShape(replay_type, call->span_);
     auto tile_type = std::dynamic_pointer_cast<const TileType>(new_type);
     if (!tile_type) return call;
 
@@ -240,7 +232,7 @@ CallPtr RebuildLane1CallWithZeroValidShape(const CallPtr& call, const ExprReplac
     // 0 — so ccec cannot compile the static-zero subview (gh#1649). A
     // tile.create renders with dynamic valid (runtime 0) and compiles cleanly,
     // matching how the sibling non-subview replay tiles behave.
-    auto new_type = WithZeroValidShape(call->GetType(), call->span_);
+    auto new_type = WithZeroValidShape(replay_type, call->span_);
     auto tile_type = std::dynamic_pointer_cast<const TileType>(new_type);
     INTERNAL_CHECK_SPAN(tile_type != nullptr, call->span_)
         << "Internal error: tile.slice must produce a TileType, but got "
@@ -255,17 +247,23 @@ CallPtr RebuildLane1CallWithZeroValidShape(const CallPtr& call, const ExprReplac
     auto create_op = OpRegistry::GetInstance().GetOp("tile.create");
     return std::make_shared<Call>(create_op, std::vector<ExprPtr>{new_args[1]}, std::move(kwargs), new_type,
                                   call->span_);
-  } else if (IsOp(call, "tile.transpose")) {
+  } else if (IsOp(call, "tile.transpose") || IsOp(call, "tile.fmods") || IsOp(call, "tile.rems") ||
+             IsOp(call, "tile.row_max") || IsOp(call, "tile.row_min") || IsOp(call, "tile.row_sum") ||
+             IsOp(call, "tile.row_prod")) {
     // tile.transpose lowers to a pto-isa op that hangs the AICore (507018) when
     // every operand is a zero-valid replay tile — the same static/zero-valid
     // hazard gh#1649 hit for subview slices. The replay result is discarded, so
     // emit an empty tile of the result shape instead of running the transpose.
-    auto new_type = WithZeroValidShape(call->GetType(), call->span_);
+    // Scalar remainder and row reductions also require positive valid extents
+    // on A2/A3. Their results are discarded on this lane; materializing an empty
+    // result preserves the downstream pipe handshakes without executing an
+    // instruction with an invalid input shape.
+    auto new_type = WithZeroValidShape(replay_type, call->span_);
     auto tile_type = std::dynamic_pointer_cast<const TileType>(new_type);
     // Fail loud (like the tile.slice branch) rather than silently fall through to
     // the generic rebuild below, which would replay the hang-prone transpose.
     INTERNAL_CHECK_SPAN(tile_type != nullptr, call->span_)
-        << "Internal error: tile.transpose must produce a TileType, but got "
+        << "Internal error: " << call->op_->name_ << " must produce a TileType, but got "
         << (new_type ? new_type->TypeName() : "null");
     std::vector<ExprPtr> shape_elems(tile_type->shape_.begin(), tile_type->shape_.end());
     auto shape_tuple = std::make_shared<MakeTuple>(std::move(shape_elems), call->span_);
@@ -283,7 +281,7 @@ CallPtr RebuildLane1CallWithZeroValidShape(const CallPtr& call, const ExprReplac
     args_changed = true;
   }
 
-  auto new_type = WithZeroValidShape(call->GetType(), call->span_);
+  auto new_type = WithZeroValidShape(replay_type, call->span_);
   bool type_changed = new_type != call->GetType();
   if (!args_changed && !type_changed) return call;
   return std::make_shared<Call>(call->op_, std::move(new_args), call->kwargs_, new_type, call->span_);
@@ -382,7 +380,76 @@ std::vector<VarPtr> RebuildLane1LoopReturnVars(const std::vector<VarPtr>& return
   return new_return_vars;
 }
 
-// Lane 1 still needs to replay cross-core handshakes so Ascend910B GM-backed
+// Follow only the terminal-yield path, matching GetLastYieldStmt. Preserve
+// transparent scopes and the definitions preceding the yield inside them.
+StmtPtr ReplaceReplayTerminalYield(const StmtPtr& body, const StmtPtr& replacement) {
+  if (As<YieldStmt>(body)) return replacement;
+  if (auto seq = As<SeqStmts>(body)) {
+    INTERNAL_CHECK_SPAN(!seq->stmts_.empty(), seq->span_)
+        << "Internal error: replay yield path contains an empty sequence";
+    auto stmts = seq->stmts_;
+    auto tail = ReplaceReplayTerminalYield(stmts.back(), replacement);
+    stmts.pop_back();
+    auto tail_stmts = transform_utils::FlattenToStmts(tail);
+    stmts.insert(stmts.end(), tail_stmts.begin(), tail_stmts.end());
+    return loop_repair::MakeBody(stmts, seq->span_);
+  }
+  if (auto scope = As<RuntimeScopeStmt>(body)) {
+    auto new_scope = MutableCopy(scope);
+    new_scope->body_ = ReplaceReplayTerminalYield(scope->body_, replacement);
+    return new_scope;
+  }
+  if (auto scope = As<SplitAivScopeStmt>(body)) {
+    auto new_scope = MutableCopy(scope);
+    new_scope->body_ = ReplaceReplayTerminalYield(scope->body_, replacement);
+    return new_scope;
+  }
+  INTERNAL_UNREACHABLE_SPAN(body->span_) << "Internal error: replay branch must end in a yield";
+}
+
+// Store bypass can expose different destination shapes at a conditional join.
+// Keep the original tensor contract using metadata-only views of those buffers;
+// the empty replay lane never writes through them.
+StmtPtr NormalizeLane1TensorYields(const StmtPtr& body, const std::vector<VarPtr>& return_vars) {
+  auto yield = transform_utils::GetLastYieldStmt(body);
+  auto new_yield = MutableCopy(yield);
+  std::vector<StmtPtr> stmts;
+  for (size_t i = 0; i < return_vars.size(); ++i) {
+    const auto& value = yield->value_[i];
+    auto target = AsTensorTypeLike(return_vars[i]->GetType());
+    if (!target || structural_equal(target, value->GetType())) continue;
+
+    auto view = target->tensor_view_.value_or(TensorView{});
+    if (view.stride.empty()) {
+      view.stride = tensor_view_semantics::BuildLogicalStridesFromLayout(target->shape_, view.layout);
+    }
+    TypePtr view_type;
+    if (auto distributed = As<DistributedTensorType>(target)) {
+      auto new_type = MutableCopy(distributed);
+      new_type->tensor_view_ = view;
+      view_type = new_type;
+    } else {
+      auto new_type = MutableCopy(target);
+      new_type->tensor_view_ = view;
+      view_type = new_type;
+    }
+    std::vector<ExprPtr> args{value, std::make_shared<MakeTuple>(target->shape_, yield->span_)};
+    if (!view.valid_shape.empty()) {
+      args.push_back(std::make_shared<MakeTuple>(view.valid_shape, yield->span_));
+    }
+    auto call = std::make_shared<Call>(OpRegistry::GetInstance().GetOp("tensor.view"), std::move(args),
+                                       std::vector<std::pair<std::string, std::any>>{{"layout", view.layout}},
+                                       view_type, yield->span_);
+    auto alias = std::make_shared<Var>(return_vars[i]->name_hint_ + "_replay_view", view_type, yield->span_);
+    stmts.push_back(std::make_shared<AssignStmt>(alias, call, yield->span_));
+    new_yield->value_[i] = alias;
+  }
+  if (stmts.empty()) return body;
+  stmts.push_back(new_yield);
+  return ReplaceReplayTerminalYield(body, loop_repair::MakeBody(stmts, yield->span_));
+}
+
+// Lane 1 still needs to replay cross-core handshakes so Ascend910 GM-backed
 // pipes stay balanced. Tile-producing replay work is forced to static
 // valid_shape=0, letting PTO ops run as empty tiles while preserving the tpush /
 // tpop / tfree synchronization protocol. The only visible side effects we
@@ -396,19 +463,30 @@ std::vector<StmtPtr> BuildNoSplitLane1ReplayStmts(const std::vector<StmtPtr>& st
     if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
       auto call = std::dynamic_pointer_cast<const Call>(assign->value_);
       if (!call || !call->op_) {
-        result.push_back(SubstituteStmtIfNeeded(stmt, replacements));
+        // Aliases must inherit the replay value's type, including the empty
+        // tile view introduced on lane 1, and propagate it to later uses.
+        auto new_value = SubstituteExprIfNeeded(assign->value_, replacements);
+        auto new_var =
+            std::make_shared<Var>(assign->var_->name_hint_, new_value->GetType(), assign->var_->span_);
+        replacements[assign->var_.get()] = new_var;
+        result.push_back(std::make_shared<AssignStmt>(new_var, new_value, assign->span_));
         continue;
       }
 
       if (IsOp(call, "tile.store") && call->args_.size() >= 3) {
         auto passthrough = SubstituteExprIfNeeded(call->args_[2], replacements);
         replacements[assign->var_.get()] = passthrough;
-        result.push_back(std::make_shared<AssignStmt>(assign->var_, passthrough, assign->span_));
+        // The store result may use callee-local shape symbols while the
+        // destination uses caller-local symbols. The bypass takes its type
+        // from the actual destination, rather than the removed store call.
+        auto new_var =
+            std::make_shared<Var>(assign->var_->name_hint_, passthrough->GetType(), assign->var_->span_);
+        result.push_back(std::make_shared<AssignStmt>(new_var, passthrough, assign->span_));
         continue;
       }
 
       auto new_value = RebuildLane1CallWithZeroValidShape(call, replacements);
-      if (std::dynamic_pointer_cast<const TileType>(new_value->GetType())) {
+      if (As<TileType>(new_value->GetType()) || new_value->GetType() != assign->var_->GetType()) {
         auto new_var =
             std::make_shared<Var>(assign->var_->name_hint_, new_value->GetType(), assign->var_->span_);
         replacements[assign->var_.get()] = new_var;
@@ -483,6 +561,42 @@ std::vector<StmtPtr> BuildNoSplitLane1ReplayStmts(const std::vector<StmtPtr>& st
       new_if->condition_ = SubstituteExprIfNeeded(if_stmt->condition_, replacements);
       new_if->then_body_ = loop_repair::MakeBody(new_then_stmts, if_stmt->span_);
       new_if->else_body_ = new_else;
+      if (!if_stmt->return_vars_.empty()) {
+        auto then_yield = transform_utils::GetLastYieldStmt(new_if->then_body_);
+        auto else_yield = new_else ? transform_utils::GetLastYieldStmt(*new_else) : nullptr;
+        INTERNAL_CHECK_SPAN(then_yield && else_yield, if_stmt->span_)
+            << "Internal error: replay IfStmt results require yields in both branches";
+        INTERNAL_CHECK_SPAN(then_yield->value_.size() == if_stmt->return_vars_.size() &&
+                                else_yield->value_.size() == if_stmt->return_vars_.size(),
+                            if_stmt->span_)
+            << "Internal error: replay IfStmt yield arity must match its results";
+        for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
+          const auto& original = if_stmt->return_vars_[i];
+          // The original result already describes the branch join. Yielded
+          // tiles may have distinct padding/layout metadata, so copying one
+          // branch or requiring full structural equality is not valid here.
+          // Shape/view expressions must use replay-local scalar definitions
+          // before zeroing tile validity or normalizing tensor destinations.
+          auto type =
+              WithZeroValidShape(SubstituteExprIfNeeded(original, replacements)->GetType(), original->span_);
+          // Identical tensor yields already have a compatible join. Retain
+          // their actual destination type and backing view; materializing a
+          // separate view in each branch would break in-place codegen.
+          if (AsTensorTypeLike(type) &&
+              structural_equal(then_yield->value_[i]->GetType(), else_yield->value_[i]->GetType())) {
+            type = then_yield->value_[i]->GetType();
+          }
+          if (type != original->GetType()) {
+            auto replacement = std::make_shared<Var>(original->name_hint_, type, original->span_);
+            new_if->return_vars_[i] = replacement;
+            replacements[original.get()] = replacement;
+          }
+        }
+        new_if->then_body_ = NormalizeLane1TensorYields(new_if->then_body_, new_if->return_vars_);
+        if (new_else) {
+          new_if->else_body_ = NormalizeLane1TensorYields(*new_else, new_if->return_vars_);
+        }
+      }
       result.push_back(new_if);
       continue;
     }
@@ -496,9 +610,8 @@ std::vector<StmtPtr> BuildNoSplitLane1ReplayStmts(const std::vector<StmtPtr>& st
 // Halve a standalone (non-split_aiv) AIV/AIC function in place along the split
 // axis: inject get_subblock_idx (AIV only), route every leaf statement through
 // the shared split_axis halving driver, re-localize offsets via the final
-// Substitute, and stamp split (+ dual_aiv_dispatch for AIV). Mirrors the
-// auto-split LowerFunction path but consumes a body that already carries
-// explicit tpush/tpop boundaries (no tile.move -> aiv_shard rewrite needed).
+// Substitute, and stamp split (+ dual_aiv_dispatch for AIV). The body already
+// carries explicit tpush/tpop boundaries; no shard/gather synthesis is needed.
 FunctionPtr ProcessStandaloneSplitFunction(const FunctionPtr& func, SplitMode mode) {
   if (mode == SplitMode::None) return func;
   int split_dim = SplitDimension(mode);
@@ -539,15 +652,8 @@ FunctionPtr ProcessNoSplitDualAivFunction(const FunctionPtr& func) {
   INTERNAL_CHECK(RequiresNoSplitDualAivSync(func))
       << "Internal error: ProcessNoSplitDualAivFunction requires dual-dispatch AIV marker";
 
-  std::unordered_map<const Var*, ExprPtr> param_replacements;
-  std::vector<VarPtr> new_params;
-  new_params.reserve(func->params_.size());
-  for (const auto& param : func->params_) {
-    auto new_param = std::make_shared<Var>(param->name_hint_, param->GetType(), param->span_);
-    new_params.push_back(new_param);
-    param_replacements[param.get()] = new_param;
-  }
-
+  // The signature is unchanged. Retain its parameter identities so shapes in
+  // parameter and return types keep referring to their scalar definitions.
   auto injected = InjectSubblockIdx(func, /*is_aiv=*/true);
   INTERNAL_CHECK(!injected.body_stmts.empty())
       << "Internal error: dual-dispatch no-split AIV body must contain injected subblock_idx";
@@ -555,7 +661,7 @@ FunctionPtr ProcessNoSplitDualAivFunction(const FunctionPtr& func) {
   auto hoisted_prefix = SplitNoSplitSharedPipeSetupPrefix(guarded_stmts);
   auto lane0_body = loop_repair::MakeBody(hoisted_prefix.branch_stmts, func->span_);
 
-  ExprReplacementMap lane1_replacements = param_replacements;
+  ExprReplacementMap lane1_replacements;
   auto lane1_stmts = BuildNoSplitLane1ReplayStmts(hoisted_prefix.branch_stmts, lane1_replacements);
   auto lane1_body = loop_repair::MakeBody(lane1_stmts, func->span_);
   auto [lane1_cloned_body, lane1_clone_map_unused] = DeepClone(lane1_body);
@@ -572,14 +678,10 @@ FunctionPtr ProcessNoSplitDualAivFunction(const FunctionPtr& func) {
                         hoisted_prefix.shared_setup_stmts.end());
   new_body_stmts.push_back(branch_stmt);
   StmtPtr new_body = loop_repair::MakeBody(new_body_stmts, func->span_);
-  if (!param_replacements.empty()) {
-    new_body = transform_utils::Substitute(new_body, param_replacements);
-  }
   auto [cloned_body, clone_map_unused] = DeepClone(new_body);
   (void)clone_map_unused;
 
   auto new_func = MutableCopy(func);
-  new_func->params_ = new_params;
   new_func->body_ = cloned_body;
   return new_func;
 }
@@ -624,29 +726,23 @@ Pass SplitVectorKernel() {
         continue;
       }
 
-      // split_aiv kernels arrive here already in the explicit form: either
-      // hand-written, or produced by LowerAutoVectorSplit from an AUTO pl.split
-      // mixed InCore function. Their tile.aiv_shard / tile.aic_gather have been
-      // folded into split-stamped tpush/tpop pairs (via ExpandMixedKernel's
-      // boundary machinery) and they carry already-halved compute tiles. This is
-      // the SOLE split path through SplitVectorKernel: just stamp split +
-      // dual_aiv_dispatch and pass the body through unchanged. The former per-op
-      // halving driver was deleted — after LowerAutoVectorSplit runs, every split
-      // function reaches here split_aiv-marked, so re-halving here would
-      // double-halve the (already-half) body.
+      // Explicit regions arrive with authored per-lane computation and lowered
+      // shard/gather transport. Only stamp dispatch metadata: halving again
+      // would corrupt the explicit shapes and addresses. Standalone kernels
+      // without this marker use the separate transformation below.
       if ((func->func_type_ == FunctionType::AIV || func->func_type_ == FunctionType::AIC) &&
           func->HasAttr(kAttrSplitAiv) && func->GetAttr<bool>(kAttrSplitAiv, false)) {
         auto explicit_mode = func->GetSplitMode();
         auto new_func = MutableCopy(func);
         if (explicit_mode.has_value() && explicit_mode.value() != SplitMode::None) {
           // Single-mode split_aiv: a function-level "split" attr survives (a
-          // hand-written kernel, an AUTO function converged by LowerAutoVectorSplit,
+          // hand-written kernel
           // or a single-mode explicit region). Stamp split + dual_aiv_dispatch.
           new_func->attrs_ =
               WithSplitAttrs(func, explicit_mode.value(), func->func_type_ == FunctionType::AIV);
         } else {
           // Multi-mode explicit split_aiv: the per-region modes were lowered and
-          // erased by LowerAutoVectorSplit (pass 23); no single function-level mode
+          // consumed by ExpandMixedKernel; no single function-level mode
           // survives. The authoritative per-op "split" ints already sit on the
           // tpop/tpush pairs, so only the mode-agnostic dual_aiv_dispatch bool needs
           // stamping here (all RequiresDualAivDispatch consults).
@@ -668,8 +764,8 @@ Pass SplitVectorKernel() {
       // functions whose cross-core split is signalled by an explicit function
       // "split" attr or by a split=N kwarg on their pipe ops. These never pass
       // through LowerAutoVectorSplit (InCore-only) and arrive un-halved, so they
-      // need the per-lane halving here. Guarded by NOT split_aiv (above), so a
-      // pre-halved auto-split function can never reach this branch.
+      // need the per-lane halving here. Explicit split_aiv bodies were handled
+      // above and cannot reach this branch.
       if (func->func_type_ == FunctionType::AIV || func->func_type_ == FunctionType::AIC) {
         auto standalone_mode = ResolveSplitMode(func);
         if (standalone_mode.has_value() && standalone_mode.value() != SplitMode::None) {
@@ -679,7 +775,7 @@ Pass SplitVectorKernel() {
         }
       }
 
-      // No-split dual-AIV dispatch: the orthogonal Ascend910B path that replays
+      // No-split dual-AIV dispatch: the orthogonal Ascend910 path that replays
       // cross-core handshakes on lane 1 of a non-split AIV function. Untouched by
       // the convergence refactor.
       if (RequiresNoSplitDualAivSync(func)) {

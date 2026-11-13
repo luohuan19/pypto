@@ -139,7 +139,7 @@ def test_every_backend_entry_has_one_current_migration_classification(registry_s
 
     # These are audited baseline sizes, not a count of implemented recipes.
     assert len(MIGRATION_FAMILIES) == 22
-    assert sum(len(family.operations) for family in MIGRATION_FAMILIES) == 168
+    assert sum(len(family.operations) for family in MIGRATION_FAMILIES) == 177
     assert len(HISTORICAL_CALLBACKS) == 8
 
 
@@ -184,10 +184,10 @@ def test_restored_historical_ir_definition_requires_a_live_recipe_classification
 
 def test_target_expansion_is_detected_even_when_union_is_unchanged(registry_snapshots):
     changed = dict(registry_snapshots)
-    changed[backend.BackendType.Ascend910B] = changed[backend.BackendType.Ascend910B] | {"tile.matmul_mx"}
+    changed[backend.BackendType.Ascend910] = changed[backend.BackendType.Ascend910] | {"tile.matmul_mx"}
     assert set.union(*changed.values()) == set.union(*registry_snapshots.values())
     issues = _audit_issues(changed)
-    assert any("Ascend910B has unclassified backend entries: ['tile.matmul_mx']" in issue for issue in issues)
+    assert any("Ascend910 has unclassified backend entries: ['tile.matmul_mx']" in issue for issue in issues)
 
 
 def test_duplicate_family_and_operator_classifications_are_rejected(registry_snapshots):
@@ -204,9 +204,7 @@ def test_stale_maturity_annotation_is_rejected(registry_snapshots):
 
 
 def test_incomplete_target_snapshot_is_rejected(registry_snapshots):
-    issues = _audit_issues(
-        {backend.BackendType.Ascend910B: registry_snapshots[backend.BackendType.Ascend910B]}
-    )
+    issues = _audit_issues({backend.BackendType.Ascend910: registry_snapshots[backend.BackendType.Ascend910]})
     assert "Runtime snapshot must include all supported targets" in issues
 
 

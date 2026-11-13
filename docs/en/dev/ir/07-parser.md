@@ -8,6 +8,35 @@ The IR parser converts Python DSL code to PyPTO IR using decorators (`@pl.functi
 
 See [IR Builder](06-builder.md) for manual IR construction and [Python IR Syntax](../language/00-python_syntax.md) for full syntax.
 
+## Implementation Structure
+
+`ASTParser` remains the entry point for function parsing, statement/expression dispatch,
+and variable binding. It composes specialized parsers rather than inheriting parsing mixins.
+
+| Module | Responsibility |
+| ------ | -------------- |
+| `control_flow_parser.py` | Loops, conditionals, yields, break and continue |
+| `scope_parser.py` | Scope directives, SPMD and split-AIV expansion through shared scope emission |
+| `call_parser.py` | Kernel, external and inline calls; submit result binding |
+| `op_parser.py` | Operator calls, distributed operations and buffer metadata |
+| `subscript_parser.py` | Tensor/tile indexing, slicing and subscript assignment |
+| `attr_parser.py` | Function and call attribute parsing |
+| `dispatch_semantics.py` | TaskId producers, dependencies and dispatch predicates |
+| `source_comments.py` | Comment attachment and block-boundary handling |
+| `region_context.py` | Active scope, split and manual-region state |
+| `parser_state.py` | Shared services, recursive callbacks and state contracts |
+| `syntax_helpers.py`, `type_semantics.py` | Shared syntax recognition and type/shape helpers |
+
+Components receive explicit dependencies and a small set of recursive callbacks; they do
+not retain the entire `ASTParser`. Shared services keep one builder, scope manager,
+evaluator, type resolver and source tracker per parser. In particular, inline expansion
+changes the existing evaluator and source tracker temporarily, so indexing, operators and
+nested statements all observe the same closure and source coordinates.
+
+Function metadata, control-flow state and inline state have separate owners. Program-wide
+buffer metadata retains the identity supplied by the decorator. TaskId producer and binding
+generation tracking share one `DispatchSemantics` instance across calls and scopes.
+
 ## Usage
 
 ### Basic Function
@@ -29,6 +58,22 @@ assert isinstance(simple_add, pypto.ir.Function)
 ```
 
 ### Type Annotations
+
+Python numeric module attributes such as `math.nan`, `math.inf`, and `-math.inf`
+are accepted in assignments and operator arguments. Import `math` in the enclosing
+Python scope; import aliases also work. Use `pl.const(math.nan, pl.FP32)` (or
+`pl.FP16` / `pl.BF16`) to specify a dtype explicitly. Without `pl.const`, these
+values follow the same dtype rules as other Python float constants. `pl.const`
+requires a compile-time numeric value; it does not convert runtime scalar variables.
+`@pl.jit` also resolves `math.nan` and `math.inf` (including module aliases),
+preserves their bits in specialized source, and includes their values in the cache key.
+Raw operator arguments keep Python-number semantics: adding `math.inf` to an FP16
+tensor infers an FP16 scalar, and `pl.full` accepts it as a fill value. Printed IR
+uses explicit `pl.const` for non-finite operands to preserve their existing dtype.
+Numeric attribute evaluation rejects runtime references even inside compound bases
+such as `(x + 1.0).real`; a same-named closure value never substitutes for runtime `x`.
+Tensor and tile dtype attributes remain supported in operator arguments, such as
+`pl.cast(x, y.dtype)`: they resolve from IR type metadata without Python evaluation.
 
 All parameters and local variables require type annotations:
 
@@ -104,6 +149,11 @@ runtime wrappers do not implement the corresponding Python operator. Typed
 constant leaves in printed shapes reconstruct arithmetic, power, bitwise and
 shift nodes without constant folding. Ordinary user constant expressions may
 still fold; simplification of reconstructed IR belongs to a separate pass.
+
+Shape dimensions also restore private `pl._dump.call(...)` snapshots through
+the expression parser, preserving recorded result types, operand bindings, and
+metadata. These calls must return integer/index scalars. A `tensor.dim` read
+whose operand carries storage can use this form without folding the read.
 
 Nested `pl.Tuple[...]` denotes a recursive tuple value type. The built-in
 `tuple[...]` return annotation continues to denote a list of function results;

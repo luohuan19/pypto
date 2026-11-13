@@ -51,6 +51,7 @@ def entry(
 | Line | What it does |
 | ---- | ------------ |
 | `@pl.jit.incore` | Marks a device kernel — the execution plane, where operators live |
+| `@pl.jit.aiv` | Explicit AIV device kernel; required for `pl.simt_scope` |
 | `@pl.jit` | Marks the chip-level entry point — the control plane, which dispatches |
 | `add_kernel(a, b, out)` | A plain call; the decorator discovers the callee and wires it in |
 | `out: pl.Out[...]` | Declares the direction, which is how the compiler orders this task |
@@ -69,10 +70,20 @@ core levels:
 | --------- | --------- | ------- |
 | `@pl.jit` | `Orchestration` | Chip-level entry point that dispatches InCore work |
 | `@pl.jit.host` | `level=HOST, role=Orchestrator` | HOST entry — allocates window buffers, dispatches chip orchestrators per rank |
-| `@pl.jit.incore` | `InCore` | A device kernel (accepts `level=` to target a specific hierarchy level) |
+| `@pl.jit.incore` | `InCore`, `AIC`, `AIV`, or `Group` | A device kernel; explicit `level=AIC` / `AIV` selects that core kind, and `level=CORE_GROUP` co-schedules explicit peers |
 | `@pl.jit.inline` | `Inline` | Helper spliced into every call site by `InlineFunctions` |
 | `@pl.jit.opaque` | `Opaque` | A separate IR function that may hold orchestration loops and `pl.at` scopes |
 | `@pl.jit.graph` | `Graph` | A recordable orchestration fragment — the `host_build_graph` runtime records its task topology on the first call and replays it after, so N calls cost one graph build rather than N. Requires compiling under `RuntimeKind.HOST_BUILD_GRAPH` |
+
+`@pl.jit.incore` without a level (or with `level=pl.Level.CHIP_DIE`) keeps the
+ordinary `InCore` kind. For a manual cross-core protocol, use
+`@pl.jit.incore(level=pl.Level.AIC)` and `level=pl.Level.AIV` helpers, called by
+an `@pl.jit.incore(level=pl.Level.CORE_GROUP)` helper. Dispatch that group once
+from the `@pl.jit` entry, for example inside `pl.spmd(...)`; the two peers then
+run as one co-scheduled task. This exposes explicit pipe initialization through
+the normal JIT specialization and compilation path.
+When factories produce same-named peers, JIT resolves `peer_func` within each
+Group and rewrites it to that peer's generated name, including aliased calls.
 
 `@pl.jit.graph` has a scope form: `with pl.graph("name"):` marks a region *in place*
 instead of splitting it into a function. The two compile to the same thing — the region is
@@ -94,8 +105,37 @@ region cannot nest inside another Graph region, nor inside `pl.at` / `pl.cluster
 `pl.spmd` — those become a single device task, whereas a Graph region records a topology of
 them. All three are compile errors.
 
+Orchestration codegen currently supports bounded `for ... in pl.range(...)`
+loops, but rejects `while` loops, including Graph dispatches inside them.
+Dynamic loops can be placed inside an InCore kernel.
+
+Inside an `@pl.program` class, launch a Graph method with
+`pl.submit(self.layer, ..., deps=[producer])` under a manual scope. This Submit
+form requires a `self.<kernel>` method reference. A JIT entry may submit a
+`@pl.jit.graph` dependency by name. JIT specializes it and supplies the method
+reference. For an inline region, use
+`with pl.graph("layer", deps=[producer]) as done:` to express its dependencies
+and capture completion.
+The trailing `TASK_ID` result of `pl.submit`, or the scope's `done` binding,
+names the outer Graph task and becomes ready when
+the entire invocation completes, including on the first recording. Explicit
+predecessors order that outer task; they are not stored as internal edges of the
+recorded Definition. Graph functions still write into caller-supplied tensors;
+computed values and recorded-internal TaskIds cannot be returned to the caller.
+Definition reuse is within one orchestration run, not across separate L2 calls.
+
 Sub-function dependencies (`.incore` / `.inline` / `.opaque` / `.graph`) are auto-discovered from
-the entry's body — call them by name. The name you call is resolved in the entry's own
+the entry's body — call them by name. Functions passed to `pl.submit` or
+`pl.spmd_submit` are discovered too; callee constexpr arguments specialize the
+function, while `deps` and other dispatch metadata remain on the submission.
+A first submission can omit runtime-allocated Out parameters when their complete
+tensor annotations determine shape and dtype, including call-owned constexpr
+values. JIT uses the specialized result metadata and fills unavailable slots
+from complete annotations. A genuinely void callee contributes no tensor result. Submit appends one TaskId
+after the callee values. Tensor metadata follows single-variable tuple bindings
+and constant projections, including projections used directly as call arguments;
+the TaskId slot is never treated as a tensor.
+The name you call is resolved in the entry's own
 namespace, so an aliased import (`from kernels import matmul as mm`, or a plain
 `mm = matmul` rebinding) is discovered like any other binding; the generated program still
 names the function after its `def`. When two distinct sub-functions share that name — two
@@ -138,6 +178,19 @@ silently folding into one program.
 
 `@pl.jit.host` rejects `level=` (HOST is implicit).
 
+### Explicit dependencies on a Graph scope
+
+Use `with pl.graph("layer", deps=[ready]) as done:` to wait for preceding tasks
+and capture completion of the whole Graph. The scope uses the same existing
+Submit metadata as `pl.at`/`pl.spmd`; the completion is valid for the first
+recording as well as cached invocations in that orchestration run.
+
+Keep TaskId arrays used by the recorded body local to the region. Pass incoming
+readiness with `deps`, then update the caller's readiness state from `done`.
+Recorded-internal TaskIds and computed returns still cannot escape the Graph.
+A compiled program can be called again with fresh arguments, but the runtime
+Definition cache belongs to each orchestration run, not to the Python callable.
+
 ### What a sub-function hands back keeps its shape and dtype
 
 Specialization stamps every generated parameter with a concrete shape and dtype, so a
@@ -170,6 +223,14 @@ A device kernel (`@pl.jit.incore`) cannot allocate, so it always takes the secon
 `pl.create_tensor` belongs on the control plane. An `@pl.jit.inline` helper is spliced into
 the caller, so either form is available to it.
 
+A complete one-dimensional view of an NZ tensor also keeps inferable metadata. For
+`w: pl.Tensor[[256, 512], pl.INT8, pl.NZ]`, `w_flat = pl.reshape(w, [131072])`
+can be passed to a helper declared with `src: pl.Tensor`; specialization supplies
+`src: pl.Tensor[[131072], pl.INT8]` (ND). The reshape creates a view of the existing physical
+bytes without layout conversion or copying. Every source dimension and the target length must be
+static, and the target length must equal the source element count. Other NZ reshape
+targets and symbolic NZ flattening remain unsupported.
+
 An extent the specializer cannot compute statically is *not* by itself a problem. A
 `pl.create_tensor` sized from a value only the device knows — `pl.tensor.read(cfg, [0])`,
 `pld.world_size()` — becomes a dynamic dimension and keeps flowing, and the shared pass
@@ -177,10 +238,43 @@ pipeline judges whatever the program then does with it (loading the whole tensor
 say, gets you `InitMemRef requires static shape` — the same error the equivalent
 `@pl.program` earns).
 
+`pl.reshape` also preserves metadata when its target dimensions use known tensor
+dimensions and integer arithmetic (`+`, `-`, `*`, `//`, and unary `-`). For example,
+`pl.reshape(src, [src.shape[0] * src.shape[1]])` keeps a dynamic extent when either
+source dimension is dynamic. The consuming JIT function reads the actual extent from
+the reshaped tensor's descriptor. The original reshape expression remains in IR,
+and existing reshape validation is unchanged.
+Calls to `pl.tensor.dim` support positional or keyword `tensor`/`axis` arguments
+and static constant or negative axes. Unknown runtime axes remain unresolved.
+Shape subscripts use nonnegative integer literal indices; use `pl.tensor.dim(src, -1)` for
+a negative axis. Dynamic unary `+` remains unsupported.
+
+Intermediate scalar aliases work as well: `total = src.shape[0] * src.shape[1]`
+followed by `flat = pl.reshape(src, [total])` preserves the dynamic extent.
+Scalar calculations stay scalar: inference records immutable expression snapshots
+and creates dynamic-axis symbols when recording a tensor shape. Rebinding a source
+name does not change an already computed alias. Chains of simple names such as
+`total = half = total // 2` evaluate the right-hand side once and are lowered
+to individual assignments before parsing. Static integer aliases fold normally;
+unknown runtime values and invalid arithmetic remain unresolved. Aliases rebound
+under conditionals or loops are handled conservatively across control-flow
+boundaries, rather than assuming the value from one syntactic execution.
+After a tensor variable is rebound, shape reads use its current value, including
+whole-shape unpacking and results of tensor operations. Shape and dtype arguments
+such as `shape=src.shape` and `dtype=src.dtype` also use the current tensor type.
+Unrelated branches and loops keep existing aliases; a loop-carried alias becomes
+unknown until a definite assignment establishes its value in the current iteration.
+Mutually exclusive `if`/`elif`/`else` arms start from the same incoming scalar
+bindings and tensor metadata. Conditional scalar writes remain unknown after
+the branches join. Tensor metadata established identically in both arms remains
+usable; conflicting or missing tensor metadata remains unknown.
+Metadata keeps independent derived dimensions separate when a Python variable
+is reused or a helper is called repeatedly. Use explicit assignments such as
+`n = n + step`; augmented assignment (`n += step`) remains unsupported.
+
 What does not resolve is a returned tensor whose shape the specializer cannot *reach* at
-all: a `pl.reshape` whose target shape is not static (a reshape is constrained by its
-source's element count, so no dynamic dimension can stand in for it), or a result rebound
-through an operation the specializer does not model. That surfaces as
+all: a `pl.reshape` sized from an unknown runtime scalar, such as `pl.tensor.read(cfg, [0])`,
+or a result rebound through an operation the specializer does not model. That surfaces as
 `missing inferred tensor metadata for parameter '<name>'` at the *next* call that consumes
 it — the error names the consumer, but the fix belongs at the producer: give the producing
 statement a statically inferable shape, or pass the buffer in as a `pl.Out[...]` parameter.
@@ -356,7 +450,7 @@ generation, so handing it `lower()`'s output would run the pipeline twice.
 
 ```python
 program = my_kernel.specialize(sample_x, sample_w, sample_out)
-ir.compile(program, output_dir="build/out", backend_type=BackendType.Ascend910B)
+ir.compile(program, output_dir="build/out", backend_type=BackendType.Ascend910)
 ```
 
 It takes no `config=`: no pass runs here, so a `RunConfig` would have nothing to
@@ -406,5 +500,5 @@ deps of a `@pl.jit` entry and spliced at the call site.
 - [Control Flow](02-control-flow.md) — loops and conditionals inside these bodies.
 - [Scopes and Placement](04-scopes.md) — `pl.at` and the other placement scopes.
 - [Quickstart](../02-quickstart.md) — the same decorators in a worked example.
-- [InlineFunctions](../../dev/passes/01-inline_functions.md) — how `Inline` bodies are spliced.
+- [InlineFunctions](../../dev/passes/02-inline_functions.md) — how `Inline` bodies are spliced.
 - [Integrating Hand-Written C++ Kernels](../../dev/language/04-external-kernels.md) — calling external kernels.

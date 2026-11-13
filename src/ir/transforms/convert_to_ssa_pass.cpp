@@ -13,6 +13,7 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -79,6 +80,9 @@ class TypeCollector : public IRVisitor {
   }
 
  protected:
+  void VisitStmt_(const SimtLaunchStmtPtr& op) override {
+    for (const auto& result : op->results_) types[result.get()] = result->GetType();
+  }
   void VisitStmt_(const AssignStmtPtr& op) override {
     types[op->var_.get()] = GetAuthoritativeAssignmentType(op->var_->GetType(), op->value_);
   }
@@ -102,6 +106,7 @@ class UseCollector : public IRVisitor {
   void CollectExpr(const ExprPtr& expr) {
     if (expr) VisitExpr(expr);
   }
+  void CollectScopeAttrs(const ScopeStmtPtr& scope) { VisitScopeAttrs(scope); }
 
  protected:
   void VisitVarLike_(const VarPtr& op) override {
@@ -121,11 +126,47 @@ class UseCollector : public IRVisitor {
 // Returns raw Var* pointers (pointer identity = variable identity).
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Only assignments guaranteed to execute can kill a later use. In particular,
+// a loop's explicit results are defined even when its body runs zero times.
+// Accumulate straight-line regions into one set: copying each nested region's
+// definitions into its parent would repeatedly walk the same descendants.
+static void CollectDefiniteDefs(const StmtPtr& stmt, std::unordered_set<const Var*>& defs) {
+  if (auto op = As<SeqStmts>(stmt)) {
+    for (const auto& child : op->stmts_) CollectDefiniteDefs(child, defs);
+    return;
+  }
+  if (auto op = As<ScopeStmt>(stmt)) {
+    CollectDefiniteDefs(op->body_, defs);
+    return;
+  }
+
+  defs.merge(var_collectors::CollectStmtDefinedVars(stmt));
+  if (auto op = As<IfStmt>(stmt); op && op->else_body_.has_value()) {
+    // Implicit rebindings are definite only when both branches define them.
+    // Intersect by scanning the smaller summary; union-only regions above
+    // never materialize or copy a separate set.
+    std::unordered_set<const Var*> then_defs;
+    std::unordered_set<const Var*> else_defs;
+    CollectDefiniteDefs(op->then_body_, then_defs);
+    CollectDefiniteDefs(*op->else_body_, else_defs);
+    if (then_defs.size() > else_defs.size()) then_defs.swap(else_defs);
+    std::copy_if(then_defs.begin(), then_defs.end(), std::inserter(defs, defs.end()),
+                 [&else_defs](const Var* var) { return else_defs.count(var) != 0; });
+  }
+}
+
 // Forward declaration for mutual recursion
 static std::unordered_set<const Var*> ComputeSeqLiveIn(const std::vector<StmtPtr>& stmts);
 
 static std::unordered_set<const Var*> ComputeStmtLiveIn(const StmtPtr& stmt) {
   if (!stmt) return {};
+
+  if (auto op = As<SimtLaunchStmt>(stmt)) {
+    UseCollector uc;
+    for (const auto& dim : op->block_dims_) uc.CollectExpr(dim);
+    for (const auto& arg : op->args_) uc.CollectExpr(arg);
+    return uc.used;
+  }
 
   if (auto op = As<AssignStmt>(stmt)) {
     UseCollector uc;
@@ -184,14 +225,12 @@ static std::unordered_set<const Var*> ComputeStmtLiveIn(const StmtPtr& stmt) {
   }
   if (auto op = As<ScopeStmt>(stmt)) {
     auto body_li = ComputeStmtLiveIn(op->body_);
-    // SpmdScopeStmt::core_num_ is a direct ExprPtr field evaluated in the
-    // enclosing scope — its uses are live-in there, same as
-    // ForStmt::start_/stop_/step_ above.
-    if (auto spmd = As<SpmdScopeStmt>(stmt)) {
-      UseCollector uc;
-      uc.CollectExpr(spmd->core_num_);
-      body_li.insert(uc.used.begin(), uc.used.end());
-    }
+    // Scope attrs are resolved at entry, before any writes in the body.
+    UseCollector uc;
+    uc.CollectScopeAttrs(op);
+    // SpmdScopeStmt::core_num_ is likewise evaluated in the enclosing scope.
+    if (auto spmd = As<SpmdScopeStmt>(stmt)) uc.CollectExpr(spmd->core_num_);
+    body_li.insert(uc.used.begin(), uc.used.end());
     return body_li;
   }
   return {};
@@ -205,9 +244,7 @@ static std::unordered_set<const Var*> ComputeSeqLiveIn(const std::vector<StmtPtr
     for (const auto& v : stmt_li) {  // NOLINT: set insertion is order-independent
       if (!defined.count(v)) live_in.insert(v);
     }
-    var_collectors::VarDefUseCollector stmt_collector;
-    stmt_collector.VisitStmt(s);
-    defined.insert(stmt_collector.var_assign_defs.begin(), stmt_collector.var_assign_defs.end());
+    CollectDefiniteDefs(s, defined);
   }
   return live_in;
 }
@@ -436,6 +473,7 @@ class SSAConverter {
   StmtPtr ConvertStmt(const StmtPtr& s) {
     if (!s) return s;
     auto kind = s->GetKind();
+    CHECK_SPAN(kind != ObjectKind::SimtScopeStmt, s->span_) << "Run OutlineSimtScopes before ConvertToSSA";
     if (kind == ObjectKind::AssignStmt) return ConvertAssign(As<AssignStmt>(s));
     if (kind == ObjectKind::SeqStmts) return ConvertSeq(As<SeqStmts>(s));
     if (kind == ObjectKind::ForStmt) return ConvertFor(As<ForStmt>(s));
@@ -444,10 +482,12 @@ class SSAConverter {
     if (kind == ObjectKind::ReturnStmt) return ConvertReturn(As<ReturnStmt>(s));
     if (kind == ObjectKind::YieldStmt) return ConvertYield(As<YieldStmt>(s));
     if (kind == ObjectKind::EvalStmt) return ConvertEval(As<EvalStmt>(s));
+    if (kind == ObjectKind::SimtLaunchStmt) return ConvertSimtLaunch(As<SimtLaunchStmt>(s));
     if (kind == ObjectKind::InCoreScopeStmt || kind == ObjectKind::ClusterScopeStmt ||
         kind == ObjectKind::HierarchyScopeStmt || kind == ObjectKind::SpmdScopeStmt ||
         kind == ObjectKind::RuntimeScopeStmt || kind == ObjectKind::SplitAivScopeStmt ||
-        kind == ObjectKind::CommDomainScopeStmt || kind == ObjectKind::GraphScopeStmt) {
+        kind == ObjectKind::CommDomainScopeStmt || kind == ObjectKind::GraphScopeStmt ||
+        kind == ObjectKind::RegScopeStmt) {
       return ConvertScope(As<ScopeStmt>(s));
     }
     return s;
@@ -478,11 +518,11 @@ class SSAConverter {
     std::vector<std::unordered_set<const Var*>> suffix_needs(n + 1);
     for (size_t j = n; j > 0; --j) {
       auto live_in = ComputeStmtLiveIn(op->stmts_[j - 1]);
-      var_collectors::VarDefUseCollector stmt_collector;
-      stmt_collector.VisitStmt(op->stmts_[j - 1]);
+      std::unordered_set<const Var*> stmt_defs;
+      CollectDefiniteDefs(op->stmts_[j - 1], stmt_defs);
       suffix_needs[j - 1] = live_in;
       for (const auto& v : suffix_needs[j]) {
-        if (!stmt_collector.var_assign_defs.count(v)) {
+        if (!stmt_defs.count(v)) {
           suffix_needs[j - 1].insert(v);
         }
       }
@@ -944,6 +984,18 @@ class SSAConverter {
     return result;
   }
 
+  StmtPtr ConvertSimtLaunch(const SimtLaunchStmtPtr& op) {
+    auto result = MutableCopy(op);
+    // Resolve every input against the pre-launch environment before defining
+    // any output, including a non-SSA storage variable updated in place.
+    for (auto& dim : result->block_dims_) dim = SubstExpr(dim);
+    for (auto& arg : result->args_) arg = SubstExpr(arg);
+    for (auto& var : result->results_) {
+      var = AllocVersion(var.get(), SubstType(var->GetType()), var->span_);
+    }
+    return result;
+  }
+
   /// Substitute Var-typed entries in a ScopeStmt's ``attrs_``
   /// (``manual_dep_edges`` / ``task_id_var`` / ``arg_direction_overrides_vars`` /
   /// ``dump_vars``), plus the Expr-valued ``predicate`` attr (the
@@ -1025,7 +1077,8 @@ class SSAConverter {
     // stays fully transparent. ``SplitAivScopeStmt`` is likewise transparent:
     // it is never outlined and is lowered in place by LowerAutoVectorSplit
     // (pass 23), so its body shares SSA state with the enclosing function.
-    const bool is_outline_boundary = !As<RuntimeScopeStmt>(op) && !As<SplitAivScopeStmt>(op);
+    const bool is_outline_boundary =
+        !As<RuntimeScopeStmt>(op) && !As<SplitAivScopeStmt>(op) && !As<RegScopeStmt>(op);
     std::unordered_set<const Var*> saved_future_needs;
     if (is_outline_boundary) {
       saved_future_needs = future_needs_;
@@ -1069,6 +1122,7 @@ class SSAConverter {
     if (auto split_aiv = As<SplitAivScopeStmt>(op)) return rewrite(split_aiv);
     if (auto comm_domain = As<CommDomainScopeStmt>(op)) return rewrite(comm_domain);
     if (auto graph = As<GraphScopeStmt>(op)) return rewrite(graph);
+    if (auto reg = As<RegScopeStmt>(op)) return rewrite(reg);
     INTERNAL_UNREACHABLE_SPAN(op->span_) << "Unknown ScopeStmt subclass: " << op->TypeName();
     return op;
   }

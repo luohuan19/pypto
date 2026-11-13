@@ -23,7 +23,8 @@ from typing import Any, cast
 from pypto.pypto_core import DataType, ir
 from pypto.pypto_core.ir import IRBuilder as CppIRBuilder
 
-from .utils import _normalize_expr
+from .type import _merge_annotation_metadata
+from .utils import _get_span_or_capture, _normalize_expr
 
 
 class IRBuilder:
@@ -51,6 +52,56 @@ class IRBuilder:
         self._builder = CppIRBuilder()
         self._begin_spans: dict[int, ir.Span] = {}  # Track begin spans for multi-line contexts
         self._ctx_counter = 0  # Counter for unique context IDs
+
+    @contextmanager
+    def simt_scope(
+        self,
+        block_dims: Sequence[ir.Expr],
+        span: ir.Span | None = None,
+        *,
+        private_scalars: Sequence[ir.Var] = (),
+    ) -> Iterator[None]:
+        """Build a transient SIMT region; captures are resolved before SSA."""
+        span = _get_span_or_capture(span, frame_offset=2)
+        self._builder.begin_simt_scope(block_dims, span)
+        try:
+            yield
+        finally:
+            self._builder.end_simt_scope(span, private_scalars)
+
+    @contextmanager
+    def reg_scope(self, span: ir.Span | None = None) -> Iterator[None]:
+        """Build a register region with implicit captures and no yields."""
+        # The generator starts in contextlib.__enter__, one frame beyond the
+        # usual wrapper caller. Skip that frame to retain the user's with line.
+        begin_span = _get_span_or_capture(span, frame_offset=2)
+        with self.scope(ir.ScopeKind.Reg, begin_span):
+            yield
+
+    def emit_reg(
+        self,
+        name: str,
+        op_name: str,
+        args: Sequence[ir.Expr],
+        kwargs: dict[str, Any] | None = None,
+        span: ir.Span | None = None,
+    ) -> ir.Var:
+        """Infer, validate and assign a register operation."""
+        return self._builder.emit_reg(name, op_name, args, kwargs or {}, span or self._capture_call_span())
+
+    def emit_reg_store(
+        self,
+        name: str,
+        tile: ir.Expr,
+        value: ir.Expr,
+        offset: int | ir.Expr = 0,
+        mask: ir.Expr | None = None,
+        span: ir.Span | None = None,
+    ) -> ir.Var:
+        """Assign a store result with the destination Tile type and storage."""
+        span = span or self._capture_call_span()
+        off = ir.ConstInt(offset, DataType.INDEX, span) if isinstance(offset, int) else offset
+        return self._builder.emit_reg_store(name, tile, off, value, mask, span)
 
     # ========== Context Managers for Multi-line Constructs ==========
 
@@ -118,6 +169,7 @@ class IRBuilder:
         span: ir.Span | None = None,
         kind: ir.ForKind = ir.ForKind.Sequential,
         attrs: dict[str, object] | None = None,
+        hardware_loop_policy: ir.HardwareLoopPolicy = ir.HardwareLoopPolicy.Auto,
     ) -> Iterator["ForLoopBuilder"]:
         """Context manager for building for loops.
 
@@ -129,6 +181,8 @@ class IRBuilder:
             span: Optional explicit span. If None, automatically captured.
             kind: Loop kind (default: Sequential)
             attrs: Loop-level attributes (key-value metadata, default: empty)
+            hardware_loop_policy: Auto (default) or Require. Require needs a Sequential
+                loop inside RegScope, INDEX start=0 and step=1, and empty attrs.
 
         Yields:
             ForLoopBuilder: Helper object for building the loop
@@ -157,6 +211,7 @@ class IRBuilder:
             begin_span,
             kind,
             attrs=attrs_list,
+            hardware_loop_policy=hardware_loop_policy,
         )
         builder_obj = ForLoopBuilder(self)
         body_ok = False
@@ -338,6 +393,7 @@ class IRBuilder:
         name_hint: str,
         span: ir.Span,
         attrs: list[tuple[str, Any]] | None = None,
+        engines: list[str] | None = None,
     ) -> Iterator["ScopeBuilder"]:
         """Build a communication scope, reading its slots when the body is complete.
 
@@ -350,6 +406,7 @@ class IRBuilder:
             name_hint: Communication-domain name.
             span: Source span of the complete scope.
             attrs: Scope metadata, read on context exit.
+            engines: Required async workspace engines.
 
         Yields:
             A builder exposing the completed scope after context exit.
@@ -359,7 +416,7 @@ class IRBuilder:
         try:
             yield builder_obj
         finally:
-            builder_obj._result = self._builder.end_scope(span, devices, slots, attrs)
+            builder_obj._result = self._builder.end_scope(span, devices, slots, attrs, engines or [])
 
     @contextmanager
     def program(self, name: str, span: ir.Span | None = None) -> Iterator["ProgramBuilder"]:
@@ -1073,7 +1130,7 @@ class ForLoopBuilder(_ReturnVarsAccessor):
         inferred_type = init_expr.type
 
         # If explicit type is provided, validate it matches the inferred type
-        if type is not None and type != inferred_type:
+        if type is not None and ir._without_type_memref(type) != ir._without_type_memref(inferred_type):
             raise ValueError(
                 f"Type mismatch in iter_arg for '{name}':\n"
                 f"  Inferred type: {inferred_type}\n"
@@ -1125,8 +1182,12 @@ class ForLoopBuilder(_ReturnVarsAccessor):
                 )
             final_type = inferred_type
         else:
+            if inferred_type is not None:
+                type = _merge_annotation_metadata(type, inferred_type)
             # Validate provided type if we have inferred type
-            if inferred_type is not None and type != inferred_type:
+            if inferred_type is not None and ir._without_type_memref(type) != ir._without_type_memref(
+                inferred_type
+            ):
                 raise ValueError(
                     f"Type mismatch in return_var '{name}':\n"
                     f"  Inferred type (from iter_arg): {inferred_type}\n"
@@ -1202,7 +1263,7 @@ class WhileLoopBuilder(_ReturnVarsAccessor):
         inferred_type = init_expr.type
 
         # If explicit type is provided, validate it matches the inferred type
-        if type is not None and type != inferred_type:
+        if type is not None and ir._without_type_memref(type) != ir._without_type_memref(inferred_type):
             raise ValueError(
                 f"Type mismatch in iter_arg for '{name}':\n"
                 f"  Inferred type: {inferred_type}\n"
@@ -1272,8 +1333,12 @@ class WhileLoopBuilder(_ReturnVarsAccessor):
                 )
             final_type = inferred_type
         else:
+            if inferred_type is not None:
+                type = _merge_annotation_metadata(type, inferred_type)
             # Validate provided type if we have inferred type
-            if inferred_type is not None and type != inferred_type:
+            if inferred_type is not None and ir._without_type_memref(type) != ir._without_type_memref(
+                inferred_type
+            ):
                 raise ValueError(
                     f"Type mismatch in return_var '{name}':\n"
                     f"  Inferred type (from iter_arg): {inferred_type}\n"

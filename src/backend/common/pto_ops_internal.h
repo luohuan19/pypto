@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -34,13 +35,24 @@
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/codegen/pto/pto_type_utils.h"
-#include "pypto/core/dtype.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
 namespace backend {
+
+/// Whether a registration site should register @p op_name.
+///
+/// @p exclude_ops is the caller's opt-out set (``RegisterPTOOps`` forwards it to
+/// every category). Every site must consult it, and the polarity — *registered*
+/// means *not excluded* — is easy to invert in a hand-written
+/// ``count(...) == 0``. Naming the question keeps a new site from silently
+/// registering an op the caller asked it to skip.
+[[nodiscard]] inline bool ShouldRegister(const std::unordered_set<std::string>& exclude_ops,
+                                         std::string_view op_name) {
+  return exclude_ops.find(std::string(op_name)) == exclude_ops.end();
+}
 
 // Per-category registration entry points. Each mirrors the RegisterPTOOps
 // signature and registers one op category to the backend (skipping exclude_ops).
@@ -68,17 +80,6 @@ std::vector<std::string> GetIndexOffsetCodes(const std::vector<ir::ExprPtr>& exp
                                              codegen::PTOCodegen& codegen);
 std::vector<std::string> GetDimStrings(const std::vector<ir::ExprPtr>& exprs);
 std::vector<std::string> GetSizeCodes(const std::vector<ir::ExprPtr>& exprs, codegen::PTOCodegen& codegen);
-/// PackFp4 / hand-written FP4E2M1X2 use carrier last-axis units in IR.
-/// Expand them to pto-isa nibble units so partition windows match EmitC-doubled
-/// tiles and GetByteSize multi-row pitch (see EmitMakeTensorViews).
-/// Unit table: docs/en/dev/fp4.md#unit-convention
-/// When ``last_size`` / ``last_offset`` are ConstInt, fold ``*2`` into a constant
-/// SSA (same as ExpandPackedFp4MakeTensorViewDims) instead of emitting arith.muli.
-void ExpandPackedFp4GmLastAxis(DataType dtype, std::vector<std::string>& offset_codes,
-                               std::vector<std::string>& size_codes, std::vector<std::string>& dim_strings,
-                               codegen::PTOCodegen& codegen, const ir::ExprPtr& last_size = nullptr,
-                               const ir::ExprPtr& last_offset = nullptr,
-                               ir::TensorLayout layout = ir::TensorLayout::ND);
 bool ExprsEquivalentForSubview(const ir::ExprPtr& lhs, const ir::ExprPtr& rhs);
 codegen::TileTypeComponents InferSubviewTileTypeComponents(const ir::TileType& source_tile_type,
                                                            const ir::MakeTuple& shape_tuple,
@@ -97,9 +98,19 @@ bool HasStaticValidShape(const std::shared_ptr<const ir::TileType>& tile_type);
 void RequireStaticValidShapeForPtoas(const std::shared_ptr<const ir::TileType>& tile_type,
                                      std::string_view op_name, std::string_view role, const ir::Span& span);
 std::string GetTileViewTypeAnnotation(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen);
+/// Explicit validity for a mutable reshape alias. Both fields name emitted
+/// index SSA operands in physical tile coordinates (including FP4 packing).
+struct MutableTileViewShape {
+  std::string rows;
+  std::string cols;
+};
+/// Reuse a matching static view or create a typed alias of expr's storage.
+/// Supplying mutable_valid_shape requires a mutable local source and always
+/// creates a fresh handle, then initializes its independent runtime validity.
 std::string EnsureTileViewSsa(const ir::ExprPtr& expr,
                               const std::shared_ptr<const ir::TileType>& view_tile_type,
-                              codegen::PTOCodegen& codegen, const std::string& temp_prefix);
+                              codegen::PTOCodegen& codegen, const std::string& temp_prefix,
+                              std::optional<MutableTileViewShape> mutable_valid_shape = std::nullopt);
 std::string EnsureStaticViewTileSsa(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen,
                                     const std::string& temp_prefix);
 void EmitInsOutsWithViewTypes(codegen::PTOCodegen& codegen, std::string_view pto_op_name,

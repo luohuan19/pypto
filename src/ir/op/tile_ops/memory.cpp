@@ -21,6 +21,7 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,7 +39,6 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/phase.h"
-#include "pypto/ir/pipe.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/tile_view_semantics.h"
@@ -96,6 +96,41 @@ void ValidateIntScalarTupleElements(const MakeTuplePtr& tuple, const std::string
         << op_name << " " << role << " tuple element " << i << " must have integer dtype, but got "
         << scalar_type->dtype_.ToString();
   }
+}
+
+// A packed tile counts byte carriers along BLayout's contiguous axis. Changing
+// that axis must preserve logical rows/columns, not the raw carrier shape:
+// row-major [M,K/2] becomes column-major [M/2,K]. PTOAS expands only the
+// destination's packing axis when declaring the ISA tile.
+void RetargetPackedFp4Geometry(DataType dtype, TileLayout source_layout, TileLayout target_layout,
+                               std::vector<ExprPtr>& shape, TileView& view, const Span& span,
+                               const std::string& op_name) {
+  if (!dtype.IsPackedFp4() || source_layout == target_layout) return;
+  CHECK_SPAN(shape.size() >= 2, span)
+      << op_name << ": changing a packed FP4 packing axis requires at least two dimensions";
+  const size_t old_axis = source_layout == TileLayout::col_major ? shape.size() - 2 : shape.size() - 1;
+  const size_t new_axis = target_layout == TileLayout::col_major ? shape.size() - 2 : shape.size() - 1;
+  auto convert = [&](std::vector<ExprPtr>& dims) {
+    if (dims.empty()) return;
+    auto two = std::make_shared<ConstInt>(2, DataType::INDEX, span);
+    auto zero = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+    CHECK_SPAN(DimensionsEqual(MakeFloorMod(dims[new_axis], two, span), zero), span)
+        << op_name << ": packed FP4 layout conversion requires an even extent on the new packing axis";
+    if (auto extent = As<ConstInt>(dims[new_axis])) {
+      dims[new_axis] = std::make_shared<ConstInt>(extent->value_ / 2, extent->dtype(), span);
+    } else {
+      dims[new_axis] = MakeFloorDiv(dims[new_axis], two, span);
+    }
+    if (auto extent = As<ConstInt>(dims[old_axis])) {
+      CHECK_SPAN(extent->value_ <= std::numeric_limits<int64_t>::max() / 2, span)
+          << op_name << ": packed FP4 layout conversion extent overflows int64";
+      dims[old_axis] = std::make_shared<ConstInt>(extent->value_ * 2, extent->dtype(), span);
+    } else {
+      dims[old_axis] = MakeMul(dims[old_axis], two, span);
+    }
+  };
+  convert(shape);
+  convert(view.valid_shape);
 }
 
 }  // namespace
@@ -189,12 +224,6 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
       target_memory_opt = AnyCast<MemorySpace>(v, "target_memory");
       break;
     }
-  }
-  if (tensor_type->dtype_.IsFp4Family() && target_memory_opt.has_value()) {
-    CHECK_SPAN(!IsCubeMemorySpace(*target_memory_opt), args[0]->span_)
-        << "The operator " << op_name
-        << " cannot load FP4/FP4E2M1X2 into cube memory (Mat/Left/Right/Acc/Bias/scale); "
-           "load to Vec, cast to FP8, then move into cube";
   }
   const bool is_mx_load =
       tensor_type->tensor_view_.has_value() && IsMxTensorLayout(tensor_type->tensor_view_->layout);
@@ -330,7 +359,12 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
     // FP32 carrier. Routing both through one helper is what keeps them from
     // drifting again.
   } else {
-    tile_view.blayout = tile_view_semantics::InferImplicitTileLayoutFromShape(shapes_tuple->elements_);
+    // FP4 pairs are packed along the declared GM contiguous axis. A carrier
+    // width of one is still two logical values and must not trigger the
+    // ordinary column-vector heuristic. DN explicitly packs the row axis.
+    tile_view.blayout = tensor_type->dtype_.IsPackedFp4()
+                            ? (source_is_dn ? TileLayout::col_major : TileLayout::row_major)
+                            : tile_view_semantics::InferImplicitTileLayoutFromShape(shapes_tuple->elements_);
   }
 
   // Build tile shape from shapes tuple (always in source-tensor coordinates).
@@ -373,9 +407,11 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
   // parser and hand-built or deserialized IR can hand over any int, and an
   // unknown one would otherwise surface at codegen with no context.
   const int cache = GetKwarg<int>(kwargs, "cache", static_cast<int>(CachePolicy::kDefault));
-  CHECK(cache == static_cast<int>(CachePolicy::kDefault) || cache == static_cast<int>(CachePolicy::kBypass))
-      << "The operator " << op_name
-      << " cache kwarg must be CachePolicy.DEFAULT or CachePolicy.BYPASS, but got int " << cache;
+  CHECK(IsValidCachePolicy(cache)) << "The operator " << op_name << " has invalid CachePolicy value "
+                                   << cache;
+
+  RetargetPackedFp4Geometry(tensor_type->dtype_, source_is_dn ? TileLayout::col_major : TileLayout::row_major,
+                            tile_view.blayout, tile_shape, tile_view, args[0]->span_, op_name);
 
   // Return TileType with same dtype as tensor and TileView containing valid_shape.
   // When target_memory is specified, write it into memory_space_ so the constructed
@@ -479,7 +515,7 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
       << " atomic kwarg must be AtomicType.None_ or AtomicType.Add, but got int " << atomic;
   if (atomic == static_cast<int>(AtomicType::kAdd)) {
     const DataType& dt = tile_type->dtype_;
-    // Hardware atomic-add dtypes. bf16 is honoured on the A2/A3 (Ascend910B) and
+    // Hardware atomic-add dtypes. bf16 is honoured on the A2/A3 (Ascend910) and
     // kirinX90 profiles (pto-isa SetAtomicAdd<bfloat16_t> -> set_atomic_bf16);
     // it is NOT supported on the A5/kirin9030 store path, where a bf16 atomic
     // store is rejected downstream by the pto-isa static_assert.
@@ -492,6 +528,12 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
         << dt.ToString();
   }
 
+  const int cache = GetKwarg<int>(kwargs, "cache", 0);
+  CHECK(IsValidCachePolicy(cache)) << "The operator " << op_name << " has invalid CachePolicy value "
+                                   << cache;
+  CHECK(cache != static_cast<int>(CachePolicy::kNotAllocKeep) &&
+        cache != static_cast<int>(CachePolicy::kNotAllocDrop))
+      << "tile.store does not support load-only CachePolicy.NOT_ALLOC_KEEP/NOT_ALLOC_DROP";
   const int st_phase = GetKwarg<int>(kwargs, "st_phase", static_cast<int>(STPhase::kUnspecified));
   CHECK(IsValidSTPhase(st_phase))
       << "The operator " << op_name
@@ -586,11 +628,6 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
 
   // Extract MemorySpace
   MemorySpace space = GetKwarg<MemorySpace>(kwargs, "target_memory");
-  CHECK_SPAN(!tile_type->dtype_.IsFp4Family() || !IsCubeMemorySpace(space), args[0]->span_)
-      << "The operator " << op_name
-      << " cannot move FP4/FP4E2M1X2 into cube memory (Mat/Left/Right/Acc/Bias/scale); "
-         "cast to FP8 on Vec first";
-
   const auto& input_shape = tile_type->shape_;
 
   const TileView source_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
@@ -701,6 +738,39 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
     }
   }
 
+  // Vec-to-Mat TMOV copies storage without converting its layout.
+  const bool source_is_vec =
+      !tile_type->memory_space_.has_value() || tile_type->memory_space_ == MemorySpace::Vec;
+  // The native ND-to-NZ kernel explicitly converts FP4 logical columns to
+  // packed-byte strides. The generic Vec copy and ND-to-ZN kernel do not:
+  // they address byte-sized FP4 carriers with logical element counts.
+  const bool is_packed_nd_to_nz =
+      source_view.blayout == TileLayout::row_major && source_view.slayout == TileLayout::none_box &&
+      tile_view.blayout == TileLayout::col_major && tile_view.slayout == TileLayout::row_major;
+  CHECK_SPAN(!out_dtype.IsPackedFp4() || !source_is_vec || space != MemorySpace::Vec || is_packed_nd_to_nz,
+             args[0]->span_)
+      << op_name
+      << ": native packed FP4 Vec-to-Vec moves support only ND-to-NZ layout conversion; "
+         "the other PTO-ISA move paths address byte carriers using logical FP4 extents. "
+         "Use a UINT8 carrier alias for a byte-preserving copy";
+  CHECK_SPAN(!out_dtype.IsPackedFp4() || !source_is_vec || space != MemorySpace::Mat ||
+                 (source_view.blayout == tile_view.blayout && source_view.slayout == tile_view.slayout &&
+                  source_view.fractal == tile_view.fractal),
+             args[0]->span_)
+      << op_name
+      << ": packed FP4 Vec-to-Mat moves require matching source and destination layouts; "
+         "the native move copies storage without ND-to-NZ conversion. Load directly to Mat or "
+         "convert the Vec layout before staging";
+  // A Mat-to-L0 transfer changes the packing axis while preserving logical
+  // extents. Other Mat destinations retain the existing layout restriction.
+  CHECK_SPAN(!out_dtype.IsPackedFp4() || tile_type->GetMemorySpace() != MemorySpace::Mat ||
+                 source_view.blayout == tile_view.blayout || space == MemorySpace::Left ||
+                 space == MemorySpace::Right,
+             args[0]->span_)
+      << op_name << ": packed FP4 Mat layout conversion requires a Left or Right destination";
+  RetargetPackedFp4Geometry(out_dtype, source_view.blayout, tile_view.blayout, output_shape, tile_view,
+                            args[0]->span_, op_name);
+
   // Stamp memory_space_ for every destination so the view is canonicalized once,
   // against the space it is actually a view of (same contract as tile.load).
   return std::make_shared<TileType>(output_shape, out_dtype, std::nullopt, tile_view, space);
@@ -766,13 +836,6 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name
       << " does not support target_memory=LeftScale/RightScale; create the scale tile with tile.load "
          "to Mat followed by tile.move";
-  if (dtype.IsFp4Family() && target_memory_opt.has_value()) {
-    CHECK_SPAN(!IsCubeMemorySpace(*target_memory_opt), args[0]->span_)
-        << "The operator " << op_name
-        << " cannot create an FP4/FP4E2M1X2 tile on cube memory (Mat/Left/Right/Acc/Bias/scale); "
-           "create on Vec, cast to FP8, then move into cube";
-  }
-
   TileView tile_view;
   // `transpose=true` requests the transposed Mat (ZN) fractal layout
   // (blayout=row_major, slayout=col_major) — the layout a matmul B-operand
@@ -1330,6 +1393,7 @@ REGISTER_OP("tile.store")
                   "Injected by FlattenTileNdTo2D for ND tensors.")
     .set_attr<int>("atomic")
     .set_attr<int>("st_phase")
+    .set_attr<int>("cache")
     // FIXPIPE pre-ops on an Acc->GM writeback (`pto.tstore`): `pre_quant` is an
     // FP32 scale the accumulator is multiplied by on the way out, `pre_relu` an
     // activation applied after that multiply and the destination clamp. Both are
@@ -1473,6 +1537,18 @@ bool IsNdTensor(const TensorType& type) {
 }
 }  // namespace
 
+/// Deduce the result type of `tile.mgather`.
+///
+/// The output space decides both the index carrier and the shape rule:
+/// * `Vec` output: `idx` is an INT32 tile. `coalesce=elem` copies the index
+///   tile's shape; `coalesce=row` turns a `[1, R]`/`[R, 1]` index into `[R, C]`
+///   using `mem`'s element extent.
+/// * `Mat` output: `idx` is an INT32 GM tensor and the result is a col-major L0
+///   tile. `coalesce=elem` additionally requires a distinct GM scratch buffer;
+///   `coalesce=row` accepts only an optional `valid_shape`.
+///
+/// Both paths converge on a static output shape and reject an explicit
+/// `valid_shape` that exceeds it.
 TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
                               const std::vector<std::pair<std::string, std::any>>& kwargs,
                               const std::string& op_name) {
@@ -1493,6 +1569,8 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
   CHECK(!mem_type->shape_.empty()) << "The operator " << op_name
                                    << " requires mem to have at least one dimension";
 
+  // Three kwargs select the dispatch: row vs elem coalescing, the out-of-bounds
+  // policy, and the output space (Vec tile vs Mat GM).
   int coalesce = GetKwarg<int>(kwargs, "coalesce", static_cast<int>(MgatherCoalesceMode::kRow));
   CHECK(coalesce == static_cast<int>(MgatherCoalesceMode::kRow) ||
         coalesce == static_cast<int>(MgatherCoalesceMode::kElem))
@@ -1509,6 +1587,8 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
   std::vector<ExprPtr> output_valid_shape;
   TileView tile_view;
   if (target_memory == MemorySpace::Vec) {
+    // Vec output: the index is an on-chip tile. Elem mode keeps its layout;
+    // row mode expands a vector index along mem's last (element) extent.
     CHECK_SPAN(!mem_type->tensor_view_ || !IsMxTensorLayout(mem_type->tensor_view_->layout), args[0]->span_)
         << "The operator " << op_name << " with Vec output does not support MX-layout source tensors";
     CHECK(args.size() == 2) << "The operator " << op_name << " permits scratch only for Mat elem mode";
@@ -1547,6 +1627,9 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
     }
     tile_view.blayout = TileLayout::row_major;
   } else {
+    // Mat output: the index is a GM INT32 tensor and the result is addressed as
+    // a col-major L0 tile. Elem mode stages through a caller-provided scratch
+    // buffer; row mode has no scratch and only accepts an optional valid_shape.
     CHECK(IsNdTensor(*mem_type)) << "The operator " << op_name
                                  << " with Mat output requires mem to use ND tensor layout";
     auto idx_type = AsTensorTypeLike(args[1]->GetType());
@@ -1600,6 +1683,7 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
           << "The operator " << op_name << " Mat row mode requires a [1, R] GM idx tensor";
       output_shape = {idx_type->shape_[1], mem_type->shape_.back()};
     }
+    // Both Mat paths converge on a static, fractal-aligned physical shape.
     auto output_rows = As<ConstInt>(output_shape[0]);
     auto output_cols = As<ConstInt>(output_shape[1]);
     CHECK(output_rows && output_cols) << "The operator " << op_name << " Mat output shape must be static";
@@ -1610,6 +1694,8 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
         << "The operator " << op_name << " Mat output rows must be a multiple of 16";
     CHECK(output_cols->value_ % c0 == 0)
         << "The operator " << op_name << " Mat output cols must be a multiple of " << c0;
+    // An explicit valid_shape, when present, must be constant and fit the
+    // physical output; otherwise the full output is valid.
     output_valid_shape = output_shape;
     const size_t valid_shape_index = coalesce == static_cast<int>(MgatherCoalesceMode::kElem) ? 3 : 2;
     if (args.size() > valid_shape_index) {

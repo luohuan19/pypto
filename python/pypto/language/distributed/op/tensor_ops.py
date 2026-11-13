@@ -48,7 +48,7 @@ from pypto.language.typing import IntLike, Ptr
 from pypto.language.typing.tensor import Tensor
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
-from pypto.pypto_core.ir import AtomicType, Call, Expr, ReduceOp
+from pypto.pypto_core.ir import AtomicType, Call, CommEngine, Expr, ReduceOp
 
 from ..typing.distributed_tensor import DistributedTensor
 from ._utils import _normalize_intlike, _unwrap, _unwrap_distributed_tensors
@@ -431,7 +431,7 @@ def put(
             ``Add`` requires an fp32/bf16/fp16/int32/int16/int8 destination —
             TPUT lands its chunks through the same store pipe as ``pl.store``,
             so the hardware atomic-add dtypes apply. A bf16 destination is
-            further Ascend910B (A2/A3) only; on Ascend950 use an fp32 window
+            further Ascend910 (A2/A3) only; on Ascend950 use an fp32 window
             and cast after the reduction.
         chunk_rows: Optional VEC staging-tile row extent (keyword-only,
             ``0`` = full). Sizes the staging tile to a sub-tile of the flattened
@@ -580,6 +580,105 @@ def get(
     )
 
 
+def put_async(
+    dst: DistributedTensor,
+    peer: IntLike,
+    src: DistributedTensor,
+    dst_offsets: Sequence[IntLike] | None = None,
+    src_offsets: Sequence[IntLike] | None = None,
+    shape: Sequence[IntLike] | None = None,
+    *,
+    engine: CommEngine = CommEngine.URMA,
+) -> DistributedTensor:
+    """Asynchronously write the local ``src`` into the peer rank's ``dst`` slice.
+
+    Both ``dst`` and ``src`` must be window-bound :class:`DistributedTensor`s;
+    V1 does not register ordinary tensors or stage through UB.
+
+    Returns ``dst`` (the result aliases the destination). Returning does **not**
+    mean the transfer completed: completion is owned by the enclosing task and
+    rides the producer ``InOut`` -> consumer ``In`` dependency. The user must
+    pass ``dst`` as an ``InOut`` producer parameter and let a later task consume
+    it as ``In``.
+
+    ``engine`` is a compile-time kwarg; V1 accepts
+    :attr:`pld.CommEngine.URMA` only; other types are rejected before integer
+    conversion. A constant ``peer`` must be non-negative. Offsets and shape,
+    when supplied, must be provided together and describe a contiguous GM
+    range: skip leading singleton transfer dimensions, then require every
+    dimension after the first non-singleton to span its full extent.
+    """
+    dst_expr, src_expr = _unwrap_distributed_tensors("pld.tensor.put_async", dst=dst, src=src)
+    has_region = dst_offsets is not None or src_offsets is not None or shape is not None
+    if has_region and (dst_offsets is None or src_offsets is None or shape is None):
+        raise ValueError("pld.tensor.put_async dst_offsets, src_offsets, and shape must be provided together")
+    if not has_region:
+        call = _ir_tensor.put_async(dst_expr, _unwrap(peer), src_expr, engine=engine)
+    else:
+        assert dst_offsets is not None
+        assert src_offsets is not None
+        assert shape is not None
+        call = _ir_tensor.put_async(
+            dst_expr,
+            _unwrap(peer),
+            src_expr,
+            _normalize_intlike(dst_offsets),
+            _normalize_intlike(src_offsets),
+            _normalize_intlike(shape),
+            engine=engine,
+        )
+    return DistributedTensor(expr=call)
+
+
+def get_async(
+    dst: DistributedTensor,
+    peer: IntLike,
+    src: DistributedTensor,
+    dst_offsets: Sequence[IntLike] | None = None,
+    src_offsets: Sequence[IntLike] | None = None,
+    shape: Sequence[IntLike] | None = None,
+    *,
+    engine: CommEngine = CommEngine.URMA,
+) -> DistributedTensor:
+    """Asynchronously read the peer rank's ``src`` slice into local ``dst``.
+
+    Both ``dst`` and ``src`` must be window-bound :class:`DistributedTensor`s;
+    V1 does not register ordinary tensors or stage through UB.
+
+    Returns ``dst`` (the result aliases the destination). Returning does **not**
+    mean the data has arrived: completion is owned by the enclosing task and
+    rides the producer ``InOut`` -> consumer ``In`` dependency. A local consumer
+    may read the fetched data only after that dependency is released.
+
+    ``engine`` is a compile-time kwarg; V1 accepts
+    :attr:`pld.CommEngine.URMA` only; other types are rejected before integer
+    conversion. A constant ``peer`` must be non-negative. Offsets and shape,
+    when supplied, must be provided together and describe a contiguous GM
+    range: skip leading singleton transfer dimensions, then require every
+    dimension after the first non-singleton to span its full extent.
+    """
+    dst_expr, src_expr = _unwrap_distributed_tensors("pld.tensor.get_async", dst=dst, src=src)
+    has_region = dst_offsets is not None or src_offsets is not None or shape is not None
+    if has_region and (dst_offsets is None or src_offsets is None or shape is None):
+        raise ValueError("pld.tensor.get_async dst_offsets, src_offsets, and shape must be provided together")
+    if not has_region:
+        call = _ir_tensor.get_async(dst_expr, _unwrap(peer), src_expr, engine=engine)
+    else:
+        assert dst_offsets is not None
+        assert src_offsets is not None
+        assert shape is not None
+        call = _ir_tensor.get_async(
+            dst_expr,
+            _unwrap(peer),
+            src_expr,
+            _normalize_intlike(dst_offsets),
+            _normalize_intlike(src_offsets),
+            _normalize_intlike(shape),
+            engine=engine,
+        )
+    return DistributedTensor(expr=call)
+
+
 @overload
 def allreduce(
     target: DistributedTensor,
@@ -673,7 +772,7 @@ def allreduce(
     counts do not read or store past the end.
 
     See ``docs/en/dev/distributed_ops.md`` and
-    ``docs/en/dev/passes/13-lower_composite_ops.md`` for the mesh partial-valid /
+    ``docs/en/dev/passes/15-lower_composite_ops.md`` for the mesh partial-valid /
     symbolic-extent target constraints (unchanged by this PR).
 
     **Barrier protocol (self-clearing credit barrier):** every call's
@@ -1055,21 +1154,30 @@ def all_to_all_v(
     AND finished consuming the previous invocation's receive window; Barrier B
     certifies every peer read this rank's counts and pushed its payload, so
     returning — and restaging counts for the next call — is safe. The InCore
-    composite rail instead publishes ``clamp(send_counts[dest], 0, MAX_RECV)``
-    into peer ``dest``'s ``recv_counts[my_rank, 0]`` via ``pld.system.notify``
-    (Set). Either way, after the call ``recv_counts[src, 0]`` tells this rank
+    composite rail atomically resets its own receive counts and announces
+    readiness to all peers. It then waits for each non-self destination before
+    publishing a positive ``clamp(send_counts[dest], 0, MAX_RECV)`` into that
+    destination's ``recv_counts[my_rank, 0]`` via ``pld.system.notify``
+    (AtomicAdd) and pushing payload; it need not wait for every destination
+    before starting a send. Zero-row destinations retain the receiver's reset
+    count without a publication or payload transfer. A final completion barrier
+    follows. Atomic updates prevent adjacent count cells from
+    clobbering each other through whole-cache-line write-back. Either way,
+    after the call ``recv_counts[src, 0]`` tells this rank
     how many rows ``src`` sent — which is also exactly how many were
     transferred — so use that count to know where to stop reading. This is the
     MPI_Alltoallv recvcounts side. A second call on the same windows must be
     ordered after the first call's local consumer: the receive window is
     overwritten in place.
 
-    The barrier ``signal`` is credit-based, not self-clearing: each call adds
+    The barrier ``signal`` uses self-clearing credits: each call adds
     +1 per round to every peer's slot (wait thresholds 1, then 2) and subtracts
     2 per local slot at the end — never a reset, and never "wait for 1 twice" —
     so back-to-back calls on the same buffer stay ordered. Zero-initialise it
-    once and do not reset it. Calls nested in ``for``/``while`` loops are still
-    rejected by the compiler.
+    once and do not reset it. InCore calls inside ``for``/``while`` loops are
+    supported when every rank executes the same collective sequence. HOST
+    orchestrators reject such loops because loop-carried comm-domain window
+    lifetime management is not modeled.
 
     Args:
         input: Flat 2D Tensor or DistributedTensor [NR*MAX_RECV, SIZE] with
@@ -1121,16 +1229,66 @@ def all_to_all_v(
     return DistributedTensor(expr=call)
 
 
+def indexed_all_to_all_v(
+    input: Tensor | DistributedTensor,
+    target: DistributedTensor,
+    signal: DistributedTensor,
+    send_counts: DistributedTensor,
+    recv_counts: Tensor | DistributedTensor,
+    index: Tensor | DistributedTensor,
+    *,
+    core_num: IntLike = 1,
+) -> DistributedTensor:
+    """Exchange indexed rows on A5 URMA using one AIV writer per destination.
+
+    Input is [Nmax,H], index is INT32 [P,C], target is [P*C,H]. Each
+    destination receives the selected input rows in index order, in its
+    source-rank partition. Counts must be in [0,C]; valid indices must be
+    in [0,Nmax). Duplicate indices are allowed; unused tails are untouched.
+    Only L2 orchestration is supported. L2 accepts local input
+    and index tensors, and a local recv_counts output. Payload is FP32 or
+    INT8; HOST and InCore are unsupported. Self uses MTE, remote peers use URMA.
+    Signal is INT32 [P,S], S >= core_num, zero-initialized once.
+    Signal, send_counts and recv_counts must use pairwise distinct buffers.
+    All ranks use the same positive core_num and collective order. All AIVs share local
+    copies between remote submission and completion waits; AIVs beyond P
+    do not submit URMA work. Reuse must follow
+    the previous receive-window consumer. Completion is a task dependency,
+    not a CPU synchronization or asynchronous issue-only handle.
+    Callers must order exchanges sharing URMA queues: reuse the same InOut
+    signal or establish an explicit task dependency when signals differ.
+    """
+    target_expr, signal_expr, counts_expr = _unwrap_distributed_tensors(
+        "pld.tensor.indexed_all_to_all_v",
+        target=target,
+        signal=signal,
+        send_counts=send_counts,
+    )
+    call = _ir_tensor.indexed_all_to_all_v(
+        _unwrap(input),
+        target_expr,
+        signal_expr,
+        counts_expr,
+        _unwrap(recv_counts),
+        _unwrap(index),
+        _unwrap(core_num),
+    )
+    return DistributedTensor(expr=call)
+
+
 __all__ = [
     "all_to_all",
     "all_to_all_v",
+    "indexed_all_to_all_v",
     "alloc_window_buffer",
     "allgather",
     "allreduce",
     "barrier",
     "broadcast",
     "get",
+    "get_async",
     "put",
+    "put_async",
     "remote_store",
     "reduce_scatter",
     "window",

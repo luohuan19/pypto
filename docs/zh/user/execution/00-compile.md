@@ -1,5 +1,9 @@
 # 编译
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 把一个程序或一个 `@pl.jit` kernel 变成设备 kernel 与主机编排。
 
 ## 概念
@@ -54,7 +58,7 @@ assert compiled.param_names == ["a", "b", "out"]
 | `output_dir` | `None` | 产物落点；`None` 表示每次调用在 `PYPTO_PROG_BUILD_DIR` 或 `build_output` 下新建一个 `<name>_<YYYYmmdd_HHMMSS>_<random>`。时间戳便于阅读，随机尾缀保证并发编译互不覆盖，因此路径不可推导 —— 请读 `compiled.output_dir` |
 | `strategy` | `Default` | pass 流水。`Default` 是唯一策略 |
 | `dump_passes` | `True` | 每个 pass 之后的 IR 快照 —— 见下 |
-| `backend_type` | `Ascend910B` | pass 与 codegen 的目标（`Ascend910B` / `Ascend950`） |
+| `backend_type` | `Ascend910` | pass 与 codegen 的目标（`Ascend910` / `Ascend950`） |
 | `platform` | `None` | 产物面向的执行平台；必须与派发它的 worker 一致 |
 | `skip_ptoas` | `False` | 停在 `.pto`（MLIR），不构建设备二进制 |
 | `verification_level` | `None` | `NONE` / `BASIC` / `ROUNDTRIP`；`None` 交给 `PYPTO_VERIFY_LEVEL`，否则 `BASIC` |
@@ -64,7 +68,7 @@ assert compiled.param_names == ["a", "b", "out"]
 | `profiling` | `False` | 逐阶段编译计时写入 `report/pipeline_profile.{txt,json}` |
 | `distributed_config` | `None` | 按 rank 编译 HOST 级程序（[分布式](../distributed/index.md)） |
 | `analyze_auto_scopes_for_deps` | `False` | 对 AUTO 作用域做编译器推导依赖 |
-| `enable_pypto_l0c_double_buffer` | `None` | L0C double buffer |
+| `enable_pypto_l0c_double_buffer` | `None` | 旧版开关；PYPTO/DSA_RP 禁用自动 dbC，PTOAS 保留自动 dbC 且不受此开关影响 |
 | `emit_source_loc` | `None` | 把 DSL 源位置带进发出的 `.pto` |
 | `dump_ptoas_passes` | `False` | 同时 dump ptoas 自己的 pass IR |
 | `runtime` | `None` | 面向哪个 Simpler 运行时 ABI —— `TENSORMAP_AND_RINGBUFFER` 或 `HOST_BUILD_GRAPH`（`@pl.jit.graph` 需要它 —— [函数](../language/01-functions.md)）；`None` 继承当前 `PassContext`。派发它的 worker 必须与之匹配 |

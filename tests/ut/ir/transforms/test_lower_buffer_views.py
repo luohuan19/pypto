@@ -11,7 +11,6 @@
 
 from pathlib import Path
 
-import pypto
 import pypto.language as pl
 import pytest
 import torch
@@ -184,7 +183,7 @@ class ReshapedLoad:
 """)
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("planner", _PLANNERS)
 @pytest.mark.parametrize(
     "planned,dtype_name",
@@ -211,7 +210,7 @@ def test_automatic_views_compile_without_new_allocations_or_data_copies(
         pytest.skip("PTOAS is not available")
     source, output = tmp_path / "lowered_views.pto", tmp_path / "lowered_views.cpp"
     source.write_text(text)
-    arch = "a2" if ascend_backend == BackendType.Ascend910B else "a5"
+    arch = "a2" if ascend_backend == BackendType.Ascend910 else "a5"
     _run_ptoas(
         str(source), str(output), [f"--pto-arch={arch}", f"--pto-level={'level3' if addressed else 'level2'}"]
     )
@@ -289,26 +288,20 @@ def _compile(tmp_path: Path, program: ir.Program, backend: BackendType, addresse
         pytest.skip("PTOAS is not available")
     source, output = tmp_path / "window.pto", tmp_path / "window.cpp"
     source.write_text(text)
-    arch = "a2" if backend == BackendType.Ascend910B else "a5"
+    arch = "a2" if backend == BackendType.Ascend910 else "a5"
     _run_ptoas(
         str(source), str(output), [f"--pto-arch={arch}", f"--pto-level={'level3' if addressed else 'level2'}"]
     )
     return text
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("planner", _PLANNERS)
 def test_slice_and_assemble_become_use_site_windows(
     tmp_path: Path, ascend_backend: BackendType, planner: passes.MemoryPlanner
 ) -> None:
     program = _window_program("StaticWindow")
     addressed = planner != passes.MemoryPlanner.PTOAS
-    if planner == passes.MemoryPlanner.DSA_RP:
-        # DSA_RP places the sum over part of the live window's source; the
-        # verifier cannot prove that partial overlap safe and fails closed.
-        with pytest.raises(pypto.Error, match="partially overlapping"):
-            _lower_default(program, planner)
-        return
     lowered = _lower_default(program, planner)
     windows = _calls(lowered, "buffer.subview")
     # Slice window and assemble window, each with an explicit valid clause.
@@ -319,7 +312,7 @@ def test_slice_and_assemble_become_use_site_windows(
     assert "valid [" in text and "pto.tmov ins(" in text
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 def test_runtime_slice_offset_stays_an_operand_of_its_window(
     tmp_path: Path, ascend_backend: BackendType
 ) -> None:
@@ -333,16 +326,18 @@ def test_runtime_slice_offset_stays_an_operand_of_its_window(
 
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
-def test_runtime_window_overlapping_its_planned_destination_fails_closed(
+def test_runtime_window_destination_is_separated_from_parent(
+    tmp_path: Path,
+    ascend_backend: BackendType,
     planner: passes.MemoryPlanner,
 ) -> None:
-    # The planner reuses the parent's storage for the sum; a runtime window
-    # offset cannot prove that range disjoint from the source window.
-    with pytest.raises(pypto.Error, match="partially overlapping"):
-        _lower_default(_window_program("RuntimeWindow"), planner)
+    # Low-level pipelines also constrain the whole parent's allocation when
+    # the window offset is unknown. Default selection still excludes this form.
+    lowered = _lower_default(_window_program("RuntimeWindow"), planner)
+    _compile(tmp_path, lowered, ascend_backend, addressed=True)
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("planner", _PLANNERS)
 # NarrowedValid shares one handle: the load states its full extents, then
 # set_validshape narrows them, then the sum states its own.
@@ -376,7 +371,7 @@ def test_rank_reducing_slice_is_rejected_even_when_type_inference_pads_to_rank_t
         _lower_default(ColumnSlice, planner)
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("valid", ["[16, cols]", "[rows, 32]", "[rows, cols]"])
 @pytest.mark.parametrize("operation", ["pl.add(window, window)", "pl.add(window, loaded)", "pl.exp(window)"])
 def test_runtime_valid_window_arithmetic_compiles(
@@ -402,7 +397,7 @@ class WindowArithmetic:
     assert "pto.subview" in text and "pto.set_validshape" in text
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("valid", ["[16, cols]", "[rows, 32]", "[rows, cols]"])
 @pytest.mark.parametrize("source", ["loaded", "window"])
 def test_runtime_valid_assemble_compiles(
@@ -430,7 +425,7 @@ class RuntimeAssemble:
     assert "pto.tmov ins(" in text
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("planner", _PLANNERS)
 def test_assemble_preserves_a_partially_valid_target(
     tmp_path: Path, ascend_backend: BackendType, planner: passes.MemoryPlanner
@@ -447,16 +442,12 @@ def test_assemble_preserves_a_partially_valid_target(
             result = pl.store(assembled, [0, 0], out)
             return result
 
-    if planner == passes.MemoryPlanner.PTOAS:
-        with pytest.raises(ValueError, match="cannot share an addressless storage root"):
-            _lower_default(GrowValidTarget, planner)
-        return
     lowered = _lower_default(GrowValidTarget, planner)
     copies = _calls(lowered, "buffer.copy")
     assert copies
     for copy in copies:
         ir.assert_structural_equal(copy.args[0].type, copy.args[1].type)
-    text = _compile(tmp_path, lowered, ascend_backend, addressed=True)
+    text = _compile(tmp_path, lowered, ascend_backend, addressed=planner != passes.MemoryPlanner.PTOAS)
     assert "pto.tmov ins(" in text
 
 

@@ -129,7 +129,7 @@ class TestPrinterIntegration:
         printed = func_with_tuple_yield.as_python()
 
         # Tuple unpacking should NOT have type annotations
-        assert "val1, val2 = pl.yield_" in printed
+        assert "val1, val2 = pl._dump.yield_" in printed
         # Ensure no type annotations are added to tuple-unpacked variables
         assert "val1: pl.Tensor" not in printed
         assert "val2: pl.Tensor" not in printed
@@ -451,6 +451,21 @@ class TestTextFormRoundtrip:
         assert isinstance(result, ir.ConstFloat)
         assert struct.pack(">d", result.value).hex() == bits
 
+    @pytest.mark.parametrize("bits", ["7ff0000000000000", "fff0000000000000", "7ff8000000000012"])
+    def test_nonfinite_fp32_operand_stays_typed_with_fp16_tensor(self, bits):
+        """Raw operator literals infer FP16, but an existing FP32 IR operand must stay FP32."""
+        program = pl.parse_program(f"""
+@pl.program
+class TypedConstant:
+    @pl.function
+    def f(self, x: pl.Tensor[[1, 16], pl.FP16]):
+        y = pl.add(x, pl.const(pl._dump.float64("{bits}"), pl.FP32))
+        return y
+""")
+        printed = ir.python_print(program)
+        assert "pl.const(pl._dump.float64(" in printed
+        ir.assert_structural_equal(program, pl.parse_program(printed))
+
     @pytest.mark.parametrize(
         "left,right,equal",
         [
@@ -458,7 +473,7 @@ class TestTextFormRoundtrip:
             ("7ff8000000000012", "7ff8000000000013", False),
             ("7ff8000000000012", "fff8000000000012", False),
             ("7ff0000000000000", "fff0000000000000", False),
-            ("0000000000000000", "8000000000000000", True),
+            ("0000000000000000", "8000000000000000", False),
         ],
     )
     def test_float_structural_identity(self, left, right, equal):
@@ -472,7 +487,7 @@ class TestTextFormRoundtrip:
             ir.assert_structural_equal(lhs, rhs)
             assert ir.structural_hash(lhs) == ir.structural_hash(rhs)
         else:
-            with pytest.raises(ValueError, match="Structural equality assertion failed"):
+            with pytest.raises(ValueError, match="Structural mismatch at root"):
                 ir.assert_structural_equal(lhs, rhs)
         other_dtype = ir.ConstFloat(lhs.value, DataType.FP16, span)
         assert not ir.structural_equal(lhs, other_dtype)

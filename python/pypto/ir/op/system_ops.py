@@ -12,7 +12,7 @@
 System operations handle hardware synchronization and cross-core communication:
 - sync_src / sync_dst: Set/Wait flag-based synchronization between pipes
 - set_ffts / sync_set / sync_wait: Explicit Cube/Vector cross-core event synchronization
-- bar_v / bar_m / bar_all: Barrier synchronization for vector, matrix, or all units
+- barrier: Barrier synchronization for any one hardware pipeline, or all of them, on one core
 - tpush_to_aiv / tpush_to_aic: Push tile data across cores
 - tpop_from_aic / tpop_from_aiv: Pop tile data from cross-core pipe
 - aic_initialize_pipe / aiv_initialize_pipe: Initialize cross-core pipes
@@ -27,7 +27,7 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import Call, ConstInt, Expr, PipeType, ScalarType, Span, TensorType
 
-from ..utils import _get_span_or_capture, _to_make_tuple
+from ..utils import _get_span_or_capture, _to_make_tuple, resolve_fixpipe_epilogue
 
 # Redundant aliases: the PEP 484 re-export form pyright accepts (plain
 # names would be reportUnusedImport in the IR contract tier).
@@ -175,15 +175,20 @@ def _create_sync_op(
     return _ir_core.create_op_call(op_name, [], kwargs, actual_span)
 
 
-def _create_barrier_op(op_name: str, *, span: Span | None) -> Call:
+def _create_barrier_op(op_name: str, *, core_type_attr: str | None = None, span: Span | None) -> Call:
     """Create a barrier synchronization operation.
 
     Args:
         op_name: Operation name (e.g., "system.bar_v")
+        core_type_attr: Already-validated IR spelling of the kernel to pin the
+            barrier to (``"aic"`` / ``"aiv"``); ``None`` leaves it in both.
+            Validated by the caller, which knows the public API name to blame
+            -- these ops are reached as ``system.barrier``, not by op name.
         span: Optional source span for debugging
     """
     actual_span = _get_span_or_capture(span, frame_offset=2)
-    return _ir_core.create_op_call(op_name, [], {}, actual_span)
+    kwargs: dict[str, Any] = {} if core_type_attr is None else {"core_type": core_type_attr}
+    return _ir_core.create_op_call(op_name, [], kwargs, actual_span)
 
 
 def sync_src(
@@ -230,6 +235,62 @@ def sync_dst(
     return _create_sync_op(
         "system.sync_dst", set_pipe=set_pipe, wait_pipe=wait_pipe, event_id=event_id, span=span
     )
+
+
+def _pipeline_flag(
+    name: str,
+    src_pipe: object,
+    dst_pipe: object,
+    event_id: int | Expr,
+    *,
+    core_type: KernelType | None,
+    span: Span | None,
+) -> Call:
+    """Build the explicit intra-core flag IR call."""
+    if not isinstance(src_pipe, PipeType) or not isinstance(dst_pipe, PipeType):
+        raise TypeError(f"{name} src_pipe and dst_pipe must be PipeType values")
+    if PipeType.ALL in (src_pipe, dst_pipe) or src_pipe == dst_pipe:
+        raise ValueError(f"{name} requires two different concrete pipes")
+    args: list[Expr] = []
+    kwargs: dict[str, Any] = {"src_pipe": src_pipe, "dst_pipe": dst_pipe}
+    if isinstance(event_id, ConstInt):
+        event_id = event_id.value
+    if isinstance(event_id, int) and not isinstance(event_id, bool):
+        if not 0 <= event_id <= 7:
+            raise ValueError(f"{name} event_id must be in [0, 7], got {event_id}")
+        kwargs["event_id"] = event_id
+    elif isinstance(event_id, Expr):
+        args.append(event_id)
+    else:
+        raise TypeError(f"{name} event_id must be int or INDEX Expr, got {type(event_id).__name__}")
+    if core_type is not None:
+        _check_enum(core_type, KernelType, "core_type", name, allowed=_SYNC_EVENT_KERNELS)
+        kwargs["core_type"] = _SYNC_EVENT_CORE_TYPE[core_type]
+    return _ir_core.create_op_call(name, args, kwargs, _get_span_or_capture(span, frame_offset=2))
+
+
+def set_flag(
+    src_pipe: PipeType,
+    dst_pipe: PipeType,
+    event_id: int | Expr = 0,
+    *,
+    core_type: KernelType | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Signal an intra-core pipeline event after work on ``src_pipe``."""
+    return _pipeline_flag("system.set_flag", src_pipe, dst_pipe, event_id, core_type=core_type, span=span)
+
+
+def wait_flag(
+    src_pipe: PipeType,
+    dst_pipe: PipeType,
+    event_id: int | Expr = 0,
+    *,
+    core_type: KernelType | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Wait on ``dst_pipe`` for the matching source-pipe signal."""
+    return _pipeline_flag("system.wait_flag", src_pipe, dst_pipe, event_id, core_type=core_type, span=span)
 
 
 _MIN_FFTS_WORKSPACE_ELEMENTS = 256
@@ -328,19 +389,77 @@ def sync_wait(
     )
 
 
-def bar_v(*, span: Span | None = None) -> Call:
-    """Vector unit barrier."""
-    return _create_barrier_op("system.bar_v", span=span)
+def barrier(*, pipe: PipeType, core_type: KernelType | None = None, span: Span | None = None) -> Call:
+    """Order work on one pipeline, or across all of them, on one core.
 
+    Every ``PipeType`` member is accepted. A barrier is pipe-scoped rather than
+    operation-scoped: it drains whatever was issued on that pipe, so the pipe a
+    transfer rides decides which barrier orders it. On A5 that mapping is
+    ``Backend::InferTransferPipe`` -- GM <-> UB and GM -> L1 ride MTE2/MTE3,
+    UB -> L1 also rides MTE3, L1 -> L0A/L0B rides MTE1, and the L0C writeback
+    rides FIX.
 
-def bar_m(*, span: Span | None = None) -> Call:
-    """Matrix unit barrier."""
-    return _create_barrier_op("system.bar_m", span=span)
+    Args:
+        pipe: The pipeline to drain, or ``PipeType.ALL`` for every pipeline on
+            the current core. A single-pipe barrier orders that pipeline's
+            preceding and following work and spends no event slot. It is NOT a
+            drop-in replacement for a ``set_flag`` / ``wait_flag`` pair: a
+            barrier drains one pipe, where a flag pair orders one producer ->
+            consumer dependency BETWEEN two pipes. Use a flag pair (or ``ALL``)
+            for a cross-pipeline handoff, which matters most in a function
+            carrying static flags, where PTOAS skips automatic synchronization.
+        core_type: Which kernel the barrier lands in when a mixed InCore
+            function is expanded into an AIC and an AIV kernel. The two lanes
+            own different pipelines -- FIX and MTE1 are cube-side, V is
+            vector-side -- so a mixed kernel should pin a single-pipe barrier to
+            the lane that owns the pipe. Omit it to leave the barrier in both,
+            which is what an explicitly typed AIC/AIV function wants.
+        span: Optional source span for debugging (auto-captured if not provided).
 
+    Returns:
+        Barrier call expression with no result value.
 
-def bar_all(*, span: Span | None = None) -> Call:
-    """Global barrier synchronization."""
-    return _create_barrier_op("system.bar_all", span=span)
+    ``PipeType.S`` is accepted for completeness but orders nothing in practice:
+    both of PTOAS's synchronization allocators treat a scalar-to-scalar pair as
+    already ordered on every architecture.
+
+    A barrier is rejected inside ``pl.pipeline``, as explicit flags are: it has
+    no operand, so pipeline scheduling has no dependency edge to hold it in
+    place and could order it before the transfer it was written to follow.
+
+    Raises:
+        TypeError: If pipe is not a PipeType member, or core_type is not a
+            KernelType member.
+        ValueError: If core_type is KernelType.MIX, which names a participant
+            set rather than one kernel; omit it to reach both lanes.
+    """
+    # Preserve the established IR and native PTO barrier lowering. Barriers
+    # have no event ID and must not allocate or consume pipeline event slots.
+    # Keep this table exhaustive over PipeType: a member without an entry would
+    # raise KeyError below rather than the TypeError the signature promises.
+    op_names = {
+        PipeType.MTE1: "system.bar_mte1",
+        PipeType.MTE2: "system.bar_mte2",
+        PipeType.MTE3: "system.bar_mte3",
+        PipeType.M: "system.bar_m",
+        PipeType.V: "system.bar_v",
+        PipeType.S: "system.bar_s",
+        PipeType.FIX: "system.bar_fix",
+        PipeType.ALL: "system.bar_all",
+    }
+    _check_enum(pipe, PipeType, "pipe", "system.barrier", allowed=tuple(op_names))
+    core_type_attr = None
+    if core_type is not None:
+        _check_enum(
+            core_type,
+            KernelType,
+            "core_type",
+            "system.barrier",
+            allowed=_SYNC_EVENT_KERNELS,
+            hint=_SYNC_EVENT_MIX_HINT,
+        )
+        core_type_attr = _SYNC_EVENT_CORE_TYPE[core_type]
+    return _create_barrier_op(op_names[pipe], core_type_attr=core_type_attr, span=span)
 
 
 def fence(*, span: Span | None = None) -> Call:
@@ -557,20 +676,33 @@ def _build_pipe_init_kwargs(
     slot_num: int | None,
     local_slot_num: int | None,
     id: int | None,
-) -> dict[str, int]:
+    c2v_dtype: object,
+    pre_relu: bool,
+) -> dict[str, Any]:
     """Build the attribute kwargs shared by aic/aiv_initialize_pipe.
 
     Value constraints (slot_num > 0, local_slot_num > 0, local_slot_num <=
     slot_num) are enforced downstream by the IR verifier and PTOAS, matching how
     dir_mask / slot_size are handled, so they are not re-checked here.
     """
-    kwargs: dict[str, int] = {"dir_mask": dir_mask, "slot_size": slot_size}
+    kwargs: dict[str, Any] = {"dir_mask": dir_mask, "slot_size": slot_size}
     if slot_num is not None:
         kwargs["slot_num"] = slot_num
     if local_slot_num is not None:
         kwargs["local_slot_num"] = local_slot_num
     if id is not None:
         kwargs["id"] = id
+    # Match store's compile-time ReLU semantics, without introducing a scale:
+    # the pipe's payload dtype selects an unscaled FP32 conversion instead.
+    _, relu = resolve_fixpipe_epilogue("initialize_pipe", None, pre_relu)
+    if relu and c2v_dtype is None:
+        raise ValueError("initialize_pipe: pre_relu=True requires an explicit c2v_dtype")
+    if c2v_dtype is not None:
+        if not isinstance(c2v_dtype, DataType):
+            raise TypeError(f"initialize_pipe: c2v_dtype must be a DataType, got {type(c2v_dtype).__name__}")
+        kwargs["c2v_dtype"] = c2v_dtype
+    if relu:
+        kwargs["pre_relu"] = True
     return kwargs
 
 
@@ -583,6 +715,8 @@ def aic_initialize_pipe(
     slot_num: int | None = None,
     local_slot_num: int | None = None,
     id: int | None = None,
+    c2v_dtype: DataType | None = None,
+    pre_relu: bool = False,
     span: Span | None = None,
 ) -> Call:
     """Initialize cross-core pipe on AIC side.
@@ -598,10 +732,17 @@ def aic_initialize_pipe(
             ``<= slot_num``). On a3 the reserved/imported buffer is sized
             ``slot_size * local_slot_num``; on a5 it is ``slot_size * slot_num``.
         id: Optional frontend pipe id. Omit to use PTOAS default id 0.
+        c2v_dtype: Explicit A5 non-split C2V payload type: FP32, FP16, or BF16.
+            The producer must push FP32 Acc tiles. Both peer initializers must
+            agree, and the consumer must pop this dtype. Narrowing uses RNE.
+            Slot bytes describe the payload, not the FP32 accumulator.
+        pre_relu: Apply ReLU before conversion on every push in this pipe.
+            Requires c2v_dtype. Like store's pre_relu, this is a compile-time
+            setting. No scalar pre_quant scale is applied.
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    kwargs = _build_pipe_init_kwargs(dir_mask, slot_size, slot_num, local_slot_num, id)
+    kwargs = _build_pipe_init_kwargs(dir_mask, slot_size, slot_num, local_slot_num, id, c2v_dtype, pre_relu)
     args = _build_pipe_init_args(c2v_consumer_buf, v2c_consumer_buf, actual_span)
     return _ir_core.create_op_call("system.aic_initialize_pipe", args, kwargs, actual_span)
 
@@ -615,6 +756,8 @@ def aiv_initialize_pipe(
     slot_num: int | None = None,
     local_slot_num: int | None = None,
     id: int | None = None,
+    c2v_dtype: DataType | None = None,
+    pre_relu: bool = False,
     span: Span | None = None,
 ) -> Call:
     """Initialize cross-core pipe on AIV side.
@@ -630,10 +773,15 @@ def aiv_initialize_pipe(
             ``<= slot_num``). On a3 the reserved/imported buffer is sized
             ``slot_size * local_slot_num``; on a5 it is ``slot_size * slot_num``.
         id: Optional frontend pipe id. Omit to use PTOAS default id 0.
+        c2v_dtype: Explicit A5 non-split C2V payload type: FP32, FP16, or BF16.
+            Must match the producer's initializer and every consumer pop.
+            Narrowing uses RNE; slot bytes describe the payload dtype.
+        pre_relu: Apply ReLU before conversion on every push in this pipe.
+            Must match the producer's initializer and requires c2v_dtype.
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    kwargs = _build_pipe_init_kwargs(dir_mask, slot_size, slot_num, local_slot_num, id)
+    kwargs = _build_pipe_init_kwargs(dir_mask, slot_size, slot_num, local_slot_num, id, c2v_dtype, pre_relu)
     args = _build_pipe_init_args(c2v_consumer_buf, v2c_consumer_buf, actual_span)
     return _ir_core.create_op_call("system.aiv_initialize_pipe", args, kwargs, actual_span)
 

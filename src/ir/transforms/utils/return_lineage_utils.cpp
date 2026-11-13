@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -21,6 +22,8 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
+#include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -30,6 +33,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/result_alias_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 #include "pypto/ir/type.h"
@@ -42,10 +46,17 @@ namespace {
 
 using op_predicates::IsBuiltinOp;
 
-CallPtr AsCallOrSubmitView(const ExprPtr& expr) {
-  if (auto call = As<Call>(expr)) return call;
-  if (auto submit = As<Submit>(expr)) return SubmitToCallView(submit);
-  return nullptr;
+// Borrow the original operands without allocating a Call view for each tuple
+// projection. Submit keeps its original compact argument list and result type.
+struct CallLikeView {
+  OpPtr op;
+  const std::vector<ExprPtr>* args = nullptr;
+};
+
+CallLikeView AsCallLike(const ExprPtr& expr) {
+  if (auto call = As<Call>(expr)) return {call->op_, &call->args_};
+  if (auto submit = As<Submit>(expr)) return {submit->op_, &submit->args_};
+  return {};
 }
 
 using ParamIndexMap = std::unordered_map<const Var*, size_t>;
@@ -57,6 +68,54 @@ ParamIndexMap IndexParams(const std::vector<VarPtr>& params) {
   return result;
 }
 
+// External functions have no executable IR body. Their result identities are
+// a declaration contract, not an inference from the set of writable arguments.
+// A missing contract is unambiguous only for a complete, ordered set of writable
+// parameters; subsets and reordered results require explicit references.
+std::vector<std::optional<size_t>> ExternalReturnedParamIndices(const FunctionPtr& func) {
+  std::vector<VarPtr> returned;
+  if (func->HasAttr(kAttrExternalReturnParams)) {
+    returned = func->GetAttr<std::vector<VarPtr>>(kAttrExternalReturnParams);
+  } else {
+    if (func->return_types_.empty()) return {};
+    for (size_t i = 0; i < func->params_.size(); ++i) {
+      const auto direction = func->param_directions_[i];
+      if (direction == ParamDirection::Out || direction == ParamDirection::InOut) {
+        returned.push_back(func->params_[i]);
+      }
+    }
+  }
+  CHECK_SPAN(returned.size() == func->return_types_.size(), func->span_)
+      << "External kernel '" << func->name_ << "' declares " << func->return_types_.size()
+      << " results but its returned parameter contract has " << returned.size()
+      << " entries. Declare the returned tensor parameters explicitly with " << kAttrExternalReturnParams;
+
+  const auto param_indices = IndexParams(func->params_);
+  std::vector<std::optional<size_t>> result;
+  result.reserve(returned.size());
+  for (size_t i = 0; i < returned.size(); ++i) {
+    auto it = param_indices.find(returned[i].get());
+    CHECK_SPAN(it != param_indices.end(), func->span_)
+        << "External kernel '" << func->name_ << "' return " << i << " must reference its own parameter";
+    const auto param_type = AsTensorTypeLike(returned[i]->GetType());
+    const auto return_type = AsTensorTypeLike(func->return_types_[i]);
+    CHECK_SPAN(param_type && return_type && param_type->dtype_ == return_type->dtype_ &&
+                   param_type->shape_.size() == return_type->shape_.size(),
+               func->span_)
+        << "External kernel '" << func->name_ << "' return " << i
+        << " must have the same tensor dtype and shape as its returned parameter";
+    // MemRefs and lowering-specific views may differ after memory assignment;
+    // the declaration promises the logical tensor shape, not storage metadata.
+    for (size_t axis = 0; axis < param_type->shape_.size(); ++axis) {
+      CHECK_SPAN(structural_equal(param_type->shape_[axis], return_type->shape_[axis]), func->span_)
+          << "External kernel '" << func->name_ << "' return " << i
+          << " has a different shape from its returned parameter at axis " << axis;
+    }
+    result.emplace_back(it->second);
+  }
+  return result;
+}
+
 // Per-body index: topmost ReturnStmt, per-var defining AssignStmt, loop-carry
 // edges (iter_arg / tensor return_var -> init value var), and optionally tensor
 // IfStmt merge edges. Return queries and scope outlining share branch consensus.
@@ -65,24 +124,45 @@ class BodyIndexCollector : public IRVisitor {
   explicit BodyIndexCollector(bool collect_if_merges = false) : collect_if_merges_(collect_if_merges) {}
 
   ReturnStmtPtr first_return;
+  std::vector<ReturnStmtPtr> returns;
   std::unordered_map<const Var*, AssignStmtPtr> var_def;
   std::unordered_map<const Var*, const Var*> carry_src;
+  std::unordered_map<const Var*, ExprPtr> carry_yields;
   std::unordered_map<const Var*, std::vector<const Var*>> merge_srcs;
+  std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_merge_srcs;
+  std::unordered_map<const Var*, std::pair<ExprPtr, ExprPtr>> tuple_carries;
+  std::unordered_map<const Var*, IterArgPtr> tuple_carry_results;
 
  protected:
   void VisitStmt_(const ReturnStmtPtr& ret) override {
     if (!first_return) first_return = ret;
+    returns.push_back(ret);
   }
   void VisitStmt_(const AssignStmtPtr& assign) override {
-    if (assign->var_) var_def.emplace(assign->var_.get(), assign);
+    if (assign->var_) {
+      auto [it, inserted] = var_def.emplace(assign->var_.get(), assign);
+      // A pre-SSA binding may have different definitions across control flow.
+      // Null entries retain that ambiguity even after further assignments.
+      if (!inserted) it->second = nullptr;
+    }
     IRVisitor::VisitStmt_(assign);
   }
+  void VisitStmt_(const SimtLaunchStmtPtr& launch) override {
+    for (size_t i = 0; i < launch->results_.size(); ++i) {
+      const auto& result = launch->results_[i];
+      if (!AsTensorTypeLike(result->GetType())) continue;
+      if (auto source = AsVarLike(launch->args_[launch->result_param_indices_[i]])) {
+        carry_src[result.get()] = source.get();
+      }
+    }
+    IRVisitor::VisitStmt_(launch);
+  }
   void VisitStmt_(const ForStmtPtr& for_stmt) override {
-    RecordCarries(for_stmt->iter_args_, for_stmt->return_vars_);
+    RecordCarries(for_stmt->iter_args_, for_stmt->return_vars_, for_stmt->body_);
     IRVisitor::VisitStmt_(for_stmt);
   }
   void VisitStmt_(const WhileStmtPtr& while_stmt) override {
-    RecordCarries(while_stmt->iter_args_, while_stmt->return_vars_);
+    RecordCarries(while_stmt->iter_args_, while_stmt->return_vars_, while_stmt->body_);
     IRVisitor::VisitStmt_(while_stmt);
   }
   void VisitStmt_(const IfStmtPtr& if_stmt) override {
@@ -91,15 +171,27 @@ class BodyIndexCollector : public IRVisitor {
   }
 
  private:
-  void RecordCarries(const std::vector<IterArgPtr>& iter_args, const std::vector<VarPtr>& return_vars) {
+  void RecordCarries(const std::vector<IterArgPtr>& iter_args, const std::vector<VarPtr>& return_vars,
+                     const StmtPtr& body) {
+    auto yield = transform_utils::GetLastYieldStmt(body);
     for (size_t i = 0; i < iter_args.size(); ++i) {
-      auto init_var = AsVarLike(iter_args[i]->initValue_);
+      if (!yield || i >= yield->value_.size()) continue;
+      const auto& carry = iter_args[i];
+      if (As<TupleType>(carry->GetType())) {
+        tuple_carries.emplace(carry.get(), std::make_pair(carry->initValue_, yield->value_[i]));
+        if (i < return_vars.size() && As<TupleType>(return_vars[i]->GetType())) {
+          tuple_carry_results.emplace(return_vars[i].get(), carry);
+        }
+        continue;
+      }
+      auto init_var = AsVarLike(carry->initValue_);
       if (!init_var) continue;
       carry_src[iter_args[i].get()] = init_var.get();
-      // Scalar carries are value-typed: the body may overwrite them with a
-      // value unrelated to the init param, so only Tensor carries propagate.
+      carry_yields[iter_args[i].get()] = yield->value_[i];
+      // A loop result must pass the carry's identity proof, not bypass it by
+      // pointing straight at the initializer. Scalar carries remain value-typed.
       if (i < return_vars.size() && AsTensorTypeLike(return_vars[i]->GetType())) {
-        carry_src[return_vars[i].get()] = init_var.get();
+        carry_src[return_vars[i].get()] = iter_args[i].get();
       }
     }
   }
@@ -114,7 +206,13 @@ class BodyIndexCollector : public IRVisitor {
         std::min({if_stmt->return_vars_.size(), then_yield->value_.size(), else_yield->value_.size()});
     for (size_t i = 0; i < count; ++i) {
       const auto& return_var = if_stmt->return_vars_[i];
-      if (!return_var || !AsTensorTypeLike(return_var->GetType())) continue;
+      if (!return_var) continue;
+      if (As<TupleType>(return_var->GetType())) {
+        tuple_merge_srcs.emplace(return_var.get(),
+                                 std::vector<ExprPtr>{then_yield->value_[i], else_yield->value_[i]});
+        continue;
+      }
+      if (!AsTensorTypeLike(return_var->GetType())) continue;
       auto then_var = AsVarLike(then_yield->value_[i]);
       auto else_var = AsVarLike(else_yield->value_[i]);
       if (!then_var || !else_var) continue;
@@ -126,12 +224,32 @@ class BodyIndexCollector : public IRVisitor {
 };
 
 // Cross-function memo + cycle guard, shared by the recursive tracer. The
-// per-function result depends only on the callee body, so a thread_local
-// cache bounds total work to one body walk per distinct function reached
-// from the outermost query (cleared when it unwinds).
+// Results depend on the callee and its callees in an unchanged Program. The
+// thread_local cache bounds work to one body walk per distinct function reached
+// from the outermost function, batched query, or explicit cache scope.
 struct TraceContext {
   std::vector<const Function*> call_stack;
+  std::unordered_set<const Function*> active_functions;
   std::unordered_map<const Function*, std::vector<std::optional<size_t>>> memo;
+  std::unordered_map<const Function*, size_t> trailing_ctx_counts;
+  size_t query_depth = 0;
+  bool require_terminal_returns = false;
+  // Strict queries must not reuse maps computed without recursive validation.
+  std::unordered_map<const Function*, std::vector<std::optional<size_t>>> strict_memo;
+
+  std::unordered_map<const Function*, std::vector<std::optional<size_t>>> strict_tuple_memo;
+
+  auto& ReturnMaps(bool project_tuple = false) {
+    if (project_tuple) return strict_tuple_memo;
+    return require_terminal_returns ? strict_memo : memo;
+  }
+
+  void ClearCache() {
+    memo.clear();
+    strict_memo.clear();
+    strict_tuple_memo.clear();
+    trailing_ctx_counts.clear();
+  }
 };
 
 TraceContext& Ctx() {
@@ -139,67 +257,427 @@ TraceContext& Ctx() {
   return ctx;
 }
 
+// Keep callee maps alive while a batch traces several independent Vars. A
+// nested function query must not clear maps still needed by the outer batch.
+using TraceQueryGuard = ScopedTraceCache;
+
+// Map a callee parameter back to its actual argument using Submit::args_'s
+// prefix / omitted-Out gap / CommCtx suffix contract. Call's full coverage is
+// the gap==0 case; wrapper Call views use this same compact-list mapping.
+ExprPtr ParamArgument(const CallLikeView& call, const FunctionPtr& callee, size_t param_index) {
+  if (!call.args || param_index >= callee->params_.size()) return nullptr;
+  const auto& args = *call.args;
+  auto& counts = Ctx().trailing_ctx_counts;
+  auto [it, inserted] = counts.try_emplace(callee.get(), 0);
+  if (inserted) it->second = transform_utils::TrailingCommCtxParamCount(callee);
+  const size_t ctx_count = it->second;
+  if (args.size() < ctx_count || args.size() > callee->params_.size()) return nullptr;
+  const size_t prefix = args.size() - ctx_count;
+  if (param_index < prefix) return args[param_index];
+  if (param_index < callee->params_.size() - ctx_count) return nullptr;
+  return args[param_index - (callee->params_.size() - args.size())];
+}
+
 std::vector<std::optional<size_t>> ReturnedParamIndicesImpl(const FunctionPtr& func,
-                                                            const ProgramPtr& program);
+                                                            const ProgramPtr& program,
+                                                            bool project_tuple = false);
+
+// Avoid copying an entire tuple return map for each TupleGetItem in a batch.
+// TraceQueryGuard or the enclosing function query owns the reference lifetime.
+const std::vector<std::optional<size_t>>& CachedReturnedParamIndices(const FunctionPtr& func,
+                                                                     const ProgramPtr& program,
+                                                                     bool project_tuple = false) {
+  static const std::vector<std::optional<size_t>> empty;
+  if (!func || !func->body_) return empty;
+  auto& ctx = Ctx();
+  if (ctx.active_functions.count(func.get()) != 0) {
+    return empty;
+  }
+  if (auto it = ctx.ReturnMaps(project_tuple).find(func.get()); it != ctx.ReturnMaps(project_tuple).end()) {
+    return it->second;
+  }
+  auto result = ReturnedParamIndicesImpl(func, program, project_tuple);
+  return ctx.ReturnMaps(project_tuple).emplace(func.get(), std::move(result)).first->second;
+}
 
 struct VarLineage {
   const Var* root = nullptr;
   TypePtr returned_type;
+  size_t proof = 0;
 };
 using VarRootMap = std::unordered_map<const Var*, VarLineage>;
+using TupleSourceMap = std::unordered_map<const Expr*, ExprPtr>;
+
+struct LineageMemo {
+  // Only the leading roots are formals; trailing designated local definitions
+  // are valid storage origins and must not be rejected as rebound parameters.
+  std::optional<size_t> formal_param_count;
+  VarRootMap var_roots;
+  std::unordered_map<const Expr*, VarLineage> expr_roots;
+  TupleSourceMap tuple_sources;
+  std::unordered_map<const Var*, std::unordered_map<int64_t, VarLineage>> tuple_control_roots;
+
+  // Cached roots name the assumption they actually depend on. Successful
+  // proofs discharge their own induction and retain only observed ancestor
+  // assumptions; lexical nesting alone must not invalidate independent work.
+  // Union/find keeps cache invalidation lazy. Dependency heaps are melded on
+  // discharge, so each observed edge costs O(log N), without copying sets.
+  struct Proof {
+    size_t parent;
+    size_t depth;
+    bool rejected = false;
+    size_t dependencies = 0;
+  };
+  std::vector<Proof> proofs{{0, 0}};
+  size_t active_proof = 0;
+
+  size_t ResolveProof(size_t proof) {
+    size_t root = proof;
+    while (proofs[root].parent != root) root = proofs[root].parent;
+    while (proof != root) {
+      const size_t next = proofs[proof].parent;
+      proofs[proof].parent = root;
+      proof = next;
+    }
+    return root;
+  }
+
+  bool IsUsable(VarLineage& lineage) {
+    lineage.proof = ResolveProof(lineage.proof);
+    return !proofs[lineage.proof].rejected;
+  }
+
+  // A leftist max-heap retains all actual dependencies while selecting the
+  // deepest active ancestor. Nodes have one heap owner; melding moves ownership
+  // in O(log N). Rank zero denotes an empty heap. Duplicate edges are allowed
+  // and removed once when their assumption is selected for discharge.
+  struct Dependency {
+    size_t proof;
+    size_t left;
+    size_t right;
+    size_t rank;
+  };
+  std::vector<Dependency> dependencies{{0, 0, 0, 0}};
+
+  size_t MeldDependencies(size_t lhs, size_t rhs) {
+    if (lhs == 0) return rhs;
+    if (rhs == 0) return lhs;
+    if (proofs[dependencies[lhs].proof].depth < proofs[dependencies[rhs].proof].depth) {
+      std::swap(lhs, rhs);
+    }
+    dependencies[lhs].right = MeldDependencies(dependencies[lhs].right, rhs);
+    if (dependencies[dependencies[lhs].left].rank < dependencies[dependencies[lhs].right].rank) {
+      std::swap(dependencies[lhs].left, dependencies[lhs].right);
+    }
+    dependencies[lhs].rank = dependencies[dependencies[lhs].right].rank + 1;
+    return lhs;
+  }
+
+  void RecordDependency(size_t proof) {
+    proof = ResolveProof(proof);
+    if (active_proof == 0 || proof == 0 || proof == active_proof) return;
+    dependencies.push_back({proof, 0, 0, 1});
+    proofs[active_proof].dependencies =
+        MeldDependencies(proofs[active_proof].dependencies, dependencies.size() - 1);
+  }
+
+  void AcceptProof(size_t proof) {
+    size_t pending = proofs[proof].dependencies;
+    proofs[proof].dependencies = 0;
+    if (pending == 0) {
+      proofs[proof].parent = 0;
+      return;
+    }
+    // Dependencies refer only to active ancestors, so their depths remain
+    // stable until this proof closes. Retain the deepest one as the cache
+    // token and move every other requirement into it before it can close.
+    const size_t parent = dependencies[pending].proof;
+    do {
+      pending = MeldDependencies(dependencies[pending].left, dependencies[pending].right);
+    } while (pending != 0 && dependencies[pending].proof == parent);
+    proofs[proof].parent = parent;
+    proofs[parent].dependencies = MeldDependencies(proofs[parent].dependencies, pending);
+  }
+
+  size_t MergeProofs(size_t lhs, size_t rhs) {
+    lhs = ResolveProof(lhs);
+    rhs = ResolveProof(rhs);
+    return proofs[lhs].depth >= proofs[rhs].depth ? lhs : rhs;
+  }
+};
+
+ExprPtr ResolveTupleSource(ExprPtr expr, const BodyIndexCollector& index, const ProgramPtr& program,
+                           TupleSourceMap& memo);
+
+// Select an original expression, rather than inventing an SSA binding. This
+// lets direct projections and assigned projections share the same lineage.
+ExprPtr ResolveTupleElement(const ExprPtr& tuple, int64_t position, const BodyIndexCollector& index,
+                            const ProgramPtr& program, TupleSourceMap& memo) {
+  if (position < 0) return nullptr;
+  auto source = ResolveTupleSource(tuple, index, program, memo);
+  if (!source) return nullptr;
+  size_t pos = static_cast<size_t>(position);
+  if (auto make_tuple = As<MakeTuple>(source)) {
+    return pos < make_tuple->elements_.size() ? make_tuple->elements_[pos] : nullptr;
+  }
+
+  auto call = AsCallLike(source);
+  if (!call.args || IsBuiltinOp(call.op->name_)) return nullptr;
+  auto callee = program ? program->GetFunction(call.op->name_) : nullptr;
+  if (!callee) return nullptr;
+  // A single TupleType return occupies one flat slot. Strict HOST tracing
+  // may ask for its separate element map through ordinary Calls. For an
+  // unannotated Call, distinguish one inferred tuple value from flat results
+  // using the flat map's arity and the parser's inferred Call type.
+  const bool can_project = Ctx().require_terminal_returns && As<Call>(source);
+  const bool declared_tuple = callee->return_types_.size() == 1 && As<TupleType>(callee->return_types_[0]);
+  if (declared_tuple && !can_project) return nullptr;
+  const bool inferred_tuple = can_project && callee->return_types_.empty() &&
+                              As<TupleType>(source->GetType()) &&
+                              CachedReturnedParamIndices(callee, program).size() == 1;
+  const auto& ret_map = CachedReturnedParamIndices(callee, program, declared_tuple || inferred_tuple);
+  if (pos >= ret_map.size() || !ret_map[pos]) return nullptr;
+  size_t mapped = ret_map[pos].value();  // NOLINT(bugprone-unchecked-optional-access)
+  return ParamArgument(call, callee, mapped);
+}
+
+// Tuple aliases and nested projections can share arbitrarily long prefixes.
+// Compress each source chain once, including failures and provisional cycle
+// entries, so querying many projections never rescans their common prefix.
+ExprPtr ResolveTupleSource(ExprPtr expr, const BodyIndexCollector& index, const ProgramPtr& program,
+                           TupleSourceMap& memo) {
+  std::vector<const Expr*> path;
+  auto finish = [&](const ExprPtr& source) {
+    for (const auto* item : path) memo[item] = source;
+    return source;
+  };
+  while (expr) {
+    if (auto it = memo.find(expr.get()); it != memo.end()) {
+      return finish(it->second);
+    }
+    memo.emplace(expr.get(), nullptr);
+    path.push_back(expr.get());
+    if (auto var = AsVarLike(expr)) {
+      if (index.tuple_merge_srcs.count(var.get()) || index.tuple_carries.count(var.get())) {
+        return finish(expr);
+      }
+      if (auto carry = index.tuple_carry_results.find(var.get()); carry != index.tuple_carry_results.end()) {
+        expr = carry->second;
+        continue;
+      }
+      auto def = index.var_def.find(var.get());
+      if (def == index.var_def.end() || !def->second) return finish(nullptr);
+      expr = def->second->value_;
+    } else if (auto projection = As<TupleGetItemExpr>(expr)) {
+      expr = ResolveTupleElement(projection->tuple_, projection->index_, index, program, memo);
+    } else {
+      return finish(expr);
+    }
+  }
+  return finish(nullptr);
+}
+
+VarLineage TraceExpr(const ExprPtr& expr, const BodyIndexCollector& index, const ParamIndexMap& param_indices,
+                     const ProgramPtr& program, LineageMemo& memo);
+
+// A pre-SSA formal may be assigned the result of a write through that same
+// argument. Accept only a unique definition with an exact same-typed, direct
+// destination identity; do not make arbitrary rebinding or multi-defs precise.
+bool IsUniqueFormalSelfWriteback(const Var* var, const BodyIndexCollector& index, const ProgramPtr& program,
+                                 TupleSourceMap& memo) {
+  auto def = index.var_def.find(var);
+  if (def == index.var_def.end() || !def->second) return false;
+  auto value = def->second->value_;
+  if (!structural_equal(value->GetType(), var->GetType())) return false;
+  if (auto projection = As<TupleGetItemExpr>(value)) {
+    value = ResolveTupleElement(projection->tuple_, projection->index_, index, program, memo);
+  }
+  if (value.get() == var) return true;
+  auto call = AsCallLike(value);
+  if (!call.args) return false;
+  if (auto source = As<Call>(value)) {
+    if (auto aliased = ResultAliasedArgIndex(source)) {
+      return source->args_[*aliased].get() == var;
+    }
+  }
+  if (IsBuiltinOp(call.op->name_)) return false;
+  auto callee = program ? program->GetFunction(call.op->name_) : nullptr;
+  if (!callee || callee->return_types_.size() != 1) return false;
+  const auto& mapping = CachedReturnedParamIndices(callee, program);
+  if (mapping.size() != 1) return false;
+  const auto& parameter = mapping.front();
+  if (!parameter.has_value()) return false;
+  return ParamArgument(call, callee, *parameter).get() == var;
+}
+
+std::optional<size_t> WritebackArgument(const CallPtr& call) {
+  if (!call) return std::nullopt;
+  if (auto index = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size())) return index;
+  // Composite collectives also declare their logical destination window.
+  return ResultAliasedArgIndex(call);
+}
+
+template <typename Source, typename Trace>
+VarLineage TraceBranchConsensus(const std::vector<Source>& sources, Trace trace, LineageMemo& memo) {
+  VarLineage merged;
+  for (const auto& source : sources) {
+    auto branch = trace(source);
+    merged.proof = memo.MergeProofs(merged.proof, branch.proof);
+    if (!branch.root || (merged.root && branch.root != merged.root)) return {nullptr, nullptr, merged.proof};
+    if (!merged.root) {
+      merged.returned_type = branch.returned_type;
+    } else if (!merged.returned_type || !branch.returned_type ||
+               !structural_equal(merged.returned_type, branch.returned_type)) {
+      merged.returned_type = nullptr;
+    }
+    merged.root = branch.root;
+  }
+  return merged;
+}
+
+std::optional<VarLineage> TraceTupleControlElement(const ExprPtr& tuple, int64_t position,
+                                                   const BodyIndexCollector& index,
+                                                   const ParamIndexMap& param_indices,
+                                                   const ProgramPtr& program, LineageMemo& memo) {
+  if (!Ctx().require_terminal_returns || position < 0) return std::nullopt;
+  const auto source = AsVarLike(ResolveTupleSource(tuple, index, program, memo.tuple_sources));
+  if (!source) return std::nullopt;
+  auto merge = index.tuple_merge_srcs.find(source.get());
+  auto carry = index.tuple_carries.find(source.get());
+  if (merge == index.tuple_merge_srcs.end() && carry == index.tuple_carries.end()) return std::nullopt;
+
+  auto& slots = memo.tuple_control_roots[source.get()];
+  if (auto it = slots.find(position); it != slots.end()) {
+    if (memo.IsUsable(it->second)) {
+      memo.RecordDependency(it->second.proof);
+      return it->second;
+    }
+    slots.erase(it);
+  }
+  slots.emplace(position, VarLineage{nullptr, nullptr, memo.active_proof});
+  auto trace_element = [&](const ExprPtr& value) {
+    if (auto nested = TraceTupleControlElement(value, position, index, param_indices, program, memo)) {
+      return *nested;
+    }
+    auto selected = ResolveTupleElement(value, position, index, program, memo.tuple_sources);
+    return TraceExpr(selected, index, param_indices, program, memo);
+  };
+  VarLineage result;
+  if (merge != index.tuple_merge_srcs.end()) {
+    result = TraceBranchConsensus(merge->second, trace_element, memo);
+  } else if (auto initial = trace_element(carry->second.first); initial.root) {
+    // Validate the induction for this element. The provisional lineage is
+    // visible to projections of the iter arg while tracing its yield.
+    const size_t enclosing_proof = memo.active_proof;
+    const size_t proof = memo.proofs.size();
+    memo.proofs.push_back({proof, memo.proofs[enclosing_proof].depth + 1});
+    memo.active_proof = proof;
+    memo.RecordDependency(initial.proof);
+    slots[position] = {initial.root, initial.returned_type, proof};
+    const auto yielded = trace_element(carry->second.second);
+    memo.active_proof = enclosing_proof;
+    if (yielded.root == initial.root && yielded.returned_type && initial.returned_type &&
+        structural_equal(yielded.returned_type, initial.returned_type)) {
+      memo.AcceptProof(proof);
+      result = {initial.root, initial.returned_type, proof};
+    } else {
+      memo.proofs[proof].rejected = true;
+    }
+  }
+  slots[position] = result;
+  memo.RecordDependency(result.proof);
+  return result;
+}
 
 // Trace each body var once, caching both roots and failures across branch arms
 // and return values. A provisional empty lineage stops cycles without copying
 // the active path at every merge. Alias chains remain iterative.
 VarLineage TraceVar(const Var* var, const BodyIndexCollector& index, const ParamIndexMap& param_indices,
-                    const ProgramPtr& program, VarRootMap& memo) {
+                    const ProgramPtr& program, LineageMemo& memo) {
   // Aliases and validated user calls forward their source type. Builtin
   // writebacks retain their own final type, allowing intermediate narrowing
   // followed by restoration without poisoning the cached storage lineage.
+  auto& roots = memo.var_roots;
   std::vector<std::pair<const Var*, bool>> path;
-  auto finish = [&](const Var* root, TypePtr returned_type = nullptr) {
-    VarLineage lineage{root, std::move(returned_type)};
+  auto finish = [&](const Var* root, TypePtr returned_type = nullptr, size_t proof = 0) {
+    VarLineage lineage{root, std::move(returned_type), proof};
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
       if (!it->second) lineage.returned_type = it->first->GetType();
-      memo[it->first] = lineage;
+      roots[it->first] = lineage;
     }
+    memo.RecordDependency(lineage.proof);
     return lineage;
   };
   while (var) {
-    if (auto it = memo.find(var); it != memo.end()) {
-      return finish(it->second.root, it->second.returned_type);
+    if (auto it = roots.find(var); it != roots.end()) {
+      if (memo.IsUsable(it->second)) {
+        return finish(it->second.root, it->second.returned_type, it->second.proof);
+      }
+      roots.erase(it);
     }
-    memo.emplace(var, VarLineage{});
+    roots.emplace(var, VarLineage{nullptr, nullptr, memo.active_proof});
     path.emplace_back(var, false);
-    if (param_indices.count(var)) return finish(var);
+    if (param_indices.count(var)) {
+      // A reassigned formal no longer denotes its original argument at every
+      // use. SSA conversion gives those definitions distinct identities.
+      if (param_indices.at(var) < memo.formal_param_count.value_or(param_indices.size()) &&
+          index.var_def.count(var) && !IsUniqueFormalSelfWriteback(var, index, program, memo.tuple_sources)) {
+        return finish(nullptr);
+      }
+      return finish(var);
+    }
 
     if (auto merge_it = index.merge_srcs.find(var); merge_it != index.merge_srcs.end()) {
-      const Var* root = nullptr;
-      TypePtr returned_type;
-      for (const Var* source : merge_it->second) {
-        auto branch = TraceVar(source, index, param_indices, program, memo);
-        if (!branch.root || (root && branch.root != root)) return finish(nullptr);
-        if (!root) {
-          returned_type = branch.returned_type;
-        } else if (!returned_type || !branch.returned_type ||
-                   !structural_equal(returned_type, branch.returned_type)) {
-          returned_type = nullptr;
-        }
-        root = branch.root;
-      }
-      // Keep storage consensus through narrowed merges; an outer writeback may
-      // restore the final type. Inconsistent branch metadata stays unknown.
-      path.back().second = true;
-      return finish(root, std::move(returned_type));
+      auto merged = TraceBranchConsensus(
+          merge_it->second,
+          [&](const Var* source) { return TraceVar(source, index, param_indices, program, memo); }, memo);
+      // Storage consensus may survive narrowed views; an outer writeback
+      // can still restore the final type when branch metadata differs.
+      path.back().second = merged.root != nullptr;
+      return finish(merged.root, std::move(merged.returned_type), merged.proof);
     }
 
     if (auto carry_it = index.carry_src.find(var); carry_it != index.carry_src.end()) {
+      if (auto yield_it = index.carry_yields.find(var); yield_it != index.carry_yields.end()) {
+        auto initial = TraceVar(carry_it->second, index, param_indices, program, memo);
+        if (!initial.root) return finish(nullptr);
+        const size_t enclosing_proof = memo.active_proof;
+        const size_t proof = memo.proofs.size();
+        memo.proofs.push_back({proof, memo.proofs[enclosing_proof].depth + 1});
+        memo.active_proof = proof;
+        memo.RecordDependency(initial.proof);
+        const auto provisional = roots.at(var);
+        // The query may enter through a writeback inside this carry (e.g.
+        // the first of several unrolled stores). Seed that proven alias prefix
+        // too; leaving its provisional failure cached would reject the valid
+        // induction when the yield traces back through the same prefix.
+        finish(initial.root, initial.returned_type, proof);
+        auto yielded = TraceExpr(yield_it->second, index, param_indices, program, memo);
+        const bool preserved = yielded.root == initial.root && yielded.returned_type &&
+                               initial.returned_type &&
+                               structural_equal(yielded.returned_type, initial.returned_type);
+        roots[var] = provisional;
+        memo.active_proof = enclosing_proof;
+        if (!preserved) {
+          memo.proofs[proof].rejected = true;
+          // Unknown is conservative in every proof context. Keep rejected
+          // carries as stable negative entries, so other return positions do
+          // not repeatedly retrace a rejected cycle's remaining suffix.
+          return finish(nullptr);
+        }
+        memo.AcceptProof(proof);
+        path.back().second = true;
+        // AcceptProof preserves observed outer dependencies, including ones
+        // reached through a nested successful proof. Independent chains now
+        // resolve to proof zero and survive unrelated outer rejection.
+        return finish(initial.root, initial.returned_type, proof);
+      }
       var = carry_it->second;
       continue;
     }
 
     auto def_it = index.var_def.find(var);
-    if (def_it == index.var_def.end()) return finish(nullptr);
+    if (def_it == index.var_def.end() || !def_it->second) return finish(nullptr);
     const auto& value = def_it->second->value_;
 
     if (auto rhs_var = AsVarLike(value)) {
@@ -208,36 +686,37 @@ VarLineage TraceVar(const Var* var, const BodyIndexCollector& index, const Param
       continue;
     }
 
-    if (auto tuple_get = As<TupleGetItemExpr>(value)) {
-      // Tuple destructuring of a user call: resolve via the callee's own
-      // returned-param map, then continue from the corresponding arg var.
-      auto tuple_var = AsVarLike(tuple_get->tuple_);
-      if (!tuple_var) return finish(nullptr);
-      auto tuple_def = index.var_def.find(tuple_var.get());
-      if (tuple_def == index.var_def.end()) return finish(nullptr);
-      auto call = AsCallOrSubmitView(tuple_def->second->value_);
-      if (!call || IsBuiltinOp(call->op_->name_)) return finish(nullptr);
-      auto callee = program ? program->GetFunction(call->op_->name_) : nullptr;
-      if (!callee) return finish(nullptr);
-      auto ret_map = ReturnedParamIndicesImpl(callee, program);
-      size_t pos = static_cast<size_t>(tuple_get->index_);
-      if (tuple_get->index_ < 0 || pos >= ret_map.size() || !ret_map[pos]) return finish(nullptr);
-      size_t mapped = ret_map[pos].value();  // NOLINT(bugprone-unchecked-optional-access)
-      if (mapped >= call->args_.size()) return finish(nullptr);
-      auto arg_var = AsVarLike(call->args_[mapped]);
-      if (!arg_var) return finish(nullptr);
+    if (auto projection = As<TupleGetItemExpr>(value)) {
       path.back().second = true;
-      var = arg_var.get();
-      continue;
+      if (auto merged = TraceTupleControlElement(projection->tuple_, projection->index_, index, param_indices,
+                                                 program, memo)) {
+        return finish(merged->root, merged->returned_type, merged->proof);
+      }
+      auto selected =
+          ResolveTupleElement(projection->tuple_, projection->index_, index, program, memo.tuple_sources);
+      if (auto source_var = AsVarLike(selected)) {
+        var = source_var.get();
+        continue;
+      }
+      auto lineage = TraceExpr(selected, index, param_indices, program, memo);
+      return finish(lineage.root, lineage.returned_type, lineage.proof);
     }
 
-    if (auto call = AsCallOrSubmitView(value)) {
-      const std::string& op_name = call->op_->name_;
+    // A Submit value is the whole (results..., TaskId) tuple. Only an
+    // explicit projection can alias a tensor parameter, never the container.
+    if (As<Submit>(value)) return finish(nullptr);
+    if (auto call = AsCallLike(value); call.args) {
+      const auto& args = *call.args;
+      const std::string& op_name = call.op->name_;
       // Builtin output-side ops bind a fresh SSA var to an existing buffer, so
       // the result inherits that argument's param lineage.
-      if (auto aliased = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size())) {
-        auto arg_var = AsVarLike(call->args_[*aliased]);
-        if (!arg_var) return finish(nullptr);
+      const auto aliased = WritebackArgument(As<Call>(value));
+      if (aliased) {
+        auto arg_var = AsVarLike(args[*aliased]);
+        if (!arg_var) {
+          auto lineage = TraceExpr(args[*aliased], index, param_indices, program, memo);
+          return finish(lineage.root, lineage.returned_type, lineage.proof);
+        }
         var = arg_var.get();
         continue;
       }
@@ -262,13 +741,16 @@ VarLineage TraceVar(const Var* var, const BodyIndexCollector& index, const Param
         // Single-result user call: continue from the arg the callee returns.
         auto callee = program ? program->GetFunction(op_name) : nullptr;
         if (!callee) return finish(nullptr);
-        auto ret_map = ReturnedParamIndicesImpl(callee, program);
+        const auto& ret_map = CachedReturnedParamIndices(callee, program);
         if (ret_map.size() != 1 || !ret_map[0]) return finish(nullptr);
         size_t mapped = ret_map[0].value();  // NOLINT(bugprone-unchecked-optional-access)
-        if (mapped >= call->args_.size()) return finish(nullptr);
-        auto arg_var = AsVarLike(call->args_[mapped]);
-        if (!arg_var) return finish(nullptr);
+        auto source = ParamArgument(call, callee, mapped);
+        auto arg_var = AsVarLike(source);
         path.back().second = true;
+        if (!arg_var) {
+          auto lineage = TraceExpr(source, index, param_indices, program, memo);
+          return finish(lineage.root, lineage.returned_type, lineage.proof);
+        }
         var = arg_var.get();
         continue;
       }
@@ -279,19 +761,64 @@ VarLineage TraceVar(const Var* var, const BodyIndexCollector& index, const Param
   return finish(nullptr);
 }
 
-std::vector<std::optional<size_t>> TraceExprsToParamIndices(const std::vector<ExprPtr>& exprs,
-                                                            const BodyIndexCollector& index,
-                                                            const ParamIndexMap& param_indices,
-                                                            const ProgramPtr& program) {
+VarLineage TraceExpr(const ExprPtr& expr, const BodyIndexCollector& index, const ParamIndexMap& param_indices,
+                     const ProgramPtr& program, LineageMemo& memo) {
+  if (!expr) return {};
+  if (auto var = AsVarLike(expr)) return TraceVar(var.get(), index, param_indices, program, memo);
+  if (auto it = memo.expr_roots.find(expr.get()); it != memo.expr_roots.end()) {
+    if (memo.IsUsable(it->second)) {
+      memo.RecordDependency(it->second.proof);
+      return it->second;
+    }
+    memo.expr_roots.erase(it);
+  }
+  memo.expr_roots.emplace(expr.get(), VarLineage{nullptr, nullptr, memo.active_proof});
+  VarLineage lineage;
+  if (auto projection = As<TupleGetItemExpr>(expr)) {
+    // Non-strict lineage is consumed by rewrites and their verifiers. An
+    // inline producer must first be flattened so replacing its projection
+    // cannot erase the call and its side effects.
+    if (auto merged = TraceTupleControlElement(projection->tuple_, projection->index_, index, param_indices,
+                                               program, memo)) {
+      lineage = *merged;
+    } else if (Ctx().require_terminal_returns || !transform_utils::ExprContainsCallLike(expr)) {
+      auto selected =
+          ResolveTupleElement(projection->tuple_, projection->index_, index, program, memo.tuple_sources);
+      lineage = TraceExpr(selected, index, param_indices, program, memo);
+    }
+  } else if (Ctx().require_terminal_returns) {
+    // Raw HOST binding analyzes the callee without rewriting it. A direct
+    // call has no SSA result Var, but uses the same return and writeback
+    // contracts as assigned calls. Normalization must keep its side effects.
+    if (const auto call = As<Call>(expr); call && AsTensorTypeLike(call->GetType())) {
+      if (const auto aliased = WritebackArgument(call)) {
+        lineage = TraceExpr(call->args_[*aliased], index, param_indices, program, memo);
+        lineage.returned_type = call->GetType();
+      } else if (!IsBuiltinOp(call->op_->name_)) {
+        auto source = ResolveTupleElement(expr, 0, index, program, memo.tuple_sources);
+        lineage = TraceExpr(source, index, param_indices, program, memo);
+      }
+    }
+  }
+  memo.expr_roots[expr.get()] = lineage;
+  memo.RecordDependency(lineage.proof);
+  return lineage;
+}
+
+std::vector<std::optional<size_t>> TraceIndexedExprsToParamIndices(
+    const std::vector<ExprPtr>& exprs, const BodyIndexCollector& index, const ParamIndexMap& param_indices,
+    const ProgramPtr& program, std::optional<size_t> formal_param_count = std::nullopt) {
+  TraceQueryGuard query_guard;
   std::vector<std::optional<size_t>> result;
   result.reserve(exprs.size());
-  VarRootMap memo;
+  LineageMemo memo;
+  memo.formal_param_count = formal_param_count;
   for (const auto& expr : exprs) {
     std::optional<size_t> idx;
-    if (auto var = AsVarLike(expr)) {
-      auto lineage = TraceVar(var.get(), index, param_indices, program, memo);
+    if (expr) {
+      auto lineage = TraceExpr(expr, index, param_indices, program, memo);
       if (lineage.root &&
-          (!AsTensorTypeLike(var->GetType()) ||
+          (!AsTensorTypeLike(expr->GetType()) ||
            (lineage.returned_type && structural_equal(lineage.returned_type, lineage.root->GetType())))) {
         auto param_it = param_indices.find(lineage.root);
         if (param_it != param_indices.end()) idx = param_it->second;
@@ -331,11 +858,11 @@ std::vector<std::optional<size_t>> ExpandForwardedTupleVar(const Var* tuple_var,
   // Walk SSA var-to-var aliases down to the statement that defines the tuple.
   const Var* var = tuple_var;
   std::unordered_set<const Var*> seen;
-  CallPtr call;
+  CallLikeView call;
   while (var) {
     if (!seen.insert(var).second) return {};
     auto def_it = index.var_def.find(var);
-    if (def_it == index.var_def.end()) return {};
+    if (def_it == index.var_def.end() || !def_it->second) return {};
     const auto& value = def_it->second->value_;
     if (auto rhs_var = AsVarLike(value)) {
       var = rhs_var.get();
@@ -343,14 +870,14 @@ std::vector<std::optional<size_t>> ExpandForwardedTupleVar(const Var* tuple_var,
     }
     // A literal tuple construction: each element traces on its own.
     if (auto make_tuple = As<MakeTuple>(value)) {
-      return TraceExprsToParamIndices(make_tuple->elements_, index, param_indices, program);
+      return TraceIndexedExprsToParamIndices(make_tuple->elements_, index, param_indices, program);
     }
-    call = AsCallOrSubmitView(value);
+    call = AsCallLike(value);
     break;
   }
-  if (!call || IsBuiltinOp(call->op_->name_)) return {};
+  if (!call.args || IsBuiltinOp(call.op->name_)) return {};
 
-  auto callee = program ? program->GetFunction(call->op_->name_) : nullptr;
+  auto callee = program ? program->GetFunction(call.op->name_) : nullptr;
   if (!callee) return {};
   auto inner_map = ReturnedParamIndicesImpl(callee, program);
   if (inner_map.empty()) return {};
@@ -359,11 +886,11 @@ std::vector<std::optional<size_t>> ExpandForwardedTupleVar(const Var* tuple_var,
   for (size_t pos = 0; pos < inner_map.size(); ++pos) {
     if (!inner_map[pos]) continue;
     size_t mapped = inner_map[pos].value();  // NOLINT(bugprone-unchecked-optional-access)
-    if (mapped < call->args_.size()) forwarded_args[pos] = call->args_[mapped];
+    forwarded_args[pos] = ParamArgument(call, callee, mapped);
   }
   // Args may themselves be assemble / loop-carry chains, so trace them through
   // the same batch path as ordinary returns.
-  return TraceExprsToParamIndices(forwarded_args, index, param_indices, program);
+  return TraceIndexedExprsToParamIndices(forwarded_args, index, param_indices, program);
 }
 
 // Group/Spmd wrappers may end in the inner kernel call with no top-level
@@ -392,8 +919,7 @@ std::vector<std::optional<size_t>> MapWrapperReturnToParams(const FunctionPtr& w
   for (size_t pos = 0; pos < inner_map.size(); ++pos) {
     if (!inner_map[pos]) continue;
     size_t mapped = inner_map[pos].value();  // NOLINT(bugprone-unchecked-optional-access)
-    if (mapped >= returning_call->args_.size()) continue;
-    if (auto arg_var = AsVarLike(returning_call->args_[mapped])) {
+    if (auto arg_var = AsVarLike(ParamArgument(AsCallLike(returning_call), returning_callee, mapped))) {
       if (auto it = param_to_index.find(arg_var.get()); it != param_to_index.end()) {
         result[pos] = it->second;
       }
@@ -403,36 +929,72 @@ std::vector<std::optional<size_t>> MapWrapperReturnToParams(const FunctionPtr& w
 }
 
 std::vector<std::optional<size_t>> ReturnedParamIndicesImpl(const FunctionPtr& func,
-                                                            const ProgramPtr& program) {
+                                                            const ProgramPtr& program, bool project_tuple) {
   if (!func || !func->body_) return {};
 
   auto& ctx = Ctx();
-  if (std::find(ctx.call_stack.begin(), ctx.call_stack.end(), func.get()) != ctx.call_stack.end()) {
+  if (ctx.active_functions.count(func.get()) != 0) {
     return {};
   }
-  if (auto it = ctx.memo.find(func.get()); it != ctx.memo.end()) {
+  if (auto it = ctx.ReturnMaps(project_tuple).find(func.get()); it != ctx.ReturnMaps(project_tuple).end()) {
     return it->second;
   }
 
   ctx.call_stack.push_back(func.get());
+  ctx.active_functions.insert(func.get());
   bool is_top_level = ctx.call_stack.size() == 1;
   struct Guard {
     TraceContext& ctx;
+    const Function* function;
     bool top_level;
     ~Guard() {
+      ctx.active_functions.erase(function);
       ctx.call_stack.pop_back();
-      if (top_level) ctx.memo.clear();
+      if (top_level && ctx.query_depth == 0) ctx.ClearCache();
     }
-  } guard{ctx, is_top_level};
+  } guard{ctx, func.get(), is_top_level};
 
   auto record = [&](std::vector<std::optional<size_t>> result) {
-    if (!is_top_level) ctx.memo.emplace(func.get(), result);
+    if (!is_top_level || ctx.query_depth != 0) ctx.ReturnMaps(project_tuple).emplace(func.get(), result);
     return result;
   };
+
+  if (func->HasAttr(kAttrExternalSource)) {
+    if (project_tuple) return record({});
+    return record(ExternalReturnedParamIndices(func));
+  }
 
   // Graph boundary analyses do not propagate tensor roots through If merges yet.
   BodyIndexCollector index(/*collect_if_merges=*/func->func_type_ != FunctionType::Graph);
   index.VisitStmt(func->body_);
+  if (index.returns.size() != 0) {
+    auto tail = func->body_;
+    while (tail) {
+      if (auto seq = As<SeqStmts>(tail); seq && !seq->stmts_.empty()) {
+        tail = seq->stmts_.back();
+      } else if (auto scope = As<RuntimeScopeStmt>(tail)) {
+        // AUTO and MANUAL scopes are both unconditional containers.
+        tail = scope->body_;
+      } else {
+        break;
+      }
+    }
+    // Device returns identify writeback storage. Mixed-core splitting can
+    // produce mutually exclusive returns, whose identities must agree below.
+    // Host-callable helpers still require normalized return control flow.
+    const bool kernel_writeback = IsInCoreType(func->func_type_) || IsWrapperType(func->func_type_);
+    const bool terminal_return = kernel_writeback || (index.returns.size() == 1 && As<ReturnStmt>(tail));
+    CHECK_SPAN(!ctx.require_terminal_returns || terminal_return, func->span_)
+        << "Distributed HOST tensor result binding requires a single terminal return in '" << func->name_
+        << "'; normalize return control flow before code generation";
+    // Before control-flow normalization, a preorder return is not a fixed
+    // result identity. Keep it unknown even for non-strict pass queries:
+    // canonicalizing a caller here would erase the helper before HOST's
+    // later recursive validation can inspect its competing return paths.
+    if (!terminal_return) {
+      return record(std::vector<std::optional<size_t>>(func->return_types_.size()));
+    }
+  }
   if (!index.first_return || index.first_return->value_.empty()) {
     if (IsWrapperType(func->func_type_)) {
       return record(MapWrapperReturnToParams(func, program));
@@ -454,6 +1016,46 @@ std::vector<std::optional<size_t>> ReturnedParamIndicesImpl(const FunctionPtr& f
   const auto& rets = index.first_return->value_;
   const size_t declared_arity = func->return_types_.size();
   auto param_indices = IndexParams(func->params_);
+  const auto tuple_type = rets.size() == 1 ? As<TupleType>(rets.front()->GetType()) : nullptr;
+  // The strict HOST query binds the same elements when a single tuple value
+  // implements a flat return signature. Other consumers keep the existing
+  // flat expansion, which may rewrite returns and must preserve effects.
+  const bool strict_flat_tuple = ctx.require_terminal_returns && declared_arity > 1 && tuple_type &&
+                                 tuple_type->types_.size() == declared_arity;
+  if (project_tuple || strict_flat_tuple) {
+    if (index.returns.size() != 1 || !tuple_type) return record({});
+    std::vector<ExprPtr> projections;
+    projections.reserve(tuple_type->types_.size());
+    for (size_t i = 0; i < tuple_type->types_.size(); ++i) {
+      projections.push_back(
+          std::make_shared<TupleGetItemExpr>(rets[0], static_cast<int>(i), index.first_return->span_));
+    }
+    return record(TraceIndexedExprsToParamIndices(projections, index, param_indices, program));
+  }
+  if (index.returns.size() > 1) {
+    // Trace all branch returns in one batch, sharing the indexed body and
+    // variable memo. Only unanimous per-position storage identities may be
+    // canonicalized; taking the first core branch would silently guess.
+    const size_t arity = rets.size();
+    if (declared_arity != 0 && arity != declared_arity) {
+      return record(std::vector<std::optional<size_t>>(declared_arity));
+    }
+    std::vector<ExprPtr> values;
+    values.reserve(index.returns.size() * arity);
+    for (const auto& ret : index.returns) {
+      if (ret->value_.size() != arity) return record(std::vector<std::optional<size_t>>(arity));
+      values.insert(values.end(), ret->value_.begin(), ret->value_.end());
+    }
+    const auto maps = TraceIndexedExprsToParamIndices(values, index, param_indices, program);
+    std::vector<std::optional<size_t>> result(arity);
+    std::copy_n(maps.begin(), arity, result.begin());
+    for (size_t offset = arity; offset < maps.size(); offset += arity) {
+      for (size_t pos = 0; pos < arity; ++pos) {
+        if (result[pos] != maps[offset + pos]) result[pos] = std::nullopt;
+      }
+    }
+    return record(result);
+  }
   if (rets.size() == 1 && declared_arity > 1) {
     if (auto tuple_var = AsVarLike(rets[0])) {
       if (auto tuple_ty = As<TupleType>(tuple_var->GetType());
@@ -463,10 +1065,40 @@ std::vector<std::optional<size_t>> ReturnedParamIndicesImpl(const FunctionPtr& f
       }
     }
   }
-  return record(TraceExprsToParamIndices(rets, index, param_indices, program));
+  return record(TraceIndexedExprsToParamIndices(rets, index, param_indices, program));
+}
+
+std::vector<std::optional<size_t>> TraceBodyExprsToParamIndices(
+    const std::vector<ExprPtr>& exprs, const StmtPtr& body, const std::vector<VarPtr>& params,
+    const ProgramPtr& program, bool trace_if_merges,
+    std::optional<size_t> formal_param_count = std::nullopt) {
+  if (!body) return std::vector<std::optional<size_t>>(exprs.size());
+
+  BodyIndexCollector index(trace_if_merges);
+  index.VisitStmt(body);
+  return TraceIndexedExprsToParamIndices(exprs, index, IndexParams(params), program, formal_param_count);
 }
 
 }  // namespace
+
+ScopedTraceCache::ScopedTraceCache(bool require_terminal_returns)
+    : previous_require_terminal_returns_(Ctx().require_terminal_returns) {
+  ++Ctx().query_depth;
+  Ctx().require_terminal_returns |= require_terminal_returns;
+}
+
+ScopedTraceCache::~ScopedTraceCache() {
+  auto& ctx = Ctx();
+  --ctx.query_depth;
+  ctx.require_terminal_returns = previous_require_terminal_returns_;
+  if (ctx.query_depth == 0 && ctx.call_stack.empty()) ctx.ClearCache();
+}
+
+std::vector<std::optional<size_t>> ReturnedTupleElementParamIndices(const FunctionPtr& func,
+                                                                    const ProgramPtr& program) {
+  ScopedTraceCache guard(/*require_terminal_returns=*/true);
+  return CachedReturnedParamIndices(func, program, /*project_tuple=*/true);
+}
 
 // Locate the topmost ReturnStmt. Fast path: a function body is normally a
 // SeqStmts whose last statement is the return. Split AIV kernels keep theirs
@@ -489,8 +1121,22 @@ ReturnStmtPtr FindFirstReturn(const StmtPtr& body) {
   return finder.first_return;
 }
 
+std::vector<ReturnStmtPtr> CollectReturns(const StmtPtr& body) {
+  class ReturnCollector : public IRVisitor {
+   public:
+    std::vector<ReturnStmtPtr> returns;
+
+   protected:
+    void VisitStmt_(const ReturnStmtPtr& ret) override { returns.push_back(ret); }
+  };
+  ReturnCollector collector;
+  collector.VisitStmt(body);
+  return std::move(collector.returns);
+}
+
 std::vector<std::optional<size_t>> ExplicitReturnedParamIndices(const FunctionPtr& func) {
   if (!func || !func->body_) return {};
+  if (func->HasAttr(kAttrExternalSource)) return ExternalReturnedParamIndices(func);
   auto ret = FindFirstReturn(func->body_);
   if (!ret || ret->value_.empty()) return {};
 
@@ -524,26 +1170,103 @@ std::vector<std::optional<size_t>> ReturnedParamIndices(const FunctionPtr& func,
   return ReturnedParamIndicesImpl(func, program);
 }
 
+std::vector<ReturnedValueBinding> AnalyzeReturnedValues(const FunctionPtr& func, const ProgramPtr& program) {
+  if (!func) return {};
+  std::vector<ReturnedValueBinding> result;
+  result.reserve(func->return_types_.size());
+  for (const auto& type : func->return_types_) result.push_back({nullptr, type, std::nullopt});
+  if (result.empty()) return result;
+
+  TraceQueryGuard query_guard;
+  auto ret = func->body_ ? FindFirstReturn(func->body_) : nullptr;
+  if (ret && !ret->value_.empty()) {
+    const auto& values = ret->value_;
+    auto tuple_type = values.size() == 1 ? As<TupleType>(values[0]->GetType()) : nullptr;
+    if (result.size() > 1 && tuple_type && tuple_type->types_.size() == result.size()) {
+      // A forwarded tuple describes several flat return positions, but its
+      // original expression remains the source of every analysis projection.
+      for (size_t i = 0; i < result.size(); ++i) {
+        result[i].value =
+            std::make_shared<TupleGetItemExpr>(values[0], static_cast<int>(i), values[0]->span_);
+      }
+    } else {
+      for (size_t i = 0; i < std::min(values.size(), result.size()); ++i) result[i].value = values[i];
+    }
+  } else if (func->body_ && program && IsWrapperType(func->func_type_)) {
+    CallPtr returning_call;
+    FunctionPtr returning_callee;
+    bool ambiguous = false;
+    for (const auto& info : CollectInnerCalls(func, program)) {
+      if (info.inner_callee->return_types_.size() != result.size()) continue;
+      if (returning_call) {
+        ambiguous = true;
+        break;
+      }
+      returning_call = info.inner_call;
+      returning_callee = info.inner_callee;
+    }
+    if (returning_call && !ambiguous) {
+      // A Submit's transient Call view also includes the trailing TaskId.
+      // Keep only the callee's declared return positions, without fabricating
+      // an SSA variable or treating that launch handle as a kernel output.
+      auto tuple_type = As<TupleType>(returning_call->GetType());
+      if (result.size() == 1 &&
+          structural_equal(returning_call->GetType(), returning_callee->return_types_[0])) {
+        result[0].value = returning_call;
+      } else if (result.size() > 1 && tuple_type && tuple_type->types_.size() >= result.size()) {
+        for (size_t i = 0; i < result.size(); ++i) {
+          result[i].value =
+              std::make_shared<TupleGetItemExpr>(returning_call, static_cast<int>(i), returning_call->span_);
+        }
+      } else if (result.size() == 1 && tuple_type && tuple_type->types_.size() == 2) {
+        auto task_id_type = As<ScalarType>(tuple_type->types_[1]);
+        if (task_id_type && task_id_type->dtype_ == DataType::TASK_ID &&
+            structural_equal(tuple_type->types_[0], returning_callee->return_types_[0])) {
+          result[0].value = std::make_shared<TupleGetItemExpr>(returning_call, 0, returning_call->span_);
+        }
+      }
+    }
+  }
+
+  // Unknown lineage is storage information, not a missing return position.
+  // Preserve the callee-local value and type even for fresh or partial buffers.
+  auto param_indices = ReturnedParamIndicesImpl(func, program);
+  for (size_t i = 0; i < std::min(param_indices.size(), result.size()); ++i) {
+    result[i].param_index = param_indices[i];
+  }
+  return result;
+}
+
+std::vector<std::optional<size_t>> TraceToParamIndices(const std::vector<VarPtr>& vars, const StmtPtr& body,
+                                                       const std::vector<VarPtr>& params,
+                                                       const ProgramPtr& program) {
+  return TraceBodyExprsToParamIndices(std::vector<ExprPtr>(vars.begin(), vars.end()), body, params, program,
+                                      /*trace_if_merges=*/false);
+}
+
+std::vector<std::optional<size_t>> TraceExprsToParamIndices(
+    const std::vector<ExprPtr>& exprs, const StmtPtr& body, const std::vector<VarPtr>& params,
+    const ProgramPtr& program, std::optional<size_t> formal_param_count, bool trace_if_merges) {
+  return TraceBodyExprsToParamIndices(exprs, body, params, program, trace_if_merges, formal_param_count);
+}
+
 std::vector<std::optional<size_t>> TraceToParamIndicesForOutlining(const std::vector<VarPtr>& vars,
                                                                    const StmtPtr& body,
                                                                    const std::vector<VarPtr>& params,
                                                                    const ProgramPtr& program,
                                                                    bool trace_if_merges) {
-  if (!body) return std::vector<std::optional<size_t>>(vars.size());
-
-  BodyIndexCollector index(trace_if_merges);
-  index.VisitStmt(body);
-  return TraceExprsToParamIndices(std::vector<ExprPtr>(vars.begin(), vars.end()), index, IndexParams(params),
-                                  program);
+  return TraceBodyExprsToParamIndices(std::vector<ExprPtr>(vars.begin(), vars.end()), body, params, program,
+                                      trace_if_merges);
 }
 
 VarPtr TraceToParam(const VarPtr& var, const StmtPtr& body, const std::vector<VarPtr>& params,
                     const ProgramPtr& program) {
   if (!var || !body) return nullptr;
+  TraceQueryGuard query_guard;
   BodyIndexCollector index;
   index.VisitStmt(body);
   auto param_indices = IndexParams(params);
-  VarRootMap memo;
+  LineageMemo memo;
   const Var* root = TraceVar(var.get(), index, param_indices, program, memo).root;
   if (!root) return nullptr;
   auto param_it = param_indices.find(root);

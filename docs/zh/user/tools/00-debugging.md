@@ -1,5 +1,9 @@
 # 调试
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 错误类型、日志级别，以及读懂编译器产出的 IR。
 
 ## 概念
@@ -69,6 +73,16 @@ print(pypto.get_log_level())
 ```
 
 `NONE` / `FATAL` / `ERROR` / `WARN` / `INFO` / `EVENT` / `DEBUG`，依次更吵。默认是 `INFO`。
+
+`DEBUG` 级别下，成功的编译会打印产物根目录的绝对路径：
+
+```text
+2026-11-03 08:47:25.652 D | PyPTO artifacts written to /tmp/build_output/_jit_tile_add_20261103_084725_ksde7qr6
+```
+
+该目录包含 `kernels/`（编译后的 kernel；`skip_ptoas=True` 时是原始 `.pto`，包括没有 ptoas 的
+`@pl.jit`）、`ptoas/`（运行 ptoas 时的 `.pto` 输入和其他中间产物），以及启用后的
+`passes_dump/`。用 `export PYPTO_LOG_LEVEL=debug` 打开。
 
 ### 环境变量
 

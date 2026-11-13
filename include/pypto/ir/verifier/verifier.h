@@ -81,6 +81,11 @@ using PropertyVerifierPtr = std::shared_ptr<PropertyVerifier>;
  */
 PropertyVerifierPtr CreateSSAPropertyVerifier();
 
+/// Verify canonical SIMT helper and launch contracts.
+PropertyVerifierPtr CreateSimtValidPropertyVerifier();
+PropertyVerifierPtr CreateSimtOutputsMaterializedPropertyVerifier();
+PropertyVerifierPtr CreateSimtSpecializedPropertyVerifier();
+
 /**
  * @brief Factory function for creating type check property verifier
  * @return Shared pointer to TypeCheck PropertyVerifier
@@ -414,6 +419,8 @@ PropertyVerifierPtr CreateArrayNotEscapedPropertyVerifier();
  * @return Shared pointer to NoNestedInCore PropertyVerifier
  */
 PropertyVerifierPtr CreateNoNestedIncorePropertyVerifier();
+PropertyVerifierPtr CreateRegScopePropertyVerifier();
+PropertyVerifierPtr CreateHardwareLoopContractPropertyVerifier();
 
 /**
  * @brief Factory function for creating InOutUseValid property verifier

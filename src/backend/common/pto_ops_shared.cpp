@@ -168,33 +168,6 @@ std::vector<std::string> GetSizeCodes(const std::vector<ir::ExprPtr>& exprs, cod
   return codes;
 }
 
-std::string EmitIndexTimesTwo(const std::string& ssa, codegen::PTOCodegen& codegen,
-                              const ir::ExprPtr& expr = nullptr) {
-  if (auto c = As<ir::ConstInt>(expr)) {
-    return codegen.GetOrEmitConstant(c->value_ * 2, DataType::INDEX);
-  }
-  auto two = codegen.GetOrEmitConstant(static_cast<int64_t>(2), DataType::INDEX);
-  auto out = codegen.NewTemp();
-  codegen.Emit(out + " = arith.muli " + ssa + ", " + two + " : index");
-  return out;
-}
-
-void ExpandPackedFp4GmLastAxis(DataType dtype, std::vector<std::string>& offset_codes,
-                               std::vector<std::string>& size_codes, std::vector<std::string>& dim_strings,
-                               codegen::PTOCodegen& codegen, const ir::ExprPtr& last_size,
-                               const ir::ExprPtr& last_offset, ir::TensorLayout layout) {
-  // Match ExpandPackedFp4MakeTensorViewDims: MX layouts keep carrier/physical
-  // SFractal coordinates and must not nibble-expand the last axis.
-  if (!dtype.IsPackedFp4() || ir::IsMxTensorLayout(layout) || size_codes.empty()) return;
-  size_codes.back() = EmitIndexTimesTwo(size_codes.back(), codegen, last_size);
-  if (!offset_codes.empty()) {
-    offset_codes.back() = EmitIndexTimesTwo(offset_codes.back(), codegen, last_offset);
-  }
-  if (!dim_strings.empty() && dim_strings.back() != "?") {
-    dim_strings.back() = std::to_string(std::stoll(dim_strings.back()) * 2);
-  }
-}
-
 bool ExprsEquivalentForSubview(const ir::ExprPtr& lhs, const ir::ExprPtr& rhs) {
   if (lhs.get() == rhs.get()) return true;
   auto lhs_const = As<ir::ConstInt>(lhs);
@@ -416,7 +389,7 @@ void RequireStaticValidShapeForPtoas(const std::shared_ptr<const ir::TileType>& 
                                      std::string_view op_name, std::string_view role, const ir::Span& span) {
   CHECK_SPAN(HasStaticValidShape(tile_type), span)
       << op_name << " on A2/A3 requires compile-time static valid_shape on " << role
-      << " for PTOAS level3 tmp verification";
+      << " for PTOAS scratch sizing or verification";
 }
 
 std::string GetTileViewTypeAnnotation(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen) {
@@ -430,24 +403,20 @@ std::string GetTileViewTypeAnnotation(const ir::ExprPtr& expr, codegen::PTOCodeg
 
 std::string EnsureTileViewSsa(const ir::ExprPtr& expr,
                               const std::shared_ptr<const ir::TileType>& view_tile_type,
-                              codegen::PTOCodegen& codegen, const std::string& temp_prefix) {
+                              codegen::PTOCodegen& codegen, const std::string& temp_prefix,
+                              std::optional<MutableTileViewShape> mutable_valid_shape) {
   INTERNAL_CHECK(view_tile_type) << "Internal error: EnsureTileViewSsa requires a TileType view";
-  const std::string view_type = codegen.GetViewTileBufTypeStringFromTileType(view_tile_type);
-  std::string current_ssa = codegen.GetExprAsCode(expr);
-  const std::string current_type = codegen.GetExprTypeAnnotation(expr);
-  if (!current_type.empty() && current_type == view_type) {
-    return current_ssa;
+  const std::string source = codegen.GetExprAsCode(expr);
+  const std::string source_type = codegen.GetExprTypeAnnotation(expr);
+  std::optional<std::pair<std::string, std::string>> valid_shape;
+  if (mutable_valid_shape) {
+    INTERNAL_CHECK_SPAN(codegen.IsMutableTileName(source), expr->span_)
+        << "Internal error: a mutable tile view requires a locally mutable source";
+    INTERNAL_CHECK_SPAN(!mutable_valid_shape->rows.empty() && !mutable_valid_shape->cols.empty(), expr->span_)
+        << "Internal error: a mutable tile view requires both initial valid extents";
+    valid_shape.emplace(mutable_valid_shape->rows, mutable_valid_shape->cols);
   }
-  std::string view_ssa = codegen.NewNamedTemp(temp_prefix);
-  codegen.RegisterTileBufType(view_ssa, view_type);
-  codegen.RegisterTileViewName(view_ssa);
-  std::ostringstream oss;
-  oss << view_ssa << " = pto.treshape " << current_ssa;
-  if (!current_type.empty()) {
-    oss << " : " << current_type << " -> " << view_type;
-  }
-  codegen.Emit(oss.str());
-  return view_ssa;
+  return codegen.EnsureTileView(source, source_type, view_tile_type, temp_prefix, valid_shape);
 }
 
 std::string EnsureStaticViewTileSsa(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen,

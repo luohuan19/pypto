@@ -307,7 +307,7 @@ void OpConversionRegistry::RegisterScalarAndUnaryOps() {
   RegisterSimple("tensor.sqrt", "tile.sqrt");
   RegisterSimple("tensor.cast", "tile.cast");
 
-  // tensor.rsqrt → tile.rsqrt (basic) or tile.rsqrt(src, tmp) (high-precision).
+  // tensor.rsqrt preserves high_precision when lowering to tile.rsqrt.
   // The tmp scratch tile is allocated via tile.create when high_precision=True.
   RegisterCustom(
       "tensor.rsqrt",
@@ -331,7 +331,7 @@ void OpConversionRegistry::RegisterScalarAndUnaryOps() {
         std::vector<StmtPtr> prologue;
         auto tmp_var = AppendScratchTile(&prologue, tile_type, "rsqrt_tmp", span);
 
-        auto rsqrt_call = op_reg.Create("tile.rsqrt", {input, tmp_var}, span);
+        auto rsqrt_call = op_reg.Create("tile.rsqrt", {input, tmp_var}, {{"high_precision", true}}, span);
         return ConversionResult{std::move(prologue), rsqrt_call};
       });
 
@@ -1281,11 +1281,15 @@ void OpConversionRegistry::RegisterMatmulOps() {
       "tensor.matmul",
       [rank_of](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
                 const Span& span) -> ConversionResult {
-        (void)kwargs;
+        std::vector<std::pair<std::string, std::any>> tile_kwargs;
+        for (const auto& kwarg : kwargs) {
+          if (kwarg.first == "tf32_mode") tile_kwargs.push_back(kwarg);
+        }
         INTERNAL_CHECK_SPAN(args.size() == 2, span) << "tensor.matmul conversion expects 2 args (lhs, rhs)";
         const bool nd = rank_of(args[0]) > 2 || rank_of(args[1]) > 2;
         const std::string out_op = nd ? "tile.batch_matmul" : "tile.matmul";
-        return ConversionResult{OpRegistry::GetInstance().Create(out_op, {args[0], args[1]}, span)};
+        return ConversionResult{
+            OpRegistry::GetInstance().Create(out_op, {args[0], args[1]}, tile_kwargs, span)};
       },
       // Both targets of the rank dispatch above are named: an ND operand makes
       // this a tile.batch_matmul, so deriving from tile.matmul alone would read
@@ -1341,7 +1345,10 @@ void OpConversionRegistry::RegisterMatmulOps() {
       "tensor.matmul_acc",
       [rank_of](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
                 const Span& span) -> ConversionResult {
-        (void)kwargs;
+        std::vector<std::pair<std::string, std::any>> tile_kwargs;
+        for (const auto& kwarg : kwargs) {
+          if (kwarg.first == "tf32_mode") tile_kwargs.push_back(kwarg);
+        }
         INTERNAL_CHECK_SPAN(args.size() == 3 || args.size() == 4, span)
             << "tensor.matmul_acc conversion expects 3 args (acc, lhs, rhs) or 4 with init_cond";
         const bool nd = rank_of(args[0]) > 2 || rank_of(args[1]) > 2 || rank_of(args[2]) > 2;
@@ -1354,7 +1361,7 @@ void OpConversionRegistry::RegisterMatmulOps() {
         // later, in FlattenTileNdTo2D, for a reason unrelated to init_cond — the
         // per-batch accumulator is a strided L0C row window the MAD cannot address.)
         if (args.size() == 4) out_args.push_back(args[3]);
-        return ConversionResult{OpRegistry::GetInstance().Create(out_op, out_args, span)};
+        return ConversionResult{OpRegistry::GetInstance().Create(out_op, out_args, tile_kwargs, span)};
       },
       // Same M boxing as tensor.matmul, on *both* cube tiles the M axis runs
       // through. tile.matmul_acc requires the accumulator and the product to
@@ -2707,6 +2714,21 @@ void OpConversionRegistry::RegisterCmpOps() {
       auto call = op_reg.Create("tile.full", {shape_tuple, val}, kw, span);
       auto var = std::make_shared<Var>(name, call->GetType(), span);
       prologue.push_back(std::make_shared<AssignStmt>(var, call, span));
+      // The packed predicate inherits the lhs valid region. Full 0/1 tiles
+      // would ask TSEL to read mask bits outside that region on a tail tile.
+      // Keep the logical element extents here, not the mask's packed byte width.
+      // set_validshape is 2D-only. Do not turn an expanded lhs broadcast
+      // into a partial result; that path still needs broadcast-aware masks.
+      const auto valid_shape = GetValidShape(lhs_tile);
+      if (result_shape.size() == 2 && ValidExtentsEqual(lhs_tile->shape_, result_shape) &&
+          !ValidExtentsEqual(valid_shape, result_shape)) {
+        std::vector<ExprPtr> valid_args = {var};
+        valid_args.insert(valid_args.end(), valid_shape.begin(), valid_shape.end());
+        auto valid_call = op_reg.Create("tile.set_validshape", valid_args, span);
+        auto valid_var = std::make_shared<Var>(name + "_valid", valid_call->GetType(), span);
+        prologue.push_back(std::make_shared<AssignStmt>(valid_var, valid_call, span));
+        return valid_var;
+      }
       return var;
     };
     auto one_var = make_full(1.0, "cmp_one");
@@ -2970,8 +2992,8 @@ void OpConversionRegistry::RegisterDistributedOps() {
 // ============================================================================
 // High-level (@pl.jit / pl.spmd) author-facing shard / gather emitted inside a
 // ``for aiv_id in pl.split_aiv(...)`` region. Each lowers 1:1 to its tile op
-// (tile.aiv_shard / tile.aic_gather) so the result is byte-identical to what the
-// AUTO ``pl.split`` path produces via LowerAutoVectorSplit (pass 23).
+// (tile.aiv_shard / tile.aic_gather). LowerAutoVectorSplit prepares their explicit
+// boundary valid extents, then ExpandMixedKernel lowers them to cross-core pipes.
 //
 // Boundary memory space. The tile-level split deducer (DeduceSplitReshape)
 // intentionally leaves it null (returns a TileType with a null memref / null
@@ -2980,19 +3002,17 @@ void OpConversionRegistry::RegisterDistributedOps() {
 // the tile op declares via set_output_memory (cross_core.cpp): Vec for the C->V
 // aiv_shard (AIV pops into UB), Mat for the V->C aic_gather (AIC pops into L1).
 // So this converter attaches nothing of its own — it just asserts the space
-// arrived. LowerAutoVectorSplit builds its boundary ops through the same Create,
-// which is what keeps the two paths from drifting apart; this converter used to
-// hard-code Vec for both directions, which made the gather's declared type
-// disagree with the Mat tpop ExpandMixedKernel actually emits.
+// arrived. The gather must retain Mat to match the V->C tpop emitted by
+// ExpandMixedKernel; assigning Vec to both directions would violate that contract.
 //
 // No InputSpaceReq. The realistic (region-only) operand is an on-chip tile — a
-// cube (Mat/Acc) matmul result for aiv_shard, a Vec vector-compute result for
+// cube Acc matmul result for aiv_shard, a Vec vector-compute result for
 // aic_gather — already lowered to a TileType earlier in this same pass, so it
 // reaches the converter tile-typed and passes straight into the tile op (the tile
 // deducer accepts any 2D TileType regardless of memory space). aiv_shard / gather
 // ARE the cross-core transfer, so no tile.load should be synthesized; adding a Vec
 // InputSpaceReq would inject a spurious Vec load and force a cube input to Vec,
-// diverging from the AUTO oracle's Mat-tile input. Distributed operands were
+// violating the Acc-to-Vec boundary contract. Distributed operands were
 // rejected upstream (parser + tensor deducer), so only a plain TileType arrives.
 void OpConversionRegistry::RegisterCrossCoreOps() {
   auto convert = [](const std::string& tile_op) -> ConversionFunc {
@@ -3007,9 +3027,7 @@ void OpConversionRegistry::RegisterCrossCoreOps() {
       // split-axis extent.
       // The boundary memory needs no re-attachment here: the split deducer leaves
       // the space null, and Create fills it from the tile op's set_output_memory
-      // declaration (Vec for the shard, Mat for the gather). LowerAutoVectorSplit
-      // builds its aiv_shard / aic_gather through the same Create, so both paths
-      // read one declaration and cannot drift apart.
+      // declaration (Vec for the shard, Mat for the gather).
       auto call = op_reg.Create(tile_op, args, kwargs, span);
       auto tt = As<TileType>(call->GetType());
       INTERNAL_CHECK_SPAN(tt && tt->memory_space_.has_value(), span)

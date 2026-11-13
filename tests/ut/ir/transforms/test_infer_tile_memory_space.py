@@ -2703,7 +2703,7 @@ class TestInferTileMemorySpaceIterArgInherit:
         """
         # A backend is needed so the Mat tile.create carries the implicit NZ TileView,
         # matching the tile.assemble result type for the loop-carried reassignment.
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2748,7 +2748,7 @@ class TestInferTileMemorySpaceIterArgInherit:
         the ``tile.create``, the inner from the outer iter-arg via ``AsVarLike``). Pins
         the recursive seeding the single-loop test does not reach.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2805,7 +2805,7 @@ class TestInferTileMemorySpaceLoopCarriedOperand:
         target can execute -- and the property verifier stayed silent about it,
         so the violation only surfaced in the backend.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2859,7 +2859,7 @@ class TestInferTileMemorySpaceLoopCarriedOperand:
         carry edge the load defaulted to Vec and the operand was routed
         GM -> UB -> L0B, putting a cube-only operand on the vector core.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2950,7 +2950,7 @@ class TestInferTileMemorySpaceLoopCarriedOperand:
         operand reached `tile.matmul`'s Right slot with no memory space
         whatsoever.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3008,12 +3008,12 @@ class TestLoopInvariantMatResidency:
 
     @staticmethod
     def _run_infer(program):
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         return passes.infer_tile_memory_space()(passes.convert_to_ssa()(program))
 
     @staticmethod
     def _run_tensor_infer(program):
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         program = passes.convert_to_ssa()(program)
         program = passes.convert_tensor_to_tile_ops()(program)
         program = passes.flatten_tile_nd_to_2d()(program)
@@ -3225,7 +3225,7 @@ class RetargetedBridgeAttrs:
 
         Before = passes.convert_to_ssa()(pl.parse_program(program.format(body=before_body)))
         Expected = passes.convert_to_ssa()(pl.parse_program(program.format(body=expected_body)))
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
 
     def test_private_marker_stripped_when_function_has_no_tile_memory(self):
@@ -3257,7 +3257,7 @@ class MarkerOnlyScalarCall:
         Expected = passes.convert_to_ssa()(
             pl.parse_program(program.format(attrs='attrs={"residency_test_sentinel": 11}'))
         )
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
 
     def test_tensor_matmul_stationary_lhs_loads_once(self):
@@ -3267,7 +3267,7 @@ class MarkerOnlyScalarCall:
         loop.  This is the load-once QK shape reported in #2077, reduced to two
         N tiles so the test stays compact.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3317,7 +3317,7 @@ class MarkerOnlyScalarCall:
         GM->Mat load is invariant; the L0 staging remains in the inner
         pipeline.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4909,6 +4909,43 @@ class TestRewrittenTileLayout:
                 _output = result
 
         ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Before)
+
+
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+def test_packed_fp4_inferred_mat_load_retargets_carrier_shape(dtype):
+    backend.set_backend_type(BackendType.Ascend950)
+
+    # Matrix input constraints drive Mat staging; tile.move itself places no
+    # demand on its input. This tests inference only, before native MX codegen.
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[32, 64], dtype],
+            y: pl.Tensor[[64, 32], dtype, pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN)],
+        ):
+            loaded = pl.tile.load(x, [0, 0], [32, 64], valid_shape=[16, 32])
+            rhs_tile = pl.tile.load(y, [0, 0], [64, 32], valid_shape=[32, 16])
+            _product = pl.tile.matmul(loaded, rhs_tile)
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[32, 64], dtype],
+            y: pl.Tensor[[64, 32], dtype, pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN)],
+        ):
+            loaded = pl.tile.load(x, [0, 0], [32, 64], valid_shape=[16, 32], target_memory=pl.Mem.Mat)
+            rhs_tile = pl.tile.load(y, [0, 0], [64, 32], valid_shape=[32, 16], target_memory=pl.Mem.Mat)
+            loaded_Left = pl.tile.move(loaded, target_memory=pl.Mem.Left)
+            rhs_tile_Right = pl.tile.move(rhs_tile, target_memory=pl.Mem.Right)
+            _product = pl.tile.matmul(loaded_Left, rhs_tile_Right)
+
+    after = passes.infer_tile_memory_space()(Before)
+    ir.assert_structural_equal(after, Expected)
+    ir.assert_structural_equal(pl.parse_program(ir.python_print(after)), after)
 
 
 if __name__ == "__main__":

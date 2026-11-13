@@ -232,6 +232,7 @@ enum class ArgEffect : uint8_t {
 enum class WriteChannel : uint8_t {
   Dma,     ///< MTE3 / DMA store path (tile.store, tensor.assemble, cross-rank put/get).
   Scalar,  ///< Scalar D-cache write path (tensor.write).
+  Simt,    ///< SIMT lane stores; distinct from controller scalar stores and DMA.
 };
 
 /**
@@ -274,7 +275,7 @@ struct OpArgEffectSpec {
 /**
  * @brief Arguments that carry no lane-indexed data
  *
- * Automatic AIV vector splitting (`LowerAutoVectorSplit`) halves an op's RESULT
+ * Standalone AIV vector splitting (`SplitVectorKernel`) halves an op's RESULT
  * to the per-lane extent and relies on every tile operand being lane-local
  * already. An operand that is still full width normally means nothing sharded
  * it, and the two lanes would read the same rows.
@@ -367,6 +368,31 @@ struct OpLaneInvariantArgSpec {
   std::map<size_t, LaneInvariantArg> args;
 };
 
+/// Register schemas attach scope requirements and a VMI emitter to an operator.
+struct RegOpSpec {
+  std::string emitter;
+  bool requires_reg_scope = true;
+};
+
+/// Element coordinates are absolute within the root MemRef when one is known.
+/// Missing endpoints mean a conservative unknown interval, never no access.
+struct RegMemoryEffect {
+  // Accessed Tile expression; views retain their own geometry here.
+  ExprPtr target;
+  // Shared allocation identity for alias analysis, or null before resolution.
+  VarPtr root;
+  ArgEffect access;
+  // Half-open element interval, not byte offsets; either endpoint may be unknown.
+  std::optional<int64_t> begin;
+  std::optional<int64_t> end;
+  // Memory predicate, or null for an unmasked access. A present mask does not
+  // imply that every lane is written; initialization must inspect its meaning.
+  ExprPtr mask;
+};
+
+/// Validate a Reg load/store/gather/scatter and describe its memory effect.
+RegMemoryEffect GetRegMemoryEffect(const CallPtr& call);
+
 /**
  * @brief Type-erased operator registration entry
  *
@@ -389,6 +415,14 @@ struct OpLaneInvariantArgSpec {
  */
 class OpRegistryEntry {
  public:
+  OpRegistryEntry& set_reg_op(std::string emitter) {
+    CHECK(!reg_spec_.has_value()) << "Register schema is already set";
+    reg_spec_ = RegOpSpec{std::move(emitter), true};
+    set_core_affinity(core_affinity::CoreAffinity::VECTOR);
+    return *this;
+  }
+  [[nodiscard]] const std::optional<RegOpSpec>& GetRegSpec() const { return reg_spec_; }
+
   /**
    * @brief Get the operator instance
    *
@@ -422,6 +456,9 @@ class OpRegistryEntry {
     CHECK(arguments_.has_value())
         << "Operator '" + name_ +
                "' has no argument definition. Use .add_argument() or .no_argument() to define arguments.";
+
+    CHECK(pointwise_validity_args_.empty() || *pointwise_validity_args_.rbegin() < GetArgumentCount())
+        << "Operator '" << name_ << "' declares a pointwise validity argument outside its schema";
 
     CHECK(deduce_type_.has_value() || validate_explicit_type_.has_value())
         << "Operator '" + name_ + "' has no type deduction function or explicit type validator. "
@@ -826,11 +863,11 @@ class OpRegistryEntry {
   /// ISA. Ops that are pinned to one lane by set_core_affinity() need no flag:
   /// they are never duplicated in the first place.
   ///
-  /// The consumer is LowerAutoVectorSplit's `pl.split_aiv` region placement
-  /// stamp: it pins exactly the no-duplicate calls inside a region to the AIV
-  /// lane, so they are not copied onto the cube lane by ExpandMixedKernel. No
-  /// verifier rejects anything on this axis — see the "NOT CHECKED,
-  /// DELIBERATELY" note in verify_aiv_split.cpp.
+  /// ExpandMixedKernel pins core-agnostic no-duplicate calls inside a
+  /// `pl.split_aiv` region to the AIV lane, so they are not copied onto the
+  /// cube lane. Software-pipeline analysis also treats these calls as
+  /// non-replicable. No verifier rejects calls solely on this axis — see the
+  /// "NOT CHECKED, DELIBERATELY" note in verify_aiv_split.cpp.
   ///
   /// Do NOT use it for an op whose presence on the cube lane is load-bearing:
   /// pinning `pld.system.wait` to AIV would let the matmul race past the peer
@@ -946,17 +983,20 @@ class OpRegistryEntry {
   /// result is a `TupleType` with exactly N elements, and every element is an
   /// output: destination tiles must NOT appear in `add_argument()`, because a
   /// caller cannot pre-allocate a buffer that `InitMemRef` owns. Default 1.
+  /// SIMT operations may declare zero results: they access borrowed storage,
+  /// while updated functional values are defined by SimtLaunchStmt.
   inline OpRegistryEntry& set_output_arity(size_t arity) {
-    CHECK(arity >= 1 || ir_stage_ == OpIRStage::Buffer)
+    CHECK(arity >= 1 || ir_stage_ == OpIRStage::Buffer || op_category_ == "SimtOp")
         << "Operator '" << name_ << "' declared output arity " << arity
-        << "; functional operators produce at least one value. Select Buffer stage before declaring zero";
+        << "; functional operators produce at least one value. Select Buffer stage or SimtOp category before "
+           "declaring zero";
     output_arity_ = arity;
     output_arity_declared_ = true;
     return *this;
   }
 
   inline OpRegistryEntry& set_ir_stage(OpIRStage stage) {
-    CHECK(stage == OpIRStage::Buffer || output_arity_ > 0)
+    CHECK(stage == OpIRStage::Buffer || output_arity_ > 0 || op_category_ == "SimtOp")
         << "Operator '" << name_ << "' cannot give a zero-result operator Functional stage";
     ir_stage_ = stage;
     return *this;
@@ -986,8 +1026,9 @@ class OpRegistryEntry {
   void ValidateIRStage() const;
   void ValidateCall(const std::vector<ExprPtr>& args, const TypePtr& result_type, const Span& span) const;
 
-  /// Declare argument `arg_index` to be compiler-supplied scratch: the hardware
-  /// writes it, but it carries no result the caller reads. This is what
+  /// Declare argument `arg_index` to be scratch: the hardware writes it, but it
+  /// carries no result the caller reads. Its storage may be supplied by the
+  /// caller or compiler; shape and dtype requirements still apply. This
   /// separates a legitimate workspace — `tile.gather_compare`'s `tmp`, which
   /// `ConvertTensorToTileOps` synthesizes — from a destination tile leaked into
   /// the argument list, which `ValidateMultiOutputOps()` rejects.
@@ -995,6 +1036,18 @@ class OpRegistryEntry {
     workspace_args_.insert(arg_index);
     return *this;
   }
+
+  /// Data arguments read at corresponding element indices. Automatic splitting
+  /// checks their valid regions for broadcast compatibility. Packed predicates,
+  /// geometric operands and scratch are not members: their units or read
+  /// regions differ, and the operator's type deduction validates those contracts.
+  /// An empty group leaves validity entirely to type deduction.
+  inline OpRegistryEntry& set_pointwise_validity_args(std::set<size_t> arg_indices) {
+    pointwise_validity_args_ = std::move(arg_indices);
+    return *this;
+  }
+
+  [[nodiscard]] const std::set<size_t>& GetPointwiseValidityArgs() const { return pointwise_validity_args_; }
 
   /// True when this operator declared its per-argument effects. False means the
   /// operator has never been classified — an analysis that needs the answer must
@@ -1108,6 +1161,8 @@ class OpRegistryEntry {
   [[nodiscard]] const std::optional<std::string>& GetTemplateDir() const { return template_dir_; }
 
  private:
+  std::optional<RegOpSpec> reg_spec_;
+
   void EnsureMemorySpec() {
     if (!memory_spec_.has_value()) {
       memory_spec_ = OpMemorySpaceSpec{};
@@ -1174,8 +1229,9 @@ class OpRegistryEntry {
   bool output_arity_declared_{false};
   std::map<size_t, BufferArgEffect> buffer_arg_effects_;
   std::map<size_t, BufferResultSpec> buffer_results_;
-  std::set<size_t> workspace_args_;          ///< Args written as scratch rather than as results
-  std::optional<std::string> template_dir_;  ///< Package resource for builtin templates.
+  std::set<size_t> workspace_args_;           ///< Args written as scratch rather than as results
+  std::set<size_t> pointwise_validity_args_;  ///< Data args sharing element-indexed validity
+  std::optional<std::string> template_dir_;   ///< Package resource for builtin templates.
 };
 
 /**

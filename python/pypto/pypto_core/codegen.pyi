@@ -9,7 +9,48 @@
 # pylint: disable=unused-argument
 """Code generation module for converting IR to PTO assembly (PTOCodegen)."""
 
+from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import CoreType, Expr, Function, Program, Var
+
+def data_type_to_mlir(dtype: DataType) -> str:
+    """Return the PTO MLIR spelling of an element data type."""
+
+class VFHelper:
+    """No-Bridge VF/SIMT helper and adapter with ordered storage effects."""
+
+    @property
+    def kind(self) -> str: ...
+    @property
+    def symbol(self) -> str: ...
+    @property
+    def adapter_symbol(self) -> str: ...
+    @property
+    def source(self) -> str: ...
+    @property
+    def parameter_types(self) -> list[str]: ...
+    @property
+    def caller_parameter_types(self) -> list[str]: ...
+    @property
+    def parameter_effects(self) -> list[str]: ...
+    @property
+    def parameter_indices(self) -> list[int]: ...
+    @property
+    def capture_byte_offsets(self) -> list[int]: ...
+
+class PTOCodegenBundle:
+    """Execution artifacts owned by one PTO codegen invocation."""
+
+    @property
+    def caller_source(self) -> str: ...
+    @property
+    def helpers(self) -> list[VFHelper]: ...
+    @property
+    def entry_helpers(self) -> dict[str, list[str]]:
+        """Sorted emitted InCore entries mapped to unique helper symbols in first-use order.
+
+        Entries without helpers have empty lists. Shared VF/SIMT artifacts are
+        stored once in ``helpers`` and referenced by symbol from each caller.
+        """
 
 class PTOCodegen:
     """Code generator that transforms PyPTO IR to PTO assembly (.pto format).
@@ -24,7 +65,17 @@ class PTOCodegen:
     def __init__(self) -> None:
         """Create a new PTO code generator."""
 
-    def generate(self, program: Program, emit_tile_addr: bool = True, emit_source_loc: bool = True) -> str:
+    def generate_bundle(
+        self, program: Program, emit_tile_addr: bool = True, emit_source_loc: bool = True
+    ) -> PTOCodegenBundle:
+        """Generate an EmitC caller and separate typed-VMI helpers for A5/AIV."""
+
+    def generate(
+        self,
+        program: Program,
+        emit_tile_addr: bool = True,
+        emit_source_loc: bool = True,
+    ) -> str:
         """Generate PTO assembly from PyPTO IR Program.
 
         Args:
@@ -47,6 +98,18 @@ class PTOCodegen:
             >>> pto_code = cg.generate(program)
         """
 
+class KernelRegistration:
+    """Runtime tensor ABI and ID for a generated code unit."""
+
+    @property
+    def func_id(self) -> int: ...
+    @property
+    def code_name(self) -> str: ...
+    @property
+    def core_type(self) -> CoreType: ...
+    @property
+    def signature(self) -> list[str]: ...
+
 class OrchestrationResult:
     """Result of orchestration code generation."""
 
@@ -56,18 +119,8 @@ class OrchestrationResult:
         ...
 
     @property
-    def func_name_to_id(self) -> dict[str, int]:
-        """Kernel function name to func_id mapping."""
-        ...
-
-    @property
-    def func_name_to_core_type(self) -> dict[str, CoreType]:
-        """Kernel function name to core type mapping."""
-        ...
-
-    @property
-    def func_name_to_signature(self) -> dict[str, list[str]]:
-        """Kernel name to tensor-arg ArgDirection name list (scalars excluded), in task-payload order."""
+    def kernel_registrations(self) -> list[KernelRegistration]:
+        """Distinct runtime registrations, in func_id order; code may be shared."""
         ...
 
     @property
@@ -162,12 +215,18 @@ def collect_vars_from_shape_expr(expr: Expr) -> list[Var]:
         Vars in first-seen DFS order, deduped within this single call.
     """
 
+def collect_tensor_shape_dyn_vars(func: Function) -> list[Var]:
+    """Return ordered trailing shape arguments, excluding explicit scalar parameters."""
+
 __all__ = [
+    "data_type_to_mlir",
     "PTOCodegen",
     "BuiltinNextLevelSpec",
     "DistributedCodegen",
     "OrchestrationResult",
+    "KernelRegistration",
     "collect_vars_from_shape_expr",
+    "collect_tensor_shape_dyn_vars",
     "generate_orchestration",
     "infer_function_core_type",
 ]

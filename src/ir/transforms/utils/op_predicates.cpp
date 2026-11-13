@@ -28,6 +28,16 @@ namespace op_predicates {
 
 using core_affinity::CrossCoreRole;
 
+bool CastRequiresDisjointSource(const CallPtr& call, bool is_a2a3) {
+  if (!IsOp(call, "tile.cast") || call->args_.empty()) return false;
+  const auto source = As<TileType>(call->args_[0]->GetType());
+  const auto result = As<TileType>(call->GetType());
+  if (!source || !result) return false;
+  const auto source_bits = source->dtype_.GetBit();
+  const auto result_bits = result->dtype_.GetBit();
+  return result_bits > source_bits || (is_a2a3 && result_bits < source_bits);
+}
+
 namespace {
 
 bool HasRole(const CallPtr& call, CrossCoreRole expected) {
@@ -83,7 +93,7 @@ std::optional<size_t> BuiltinWritebackArgIndex(const OpPtr& op, size_t arg_count
 bool IsBuiltinOp(const std::string& op_name) {
   return op_name.rfind("tile.", 0) == 0 || op_name.rfind("tensor.", 0) == 0 ||
          op_name.rfind("system.", 0) == 0 || op_name.rfind("array.", 0) == 0 ||
-         op_name == "pld.system.get_comm_ctx";
+         op_name.rfind("reg.", 0) == 0 || op_name == "pld.system.get_comm_ctx";
 }
 
 bool IsManagedTensorCollective(const OpPtr& op) {
@@ -91,7 +101,7 @@ bool IsManagedTensorCollective(const OpPtr& op) {
   return IsOp(op, "pld.tensor.allgather") || IsOp(op, "pld.tensor.allreduce") ||
          IsOp(op, "pld.tensor.barrier") || IsOp(op, "pld.tensor.broadcast") ||
          IsOp(op, "pld.tensor.reduce_scatter") || IsOp(op, "pld.tensor.all_to_all") ||
-         IsOp(op, "pld.tensor.all_to_all_v");
+         (IsOp(op, "pld.tensor.all_to_all_v") || IsOp(op, "pld.tensor.indexed_all_to_all_v"));
 }
 
 bool IsPublishingWrite(const CallPtr& call) {

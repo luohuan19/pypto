@@ -12,27 +12,40 @@
 import ast
 import math
 import textwrap
+import types
+import typing
 import warnings
+from contextlib import nullcontext
+from types import SimpleNamespace
+from typing import Any
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
+from pypto.backend import BackendType
+from pypto.backend.pto_backend import PartialCodegenError
+from pypto.ir import python_print
+from pypto.jit._specialize_body import BodyTransformer
+from pypto.jit._specialize_values import layout_str, render_free_value
 from pypto.jit.specializer import (
     DynDim,
     SpecializeContext,
     Specializer,
     TensorMeta,
-    _BodyTransformer,
     _build_tensor_annotation,
     _classify_params,
     _collect_annotation_dynamic_dims,
     _collect_dynamic_dims,
     _collect_dynvar_names,
     _infer_return_type,
-    _layout_str,
-    _render_free_value,
+    _unwrap_direction_annotation,
+    build_specialize_context,
     specialize,
+    tile_annotation_fingerprints,
 )
-from pypto.pypto_core import DataType, ir
+from pypto.language.parser.diagnostics import UndefinedVariableError
+from pypto.pypto_core import DataType, ir, passes
+from pypto.runtime.runner import ExecutionMode, RunConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -351,7 +364,7 @@ class TestClassifyParams:
 
 
 # ---------------------------------------------------------------------------
-# _BodyTransformer
+# BodyTransformer
 # ---------------------------------------------------------------------------
 
 
@@ -362,7 +375,7 @@ class TestBodyTransformer:
         func_def = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
         # DynDim info now lives inside tensor_meta.shape — tests inject it there
         # directly when needed (see test_shape_unpack_expanded_dynamic / etc.).
-        transformer = _BodyTransformer(
+        transformer = BodyTransformer(
             tensor_meta=tensor_meta,
             dep_names=dep_names or set(),
         )
@@ -386,6 +399,101 @@ class TestBodyTransformer:
         )
         ast.fix_missing_locations(new_func)
         return ast.unparse(new_func)
+
+    @pytest.mark.parametrize("capture", [False, True])
+    def test_graph_local_task_id_shadow_preserves_folded_shape(self, capture):
+        producer = (
+            "with pl.at(level=pl.Level.CORE_GROUP) as width:\n"
+            "                            pl.store(pl.load(c, [0, 0], [128, 64]), [0, 0], c)"
+            if capture
+            else "width = pl.system.task_dummy(deps=[])"
+        )
+        source = textwrap.dedent(f"""
+            def f(c: pl.InOut[pl.Tensor]):
+                width = c.shape[1]
+                with pl.manual_scope():
+                    with pl.graph("recording"):
+                        {producer}
+                        pl.system.task_dummy(deps=[width])
+                return pl.create_tensor([128, width], dtype=pl.FP32)
+        """)
+        ctx = _make_ctx(
+            "f", source, param_names=["c"], tensor_meta={"c": TensorMeta((128, 64), DataType.FP32)}
+        )
+        function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+        assert function is not None
+        assert isinstance(function.body, ir.SeqStmts)
+        returned = function.body.stmts[-1]
+        assert isinstance(returned, ir.ReturnStmt)
+        (value,) = returned.value
+        result = value.type
+        assert isinstance(result, ir.TensorType)
+        assert isinstance(result.shape[1], ir.ConstInt) and result.shape[1].value == 64
+
+    def test_graph_rebind_prefers_task_id_alias_over_old_folded_shape(self):
+        source = textwrap.dedent("""
+            def f(c: pl.Tensor):
+                with pl.manual_scope():
+                    seed = pl.system.task_dummy(deps=[])
+                    for i in pl.range(1):
+                        ready = c.shape[1]
+                        ready = seed
+                    with pl.graph("recording") as done:
+                        ready = pl.system.task_dummy(deps=[])
+                        pl.system.task_dummy(deps=[ready])
+                    pl.system.task_dummy(deps=[ready, done])
+        """)
+        ctx = _make_ctx(
+            "f", source, param_names=["c"], tensor_meta={"c": TensorMeta((128, 64), DataType.FP32)}
+        )
+        rendered = specialize("Before", [ctx])
+        assert "ready_v2 = pl.system.task_dummy(deps=[])" in rendered
+        assert pl.parse_program(rendered).get_function("f") is not None
+
+    def test_graph_plain_task_id_does_not_replace_outer_alias(self):
+        source = """
+            def f():
+                with pl.manual_scope():
+                    for i in pl.range(1):
+                        seed = pl.system.task_dummy(deps=[])
+                        latest = pl.system.task_dummy(deps=[])
+                        ready = seed
+                        ready = latest
+                    with pl.graph("recording") as done:
+                        ready = pl.system.task_dummy(deps=[])
+                    pl.system.task_dummy(deps=[ready, done])
+        """
+        rendered = specialize("Before", [_make_ctx("f", textwrap.dedent(source))])
+        assert "ready_v2 = pl.system.task_dummy(deps=[])" in rendered
+        assert pl.parse_program(rendered).get_function("f") is not None
+
+    @pytest.mark.parametrize(
+        "rhs",
+        ["recorded", "pl.create_tensor([64, 64], dtype=pl.FP32)", "pl.tensor.reshape(recorded, [32, 128])"],
+    )
+    def test_graph_host_tensor_assignments_can_change_shape(self, rhs):
+        source = textwrap.dedent(f"""
+            def f(first: pl.Tensor, recorded: pl.InOut[pl.Tensor]):
+                for i in pl.range(1):
+                    out = first
+                with pl.graph("recording"):
+                    out = {rhs}
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        pl.store(pl.load(recorded, [0, 0], [64, 64]), [0, 0], recorded)
+                return recorded
+        """)
+        ctx = _make_ctx(
+            "f",
+            source,
+            param_names=["first", "recorded"],
+            tensor_meta={
+                "first": TensorMeta((128, 128), DataType.FP32),
+                "recorded": TensorMeta((64, 64), DataType.FP32),
+            },
+        )
+        rendered = specialize("Before", [ctx])
+        assert "out_v1 =" in rendered
+        assert pl.parse_program(rendered).get_function("f") is not None
 
     def test_bind_dynamic_removed(self):
         src = """
@@ -482,7 +590,7 @@ class TestBodyTransformer:
         src = textwrap.dedent(src)
         tree = ast.parse(src)
         func_def = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
-        transformer = _BodyTransformer(
+        transformer = BodyTransformer(
             tensor_meta=tensor_meta,
             dep_names=set(),
             py_globals=py_globals,
@@ -605,7 +713,7 @@ class TestBodyTransformer:
 
 
 class TestRenderFreeValue:
-    """``_render_free_value`` — the single answer to "can this value be written as source?"."""
+    """``render_free_value`` — the single answer to "can this value be written as source?"."""
 
     @pytest.mark.parametrize(
         "value, expected",
@@ -632,7 +740,7 @@ class TestRenderFreeValue:
         ],
     )
     def test_renders_to_evaluable_source(self, value, expected):
-        rendered = _render_free_value(value)
+        rendered = render_free_value(value)
         assert rendered is not None
         assert ast.unparse(rendered) == expected
 
@@ -649,7 +757,7 @@ class TestRenderFreeValue:
     )
     def test_rendered_source_evaluates_back_to_the_value(self, value, expected):
         """The rendered text is only useful if ``pl`` can evaluate it back."""
-        rendered = _render_free_value(value)
+        rendered = render_free_value(value)
         assert rendered is not None
         assert eval(ast.unparse(rendered), {"pl": pl}) == expected  # noqa: S307
 
@@ -660,11 +768,22 @@ class TestRenderFreeValue:
     )
     def test_declines_values_with_no_source_form(self, value):
         """Declining is the safe answer: the name survives and the parser reports it."""
-        assert _render_free_value(value) is None
+        assert render_free_value(value) is None
+
+    @pytest.mark.parametrize("enum_type", [pld.ReduceOp, pld.NotifyOp, pld.WaitCmp, pld.AtomicType])
+    def test_distributed_enum_members_round_trip(self, enum_type):
+        # AtomicType is shared with pl; its existing canonical spelling stays stable.
+        prefix = "pl" if enum_type is pld.AtomicType else "pld"
+        for member in enum_type:
+            rendered = render_free_value(member)
+            assert rendered is not None
+            source = ast.unparse(rendered)
+            assert source == f"{prefix}.{enum_type.__name__}.{member.name}"
+            assert eval(source, {"pl": pl, "pld": pld}) is member  # noqa: S307
 
     def test_nan_renders_as_a_nan_producing_expression(self):
         """NaN has no literal, but ast.unparse still writes something evaluable."""
-        rendered = _render_free_value(float("nan"))
+        rendered = render_free_value(float("nan"))
         assert rendered is not None
         assert math.isnan(eval(ast.unparse(rendered), {"__builtins__": {}}))  # noqa: S307
 
@@ -675,6 +794,95 @@ class TestRenderFreeValue:
 
 
 class TestSpecializer:
+    @pytest.mark.parametrize("expression", ["math.nan", "math.inf", "-math.inf", "m.inf"])
+    @pytest.mark.parametrize("dtype", [DataType.FP16, DataType.BF16])
+    def test_nonfinite_jit_literal_preserves_operand_dtype(self, expression, dtype):
+        """A raw math constant must infer the same dtype before and after JIT."""
+        ctx = _make_ctx(
+            func_name="kernel",
+            source=f"def kernel(a: pl.Tensor):\n    result = pl.add(a, {expression})\n    return result\n",
+            func_type="opaque",
+            param_names=["a"],
+            tensor_meta={"a": TensorMeta((1, 16), dtype)},
+            auto_scope=False,
+        )
+        ctx.py_globals = {"math": math, "m": math}
+        program = pl.parse(specialize("Nonfinite", [ctx]))
+        assert isinstance(program, ir.Program)
+        func = program.get_function("kernel")
+        assert func is not None and isinstance(func.body, ir.SeqStmts)
+        binding = func.body.stmts[0]
+        assert isinstance(binding, ir.AssignStmt) and isinstance(binding.value, ir.Call)
+        constant = binding.value.args[1]
+        assert isinstance(constant, ir.ConstFloat) and constant.dtype == dtype
+        assert isinstance(binding.value.type, ir.TensorType) and binding.value.type.dtype == dtype
+        ir.assert_structural_equal(program, pl.parse(python_print(program, format=False)))
+
+    @pytest.mark.parametrize("expression", ["math.nan", "math.inf", "-math.inf"])
+    @pytest.mark.parametrize("keyword", [False, True])
+    def test_nonfinite_jit_full_accepts_python_number(self, expression, keyword):
+        """Lossless specialized values must reach full's Python-number slot as numbers."""
+        value_arg = f"value={expression}" if keyword else expression
+        ctx = _make_ctx(
+            func_name="kernel",
+            source=f"def kernel():\n    result = pl.full([1, 16], pl.FP32, {value_arg})\n    return result\n",
+            func_type="opaque",
+            auto_scope=False,
+        )
+        ctx.py_globals = {"math": math}
+        program = pl.parse(specialize("Nonfinite", [ctx]))
+        assert isinstance(program, ir.Program)
+        func = program.get_function("kernel")
+        assert func is not None and isinstance(func.body, ir.SeqStmts)
+        binding = func.body.stmts[0]
+        assert isinstance(binding, ir.AssignStmt) and isinstance(binding.value, ir.Call)
+        constant = binding.value.args[1]
+        assert isinstance(constant, ir.ConstFloat)
+        if expression == "math.nan":
+            assert math.isnan(constant.value)
+        else:
+            assert constant.value == (-math.inf if expression.startswith("-") else math.inf)
+        ir.assert_structural_equal(program, pl.parse(python_print(program, format=False)))
+
+    def test_nonfinite_math_module_is_shadowed_by_runtime_parameter(self):
+        ctx = _make_ctx(
+            func_name="kernel",
+            source="def kernel(math: pl.Tensor):\n    return pl.add(math, math.inf)\n",
+            param_names=["math"],
+            tensor_meta={"math": TensorMeta((32, 32), DataType.FP32)},
+            auto_scope=False,
+        )
+        ctx.py_globals = {"math": math}
+        generated = specialize("Shadowed", [ctx])
+        assert "math.inf" in generated
+
+    @pytest.mark.parametrize(
+        "expression, expected_bits",
+        [
+            ("math.nan", "7ff8000000000000"),
+            ("math.inf", "7ff0000000000000"),
+            ("-math.inf", "fff0000000000000"),
+            ("m.inf", "7ff0000000000000"),
+        ],
+    )
+    def test_nonfinite_jit_constants(self, expression, expected_bits):
+        ctx = _make_ctx(
+            func_name="kernel",
+            source=(
+                "def kernel(a: pl.Tensor):\n"
+                f"    result = pl.add(a, pl.const({expression}, pl.FP32))\n"
+                "    return result\n"
+            ),
+            param_names=["a"],
+            tensor_meta={"a": TensorMeta((32, 32), DataType.FP32)},
+            auto_scope=False,
+        )
+        ctx.py_globals = {"math": math, "m": math}
+        generated = specialize("Nonfinite", [ctx])
+        program = pl.parse(generated)
+        assert isinstance(program, ir.Program)
+        assert expected_bits in python_print(program, format=False)
+
     def _specialize_simple(
         self,
         func_source: str,
@@ -694,6 +902,20 @@ class TestSpecializer:
             auto_scope=auto_scope,
         )
         return specialize("_TestClass", [ctx])
+
+    def test_folded_distributed_enum_adds_import_without_distributed_params(self):
+        ctx = _make_ctx(
+            func_name="kernel",
+            source="def kernel():\n    pld.tensor.allreduce(data, signal, op=REDUCE_OP)\n",
+            func_type="host",
+            param_names=[],
+            tensor_meta={},
+        )
+        ctx.py_globals = {"REDUCE_OP": pld.ReduceOp.Max}
+        source = specialize("_TestClass", [ctx])
+        assert "import pypto.language.distributed as pld" in source
+        assert "op=pld.ReduceOp.Max" in source
+        assert "REDUCE_OP" not in source
 
     def test_generated_has_pl_program(self):
         src = """
@@ -1250,7 +1472,7 @@ class TestSpecializerIntegration:
 
 
 class TestVariableRebinding:
-    """Tests for alpha-renaming of variable rebindings in _BodyTransformer."""
+    """Tests for alpha-renaming of variable rebindings in BodyTransformer."""
 
     def _transform(self, src: str, tensor_meta: dict | None = None) -> str:
         src = textwrap.dedent(src)
@@ -1262,7 +1484,7 @@ class TestVariableRebinding:
             for node in ast.walk(func_def)
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
         }
-        transformer = _BodyTransformer(
+        transformer = BodyTransformer(
             tensor_meta=tensor_meta or {},
             dep_names=set(),
             param_names=param_names,
@@ -1297,6 +1519,37 @@ class TestVariableRebinding:
         out = self._transform(src, tensor_meta={"a": TensorMeta((64,), DataType.FP32)})
         assert "x =" in out
         assert "x_v1" not in out
+
+    def test_chained_assignment_keeps_rhs_snapshot(self):
+        """Chains evaluate once and do not read stale inlined or renamed targets."""
+        src = """
+            def f(a):
+                total = 32
+                total = half = total = observe(total // 2)
+                saved = total + half
+                total = total + 1
+                total = half = observe(a.shape[1])
+                width = a.shape[1]
+                with scope():
+                    width = other = observe(width // 2)
+                return saved, total, half, width, other
+        """
+        transformed = self._transform(src, tensor_meta={"a": TensorMeta((1, 128), DataType.FP32)})
+        calls = []
+
+        def observe(value):
+            calls.append(value)
+            return value
+
+        namespace: dict = {"observe": observe, "scope": nullcontext}
+        exec(transformed, namespace)
+        assert namespace["f"](None) == (32, 128, 128, 64, 64)
+        assert calls == [16, 128, 64]
+        assert all(
+            len(node.targets) == 1
+            for node in ast.walk(ast.parse(transformed))
+            if isinstance(node, ast.Assign)
+        )
 
     def test_rebind_generates_fresh_name(self):
         src = """
@@ -1377,6 +1630,60 @@ class TestVariableRebinding:
         assert "x_v1 = some_call(x)" in out
         assert "y = x_v1" in out
 
+    def test_rebound_tensor_shape_reads_current_value(self):
+        """Dimension arithmetic after a parameter rebind uses its new tensor."""
+        src = """
+            def f(src, other):
+                before = src.shape[1]
+                saved = src
+                with scope():
+                    src = identity(src)
+                    src = saved
+                    restored = src.shape
+                with scope():
+                    src = other
+                    nested = src.shape[1]
+                src = other
+                width = src.shape[1]
+                half = width // 2
+                rows, cols, tail = src.shape
+                whole = src.shape
+                dtype = src.dtype
+                src: object = src
+                annotated = src.shape
+                total = src.shape[0] * width
+                return before, nested, width, half, total, rows, cols, tail, whole, dtype, annotated, restored
+        """
+        transformed = self._transform(
+            src,
+            tensor_meta={
+                "src": TensorMeta((1, 128), DataType.FP32),
+                "other": TensorMeta((4, 64, 2), DataType.FP16),
+            },
+        )
+        namespace = {
+            "pl": SimpleNamespace(
+                tensor=SimpleNamespace(dim=lambda tensor, axis: tensor[axis]), FP16=DataType.FP16
+            ),
+            "scope": nullcontext,
+            "identity": lambda tensor: tensor,
+        }
+        exec(transformed, namespace)
+        assert namespace["f"]((1, 128), (4, 64, 2)) == (
+            128,
+            64,
+            64,
+            32,
+            256,
+            4,
+            64,
+            2,
+            (4, 64, 2),
+            DataType.FP16,
+            (4, 64, 2),
+            (1, 128),
+        )
+
     def test_alias_skips_collision(self):
         """Generated alias skips names already defined by the user."""
         src = """
@@ -1389,6 +1696,40 @@ class TestVariableRebinding:
         # x_v1 is taken by user, so rebinding of x should skip to x_v2
         assert "x_v2 =" in out
         assert "x_v1 = b" in out
+
+    @pytest.mark.parametrize(
+        "context",
+        [
+            'pl.graph("layer", deps=[ready])',
+            "pl.at(level=pl.Level.CORE_GROUP, deps=[ready])",
+            "pl.spmd(1, deps=[ready])",
+        ],
+    )
+    def test_scope_capture_uses_the_existing_emitted_binding(self, context):
+        out = self._transform(f"""
+            def f(seed, latest):
+                ready = seed
+                ready = latest
+                with {context} as ready:
+                    work()
+                consume(deps=[ready])
+        """)
+        function = ast.parse(out).body[0]
+        assert isinstance(function, ast.FunctionDef)
+        assigned, scope, consumer = function.body[1:]
+        assert isinstance(assigned, ast.Assign) and isinstance(assigned.targets[0], ast.Name)
+        assert isinstance(scope, ast.With) and isinstance(scope.items[0].optional_vars, ast.Name)
+        expected = assigned.targets[0].id
+        assert scope.items[0].optional_vars.id == expected, out
+        call = scope.items[0].context_expr
+        assert isinstance(call, ast.Call)
+        deps = next(kw.value for kw in call.keywords if kw.arg == "deps")
+        assert isinstance(deps, ast.List) and isinstance(deps.elts[0], ast.Name)
+        assert deps.elts[0].id == expected, out
+        assert isinstance(consumer, ast.Expr) and isinstance(consumer.value, ast.Call)
+        deps = next(kw.value for kw in consumer.value.keywords if kw.arg == "deps")
+        assert isinstance(deps, ast.List) and isinstance(deps.elts[0], ast.Name)
+        assert deps.elts[0].id == expected, out
 
     def test_if_branch_rebind_not_renamed(self):
         """Assignments inside if branches are not alpha-renamed.
@@ -1441,6 +1782,119 @@ class TestVariableRebinding:
         assert "x_v1 = some_op(x_v1)" in out
         # Final read uses the latest alias
         assert "y = x_v1" in out
+
+    def test_for_induction_shadows_scalar_alias_and_restores_it(self):
+        out = self._transform("""
+            def f(seed):
+                i = seed
+                i = i + 1
+                for i in range(i):
+                    before_inner(i)
+                    for i in range(i):
+                        inner(i)
+                    after_inner(i)
+                after_outer(i)
+        """)
+        assert "for i in range(i_v1):" in out
+        assert "for i in range(i):" in out
+        assert "before_inner(i)" in out
+        assert "inner(i)" in out
+        assert "after_inner(i)" in out
+        assert "after_outer(i_v1)" in out
+
+    def test_for_induction_shadows_folded_shape_and_restores_it(self):
+        out = self._transform(
+            """
+            def f(src):
+                i = src.shape[0]
+                for i in range(i):
+                    consume(i)
+                after(i)
+            """,
+            tensor_meta={"src": TensorMeta(shape=(8, 32), dtype=DataType.FP32)},
+        )
+        assert "for i in range(8):" in out
+        assert "consume(i)" in out
+        assert "after(8)" in out
+
+    @pytest.mark.parametrize("setup", ["", "x = 99; x = x + 1", "x = src.shape[0]"])
+    def test_explicit_while_publishes_yield_binding(self, setup):
+        source = f"""
+            def f(src):
+                {setup}
+                for (x,) in pl.while_(init_values=(0,)):
+                    pl.cond(x < 3)
+                    x = pl.yield_(x + 1)
+                consume(x)
+        """
+        out = self._transform(source, tensor_meta={"src": TensorMeta((8, 32), DataType.FP32)})
+        assert "pl.cond(x < 3)" in out
+        assert "x = pl.yield_(x + 1)" in out
+        assert "consume(x)" in out
+
+    def test_explicit_while_distinct_yield_restores_folded_outer_binding(self):
+        out = self._transform(
+            """
+            def f(src):
+                x = src.shape[0]
+                for (x,) in pl.while_(init_values=(0,)):
+                    pl.cond(x < 3)
+                    result = pl.yield_(x + 1)
+                consume(result, x)
+            """,
+            tensor_meta={"src": TensorMeta((8, 32), DataType.FP32)},
+        )
+        assert "pl.cond(x < 3)" in out
+        assert "result = pl.yield_(x + 1)" in out
+        assert "consume(result, 8)" in out
+
+    def test_conditional_yields_do_not_publish_enclosing_while_carry(self):
+        out = self._transform("""
+            def f():
+                x = 99
+                x = x + 1
+                for (x,) in pl.while_(init_values=(0,)):
+                    pl.cond(x < 3)
+                    if x < 1:
+                        x = pl.yield_(x + 1)
+                    else:
+                        x = pl.yield_(x + 2)
+                    result = pl.yield_(x)
+                consume(x, result)
+        """)
+        # Branch outputs update the carry inside the loop; only result escapes.
+        # Restoring the original spelling x here would read 99 instead of 100.
+        assert "consume(x_v1, result)" in out
+
+    @pytest.mark.parametrize(
+        ("wrapper", "transparent"),
+        [
+            ("if condition:", False),
+            ("for i in pl.range(2):", False),
+            ("while condition:", False),
+            ("with pl.at(pl.Level.CORE_GROUP):", False),
+            ("with pl.scope():", True),
+            ("with pl.manual_scope():", True),
+            ("for i in pl.split_aiv(2):", True),
+        ],
+    )
+    def test_loop_yield_ownership_boundaries(self, wrapper, transparent):
+        source = f"{wrapper}\n    nested = pl.yield_(1)\nresult = pl.yield_(2)"
+        names = BodyTransformer._loop_yield_targets(ast.parse(source).body)
+        assert names == ({"nested", "result"} if transparent else {"result"})
+
+    def test_nested_loop_yield_does_not_publish_outer_induction(self):
+        out = self._transform("""
+            def f(seed):
+                x = seed
+                x = x + 1
+                for x in pl.range(2):
+                    for (x,) in pl.while_(init_values=(0,)):
+                        pl.cond(x < 3)
+                        x = pl.yield_(x + 1)
+                consume(x)
+        """)
+        assert "consume(x_v1)" in out
 
     def test_parallel_for_simple_rebind(self):
         """Two sibling for loops, each a *fresh* (non-loop-carried) local of the
@@ -1705,6 +2159,120 @@ class TestInferReturnType:
         # No out_params at all (bare pl.Tensor params).
         ann = _infer_return_type(func_def, meta, [])
         assert ann == "pl.Tensor[[32, 32], pl.FP32]"
+
+
+class TestSpecializerExternReturnTypes:
+    """Extern declarations keep complete types without changing ordinary DSL inference."""
+
+    @staticmethod
+    def _specialize(
+        annotation: str, body: str = "...", func_type: str = "extern", one_output: bool = False
+    ) -> str:
+        params = "y: pl.Out[pl.Tensor]" if one_output else "y: pl.Out[pl.Tensor], z: pl.Out[pl.Tensor]"
+        ctx = _make_ctx(
+            source=f"def kernel({params}){annotation}:\n    {body}",
+            func_type=func_type,
+            param_names=["y"] if one_output else ["y", "z"],
+            tensor_meta={
+                "y": TensorMeta((16, 16), DataType.INT8),
+                "z": TensorMeta((16, 1), DataType.FP32),
+            },
+        )
+        ctx.external_core_type = "aiv"
+        ctx.external_aiv_source = "kernel.cpp"
+        ctx.py_globals = {"Tuple": vars(typing)["Tuple"], "typing": typing, "pl": pl}
+        return Specializer("Generated", [ctx]).specialize()
+
+    @pytest.mark.parametrize("tuple_name", ["tuple", "Tuple", "typing.Tuple"])
+    def test_complete_tuple_preserves_output_order(self, tuple_name):
+        source = self._specialize(
+            f" -> {tuple_name}[pl.Tensor[[16, 16], pl.INT8], pl.Tensor[[16, 1], pl.FP32]]"
+        )
+        assert "-> tuple[pl.Tensor[[16, 16], pl.INT8], pl.Tensor[[16, 1], pl.FP32]]:" in source
+
+    def test_reordered_outputs_are_rejected(self):
+        # A signature-only declaration has no return-to-parameter mapping. The
+        # consumer metadata and runtime aliases must agree on parameter order.
+        with pytest.raises(ValueError, match="result 0 must match output parameter 'y'"):
+            self._specialize(" -> tuple[pl.Tensor[[16, 1], pl.FP32], pl.Tensor[[16, 16], pl.INT8]]")
+
+    def test_partial_output_return_is_rejected(self):
+        with pytest.raises(ValueError, match="1 results for 2 Out/InOut"):
+            self._specialize(" -> pl.Tensor[[16, 1], pl.FP32]")
+
+    @pytest.mark.parametrize("shape, dtype", [("[32, 16]", "INT8"), ("[16, 16]", "FP32")])
+    def test_incompatible_single_output_type_is_rejected(self, shape, dtype):
+        with pytest.raises(ValueError, match="result 0 must match output parameter 'y'"):
+            self._specialize(f" -> pl.Tensor[{shape}, pl.{dtype}]", one_output=True)
+
+    def test_nested_tuple_value_is_not_flattened(self):
+        with pytest.raises(ValueError, match="single tuple-valued result"):
+            self._specialize(" -> tuple[pl.Tuple[pl.Tensor[[16, 16], pl.INT8]]]")
+
+    @pytest.mark.parametrize("constructor", [False, True])
+    def test_dynamic_inout_and_out_keep_parameter_order(self, constructor):
+        ctx = _make_ctx(
+            source="""
+                def kernel(y: pl.InOut[pl.Tensor], z: pl.Out[pl.Tensor]) -> tuple[
+                    pl.Tensor[[ROWS, 16], pl.INT8], pl.Tensor[[ROWS, 1], pl.FP32]
+                ]: ...
+            """,
+            func_type="extern",
+            param_names=["y", "z"],
+            tensor_meta={
+                "y": TensorMeta((DynDim("ROWS", "rows", 16), 16), DataType.INT8),
+                "z": TensorMeta((DynDim("ROWS", "rows", 16), 1), DataType.FP32),
+            },
+        )
+        ctx.external_core_type = "aiv"
+        ctx.external_aiv_source = "kernel.cpp"
+        if constructor:
+            ctx.source = ctx.source.replace(
+                "pl.Tensor[[ROWS, 16], pl.INT8]", "pl.Tensor([ROWS, 16], pl.INT8)"
+            )
+            ctx.source = ctx.source.replace("pl.Tensor[[ROWS, 1], pl.FP32]", "pl.Tensor([ROWS, 1], pl.FP32)")
+        # The emitted dynamic label must not fold to the unrelated global.
+        ctx.py_globals = {"ROWS": pl.dynamic("rows"), "rows": 128}
+        source = Specializer("Generated", [ctx]).specialize()
+        assert "-> tuple[pl.Tensor[[rows, 16], pl.INT8], pl.Tensor[[rows, 1], pl.FP32]]:" in source
+
+    def test_single_tuple_value_is_not_flattened_into_results(self):
+        with pytest.raises(ValueError, match="single tuple-valued result"):
+            self._specialize(" -> pl.Tuple[pl.Tensor[[16, 16], pl.INT8], pl.Tensor[[16, 1], pl.FP32]]")
+
+    @pytest.mark.parametrize("elements", ["", "pl.Tensor([16, 16], pl.INT8), pl.Tensor([16, 1], pl.FP32)"])
+    def test_legacy_tuple_constructor_is_not_inferred_as_tensor(self, elements):
+        with pytest.raises(ValueError, match="single tuple-valued result"):
+            self._specialize(f" -> 'pl.Tuple([{elements}])'")
+
+    @pytest.mark.parametrize("annotation", ["", " -> pl.Tensor", " -> typing.Tuple"])
+    @pytest.mark.parametrize("one_output", [False, True])
+    def test_legacy_output_inference(self, annotation, one_output):
+        source = self._specialize(annotation, one_output=one_output)
+        if one_output:
+            assert "-> pl.Tensor[[16, 16], pl.INT8]:" in source
+        else:
+            # The public legacy value remains y. The declaration now also
+            # returns z internally so callers can materialize its writeback.
+            assert "-> tuple[pl.Tensor[[16, 16], pl.INT8], pl.Tensor[[16, 1], pl.FP32]]:" in source
+            assert "'external_return_params': [y, z]" in source
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            " -> tuple[pl.Tensor, pl.Tensor]",
+            " -> tuple[pl.Tensor[[16, 16], pl.INT8], pl.Tensor]",
+        ],
+    )
+    def test_incomplete_tuple_still_uses_return_statement(self, annotation):
+        source = self._specialize(annotation, body="return y, z")
+        assert "-> tuple[pl.Tensor[[16, 16], pl.INT8], pl.Tensor[[16, 1], pl.FP32]]:" in source
+
+    def test_ordinary_dsl_return_still_uses_runtime_metadata(self):
+        # An ordinary DSL function specializes its body and return from the
+        # actual call metadata, even when a static annotation says otherwise.
+        source = self._specialize(" -> pl.Tensor[[32, 32], pl.FP32]", body="return y", func_type="incore")
+        assert "-> pl.Tensor[[16, 16], pl.INT8]:" in source
 
 
 class TestSpecializerInlineDeprecation:
@@ -2038,6 +2606,33 @@ class TestArrayParamAnnotation:
         assert "buf: pl.Array[4, pl.BF16]" in out
         assert "BFLOAT16" not in out
 
+    @pytest.mark.parametrize("shadowed", [False, True])
+    def test_array_with_module_alias_and_dtype_constant(self, shadowed):
+        """Original aliases work whether canonical ``pl`` is absent or shadowed."""
+        src = """
+            def kernel(buf: p.Array[4, DTYPE]):
+                return buf
+        """
+        namespace: dict[str, Any] = {"p": pl, "DTYPE": pl.BF16}
+        if shadowed:
+            namespace["pl"] = object()
+        out = self._specialize_with_globals(src, ["buf"], {}, py_globals=namespace)
+        assert "buf: pl.Array[4, pl.BF16]" in out
+
+    def test_annotation_evaluation_respects_original_pl_binding(self):
+        """Canonical rendering must not make an invalid original annotation valid."""
+        src = """
+            def kernel(buf: pl.Array[4, DTYPE]):
+                return buf
+        """
+        out = self._specialize_with_globals(
+            src,
+            ["buf"],
+            {},
+            py_globals={"p": pl, "pl": object(), "DTYPE": pl.BF16},
+        )
+        assert "def kernel(self, buf):" in out
+
     def test_generated_source_is_parseable(self):
         """The generated source is syntactically valid Python and carries no
         bare (unannotated) parameter — the concrete regression guard."""
@@ -2101,6 +2696,857 @@ class TestArrayParamAnnotation:
         assert "x: pl.Array" not in out
 
 
+def _annotation_function(
+    func: Any, annotations: dict[str, Any], annotation_globals: dict[str, Any] | None = None
+) -> types.FunctionType:
+    """Clone annotation bindings without mutating the defining module's globals."""
+    clone = types.FunctionType(
+        func.__code__, {**func.__globals__, **(annotation_globals or {})}, func.__name__
+    )
+    clone.__annotations__ = annotations
+    return clone
+
+
+def _inline_context(
+    func: Any,
+    *,
+    tensor_meta: dict[str, TensorMeta] | None = None,
+    constexpr_values: dict[str, str] | None = None,
+) -> SpecializeContext:
+    """Build an inline annotation context without unrelated caller metadata."""
+    return build_specialize_context(
+        func,
+        func.__name__,
+        "inline",
+        None,
+        tensor_meta or {},
+        {},
+        [],
+        auto_scope=False,
+        constexpr_values=constexpr_values,
+    )
+
+
+def _specialized_function(ctx: SpecializeContext, source: str | None = None) -> ir.Function:
+    """Parse generated annotation source and retrieve its typed function."""
+    program = pl.parse(source if source is not None else specialize("_TestClass", [ctx]))
+    assert isinstance(program, ir.Program)
+    func = program.get_function(ctx.func_name)
+    assert func is not None
+    return func
+
+
+class TestInlineTileParamAnnotations:
+    """Explicit Tile parameters must survive JIT signature specialization."""
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "pl",
+            "pld",
+            "class",
+            "for",
+            "__debug__",
+            "\uff50\uff4c",
+            "\U0001d699\U0001d695",
+            "\uff50\uff4c\uff44",
+            "\uff43\uff4c\uff41\uff53\uff53",
+            "\uff2d",
+            "\U0001d474",
+        ],
+    )
+    @pytest.mark.parametrize("postponed", [False, True])
+    def test_unsafe_dynamic_labels_rejected_before_source_emission(self, label, postponed):
+        """Canonical Tile symbols cannot overwrite DSL imports or invalidate Python syntax."""
+        dimension = pl.dynamic(label)
+
+        def keep_tile(tile: pl.Tile[[dimension, 64], pl.FP32]):
+            return tile
+
+        helper = keep_tile
+        if postponed:
+            helper = _annotation_function(
+                keep_tile, {"tile": "pl.Tile[[dimension, 64], pl.FP32]"}, {"dimension": dimension}
+            )
+        with pytest.raises(ValueError, match=rf"dynamic symbol.*'{label}'.*different"):
+            ctx = _inline_context(helper)
+            specialize("_TestClass", [ctx])
+
+    @pytest.mark.parametrize("label", ["class", "for", "__debug__"])
+    @pytest.mark.parametrize("metadata", [False, True], ids=["shape", "metadata"])
+    def test_parameterized_annotation_fingerprint_rejects_keyword_label(self, label, metadata):
+        """Cache rendering diagnoses an invalid free label before parsing canonical source."""
+        dimension = pl.dynamic(label)
+
+        def keep_tile(tile, ROWS):
+            return tile
+
+        component = (
+            "[[ROWS, 64], pl.FP32, pl.TileView(valid_shape=[dimension, 64])]"
+            if metadata
+            else "[[ROWS, dimension], pl.FP32]"
+        )
+        helper = _annotation_function(
+            keep_tile, {"tile": f"pl.Tile{component}", "ROWS": "pl.constexpr"}, {"dimension": dimension}
+        )
+        with pytest.raises(ValueError, match=rf"dynamic symbol.*'{label}'.*different"):
+            tile_annotation_fingerprints(helper)
+
+    @pytest.mark.parametrize(
+        "label",
+        ["match", "case", "type", "_pypto_tile_param_0", "__name__", "__builtins__", "\u884c", "\u03b1"],
+    )
+    def test_safe_dynamic_labels_still_parse(self, label):
+        """Soft keywords and internal-looking user symbols remain legal declarations."""
+        dimension = pl.dynamic(label)
+
+        def keep_tile(tile: pl.Tile[[dimension, 64], pl.FP32]):
+            return tile
+
+        ctx = _inline_context(keep_tile)
+        source = specialize("_TestClass", [ctx])
+        assert f'{label} = pl.dynamic("{label}")' in source
+        helper = _specialized_function(ctx, source)
+        tile_type = helper.params[0].type
+        assert isinstance(tile_type, ir.TileType)
+        assert isinstance(tile_type.shape[0], ir.Var)
+        assert tile_type.shape[0].name_hint == label
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "pl",
+            "pld",
+            "class",
+            "__debug__",
+            "\uff50\uff4c",
+            "\uff43\uff4c\uff41\uff53\uff53",
+            "match",
+            "\u884c",
+        ],
+    )
+    def test_dynamic_label_validation_through_jit_compile(self, label):
+        """The public compile path rejects unsafe labels and compiles a legal soft keyword."""
+        dimension = pl.dynamic(label)
+
+        def compile_entry():
+            @pl.jit.inline(auto_scope=False)
+            def keep_tile(tile: pl.Tile[[dimension, 64], pl.FP32]):
+                return tile
+
+            @pl.jit.incore
+            def copy_incore(src: pl.Tensor[[8, 64], pl.FP32], dst: pl.Out[pl.Tensor[[8, 64], pl.FP32]]):
+                tile = pl.load(src, [0, 0], [8, 64])
+                kept = keep_tile(tile)
+                return pl.store(kept, [0, 0], dst)
+
+            @pl.jit
+            def entry(src: pl.Tensor[[8, 64], pl.FP32], dst: pl.Out[pl.Tensor[[8, 64], pl.FP32]]):
+                return copy_incore(src, dst)
+
+            return entry.compile(
+                config=RunConfig(
+                    backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.SIM, codegen_only=True
+                )
+            )
+
+        if label not in {"match", "\u884c"}:
+            with pytest.raises(ValueError, match=rf"dynamic symbol.*'{label}'.*different"):
+                compile_entry()
+            return
+        assert compile_entry() is not None
+
+    @pytest.mark.parametrize("label", ["not-valid", "bad label"])
+    def test_invalid_native_annotation_symbol_has_clear_diagnostic(self, label):
+        """Prebuilt IR metadata cannot bypass the generated-identifier validation."""
+        dimension = pl.Scalar(expr=ir.Var(label, ir.ScalarType(pl.INDEX), ir.Span.unknown()))
+
+        def keep_tile(tile: pl.Tile[[8, 64], pl.FP32, pl.TileView(valid_shape=[dimension, 64])]):
+            return tile
+
+        with pytest.raises(ValueError, match=rf"dynamic symbol.*'{label}'.*different"):
+            _inline_context(keep_tile)
+
+    @pytest.mark.parametrize("literal", ["pl", "__debug__"])
+    def test_tensor_alias_with_reserved_literal_keeps_its_safe_binding(self, literal):
+        """A safe emitted Tensor alias is distinct from the DynVar's internal literal."""
+        ctx = _make_ctx(
+            "entry",
+            "def entry(src: pl.Tensor):\n    return src",
+            param_names=["src"],
+            tensor_meta={"src": TensorMeta((DynDim("ROWS", literal, 8), 64), DataType.FP32)},
+            auto_scope=False,
+        )
+        source = specialize("_TestClass", [ctx])
+        assert f'ROWS = pl.dynamic("{literal}")' in source
+        program = pl.parse(source)
+        assert isinstance(program, ir.Program)
+
+    @pytest.mark.parametrize("postponed", [False, True])
+    @pytest.mark.parametrize("symbol_name", ["tile", "anchor"])
+    def test_generic_tile_symbol_can_match_nonscalar_parameter(self, postponed, symbol_name):
+        """Shape globals remain needed even when an earlier parameter has the same name."""
+        ROWS = pl.dynamic(symbol_name)
+
+        def keep_tile(
+            anchor: pl.Tensor[[8, 64], pl.FP32],
+            tile: pl.Tile[[ROWS, 64], pl.FP32],
+            other: pl.Tile[[ROWS, 64], pl.FP32],
+        ):
+            return tile
+
+        helper = keep_tile
+        if postponed:
+            helper = _annotation_function(
+                keep_tile,
+                {
+                    "anchor": "pl.Tensor[[8, 64], pl.FP32]",
+                    "tile": "pl.Tile[[ROWS, 64], pl.FP32]",
+                    "other": "pl.Tile[[ROWS, 64], pl.FP32]",
+                },
+                {"ROWS": ROWS},
+            )
+        ctx = _inline_context(helper, tensor_meta={"anchor": TensorMeta((8, 64), DataType.FP32)})
+        source = specialize("_TestClass", [ctx])
+        assert f'{symbol_name} = pl.dynamic("{symbol_name}")' in source
+        func = _specialized_function(ctx, source)
+        for param in func.params[1:]:
+            tile_type = param.type
+            assert isinstance(tile_type, ir.TileType)
+            assert isinstance(tile_type.shape[0], ir.Var)
+            assert isinstance(tile_type.shape[0].type, ir.ScalarType)
+            assert tile_type.shape[0].name_hint == symbol_name
+
+    @pytest.mark.parametrize("postponed", [False, True])
+    def test_scalar_dimension_matching_parameter_stays_local(self, postponed):
+        """A real Scalar supplies the dimension and must not be shadowed by a new global."""
+        tile = pl.dynamic("tile")
+
+        def keep_tile(tile: pl.Scalar[pl.INDEX], value: pl.Tile[[tile, 64], pl.FP32]):
+            return value
+
+        helper = keep_tile
+        if postponed:
+            helper = _annotation_function(
+                keep_tile,
+                {"tile": "pl.Scalar[pl.INDEX]", "value": "pl.Tile[[tile, 64], pl.FP32]"},
+                {"tile": tile},
+            )
+        ctx = _inline_context(helper)
+        source = specialize("_TestClass", [ctx])
+        assert 'tile = pl.dynamic("tile")' not in source
+        func = _specialized_function(ctx, source)
+        tile_type = func.params[1].type
+        assert isinstance(tile_type, ir.TileType)
+        assert ir.structural_equal(tile_type.shape[0], func.params[0])
+
+    @pytest.mark.parametrize("rows", [8, 16])
+    @pytest.mark.parametrize("mixed_axes", [False, True])
+    def test_free_dynvar_name_is_not_a_constexpr_reference(self, rows, mixed_axes):
+        """Canonical free-symbol spelling must not turn into a helper parameter use."""
+        M = pl.dynamic("ROWS")
+        ROWS = 99
+        if mixed_axes:
+
+            def keep_tile(tile: pl.Tile[[M, ROWS], pl.FP32], ROWS: pl.constexpr):
+                return tile
+
+        else:
+
+            def keep_tile(tile: pl.Tile[[M, 64], pl.FP32], ROWS: pl.constexpr):
+                return tile
+
+        ctx = _inline_context(keep_tile, constexpr_values={"ROWS": str(rows)})
+        func = _specialized_function(ctx)
+        tile_type = func.params[0].type
+        assert isinstance(tile_type, ir.TileType)
+        assert isinstance(tile_type.shape[0], ir.Var)
+        assert tile_type.shape[0].name_hint == "ROWS"
+        assert isinstance(tile_type.shape[1], ir.ConstInt)
+        assert tile_type.shape[1].value == (rows if mixed_axes else 64)
+
+    def test_parameter_marker_avoids_folded_free_symbol_names(self):
+        """A free alias may use the marker prefix even when eager math folds it away."""
+        M = pl.dynamic("_pypto_tile_param_0")
+        ROWS = 0
+
+        def keep_tile(tile: pl.Tile[[ROWS * M, 64], pl.FP32], ROWS: pl.constexpr):
+            return tile
+
+        # This hygiene case requires a source-evaluable free operand. A
+        # factory-only operand erased inside a product is diagnosed separately.
+        helper = _annotation_function(keep_tile, keep_tile.__annotations__, {"M": M})
+        ctx = _inline_context(helper, constexpr_values={"ROWS": "8"})
+        func = _specialized_function(ctx)
+        span = ir.Span.unknown()
+        ir.assert_structural_equal(
+            func.params[0].type,
+            ir.TileType(
+                [ir.ConstInt(8, DataType.INDEX, span) * M.unwrap(), ir.ConstInt(64, DataType.INDEX, span)],
+                DataType.FP32,
+            ),
+            enable_auto_mapping=True,
+        )
+
+    @pytest.mark.parametrize("postponed", [False, True])
+    def test_distinct_free_symbol_matching_scalar_name_is_diagnosed(self, postponed):
+        """Separate free and local dimensions cannot silently share one emitted name."""
+        M = pl.dynamic("tile")
+        tile = 99
+
+        def keep_tile(tile: pl.Scalar[pl.INDEX], value: pl.Tile[[M, tile], pl.FP32]):
+            return value
+
+        helper = keep_tile
+        if postponed:
+            helper = _annotation_function(
+                keep_tile, {"tile": "pl.Scalar[pl.INDEX]", "value": "pl.Tile[[M, tile], pl.FP32]"}, {"M": M}
+            )
+        with pytest.raises(ValueError, match="Free dynamic symbol 'tile'.*Scalar parameter"):
+            ctx = _inline_context(helper)
+            specialize("_TestClass", [ctx])
+
+    @pytest.mark.parametrize("postponed", [False, True])
+    def test_scalar_metadata_override_keeps_true_local_binding(self, postponed):
+        """A raw ambient view is replaced before checking the genuine Scalar dimension."""
+        count = pl.dynamic("count")
+
+        def keep_tile(
+            count: pl.Scalar[pl.INDEX],
+            tile: pl.Tile[
+                [8, 64], pl.FP32, pl.TileView(valid_shape=[count, 64], start_offset=count.unwrap())
+            ],
+        ):
+            return tile
+
+        helper = keep_tile
+        if postponed:
+            helper = _annotation_function(
+                keep_tile,
+                {
+                    "count": "pl.Scalar[pl.INDEX]",
+                    "tile": "pl.Tile[[8, 64], pl.FP32, "
+                    "pl.TileView(valid_shape=[count, 64], start_offset=count.unwrap())]",
+                },
+            )
+        ctx = _inline_context(helper)
+        source = specialize("_TestClass", [ctx])
+        assert 'count = pl.dynamic("count")' not in source
+        func = _specialized_function(ctx, source)
+        tile_type = func.params[1].type
+        assert isinstance(tile_type, ir.TileType)
+        assert tile_type.tile_view is not None
+        assert ir.structural_equal(tile_type.tile_view.valid_shape[0], func.params[0])
+        assert tile_type.tile_view.start_offset is not None
+        assert ir.structural_equal(tile_type.tile_view.start_offset, func.params[0])
+
+    def test_direction_wrapper_unwrap_uses_object_identity(self):
+        source = "Direction[pl.Tile[[8, 64], pl.FP32]]"
+        for wrapper in (pl.Out, pl.InOut):
+            node = _unwrap_direction_annotation(ast.parse(source, mode="eval").body, {"Direction": wrapper})
+            assert ast.unparse(node) == "pl.Tile[[8, 64], pl.FP32]"
+        # An unrelated object named InOut has no DSL passthrough contract.
+        source = "InOut[pl.Tile[[8, 64], pl.FP32]]"
+        node = _unwrap_direction_annotation(ast.parse(source, mode="eval").body, {"InOut": object()})
+        assert ast.unparse(node) == source
+
+    @pytest.mark.parametrize("dtype", ["FP32", "BF16"])
+    @pytest.mark.parametrize("func_type", ["inline", "incore"])
+    def test_explicit_tile_annotation_preserved(self, dtype, func_type):
+        ctx = _make_ctx(
+            "keep_tile",
+            f"""
+                def keep_tile(tile: pl.Tile[[8, 64], pl.{dtype}, pl.MemorySpace.Vec]) -> pl.Tile:
+                    return tile
+            """,
+            func_type=func_type,
+            param_names=["tile"],
+            auto_scope=False,
+        )
+        ctx.py_globals = {"pl": pl}
+
+        func = _specialized_function(ctx)
+        assert func.func_type == (ir.FunctionType.Inline if func_type == "inline" else ir.FunctionType.InCore)
+        assert len(func.params) == 1
+        ir.assert_structural_equal(
+            func.params[0].type,
+            ir.TileType([8, 64], getattr(DataType, dtype), memory_space=ir.MemorySpace.Vec),
+        )
+
+    @pytest.mark.parametrize(
+        "tile_name,view_name,memref_name,space_name",
+        [
+            ("p.Tile", "p.TileView", "p.MemRef", "p.Mem.Vec"),
+            ("Tile", "View", "Ref", "MS.Vec"),
+        ],
+    )
+    def test_aliases_render_canonically_without_losing_metadata(
+        self, tile_name, view_name, memref_name, space_name
+    ):
+        """Aliases disappear from generated source while the full Tile contract remains."""
+        ctx = _make_ctx(
+            "keep_tile",
+            f"""
+                def keep_tile(tile: {tile_name}[[8, 64], DTYPE,
+                              {memref_name}("tile_buffer", 64, 2048), {space_name},
+                              {view_name}(valid_shape=[3, 64], stride=[64, 1], start_offset=0,
+                                          pad=p.PadValue.zero, compact=p.CompactMode.normal)]):
+                    return tile
+            """,
+            func_type="inline",
+            param_names=["tile"],
+            auto_scope=False,
+        )
+        ctx.py_globals = {
+            "p": pl,
+            "pl": object(),
+            "Tile": pl.Tile,
+            "View": pl.TileView,
+            "Ref": pl.MemRef,
+            "MS": pl.Mem,
+            "DTYPE": pl.BF16,
+        }
+
+        source = specialize("_TestClass", [ctx])
+        assert "tile: pl.Tile[[8, 64], pl.BF16," in source
+        assert "pl.TileView(" in source and "pl.MemRef(" in source
+        func = _specialized_function(ctx, source)
+        expected_type = ir.TileType(
+            [8, 64],
+            DataType.BF16,
+            memref=ir.MemRef("tile_buffer", 64, 2048),
+            tile_view=ir.TileView(
+                valid_shape=[3, 64],
+                stride=[64, 1],
+                start_offset=ir.ConstInt(0, DataType.INDEX, ir.Span.unknown()),
+                pad=ir.PadValue.zero,
+                compact=ir.CompactMode.normal,
+            ),
+            memory_space=ir.MemorySpace.Vec,
+        )
+        ir.assert_structural_equal(func.params[0].type, expected_type, enable_auto_mapping=True)
+
+    @pytest.mark.parametrize("shadowed", [False, True])
+    def test_eager_factory_annotation_keeps_original_local_value(self, monkeypatch, shadowed):
+        """An annotation-only local cannot be recovered from globals or closure cells."""
+
+        def factory(tile_rows):
+            dtype = pl.BF16
+            allocation = pl.MemRef("tile_buffer", 64, 2048)
+            view = pl.TileView(valid_shape=[3, 64], stride=[64, 1], start_offset=0, pad=pl.PadValue.zero)
+
+            def keep_tile(tile: pl.Tile[[tile_rows, 64], dtype, allocation, pl.Mem.Vec, view]):
+                return tile
+
+            return keep_tile
+
+        helper = factory(8)
+        assert not helper.__code__.co_freevars
+        if shadowed:
+            # A same-named module global must not replace the local value that
+            # Python already used when it evaluated the eager annotation.
+            monkeypatch.setitem(helper.__globals__, "tile_rows", 99)
+        ctx = _inline_context(helper)
+        func = _specialized_function(ctx)
+        original = helper.__annotations__["tile"]
+        expected = ir.TileType(
+            original.shape,
+            original.dtype,
+            memref=original.memref,
+            tile_view=original.tile_view,
+            memory_space=original.memory_space,
+        )
+        ir.assert_structural_equal(func.params[0].type, expected, enable_auto_mapping=True)
+
+    def test_eager_generic_tile_normalizes_static_axes(self):
+        """An evaluated [M, 64] mixes a DynVar and an int before IR normalization."""
+        M = pl.dynamic("M")
+
+        def keep_tile(tile: pl.Tile[[M, 64], pl.FP32, pl.Mem.Vec]):
+            return tile
+
+        def entry(src: pl.Tensor[[M, 64], pl.FP32]):
+            return src
+
+        helper_ctx = _inline_context(keep_tile)
+        entry_ctx = build_specialize_context(
+            entry,
+            "entry",
+            "orchestration",
+            None,
+            {"src": TensorMeta((DynDim("M", "M", 8), 64), DataType.FP32)},
+            {},
+            [],
+        )
+        source = specialize("_TestClass", [helper_ctx, entry_ctx])
+        assert 'M = pl.dynamic("M")' in source
+        helper = _specialized_function(helper_ctx, source)
+        tile_type = helper.params[0].type
+        assert isinstance(tile_type, ir.TileType)
+        assert isinstance(tile_type.shape[0], ir.Var)
+        assert tile_type.shape[0].name_hint == "M"
+        assert isinstance(tile_type.shape[1], ir.ConstInt)
+        assert tile_type.shape[1].value == 64
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            "pl.Tile[[ROWS, 64], pl.FP32, pl.Mem.Vec]",
+            "pl.Tile[[8, 64], pl.FP32, pl.Mem.Vec, "
+            "pl.TileView(valid_shape=[ROWS, 64], stride=[ROWS * 64, 1], start_offset=0)]",
+        ],
+        ids=["physical-shape", "tile-view"],
+    )
+    def test_source_tile_only_dynvars_use_canonical_names(self, annotation):
+        """Tile-only symbols need declarations and may use a different Python alias."""
+        ctx = _make_ctx(
+            "keep_tile",
+            f"""
+                def keep_tile(tile: {annotation}):
+                    return tile
+            """,
+            func_type="inline",
+            param_names=["tile"],
+            auto_scope=False,
+        )
+        ctx.py_globals = {"pl": pl, "ROWS": pl.dynamic("TILE_ROWS")}
+
+        source = specialize("_TestClass", [ctx])
+        assert 'TILE_ROWS = pl.dynamic("TILE_ROWS")' in source
+        helper = _specialized_function(ctx, source)
+        tile_type = helper.params[0].type
+        assert isinstance(tile_type, ir.TileType)
+        assert "TILE_ROWS" in ir.python_print_type(tile_type)
+
+    def test_eager_factory_tile_view_declares_its_symbols(self):
+        """Dynamic eager metadata retains its factory-only symbol and canonical name."""
+
+        def factory():
+            rows = pl.dynamic("TILE_VALID_ROWS")
+            view = pl.TileView(valid_shape=[rows, 64], stride=[rows * 64, 1], start_offset=rows.unwrap())
+
+            def keep_tile(tile: pl.Tile[[8, 64], pl.FP32, pl.Mem.Vec, view]):
+                return tile
+
+            return keep_tile
+
+        helper = factory()
+        assert not helper.__code__.co_freevars
+        ctx = _inline_context(helper)
+        source = specialize("_TestClass", [ctx])
+        assert 'TILE_VALID_ROWS = pl.dynamic("TILE_VALID_ROWS")' in source
+        func = _specialized_function(ctx, source)
+        assert "TILE_VALID_ROWS" in ir.python_print_type(func.params[0].type)
+
+    @pytest.mark.parametrize("dynamic", [False, True])
+    def test_source_tile_aggregate_and_metadata_constants_are_canonical(self, dynamic):
+        """Evaluated generic shapes and metadata cannot remain undefined aliases."""
+        dimension = pl.dynamic("TILE_ROWS") if dynamic else 8
+        allocation = pl.MemRef("tile_buffer", 64, 4096)
+        view = pl.TileView(valid_shape=[3, 64], stride=[64, 1], start_offset=0, pad=pl.PadValue.zero)
+        ctx = _make_ctx(
+            "keep_tile",
+            """
+                def keep_tile(tile: pl.Tile[SHAPE, DTYPE, ALLOCATION, SPACE, VIEW]):
+                    return tile
+            """,
+            func_type="inline",
+            param_names=["tile"],
+            auto_scope=False,
+        )
+        ctx.py_globals = {
+            "pl": pl,
+            "SHAPE": [dimension, 64],
+            "DTYPE": pl.BF16,
+            "ALLOCATION": allocation,
+            "SPACE": pl.Mem.Vec,
+            "VIEW": view,
+        }
+
+        source = specialize("_TestClass", [ctx])
+        if dynamic:
+            assert 'TILE_ROWS = pl.dynamic("TILE_ROWS")' in source
+        assert not any(name in source for name in ("SHAPE", "DTYPE", "SPACE", "ALLOCATION", "VIEW"))
+        helper = _specialized_function(ctx, source)
+        shape = (
+            [dimension.unwrap(), ir.ConstInt(64, DataType.INDEX, ir.Span.unknown())]
+            if isinstance(dimension, pl.Scalar)
+            else [dimension, 64]
+        )
+        ir.assert_structural_equal(
+            helper.params[0].type,
+            ir.TileType(
+                shape,
+                DataType.BF16,
+                memref=allocation,
+                tile_view=view,
+                memory_space=ir.MemorySpace.Vec,
+            ),
+            enable_auto_mapping=True,
+        )
+
+    @pytest.mark.parametrize("ambient", [False, True])
+    def test_scalar_tile_dimension_stays_in_function_scope(self, ambient):
+        """A runtime Scalar dimension is a formal, not a frozen or module-level symbol."""
+        ctx = _make_ctx(
+            "keep_tile",
+            """
+                def keep_tile(ROWS: pl.Scalar[pl.INDEX], tile: pl.Tile[[ROWS, 64], pl.FP32]):
+                    return tile
+            """,
+            func_type="inline",
+            param_names=["ROWS", "tile"],
+            auto_scope=False,
+        )
+        ctx.py_globals = {"pl": pl}
+        if ambient:
+            ctx.py_globals["ROWS"] = 8
+
+        source = specialize("_TestClass", [ctx])
+        assert 'ROWS = pl.dynamic("ROWS")' not in source
+        assert "tile: pl.Tile[[ROWS, 64], pl.FP32]" in source
+        helper = _specialized_function(ctx, source)
+        tile_type = helper.params[1].type
+        assert isinstance(tile_type, ir.TileType)
+        assert ir.structural_equal(tile_type.shape[0], helper.params[0])
+
+    @pytest.mark.parametrize("rows", [8, 16])
+    def test_eager_annotation_does_not_freeze_helper_constexpr(self, rows):
+        """Eager evaluation happens before calls and cannot select a constexpr variant."""
+        ROWS = 99
+
+        def keep_tile(tile: pl.Tile[[ROWS, 64], pl.FP32, pl.Mem.Vec], ROWS: pl.constexpr):
+            return tile
+
+        ctx = _inline_context(keep_tile, constexpr_values={"ROWS": str(rows)})
+        func = _specialized_function(ctx)
+        ir.assert_structural_equal(
+            func.params[0].type,
+            ir.TileType([rows, 64], DataType.FP32, memory_space=ir.MemorySpace.Vec),
+        )
+
+    @pytest.mark.parametrize("rows", [8, 16])
+    @pytest.mark.parametrize("valid_rows", [3, 8])
+    @pytest.mark.parametrize("direction", ["bare", "Out", "InOut"])
+    def test_eager_factory_constants_coexist_with_constexpr_axes(self, rows, valid_rows, direction):
+        """An erased factory column and metadata survive a per-call row binding."""
+        ROWS = 8
+
+        def factory(cols):
+            dtype = pl.BF16
+            allocation = pl.MemRef("tile_buffer", 64, 2048)
+            # A full ambient view must retain eight valid rows when the
+            # per-call physical shape later grows to sixteen.
+            view = pl.TileView(valid_shape=[valid_rows, cols], stride=[cols, 1], start_offset=0)
+
+            if direction == "Out":
+
+                def keep_tile(
+                    tile: pl.Out[pl.Tile[[ROWS, cols], dtype, allocation, pl.Mem.Vec, view]],
+                    ROWS: pl.constexpr,
+                ):
+                    return tile
+
+            elif direction == "InOut":
+
+                def keep_tile(
+                    tile: pl.InOut[pl.Tile[[ROWS, cols], dtype, allocation, pl.Mem.Vec, view]],
+                    ROWS: pl.constexpr,
+                ):
+                    return tile
+
+            else:
+
+                def keep_tile(
+                    tile: pl.Tile[[ROWS, cols], dtype, allocation, pl.Mem.Vec, view], ROWS: pl.constexpr
+                ):
+                    return tile
+
+            return keep_tile
+
+        helper = factory(64)
+        assert not helper.__code__.co_freevars
+        ctx = _inline_context(helper, constexpr_values={"ROWS": str(rows)})
+        func = _specialized_function(ctx)
+        original = helper.__annotations__["tile"]
+        ir.assert_structural_equal(
+            func.params[0].type,
+            ir.TileType(
+                [rows, 64],
+                DataType.BF16,
+                memref=original.memref,
+                tile_view=original.tile_view,
+                memory_space=original.memory_space,
+            ),
+            enable_auto_mapping=True,
+        )
+
+    @pytest.mark.parametrize("space", [pl.Mem.Vec, pl.Mem.Mat])
+    @pytest.mark.parametrize("position", ["first", "last"])
+    def test_eager_factory_shape_keeps_constexpr_memory_space(self, space, position):
+        """Metadata source order cannot lose an erased factory shape or duplicate SPACE."""
+        SPACE = pl.Mem.Vec
+
+        def factory(rows):
+            allocation = pl.MemRef("buffer", 0, 4096)
+            view = pl.TileView(valid_shape=[3, 64])
+            if position == "first":
+
+                def keep_tile(
+                    tile: pl.Tile[[rows, 64], pl.FP32, SPACE, allocation, view],
+                    SPACE: pl.constexpr,
+                ):
+                    return tile
+
+            else:
+
+                def keep_tile(
+                    tile: pl.Tile[[rows, 64], pl.FP32, view, allocation, SPACE],
+                    SPACE: pl.constexpr,
+                ):
+                    return tile
+
+            return keep_tile
+
+        helper = factory(8)
+        assert not helper.__code__.co_freevars
+        ctx = _inline_context(helper, constexpr_values={"SPACE": f"pl.Mem.{space.name}"})
+        func = _specialized_function(ctx)
+        original = helper.__annotations__["tile"]
+        ir.assert_structural_equal(
+            func.params[0].type,
+            ir.TileType(
+                [8, 64],
+                DataType.FP32,
+                memref=original.memref,
+                tile_view=original.tile_view,
+                memory_space=space,
+            ),
+            enable_auto_mapping=True,
+        )
+
+    @pytest.mark.parametrize("symbol_name", ["NEW_VALID_COLS", "tile"])
+    def test_metadata_override_declares_rebound_dynvar_alias(self, symbol_name):
+        """The active override can contain symbols absent from the original eager value."""
+        VALID = 3
+        dimension = pl.dynamic("OLD_VALID_COLS")
+
+        def keep_tile(
+            tile: pl.Tile[[8, 64], pl.FP32, pl.TileView(valid_shape=[VALID, dimension])], VALID: pl.constexpr
+        ):
+            return tile
+
+        raw = _annotation_function(keep_tile, keep_tile.__annotations__, {"dimension": dimension})
+        raw.__globals__["dimension"] = pl.dynamic(symbol_name)
+        ctx = _inline_context(raw, constexpr_values={"VALID": "4"})
+        source = specialize("_TestClass", [ctx])
+        assert f'{symbol_name} = pl.dynamic("{symbol_name}")' in source
+        func = _specialized_function(ctx, source)
+        tile_type = func.params[0].type
+        assert isinstance(tile_type, ir.TileType)
+        assert tile_type.tile_view is not None
+        assert isinstance(tile_type.tile_view.valid_shape[0], ir.ConstInt)
+        assert tile_type.tile_view.valid_shape[0].value == 4
+        assert isinstance(tile_type.tile_view.valid_shape[1], ir.Var)
+        assert tile_type.tile_view.valid_shape[1].name_hint == symbol_name
+
+    def test_metadata_override_rejects_kind_change(self):
+        """A different kind cannot leave the original eager metadata silently attached."""
+        USE_VIEW = False
+
+        def factory(rows):
+            def keep_tile(
+                tile: pl.Tile[
+                    [rows, 64], pl.FP32, pl.TileView(valid_shape=[3, 64]) if USE_VIEW else pl.Mem.Vec
+                ],
+                USE_VIEW: pl.constexpr,
+            ):
+                return tile
+
+            return keep_tile
+
+        ctx = _inline_context(factory(8), constexpr_values={"USE_VIEW": "True"})
+        with pytest.raises(ValueError, match="must retain its original MemorySpace kind, got TileView"):
+            specialize("_TestClass", [ctx])
+
+    @pytest.mark.parametrize("metadata_name_collision", [False, True])
+    def test_eager_mixed_axis_rejects_unrecoverable_factory_operand(self, metadata_name_collision):
+        """The eager sum cannot reveal a lost operand after ROWS is rebound."""
+        ROWS = 99
+
+        def factory(padding):
+            # An unrelated metadata DynVar with the erased operand's name
+            # cannot stand in for that numeric factory value.
+            valid_rows = pl.dynamic("padding") if metadata_name_collision else 3
+            view = pl.TileView(valid_shape=[valid_rows, 64])
+
+            def keep_tile(tile: pl.Tile[[ROWS + padding, 64], pl.FP32, view], ROWS: pl.constexpr):
+                return tile
+
+            return keep_tile
+
+        helper = factory(3)
+        assert not helper.__code__.co_freevars
+        with pytest.raises(ValueError, match="Cannot recover.*padding.*ROWS \\+ padding"):
+            _inline_context(helper, constexpr_values={"ROWS": "8"})
+
+    def test_eager_factory_axis_keeps_runtime_scalar_in_local_scope(self):
+        """Replacing an ambient generic axis must not declare its obsolete symbol."""
+        ROWS = pl.dynamic("AMBIENT_ROWS")
+
+        def factory(cols):
+            def keep_tile(ROWS: pl.Scalar[pl.INDEX], tile: pl.Tile[[ROWS, cols], pl.FP32]):
+                return tile
+
+            return keep_tile
+
+        helper = factory(64)
+        assert not helper.__code__.co_freevars
+        ctx = _inline_context(helper)
+        source = specialize("_TestClass", [ctx])
+        assert "AMBIENT_ROWS" not in source
+        assert 'ROWS = pl.dynamic("ROWS")' not in source
+        func = _specialized_function(ctx, source)
+        tile_type = func.params[1].type
+        assert isinstance(tile_type, ir.TileType)
+        assert ir.structural_equal(tile_type.shape[0], func.params[0])
+        assert isinstance(tile_type.shape[1], ir.ConstInt)
+        assert tile_type.shape[1].value == 64
+
+    @pytest.mark.parametrize(
+        "rows,alias,shadowed",
+        [(4, "pl", False), (4, "pl", True), (8, "pl", False), (8, "pl", True), (4, "p", True)],
+    )
+    def test_constexpr_folded_before_annotation_evaluation(self, rows, alias, shadowed):
+        """Call bindings override ambient values and decode separately from original DSL aliases."""
+        ctx = _make_ctx(
+            "keep_tile",
+            f"""
+                def keep_tile(tile: {alias}.Tile[[ROWS * 2, 64], DTYPE, SPACE],
+                              ROWS: {alias}.constexpr, DTYPE: {alias}.constexpr, SPACE: {alias}.constexpr):
+                    return tile
+            """,
+            func_type="inline",
+            param_names=["tile", "ROWS", "DTYPE", "SPACE"],
+            auto_scope=False,
+        )
+        ctx.py_globals = {alias: pl}
+        if shadowed:
+            ctx.py_globals.update(ROWS=99, DTYPE=pl.FP32, SPACE=pl.Mem.Acc)
+        if alias == "p":
+            ctx.py_globals["pl"] = object()
+        ctx.constexpr_values = {"ROWS": str(rows), "DTYPE": "pl.BF16", "SPACE": "pl.Mem.Vec"}
+
+        source = specialize("_TestClass", [ctx])
+        func = _specialized_function(ctx, source)
+        assert len(func.params) == 1
+        ir.assert_structural_equal(
+            func.params[0].type,
+            ir.TileType([rows * 2, 64], DataType.BF16, memory_space=ir.MemorySpace.Vec),
+        )
+        assert "ROWS" not in source and "DTYPE" not in source and "SPACE" not in source
+
+
 class TestTensorLayoutAnnotation:
     """The annotation's layout slot must survive specialization.
 
@@ -2110,12 +3556,12 @@ class TestTensorLayoutAnnotation:
     """
 
     def test_layout_str_renders_dsl_constant(self):
-        assert _layout_str(ir.TensorLayout.NZ) == "pl.NZ"
-        assert _layout_str(ir.TensorLayout.MX_A_ZZ) == "pl.MX_A_ZZ"
+        assert layout_str(ir.TensorLayout.NZ) == "pl.NZ"
+        assert layout_str(ir.TensorLayout.MX_A_ZZ) == "pl.MX_A_ZZ"
 
     def test_layout_str_omits_nd(self):
         """ND is what an absent slot already means — emitting it is noise."""
-        assert _layout_str(ir.TensorLayout.ND) is None
+        assert layout_str(ir.TensorLayout.ND) is None
 
     def test_annotation_carries_layout(self):
         meta = TensorMeta((64, 128), DataType.FP16, layout=ir.TensorLayout.NZ)
@@ -2211,6 +3657,1178 @@ class TestRenamedGeneratedFunction:
         )
         with pytest.warns(DeprecationWarning, match="helper' uses pl.Out"):
             specialize("_T", [ctx])
+
+
+class TestInlineTupleTileAnnotations:
+    def test_tensor_leaf_keeps_explicit_full_view_after_constexpr_shape_changes(self):
+        ROWS = 8
+        view = pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[8, 64])
+
+        def keep(
+            pair: pl.Tuple[pl.Tensor[[ROWS, 64], pl.FP32, view], pl.Tile[[8, 64], pl.FP32]],
+            ROWS: pl.constexpr,
+        ):
+            return pair[1]
+
+        ctx = _inline_context(keep, constexpr_values={"ROWS": "16"})
+        function = _specialized_function(ctx)
+        pair = function.params[0].type
+        assert isinstance(pair, ir.TupleType)
+        tensor = pair.types[0]
+        assert isinstance(tensor, ir.TensorType)
+        assert isinstance(tensor.shape[0], ir.ConstInt) and tensor.shape[0].value == 16
+        assert tensor.tensor_view is not None
+        valid = tensor.tensor_view.valid_shape[0]
+        assert isinstance(valid, ir.ConstInt) and valid.value == 8
+
+    @pytest.mark.parametrize("spelling", ["dtype", "subscript", "constructor"])
+    def test_mixed_scalar_leaf_obeys_its_own_constexpr_dtype(self, spelling):
+        DTYPE = pl.FP32
+
+        if spelling == "subscript":
+
+            def keep(pair: pl.Tuple[pl.Tile[[8, 64], pl.FP32], pl.Scalar[DTYPE]], DTYPE: pl.constexpr):
+                return pair[0]
+
+        elif spelling == "dtype":
+
+            def keep(
+                pair: pl.Tuple[pl.Tile[[8, 64], pl.FP32], DTYPE],  # pyright: ignore[reportInvalidTypeForm]
+                DTYPE: pl.constexpr,
+            ):
+                return pair[0]
+
+        else:
+
+            def keep(
+                pair: pl.Tuple[pl.Tile[[8, 64], pl.FP32], pl.Scalar(DTYPE)],  # pyright: ignore[reportInvalidTypeForm]
+                DTYPE: pl.constexpr,
+            ):
+                return pair[0]
+
+        ctx = _inline_context(keep, constexpr_values={"DTYPE": "pl.INDEX"})
+        function = _specialized_function(ctx)
+        pair = function.params[0].type
+        assert isinstance(pair, ir.TupleType)
+        scalar = pair.types[1]
+        assert isinstance(scalar, ir.ScalarType) and scalar.dtype == pl.INDEX
+
+    def test_parameterized_postponed_tuple_fingerprint_tracks_nested_view(self):
+        def keep(pair, ROWS):
+            return pair[1]
+
+        helper = _annotation_function(
+            keep,
+            {
+                "pair": "pl.Tuple[pl.Scalar[pl.INDEX], pl.Tile[[ROWS, 64], pl.FP32, VIEW]]",
+                "ROWS": "pl.constexpr",
+            },
+            {"VIEW": pl.TileView(valid_shape=[3, 64])},
+        )
+        before = tile_annotation_fingerprints(helper)
+        helper.__globals__["VIEW"] = pl.TileView(valid_shape=[2, 64])
+        assert tile_annotation_fingerprints(helper) != before
+
+    @pytest.mark.parametrize("postponed", [False, True])
+    def test_nested_tuple_preserves_mixed_types_and_dynamic_metadata(self, postponed):
+        rows = pl.dynamic("TUPLE_TILE_ROWS")
+        valid = pl.dynamic("TUPLE_VALID_ROWS")
+        view = pl.TileView(valid_shape=[valid, 64], stride=[64, 1], start_offset=valid.unwrap())
+
+        def keep(
+            pair: pl.Tuple[
+                pl.Scalar[pl.INDEX],
+                pl.Tuple[pl.Tensor[[8, 64], pl.FP32], pl.Tile[[rows, 64], pl.FP32, pl.Mem.Vec, view]],
+            ],
+        ):
+            return pair[1][1]
+
+        helper = keep
+        if postponed:
+            helper = _annotation_function(
+                keep,
+                {
+                    "pair": "TupleAlias[pl.Scalar[pl.INDEX], TupleAlias[pl.Tensor[[8, 64], pl.FP32], "
+                    "pl.Tile[[rows, 64], pl.FP32, pl.Mem.Vec, view]]]"
+                },
+                {"rows": rows, "view": view, "TupleAlias": pl.Tuple},
+            )
+        ctx = _inline_context(helper)
+        source = specialize("_TestClass", [ctx])
+        assert 'TUPLE_TILE_ROWS = pl.dynamic("TUPLE_TILE_ROWS")' in source
+        assert 'TUPLE_VALID_ROWS = pl.dynamic("TUPLE_VALID_ROWS")' in source
+        function = _specialized_function(ctx, source)
+        pair = function.params[0].type
+        assert isinstance(pair, ir.TupleType)
+        assert isinstance(pair.types[0], ir.ScalarType)
+        nested = pair.types[1]
+        assert isinstance(nested, ir.TupleType)
+        assert isinstance(nested.types[0], ir.TensorType)
+        tile = nested.types[1]
+        assert isinstance(tile, ir.TileType)
+        assert tile.tile_view is not None
+        assert isinstance(tile.tile_view.valid_shape[0], ir.Var)
+        assert tile.tile_view.valid_shape[0].name_hint == "TUPLE_VALID_ROWS"
+
+    def test_eager_tuple_factory_keeps_independent_values_and_distinct_formals(self):
+        FIRST, SECOND = 8, 16
+        SPACE = pl.Mem.Vec
+
+        def factory(cols):
+            view = pl.TileView(valid_shape=[3, cols], stride=[cols, 1], start_offset=0)
+
+            def keep(
+                pair: pl.Tuple[
+                    pl.Tile[[FIRST, cols], pl.FP32, SPACE, view],
+                    pl.Tuple[pl.Tile[[SECOND, cols], pl.FP32, view, SPACE], pl.Scalar[pl.INDEX]],
+                ],
+                FIRST: pl.constexpr,
+                SECOND: pl.constexpr,
+                SPACE: pl.constexpr,
+            ):
+                return pair[1][0]
+
+            return keep
+
+        helper = factory(64)
+        ctx = _inline_context(helper, constexpr_values={"FIRST": "16", "SECOND": "8", "SPACE": "pl.Mem.Vec"})
+        function = _specialized_function(ctx)
+        pair = function.params[0].type
+        assert isinstance(pair, ir.TupleType)
+        nested = pair.types[1]
+        assert isinstance(nested, ir.TupleType)
+        for tile, rows in ((pair.types[0], 16), (nested.types[0], 8)):
+            assert isinstance(tile, ir.TileType)
+            assert isinstance(tile.shape[0], ir.ConstInt) and tile.shape[0].value == rows
+            assert isinstance(tile.shape[1], ir.ConstInt) and tile.shape[1].value == 64
+            assert tile.tile_view is not None
+            valid = tile.tile_view.valid_shape[0]
+            assert isinstance(valid, ir.ConstInt) and valid.value == 3
+            assert tile.memory_space == ir.MemorySpace.Vec
+        assert tile_annotation_fingerprints(helper) != tile_annotation_fingerprints(factory(128))
+
+    def test_postponed_tuple_alias_fingerprint_tracks_nested_contract_rebinding(self):
+        def keep(pair):
+            return pair[1]
+
+        helper = _annotation_function(
+            keep,
+            {"pair": "CONTRACT"},
+            {"CONTRACT": pl.Tuple[pl.Scalar[pl.INDEX], pl.Tile[[8, 64], pl.FP32]]},
+        )
+        before = tile_annotation_fingerprints(helper)
+        helper.__globals__["CONTRACT"] = pl.Tuple[pl.Scalar[pl.INDEX], pl.Tile[[16, 64], pl.FP32]]
+        assert tile_annotation_fingerprints(helper) != before
+
+    def test_incomplete_tuple_tile_leaf_has_clear_error(self):
+        def keep(pair: pl.Tuple[pl.Scalar[pl.INDEX], pl.Tile]):
+            return pair[1]
+
+        with pytest.raises(ValueError, match="Tuple annotation.*incomplete"):
+            _inline_context(keep)
+
+    def test_unsupported_tensor_subclass_in_tuple_is_not_rendered_as_plain_tensor(self):
+        def keep(pair: pl.Tuple[pld.DistributedTensor[[8, 64], pl.FP32], pl.Tile[[8, 64], pl.FP32]]):
+            return pair[1]
+
+        with pytest.raises(ValueError, match="Tuple annotation.*unsupported type.*path \\(0,\\)"):
+            _inline_context(keep)
+
+    def test_tuple_tile_annotation_is_preserved_for_non_inline_function(self):
+        ctx = _make_ctx(
+            "keep",
+            "def keep(pair: pl.Tuple[pl.Tile[[8, 64], pl.FP32]]):\n    return pair[0]",
+            func_type="incore",
+            param_names=["pair"],
+            auto_scope=False,
+        )
+        ctx.py_globals = {"pl": pl}
+        func = _specialized_function(ctx)
+        assert func.func_type == ir.FunctionType.InCore
+        ir.assert_structural_equal(func.params[0].type, ir.TupleType([ir.TileType([8, 64], DataType.FP32)]))
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+def test_constexpr_branch_discards_incompatible_dead_tile_store(mode):
+    """The inactive FP8 publication branch cannot store 512 bytes into FP4 output."""
+
+    width = (256, 1024, 512)[mode]
+    ctx = _make_ctx(
+        "publish",
+        f"""
+        def publish(out: pl.Tensor[[8, {width}], pl.UINT8], MODE: pl.constexpr):
+            if MODE == 2:
+                wide = pl.tile.full([1, 512], dtype=pl.UINT8, value=0)
+                pl.store(wide, [0, 0], out)
+            elif MODE == 1:
+                extra_wide = pl.tile.full([1, 1024], dtype=pl.UINT8, value=0)
+                pl.store(extra_wide, [0, 0], out)
+            else:
+                narrow = pl.tile.full([1, 256], dtype=pl.UINT8, value=0)
+                pl.store(narrow, [0, 0], out)
+            return out
+        """,
+        func_type="inline",
+        param_names=["out", "MODE"],
+        tensor_meta={"out": TensorMeta((8, width), DataType.UINT8)},
+        auto_scope=False,
+    )
+    ctx.py_globals = {"pl": pl}
+    ctx.constexpr_values = {"MODE": str(mode)}
+    source = specialize("_TestClass", [ctx])
+    tree = ast.parse(source)
+    # Constants must prune before type deduction, not only in later IR passes.
+    assert not any(isinstance(node, ast.If) for node in ast.walk(tree))
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert names & {"wide", "extra_wide", "narrow"} == {("narrow", "extra_wide", "wide")[mode]}
+    _specialized_function(ctx, source)
+
+
+def test_runtime_condition_remains_an_ir_branch():
+    tree = ast.parse("if count == 2:\n    x = 1\nelse:\n    x = 3\n")
+    transformed = BodyTransformer({}, set(), param_names=["count"]).visit(tree)
+    assert any(isinstance(node, ast.If) for node in ast.walk(transformed))
+
+
+@pytest.mark.parametrize(
+    ("mode", "condition", "taken"),
+    [
+        (False, "MODE", False),
+        (True, "MODE", True),
+        (-1, "MODE", True),
+        (-0.5, "MODE == -0.5", True),
+        (-1, "+1 == MODE", False),
+    ],
+)
+@pytest.mark.parametrize("target", ["x", "x: int"])
+def test_constexpr_branch_rebinding_survives_specialization(mode, condition, taken, target):
+    source = f"def select():\n    x = 1\n    if {condition}:\n        {target} = 2\n    return x\n"
+    tree = BodyTransformer({}, set(), constexpr_values={"MODE": str(mode)}).visit(ast.parse(source))
+    assert not any(isinstance(node, ast.If) for node in ast.walk(tree))
+    namespace: dict[str, Any] = {}
+    # Specialization emits source through unparse. Its intermediate rewritten
+    # AST can retain child locations beyond newly synthesized parent ranges;
+    # Python 3.11 rejects those ranges if compiled directly.
+    exec(compile(ast.unparse(tree), "<specialized>", "exec"), namespace)
+    assert namespace["select"]() == (2 if taken else 1)
+
+
+@pytest.mark.parametrize("iterations", [0, 4])
+def test_jit_while_graph_capture_becomes_taskid_carry(iterations):
+    """Native SSA carries completion; full codegen rejects orchestration while."""
+
+    @pl.jit
+    def chain(c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]):
+        with pl.manual_scope():
+            with pl.at(level=pl.Level.CORE_GROUP) as ready:
+                tile = pl.load(c, [0, 0], [128, 128])
+                pl.store(pl.add(tile, 1.0), [0, 0], c)
+            i = 0
+            while i < iterations:
+                with pl.graph("layer", deps=[ready]) as ready:
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        tile = pl.load(c, [0, 0], [128, 128])
+                        pl.store(pl.add(tile, 1.0), [0, 0], c)
+                i = i + 1
+            with pl.at(level=pl.Level.CORE_GROUP, deps=[ready]):
+                tile = pl.load(c, [0, 0], [128, 128])
+                pl.store(pl.add(tile, 1.0), [0, 0], c)
+        return c
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        program = passes.outline_incore_scopes()(
+            passes.outline_graph_scopes()(passes.convert_to_ssa()(chain.specialize()))
+        )
+    loops = []
+    submits = []
+
+    class Collect(ir.IRVisitor):
+        def visit_while_stmt(self, op):
+            loops.append(op)
+            super().visit_while_stmt(op)
+
+        def visit_submit(self, op):
+            submits.append(op)
+            super().visit_submit(op)
+
+    main = program.get_function("chain")
+    assert main is not None
+    Collect().visit_function(main)
+    assert len(loops) == 1
+    loop = loops[0]
+    task_carries = [
+        (i, arg)
+        for i, arg in enumerate(loop.iter_args)
+        if isinstance(arg.type, ir.ScalarType) and arg.type.dtype == DataType.TASK_ID
+    ]
+    assert len(task_carries) == 1
+    index, carry = task_carries[0]
+    graph = next(f for f in program.functions.values() if f.func_type == ir.FunctionType.Graph)
+    launch = next(s for s in submits if isinstance(s.op, ir.GlobalVar) and s.op.name == graph.name)
+    assert launch.deps[0].unique_id == carry.unique_id
+    assert submits[-1].deps[0].unique_id == loop.return_vars[index].unique_id
+    # Native SSA supports the carry, but the orchestration backend has no
+    # while emitter. Full compilation must reject it instead of dropping it.
+    with (
+        passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH),
+        pytest.raises(PartialCodegenError, match="While loops are not supported in orchestration"),
+    ):
+        chain.compile(config=RunConfig(backend_type=BackendType.Ascend910))
+
+
+@pytest.mark.parametrize("setup_iterations,graph_iterations", [(0, 4), (1, 0), (1, 4)])
+def test_jit_independent_capture_compiles_across_empty_sibling_loops(setup_iterations, graph_iterations):
+    """A fresh nonempty capture must not require a previous loop to execute."""
+
+    @pl.jit
+    def chain(c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]):
+        with pl.manual_scope():
+            with pl.at(level=pl.Level.CORE_GROUP) as seed:
+                pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+            with pl.at(level=pl.Level.CORE_GROUP, deps=[seed]) as latest:
+                pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+            for setup in pl.range(setup_iterations):
+                ready = seed
+                ready = latest
+            for invocation in pl.range(graph_iterations):
+                # Intentional: an empty loop must preserve the preceding TaskId binding.
+                with pl.graph("layer") as ready:  # noqa: F811
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+            with pl.at(level=pl.Level.CORE_GROUP, deps=[ready]):
+                pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+        return c
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        compiled = chain.compile(config=RunConfig(backend_type=BackendType.Ascend910))
+    assert compiled.program is not None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_jit_conditional_capture_preserves_sibling_loop_carry(enabled):
+    """Conditionally captured completions carry across the surrounding loop."""
+
+    @pl.jit
+    def chain(c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]):
+        with pl.manual_scope():
+            with pl.at(level=pl.Level.CORE_GROUP) as seed:
+                pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+            for setup in pl.range(1):
+                if enabled:
+                    ready = seed
+                else:
+                    ready = seed
+            for invocation in pl.range(4):
+                if enabled:
+                    with pl.graph("layer", deps=[ready]) as ready:
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+            with pl.at(level=pl.Level.CORE_GROUP, deps=[ready]):
+                pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+        return c
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        program = passes.outline_incore_scopes()(
+            passes.outline_graph_scopes()(passes.convert_to_ssa()(chain.specialize()))
+        )
+        compiled = chain.compile(config=RunConfig(backend_type=BackendType.Ascend910))
+    assert compiled.program is not None
+    if enabled:
+        loops = []
+        launches = []
+
+        class Collect(ir.IRVisitor):
+            def visit_for_stmt(self, op):
+                loops.append(op)
+                super().visit_for_stmt(op)
+
+            def visit_submit(self, op):
+                if isinstance(op.op, ir.GlobalVar) and op.op.name == "layer":
+                    launches.append(op)
+                super().visit_submit(op)
+
+        main = program.get_function("chain")
+        assert main is not None
+        Collect().visit_function(main)
+        assert len(loops) == 2 and len(launches) == 1
+        carries = [
+            arg
+            for arg in loops[1].iter_args
+            if isinstance(arg.type, ir.ScalarType) and arg.type.dtype == DataType.TASK_ID
+        ]
+        assert len(carries) == 1
+        assert launches[0].deps[0].unique_id == carries[0].unique_id
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_jit_branch_merge_preserves_last_capture_binding(enabled):
+    """A branch-local rebind must export latest, rather than its first capture."""
+
+    @pl.jit
+    def chain(c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]):
+        with pl.manual_scope():
+            with pl.at(level=pl.Level.CORE_GROUP) as seed:
+                pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+            if enabled:
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[seed]) as ready:
+                    pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[ready]) as latest:
+                    pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+                ready = latest
+            else:
+                ready = seed
+            with pl.at(level=pl.Level.CORE_GROUP, deps=[ready]):
+                pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+        return c
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        program = passes.convert_to_ssa()(chain.specialize())
+        compiled = chain.compile(config=RunConfig(backend_type=BackendType.Ascend910))
+    assert compiled.program is not None
+    branches = []
+    scopes = []
+    aliases = {}
+    yields = []
+
+    class Collect(ir.IRVisitor):
+        def visit_if_stmt(self, op):
+            branches.append(op)
+            super().visit_if_stmt(op)
+
+        def visit_in_core_scope_stmt(self, op):
+            if "task_id_var" in op.attrs or "manual_dep_edges" in op.attrs:
+                scopes.append(op)
+            super().visit_in_core_scope_stmt(op)
+
+        def visit_assign_stmt(self, op):
+            if isinstance(op.value, ir.Var):
+                aliases[op.var.unique_id] = op.value
+            super().visit_assign_stmt(op)
+
+        def visit_yield_stmt(self, op):
+            yields.append(op)
+            super().visit_yield_stmt(op)
+
+    main = program.get_function("chain")
+    assert main is not None
+    Collect().visit_function(main)
+    assert len(branches) == 1
+    branch = branches[0]
+    assert scopes, python_print(program)
+    consumer_dep = scopes[-1].attrs["manual_dep_edges"][0]
+    index = next(i for i, value in enumerate(branch.return_vars) if value.unique_id == consumer_dep.unique_id)
+    assert len(scopes) == 4
+    expected_origins = (
+        (branch.then_body, scopes[2].attrs["task_id_var"]),
+        (branch.else_body, scopes[0].attrs["task_id_var"]),
+    )
+    # Resolve scalar copies at both exits: true exports latest, false exports seed.
+    for body, origin in expected_origins:
+        assert body is not None
+        yields.clear()
+        Collect().visit_stmt(body)
+        value = yields[-1].value[index]
+        while value.unique_id in aliases:
+            value = aliases[value.unique_id]
+        assert value.unique_id == origin.unique_id
+
+
+def test_jit_recorded_local_capture_name_can_be_reused():
+    """An independent capture must not read a previous Definition's local ID.
+
+    Its completion orders a consumer within each iteration; it needs no entry
+    TaskId from the previous Definition or a value exported from an empty loop.
+    """
+
+    @pl.jit
+    def chain(
+        first: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+    ):
+        with pl.manual_scope():
+            with pl.graph("first"):
+                with pl.at(level=pl.Level.CORE_GROUP) as ready:
+                    pl.store(pl.load(first, [0, 0], [128, 128]), [0, 0], first)
+            for invocation in pl.range(4):
+                with pl.graph("second") as ready:
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[ready]):
+                    pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+        return c
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        compiled = chain.compile(config=RunConfig(backend_type=BackendType.Ascend910))
+    assert compiled.program is not None
+
+
+def test_jit_plain_recorded_local_assignment_preserves_caller_task_id():
+    @pl.jit
+    def chain(c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]):
+        with pl.manual_scope():
+            seed = pl.system.task_dummy(deps=[])
+            latest = pl.system.task_dummy(deps=[seed])
+            for _ in pl.range(1):
+                ready = seed
+                ready = latest
+            with pl.graph("recording") as done:
+                inner = pl.system.task_dummy(deps=[])
+                ready = inner
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[ready]):
+                    c = pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+            with pl.at(level=pl.Level.CORE_GROUP, deps=[ready, done]):
+                c = pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+        return c
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        compiled = chain.compile(config=RunConfig(backend_type=BackendType.Ascend910))
+    assert compiled.program is not None
+
+
+def test_jit_graph_preserves_independent_kernel_tile_rebinding():
+    @pl.jit
+    def chain(
+        first: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        recorded: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+    ):
+        for _ in pl.range(1):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                tile = pl.load(first, [0, 0], [128, 128])
+                pl.store(tile, [0, 0], first)
+        with pl.graph("recording"):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                tile = pl.load(recorded, [0, 0], [64, 64])
+                pl.store(tile, [0, 0], recorded)
+        return recorded
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        compiled = chain.compile(config=RunConfig(backend_type=BackendType.Ascend910))
+    assert compiled.program is not None
+
+
+def test_jit_graph_host_alias_keeps_independent_kernel_tensor_rebinding():
+    @pl.jit
+    def chain(
+        first: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        recorded: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+    ):
+        for _ in pl.range(1):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                out = pl.store(pl.load(first, [0, 0], [128, 128]), [0, 0], first)
+        with pl.graph("recording"):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                out = pl.store(pl.load(recorded, [0, 0], [64, 64]), [0, 0], recorded)
+            out = recorded
+        return out
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        compiled = chain.compile(config=RunConfig(backend_type=BackendType.Ascend910))
+    assert compiled.program is not None
+
+
+@pytest.mark.parametrize("write_first", [False, True])
+def test_jit_graph_tensor_rebinding_with_same_name_task_capture_is_exported(write_first):
+    capture = (
+        "with pl.at(level=pl.Level.CORE_GROUP) as selected:\n"
+        "    pl.store(pl.load(b, [0, 0], [128, 128]), [0, 0], b)"
+    )
+    lines = ["selected = b", capture] if write_first else [capture, "selected = b"]
+    source = textwrap.dedent("""
+        def chain(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                selected = pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+            with pl.graph("recording"):
+                CAPTURE
+            return selected
+    """).replace("        CAPTURE", textwrap.indent("\n".join(lines), "        "))
+    meta = TensorMeta((128, 128), DataType.FP32)
+    ctx = _make_ctx("chain", source, param_names=["a", "b"], tensor_meta={"a": meta, "b": meta})
+
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("chain")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    graph = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.GraphScopeStmt))
+    returned = function.body.stmts[-1]
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    (selected,) = (
+        var
+        for var in ir.collect_def_vars(graph.body)
+        if var.name_hint == "selected_v1" and isinstance(var.type, ir.TensorType)
+    )
+    assert value.same_as(selected)
+
+
+@pytest.mark.parametrize("repeat_capture", [False, True])
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_jit_graph_capture_keeps_tensor_written_in_device_body(repeat_capture, overwrite):
+    second_capture = (
+        "        with pl.at(level=pl.Level.CORE_GROUP, deps=[selected]) as selected:\n"
+        "            pl.store(pl.load(b, [0, 0], [128, 128]), [0, 0], b)"
+        if repeat_capture
+        else ""
+    )
+    if overwrite:
+        second_capture += "\n        selected = c"
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor], c: pl.InOut[pl.Tensor]):
+            for i in pl.range(1):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    selected = pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+            with pl.graph("recording"):
+                with pl.at(level=pl.Level.CORE_GROUP) as selected:
+                    selected = pl.store(pl.load(b, [0, 0], [128, 128]), [0, 0], b)
+            SECOND_CAPTURE
+            return selected
+    """).replace("    SECOND_CAPTURE", second_capture)
+    meta = TensorMeta((128, 128), DataType.FP32)
+    ctx = _make_ctx("f", source, param_names=["a", "b", "c"], tensor_meta={"a": meta, "b": meta, "c": meta})
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    graph = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.GraphScopeStmt))
+    returned = function.body.stmts[-1]
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    assert isinstance(graph.body, ir.SeqStmts)
+    device_scope = next(stmt for stmt in graph.body.stmts if isinstance(stmt, ir.InCoreScopeStmt))
+    (selected,) = (
+        var
+        for var in ir.collect_def_vars(device_scope.body)
+        if var.name_hint == "selected_v1" and isinstance(var.type, ir.TensorType)
+    )
+    assert value.same_as(selected)
+    if overwrite:
+        assignment = graph.body.stmts[-1]
+        assert isinstance(assignment, ir.AssignStmt)
+        assert assignment.var.same_as(selected)
+        assert assignment.value.same_as(function.params[2])
+
+
+def test_jit_graph_capture_shape_uses_tensor_written_in_device_body():
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor]):
+            for i in pl.range(1):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    selected = a
+                    pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+            with pl.graph("recording"):
+                with pl.at(level=pl.Level.CORE_GROUP) as selected:
+                    selected = b
+                    pl.store(pl.load(b, [0, 0], [64, 128]), [0, 0], b)
+            for i in pl.range(selected.shape[0]):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    pl.store(pl.load(selected, [i, 0], [1, 128]), [i, 0], selected)
+            return selected
+    """)
+    ctx = _make_ctx(
+        "f",
+        source,
+        param_names=["a", "b"],
+        tensor_meta={"a": TensorMeta((128, 128), DataType.FP32), "b": TensorMeta((64, 128), DataType.FP32)},
+    )
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    _, loop = (stmt for stmt in function.body.stmts if isinstance(stmt, ir.ForStmt))
+    assert isinstance(loop.stop, ir.ConstInt) and loop.stop.value == 64
+
+
+def test_jit_graph_capture_matches_restored_tensor_alias():
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor]):
+            with pl.manual_scope():
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    selected = pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+                with pl.graph("first"):
+                    selected = pl.system.task_dummy(deps=[])
+                    with pl.at(level=pl.Level.CORE_GROUP, deps=[selected]):
+                        pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+                with pl.graph("second"):
+                    with pl.at(level=pl.Level.CORE_GROUP) as selected:
+                        selected = pl.store(pl.load(b, [0, 0], [128, 128]), [0, 0], b)
+                    with pl.at(level=pl.Level.CORE_GROUP, deps=[selected]):
+                        pl.store(pl.load(b, [0, 0], [128, 128]), [0, 0], b)
+            return selected
+    """)
+    meta = TensorMeta((128, 128), DataType.FP32)
+    ctx = _make_ctx("f", source, param_names=["a", "b"], tensor_meta={"a": meta, "b": meta})
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    runtime = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.RuntimeScopeStmt))
+    assert isinstance(runtime.body, ir.SeqStmts)
+    _, graph = (stmt for stmt in runtime.body.stmts if isinstance(stmt, ir.GraphScopeStmt))
+    assert isinstance(graph.body, ir.SeqStmts)
+    producer, consumer = (stmt for stmt in graph.body.stmts if isinstance(stmt, ir.InCoreScopeStmt))
+    (dependency,) = consumer.attrs["manual_dep_edges"]
+    assert dependency.same_as(producer.attrs["task_id_var"])
+    (selected,) = (var for var in ir.collect_def_vars(producer.body) if isinstance(var.type, ir.TensorType))
+    returned = function.body.stmts[-1]
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    assert value.same_as(selected)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_jit_graph_capture_does_not_reuse_incoming_tensor_alias_for_assignment(nested):
+    capture = textwrap.dedent("""
+        with pl.at(level=pl.Level.CORE_GROUP) as selected:
+            pl.store(pl.load(b, [0, 0], [128, 128]), [0, 0], b)
+    """).strip("\n")
+    if nested:
+        capture = "for i in pl.range(1):\n" + textwrap.indent(capture, "    ")
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor]):
+            selected = a
+            selected = b
+            with pl.graph("recording"):
+                CAPTURE
+                selected = a
+            return selected
+    """).replace("        CAPTURE", textwrap.indent(capture, "        "))
+    meta = TensorMeta((128, 128), DataType.FP32)
+    ctx = _make_ctx("f", source, param_names=["a", "b"], tensor_meta={"a": meta, "b": meta})
+
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    graph = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.GraphScopeStmt))
+    returned = function.body.stmts[-1]
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    (selected,) = (var for var in ir.collect_def_vars(graph.body) if isinstance(var.type, ir.TensorType))
+    assert value.same_as(selected)
+
+
+@pytest.mark.parametrize("capture_kind", ["dispatch", "graph"])
+@pytest.mark.parametrize("write_scope", ["device", "host", "loop"])
+def test_jit_dispatch_capture_then_tensor_assignment(capture_kind, write_scope):
+    capture = textwrap.dedent("""
+        with pl.at(level=pl.Level.CORE_GROUP) as selected:
+            pl.store(pl.load(b, [0, 0], [128, 128]), [0, 0], b)
+    """).strip("\n")
+    if capture_kind == "graph":
+        capture = 'with pl.graph("recording") as selected:\n' + textwrap.indent(
+            capture.replace(" as selected", ""), "    "
+        )
+    second_dispatch = textwrap.dedent("""
+        with pl.at(level=pl.Level.CORE_GROUP, deps=[selected]):
+            pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+    """).strip("\n")
+    if write_scope == "device":
+        second_dispatch = second_dispatch.replace("    pl.store", "    selected = pl.store")
+    else:
+        write = "selected = a" if write_scope == "host" else "for i in pl.range(1):\n    selected = a"
+        second_dispatch += "\n" + write
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor]):
+            selected = a
+            selected = b
+            with pl.manual_scope():
+                CAPTURE
+                SECOND_DISPATCH
+            return selected
+    """)
+    source = source.replace("        CAPTURE", textwrap.indent(capture, "        ")).replace(
+        "        SECOND_DISPATCH", textwrap.indent(second_dispatch, "        ")
+    )
+    meta = TensorMeta((128, 128), DataType.FP32)
+    ctx = _make_ctx("f", source, param_names=["a", "b"], tensor_meta={"a": meta, "b": meta})
+
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    returned = function.body.stmts[-1]
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    (original,) = (
+        stmt.var
+        for stmt in function.body.stmts
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint == "selected_v1"
+    )
+    assert value.same_as(original)
+
+
+@pytest.mark.parametrize("capture_kind", ["dispatch", "graph"])
+def test_jit_dispatch_capture_then_scalar_assignment(capture_kind):
+    capture = textwrap.dedent("""
+        with pl.at(level=pl.Level.CORE_GROUP) as index:
+            pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+    """).strip("\n")
+    if capture_kind == "graph":
+        capture = 'with pl.graph("recording") as index:\n' + textwrap.indent(
+            capture.replace(" as index", ""), "    "
+        )
+    source = textwrap.dedent("""
+        def f(c: pl.InOut[pl.Tensor]):
+            index = 1
+            index = 2
+            with pl.manual_scope():
+                CAPTURE
+                pl.system.task_dummy(deps=[index])
+                index = 3
+            return index
+    """).replace("        CAPTURE", textwrap.indent(capture, "        "))
+    ctx = _make_ctx("f", source, param_names=["c"], tensor_meta={"c": TensorMeta((128, 128), DataType.FP32)})
+
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    returned = function.body.stmts[-1]
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    (original,) = (
+        stmt.var
+        for stmt in function.body.stmts
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint == "index_v1"
+    )
+    assert value.same_as(original)
+
+
+@pytest.mark.parametrize("selected", [True, False])
+@pytest.mark.parametrize("inactive_capture", [False, True])
+@pytest.mark.parametrize("condition", ["enabled", "mode == 0", "not (mode > 0 or mode < 0)"])
+def test_jit_constexpr_selected_branch_preserves_folded_shape(selected, inactive_capture, condition):
+    fold = "rows = a.shape[0]"
+    inactive = (
+        "with pl.at(level=pl.Level.CORE_GROUP) as rows:\n"
+        "    pl.store(pl.load(a, [0, 0], [64, 128]), [0, 0], a)"
+        if inactive_capture
+        else "pass"
+    )
+    body, orelse = (fold, inactive) if selected else (inactive, fold)
+    source = (
+        textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], enabled: pl.constexpr, mode: pl.constexpr):
+            if CONDITION:
+                BODY
+            else:
+                ORELSE
+            return pl.create_tensor([rows, 128], dtype=pl.FP32)
+    """)
+        .replace("        BODY", textwrap.indent(body, "        "))
+        .replace("        ORELSE", textwrap.indent(orelse, "        "))
+    )
+    source = source.replace("CONDITION", condition)
+    ctx = _make_ctx("f", source, param_names=["a"], tensor_meta={"a": TensorMeta((64, 128), DataType.FP32)})
+    ctx.constexpr_values = {"enabled": str(selected), "mode": "0" if selected else "1"}
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    body = function.body
+    returned = body.stmts[-1] if isinstance(body, ir.SeqStmts) else body
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    assert isinstance(value.type, ir.TensorType)
+    assert isinstance(value.type.shape[0], ir.ConstInt) and value.type.shape[0].value == 64
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_jit_graph_capture_preserves_later_shape_fold(enabled):
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor], enabled: pl.constexpr):
+            rows = a.shape[0]
+            with pl.graph("recording"):
+                if enabled:
+                    with pl.at(level=pl.Level.CORE_GROUP) as rows:
+                        pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+                rows = b.shape[0]
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    pl.store(pl.load(b, [0, 0], [64, 128]), [0, 0], b)
+            for i in pl.range(rows):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    pl.store(pl.load(b, [i, 0], [1, 128]), [i, 0], b)
+            return b
+    """)
+    ctx = _make_ctx(
+        "f",
+        source,
+        param_names=["a", "b"],
+        tensor_meta={"a": TensorMeta((128, 128), DataType.FP32), "b": TensorMeta((64, 128), DataType.FP32)},
+    )
+    ctx.constexpr_values = {"enabled": str(enabled)}
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    loop = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.ForStmt))
+    assert isinstance(loop.stop, ir.ConstInt) and loop.stop.value == 64
+
+
+def test_jit_scalar_after_graph_shape_capture_keeps_loop_carry():
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor]):
+            with pl.graph("recording"):
+                row = a.shape[0]
+                with pl.at(level=pl.Level.CORE_GROUP) as row:
+                    pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+                row = b.shape[0]
+                row = 0
+                for i in pl.range(2):
+                    row = row + 1
+                if row == 2:
+                    row = row + 1
+            return a
+    """)
+    ctx = _make_ctx(
+        "f",
+        source,
+        param_names=["a", "b"],
+        tensor_meta={"a": TensorMeta((128, 128), DataType.FP32), "b": TensorMeta((64, 128), DataType.FP32)},
+    )
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    graph = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.GraphScopeStmt))
+    assert isinstance(graph.body, ir.SeqStmts)
+    initial = next(
+        stmt
+        for stmt in graph.body.stmts
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.ConstInt)
+    )
+    loop = next(stmt for stmt in graph.body.stmts if isinstance(stmt, ir.ForStmt))
+    (updated,) = ir.collect_def_vars(loop.body)
+    assert updated.same_as(initial.var)
+
+
+def test_jit_graph_capture_does_not_reuse_sibling_branch_shape():
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], flag: pl.Scalar[pl.BOOL]):
+            if flag:
+                rows = a.shape[0]
+            else:
+                with pl.graph("recording"):
+                    with pl.at(level=pl.Level.CORE_GROUP) as rows:
+                        pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+            return a
+    """)
+    ctx = _make_ctx(
+        "f", source, param_names=["a", "flag"], tensor_meta={"a": TensorMeta((128, 128), DataType.FP32)}
+    )
+    assert pl.parse_program(specialize("Before", [ctx])).get_function("f") is not None
+
+
+@pytest.mark.parametrize("capture_kind", ["dispatch", "graph"])
+def test_jit_dispatch_capture_then_folded_scalar_assignment(capture_kind):
+    capture = textwrap.dedent("""
+        with pl.at(level=pl.Level.CORE_GROUP) as rows:
+            pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+    """).strip("\n")
+    if capture_kind == "graph":
+        capture = 'with pl.graph("recording") as rows:\n' + textwrap.indent(
+            capture.replace(" as rows", ""), "    "
+        )
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor]):
+            rows = a.shape[0]
+            with pl.manual_scope():
+                CAPTURE
+                pl.system.task_dummy(deps=[rows])
+                rows = b.shape[0]
+            return rows
+    """).replace("        CAPTURE", textwrap.indent(capture, "        "))
+    ctx = _make_ctx(
+        "f",
+        source,
+        param_names=["a", "b"],
+        tensor_meta={"a": TensorMeta((128, 128), DataType.FP32), "b": TensorMeta((64, 128), DataType.FP32)},
+    )
+
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    returned = function.body.stmts[-1]
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    assert isinstance(value.type, ir.ScalarType)
+    assert value.type.dtype == DataType.INDEX
+
+
+def test_jit_dispatch_capture_then_assignment_after_graph_restores_constant():
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor], b: pl.InOut[pl.Tensor]):
+            rows = a.shape[0]
+            with pl.manual_scope():
+                with pl.graph("recording"):
+                    rows = pl.system.task_dummy(deps=[])
+                    with pl.at(level=pl.Level.CORE_GROUP, deps=[rows]):
+                        pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+                with pl.at(level=pl.Level.CORE_GROUP) as rows:
+                    pl.store(pl.load(a, [0, 0], [128, 128]), [0, 0], a)
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[rows]):
+                    pl.store(pl.load(b, [0, 0], [64, 128]), [0, 0], b)
+                rows = b.shape[0]
+            return rows
+    """)
+    ctx = _make_ctx(
+        "f",
+        source,
+        param_names=["a", "b"],
+        tensor_meta={"a": TensorMeta((128, 128), DataType.FP32), "b": TensorMeta((64, 128), DataType.FP32)},
+    )
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    runtime = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.RuntimeScopeStmt))
+    assert isinstance(runtime.body, ir.SeqStmts)
+    assignment = runtime.body.stmts[-1]
+    returned = function.body.stmts[-1]
+    assert isinstance(assignment, ir.AssignStmt)
+    assert isinstance(assignment.value, ir.ConstInt) and assignment.value.value == 64
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    assert value.same_as(assignment.var)
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+def test_jit_dispatch_capture_then_task_id_array_assignment(recorded):
+    body = textwrap.dedent("""
+        with pl.at(level=pl.Level.CORE_GROUP) as ids:
+            pl.store(pl.load(a, [0, 0], [64, 128]), [0, 0], a)
+        with pl.at(level=pl.Level.CORE_GROUP, deps=[ids]):
+            pl.store(pl.load(a, [0, 0], [64, 128]), [0, 0], a)
+        ids = pl.array.create(1, pl.TASK_ID)
+        with pl.at(level=pl.Level.CORE_GROUP, deps=[ids]):
+            pl.store(pl.load(a, [0, 0], [64, 128]), [0, 0], a)
+    """).strip("\n")
+    if recorded:
+        body = 'with pl.graph("recording") as done:\n' + textwrap.indent(body, "    ")
+        body += "\nwith pl.at(level=pl.Level.CORE_GROUP, deps=[ids, done]):\n"
+        body += "    pl.store(pl.load(a, [0, 0], [64, 128]), [0, 0], a)"
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor]):
+            ids = pl.array.create(1, pl.TASK_ID)
+            ids = pl.array.create(1, pl.TASK_ID)
+            with pl.manual_scope():
+                BODY
+            return a
+    """).replace("        BODY", textwrap.indent(body, "        "))
+    ctx = _make_ctx("f", source, param_names=["a"], tensor_meta={"a": TensorMeta((64, 128), DataType.FP32)})
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    (original,) = (
+        stmt.var
+        for stmt in function.body.stmts
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint == "ids_v1"
+    )
+    runtime = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.RuntimeScopeStmt))
+    assert isinstance(runtime.body, ir.SeqStmts)
+    scope_body = runtime.body
+    if recorded:
+        graph = next(stmt for stmt in runtime.body.stmts if isinstance(stmt, ir.GraphScopeStmt))
+        assert isinstance(graph.body, ir.SeqStmts)
+        scope_body = graph.body
+        consumer = runtime.body.stmts[-1]
+        assert isinstance(consumer, ir.InCoreScopeStmt)
+        outer_ids, done = consumer.attrs["manual_dep_edges"]
+        assert outer_ids.same_as(original)
+        assert done.same_as(graph.attrs["task_id_var"])
+    (recreated,) = (
+        stmt.var
+        for stmt in scope_body.stmts
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.var.type, ir.ArrayType)
+    )
+    assert recreated.same_as(original) is not recorded
+    consumer = scope_body.stmts[-1]
+    assert isinstance(consumer, ir.InCoreScopeStmt)
+    (dep,) = consumer.attrs["manual_dep_edges"]
+    assert dep.same_as(recreated)
+
+
+def test_jit_dispatch_capture_then_rebinding_keeps_parameter_dim_immutable():
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor]):
+            rows = 0
+            rows = pl.tensor.dim(a, 0)
+            with pl.manual_scope():
+                with pl.at(level=pl.Level.CORE_GROUP) as rows:
+                    pl.store(pl.load(a, [0, 0], [1, 128]), [0, 0], a)
+                rows = 1
+            return rows
+    """)
+    ctx = _make_ctx(
+        "f",
+        source,
+        param_names=["a"],
+        tensor_meta={"a": TensorMeta((DynDim("M", "M", 128), 128), DataType.FP32)},
+    )
+
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    returned = function.body.stmts[-1]
+    assert isinstance(returned, ir.ReturnStmt)
+    (value,) = returned.value
+    (parameter,) = function.params
+    assert isinstance(parameter.type, ir.TensorType)
+    assert isinstance(value, ir.Var)
+    assert value.name_hint == "rows_v1"
+    assert not value.same_as(parameter.type.shape[0])
+
+
+@pytest.mark.parametrize("repeat_capture", [False, True])
+def test_jit_graph_capture_preserves_outer_task_id_over_older_scalar(repeat_capture):
+    capture = textwrap.dedent("""
+        with pl.at(level=pl.Level.CORE_GROUP) as ready:
+            pl.store(pl.load(a, [0, 0], [64, 128]), [0, 0], a)
+    """).strip("\n")
+    captures = [capture, capture] if repeat_capture else [capture]
+    source = textwrap.dedent("""
+        def f(a: pl.InOut[pl.Tensor]):
+            ready = 0
+            with pl.manual_scope():
+                with pl.at(level=pl.Level.CORE_GROUP) as ready:
+                    pl.store(pl.load(a, [0, 0], [64, 128]), [0, 0], a)
+                with pl.graph("recording") as done:
+                    CAPTURES
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[ready, done]):
+                    pl.store(pl.load(a, [0, 0], [64, 128]), [0, 0], a)
+                ready = 1
+            return a
+    """).replace("            CAPTURES", textwrap.indent("\n".join(captures), "            "))
+    ctx = _make_ctx("f", source, param_names=["a"], tensor_meta={"a": TensorMeta((64, 128), DataType.FP32)})
+    function = pl.parse_program(specialize("Before", [ctx])).get_function("f")
+    assert function is not None
+    assert isinstance(function.body, ir.SeqStmts)
+    runtime = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.RuntimeScopeStmt))
+    assert isinstance(runtime.body, ir.SeqStmts)
+    producer, consumer = (stmt for stmt in runtime.body.stmts if isinstance(stmt, ir.InCoreScopeStmt))
+    graph = next(stmt for stmt in runtime.body.stmts if isinstance(stmt, ir.GraphScopeStmt))
+    ready, done = consumer.attrs["manual_dep_edges"]
+    assert ready.same_as(producer.attrs["task_id_var"])
+    assert done.same_as(graph.attrs["task_id_var"])
+
+    initial = function.body.stmts[0]
+    reassignment = runtime.body.stmts[-1]
+    assert isinstance(initial, ir.AssignStmt)
+    assert isinstance(reassignment, ir.AssignStmt)
+    assert reassignment.var.same_as(initial.var)
+
+
+def test_jit_explicit_recorded_local_dependency_remains_rejected():
+    """Fresh capture names must not erase an actual cross-recording TaskId read."""
+
+    @pl.jit
+    def chain(
+        first: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+    ):
+        with pl.manual_scope():
+            with pl.graph("first"):
+                with pl.at(level=pl.Level.CORE_GROUP) as ready:
+                    pl.store(pl.load(first, [0, 0], [128, 128]), [0, 0], first)
+            with pl.graph("second", deps=[ready]) as done:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+            with pl.at(level=pl.Level.CORE_GROUP, deps=[done]):
+                pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+        return c
+
+    with (
+        passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH),
+        pytest.raises(UndefinedVariableError, match="Undefined variable 'ready'"),
+    ):
+        chain.compile(config=RunConfig(backend_type=BackendType.Ascend910))
 
 
 if __name__ == "__main__":

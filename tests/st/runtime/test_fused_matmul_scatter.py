@@ -13,7 +13,7 @@ GM rows fused in one ``CORE_GROUP`` scope.
 A single ``pl.matmul`` writes its FP32 result into a scope-local
 ``create_tensor`` (``kv_final``); a per-row loop then casts each row and
 scatters it to a **distinct, strided** GM row of ``cache`` (row ``b * CACHE``).
-On Ascend910B this lowers to an AIC cube kernel (the matmul, storing ``kv_final``
+On Ascend910 this lowers to an AIC cube kernel (the matmul, storing ``kv_final``
 to GM) and an AIV vector kernel (the scatter, reading ``kv_final`` back from GM).
 
 Two independent codegen bugs corrupted the output (both fixed in this change):
@@ -76,7 +76,7 @@ class FusedMatmulScatterProgram:
         cache: pl.InOut[pl.Tensor[[B * CACHE, H], pl.BF16]],
     ) -> pl.Tensor[[B * CACHE, H], pl.BF16]:
         kv_final = pl.create_tensor([B, H], dtype=pl.FP32)
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.LEFT_RIGHT)]):
+        with pl.at(level=pl.Level.CORE_GROUP):
             kv_final[:, :] = pl.matmul(x, w, out_dtype=pl.FP32)  # cube matmul, whole-tile store
             for b in pl.range(B):  # per-row scatter to distinct cache rows
                 cache[b * CACHE : b * CACHE + 1, :] = pl.cast(

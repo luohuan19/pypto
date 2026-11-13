@@ -236,6 +236,75 @@ def range(
 
 
 @overload
+def hardware_loop(
+    stop: RangeArg,
+    *,
+    init_values: None = None,
+) -> RangeIterator[Scalar]: ...
+
+
+@overload
+def hardware_loop(
+    stop: RangeArg,
+    *,
+    init_values: tuple[T1],
+) -> RangeIterator[tuple[Scalar, tuple[T1]]]: ...
+
+
+@overload
+def hardware_loop(
+    stop: RangeArg,
+    *,
+    init_values: tuple[T1, T2],
+) -> RangeIterator[tuple[Scalar, tuple[T1, T2]]]: ...
+
+
+@overload
+def hardware_loop(
+    stop: RangeArg,
+    *,
+    init_values: tuple[T1, T2, T3],
+) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3]]]: ...
+
+
+@overload
+def hardware_loop(
+    stop: RangeArg,
+    *,
+    init_values: tuple[T1, T2, T3, T4],
+) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3, T4]]]: ...
+
+
+@overload
+def hardware_loop(
+    stop: RangeArg,
+    *,
+    init_values: tuple[T1, T2, T3, T4, T5],
+) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3, T4, T5]]]: ...
+
+
+def hardware_loop(
+    stop: RangeArg,
+    *,
+    init_values: tuple[Any, ...] | None = None,
+) -> RangeIterator[Scalar] | RangeIterator[tuple[Scalar, tuple[Any, ...]]]:
+    """Require a Sequential hardware loop over [0, stop) with step one.
+
+    Only valid inside an enclosing ``pl.reg_scope()``, including empty loops.
+    Integer scalar stops may be dynamic without a proven range; static stops
+    must fit the unsigned counter limit. Floating-point stops are rejected.
+    Static qualification is distinct from final artifact evidence. Unsupported
+    targets fail compilation rather than silently falling back to ordinary loops.
+    Static empty loops may be removed with their initial carry values preserved.
+    """
+    return _make_range_iterator(
+        stop,
+        init_values=init_values,
+        func_name="hardware_loop",
+    )
+
+
+@overload
 def parallel(*args: RangeArg, init_values: None = None) -> RangeIterator[Scalar]: ...
 
 
@@ -750,12 +819,13 @@ class GraphContext:
     a ``GraphScopeStmt``.
     """
 
-    def __init__(self, name: str, *, dumps: list[Any] | None = None) -> None:
+    def __init__(self, name: str, *, deps: list[Any] | None = None, dumps: list[Any] | None = None) -> None:
         self.name = name
+        self.deps = deps
         self.dumps = dumps
 
-    def __enter__(self) -> None:
-        """Enter the Graph scope context."""
+    def __enter__(self) -> Any:
+        """The DSL parser binds an optional outer completion TaskId capture."""
         pass
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -763,14 +833,15 @@ class GraphContext:
         pass
 
 
-def graph(name: str, *, dumps: list[Any] | None = None) -> GraphContext:
+def graph(name: str, *, deps: list[Any] | None = None, dumps: list[Any] | None = None) -> GraphContext:
     """Mark a repeated region of orchestration as one recordable graph.
 
     Under ``runtime="host_build_graph"`` the runtime records the region's task
-    topology the first time it executes and replays the recording on every later
-    execution. A decoder stack of N structurally identical layers therefore costs
-    one graph build instead of N, and occupies N outer task slots instead of
-    N x (tasks per layer).
+    topology on its first execution and reuses the Definition for matching
+    configurations and boundary metadata within the same orchestration run.
+    Repeated layers can then share one build and use N outer task slots instead
+    of N x (tasks per layer). A later program invocation records its own
+    Definitions; reusing a compiled program does not persist this runtime cache.
 
     ``pl.graph`` is the in-place form of ``@pl.jit.graph``: ``OutlineGraphScopes``
     extracts the region into a Graph function named after ``name``, so the two
@@ -788,6 +859,9 @@ def graph(name: str, *, dumps: list[Any] | None = None) -> GraphContext:
         name: Region name. Must be a valid Python identifier; it becomes the
             outlined function's name and hence the runtime's graph key, so keep
             it stable across edits.
+        deps: Optional explicit predecessor TaskIds or TaskId arrays from this
+            orchestration run. They order this invocation's outer Graph task;
+            they do not become recorded-internal edges or cache-key fields.
         dumps: Optional list literal of outer-scope tensor names to mark for
             selective tensor dump on the Graph task itself (distinct from the
             kernel dispatches recorded inside it) — the same surface as
@@ -796,8 +870,12 @@ def graph(name: str, *, dumps: list[Any] | None = None) -> GraphContext:
             dispatches and later consumers. The printer emits ``dumps=`` for
             a scope carrying dump marks.
 
+    ``with pl.graph(..., deps=[ready]) as done:`` binds ``done`` to completion
+    of the entire Graph, including its first recording. Keep internal TaskId
+    arrays local to the region; use this outer completion for later tasks.
+
     Returns:
-        Context manager for the Graph scope.
+        Context manager with an optional outer completion TaskId capture.
 
     Raises:
         ParserSyntaxError: if written in a device-kernel body (InCore / AIC /
@@ -810,7 +888,7 @@ def graph(name: str, *, dumps: list[Any] | None = None) -> GraphContext:
         ...         h = attention(x, wq, h)
         ...         x = mlp(h, w1, x)
     """
-    return GraphContext(name, dumps=dumps)
+    return GraphContext(name, deps=deps, dumps=dumps)
 
 
 class SpmdContext:
@@ -1135,10 +1213,12 @@ def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
 
     Two dispatch modes:
 
-    * **Data-parallel** (``UP_DOWN`` / ``LEFT_RIGHT``): the region's vector
-      compute is **halved** on the split axis (rows / cols), so each lane
-      processes one half of every tile.
-    * **Task-parallel** (``NONE``): **no halving** — both lanes run the *full*
+    * **Data-parallel** (``UP_DOWN`` / ``LEFT_RIGHT``): explicit
+      ``pl.aiv_shard`` / ``pl.aic_gather`` split/join cross-core data along
+      rows / columns. The body is already per lane: author its compute shapes,
+      input slices and output offsets explicitly using ``aiv_id``. The compiler
+      never halves the body implicitly, including regions without a crossing.
+    * **Task-parallel** (``NONE``): boundary shapes stay unchanged; both lanes run the *full*
       body for disjoint work the author dispatches via ``aiv_id`` (e.g. an
       ``aiv_id``-strided loop). Use this when the tiles cannot be halved
       (unit dims) or a reduction must stay full-width. ``pl.aiv_shard`` /
@@ -1270,8 +1350,8 @@ def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
         n: The AIV sub-core count. Positional; hardware-fixed at 2 (the two AIV
             lanes of one AICore). Any other value is rejected by the parser.
         mode: Required dispatch mode, no silent default. ``pl.SplitMode.NONE``
-            (task-parallel, no halving), ``pl.SplitMode.UP_DOWN`` or
-            ``pl.SplitMode.LEFT_RIGHT`` (data-parallel halving).
+            (task-parallel, boundary shapes unchanged), ``pl.SplitMode.UP_DOWN`` or
+            ``pl.SplitMode.LEFT_RIGHT`` (explicit data-parallel boundaries).
 
     Returns:
         Loop iterator for the explicit AIV-split region.

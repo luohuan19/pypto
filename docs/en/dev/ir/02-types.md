@@ -21,6 +21,35 @@ float_type = ir.ScalarType(DataType.FP32)
 >
 > **Note:** `TASK_ID` is an opaque 64-bit handle (type code `0x50`) representing a runtime `TaskId`. It is **not** a numeric type — no arithmetic is defined on it. A `Scalar[TASK_ID]` value is produced by `pl.submit(...)` (the second tuple element it returns names the producer task) inside `with pl.manual_scope():` regions. The Python literal `None` is the "no producer yet" sentinel — it seeds a TaskId loop iter_arg and is accepted as a `deps=[None]` entry; in a TaskId position it lowers to the [`system.task_invalid`](05-operators.md#syncop-synchronization-operations) builtin → `TaskId::invalid()`. TaskId values are passed in the `deps=[tid1, tid2]` kwarg of `pl.submit(...)`. Codegen lowers `TASK_ID` to `TaskId`.
 
+### Register IR descriptors
+
+`RegType(shape, dtype, kind)` inherits directly from `Type`. Its shape is a
+single positive integer counting logical lanes, independent of the physical
+vector width. `lanes` aliases that integer. `RegKind.VecReg` rejects `BOOL`;
+`RegKind.MaskReg` requires `BOOL`. Invalid shapes, unknown dtypes and unknown kinds fail at
+construction or deserialization.
+
+```python
+vector = ir.RegType(64, DataType.FP32, ir.RegKind.VecReg)
+mask = ir.RegType(64, DataType.BOOL, ir.RegKind.MaskReg)
+```
+
+The annotation forms are `pl.Reg[64, pl.FP32]` (VecReg by default) and
+`pl.Reg[64, pl.BOOL, pl.RegKind.MaskReg]`. These descriptors, the fieldless
+`ir.RegScopeStmt(name_hint, body, span, leading_comments=[], attrs=None)`, and
+`ir.ForStmt.hardware_loop_policy` are IR infrastructure. Direct construction,
+visitor/mutator traversal, structural comparison and binary serialization are
+supported. P0 register operations and `pl.reg_scope()` support validated DSL
+construction and text roundtrips; see [register operations](../language/06-register-operations.md).
+VF code generation remains reserved for PR3.
+
+`HardwareLoopPolicy.Auto` is the default for new loops and old serialized
+loops that omit the field. `Require` is persistent semantic metadata; it must
+never silently become Auto. Unknown serialized policy values fail. Hardware
+loop analysis and emission are not implemented by this infrastructure change.
+Simplify may remove proven zero-trip Sequential Require loops and return initial
+carried values; nonempty Require loops, including single-trip loops, are preserved.
+
 ### Internal buffer types
 
 `BufferType` describes a mutable on-chip buffer in the final device IR. It
@@ -52,10 +81,13 @@ Expression values in `Call` and `Submit` attrs and kwargs follow the same
 rule at construction, including when attributes are attached with
 `ir.set_call_attrs`.
 
-These are initial buffer IR building blocks. Automatic tile-to-buffer lowering
-is not yet enabled; the public Tile DSL and default pipeline still use
-`TileType`. Direct PTO emission accepts explicitly constructed buffer programs
+The public Tile DSL uses `TileType`; default whole-kernel selection converts
+supported functions through [LowerTileToBuffer](../passes/58-lower_tile_to_buffer.md).
+Direct PTO emission also accepts explicitly constructed buffer programs
 with dense row-major Vec FP16/BF16/FP32/INT32 descriptors of rank one or two,
+and static positive-valid FP32 column-major `[R,1]` descriptors with `R` a multiple of eight,
+UINT8 predicate and UINT32 workspace descriptors for
+[cast/compare/select recipes](../passes/58-lower_tile_to_buffer.md),
 scalar parameters and control flow, and the buffer operations below. Ordinary GM
 parameters support dense ND rank-2 FP16/BF16/FP32/INT32 tensors with static
 physical shapes and more than one column. Arithmetic recipes impose their own
@@ -148,7 +180,7 @@ Address emission depends only on the allocation operand; the legacy
 operands remain in their lexical scope. No logical `TileType` or `MemRef` is
 reconstructed, and no implicit tile allocation pass runs on this path. The
 pipeline with `enable_buffer_ir=True` converts Tile IR before emission through
-[LowerTileToBuffer](../passes/54-lower_tile_to_buffer.md).
+[LowerTileToBuffer](../passes/58-lower_tile_to_buffer.md).
 
 Static storage views use ordinary SSA alias edges in the same Buffer stage:
 
@@ -168,11 +200,13 @@ valid extent is smaller than the physical shape. Constant valid operands must
 be positive and no larger than the corresponding window dimension; zero-valid
 windows are not supported. Full-width
 `UINT8[N,32]` byte windows of a storage root are the static special case. `buffer.reshape` preserves the exact physical byte count and accepts
-static dense row-major rank-2 Vec FP16, BF16, FP32, INT16, INT32 and UINT8 descriptors, with physical
+static dense row-major rank-2 Vec FP16, BF16, FP32, INT16, INT32, UINT8 and UINT32 descriptors, with physical
 rows aligned to 32 bytes. In Mat, Left, Right and Acc it only relabels one
 whole fractal window in the same space (for example NZ to ZN) with the same
 element type, byte count and static valid extents. Both operations declare `Alias(0)`, no data access, and
 source-metadata read. They neither allocate storage nor initialize data.
+FP32 column-vector reshapes preserve their physical `[R,1]` shape and column-major
+layout; only positive static valid rows may differ. They do not enable column-vector subviews.
 Every intermediate shape, dtype and valid extent is explicit in its result type.
 `buffer.set_validshape` cannot mutate these static view handles.
 
@@ -250,9 +284,9 @@ require later recipes and are rejected explicitly.
 
 The initial emitter accepts unsigned scalar values directly as allocation
 addresses, GM offsets, or valid extents, preserving their unsigned value when widening.
-Unsigned arithmetic and casts other than index-to-integer and same-width
-integer conversions require a future native recipe and are rejected before
-emission. For loops require an `INDEX` induction variable and `INDEX` or signed
+Unsigned arithmetic and casts other than BOOL-to-integer, index-to-integer,
+and same-width integer conversions require a future native recipe and are rejected
+before emission. For loops require an `INDEX` induction variable and `INDEX` or signed
 integer bounds, with a provably positive constant step. Runtime-valued, zero,
 and negative steps are rejected before emission. These are emitter limits, not restrictions on the Buffer IR
 representation itself.
@@ -404,7 +438,7 @@ The packed canonical formulas (`BuildLogicalStridesFromLayout` in
 | ------ | ---------------- |
 | `ND` | `stride[n-1] = 1; stride[k] = stride[k+1] * shape[k+1]` |
 | `DN` (`n ≥ 2`) | `stride[n-2] = 1`; `stride[n-1] = shape[n-2]`; `stride[n-3] = shape[n-2] * shape[n-1]`; outer dims row-major |
-| `NZ` | row-major over the *blocked* rank-5 shape `[B, C/c0, R/16, 16, c0]` — see [BlockNzTensorViews](../passes/15-block_nz_tensor_views.md) |
+| `NZ` | row-major over the *blocked* rank-5 shape `[B, C/c0, R/16, 16, c0]` — see [BlockNzTensorViews](../passes/17-block_nz_tensor_views.md) |
 
 **Two ways to spell the same canonical TensorView**:
 
@@ -413,7 +447,7 @@ The packed canonical formulas (`BuildLogicalStridesFromLayout` in
   canonical for the carried layout.
 - **Explicit** — every dimension's stride is spelled out.
 
-The [`MaterializeTensorStrides`](../passes/33-materialize_tensor_strides.md)
+The [`MaterializeTensorStrides`](../passes/35-materialize_tensor_strides.md)
 pass rewrites every implicit form to its explicit packed canonical so
 codegen sees a single contract. The `TensorViewCanonical` `IRProperty` +
 verifier enforces this:

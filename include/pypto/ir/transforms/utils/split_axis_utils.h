@@ -17,7 +17,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -65,43 +64,6 @@ int SplitDimension(SplitMode mode);
 ExprPtr ComputeHalfDimSize(const ExprPtr& dim_size);
 
 /**
- * @brief The per-lane partition stride for an AUTO-split body, or null.
- *
- * The split partitions the split axis between the two AIV lanes: lane L owns
- * ``[L * S, L * S + S)`` of it, where ``S`` is this stride. Two partitions are
- * possible, and they differ only when the boundary tile is ragged:
- *
- * | Partition | ``S`` | Lane extents for a `[16, ...]` box valid to 13 |
- * | --------- | ----- | ---------------------------------------------- |
- * | box (default) | ``ceil(box / 2)`` = 8 | 8 and 5 |
- * | valid (this)  | ``ceil(V / 2)`` = 7   | 7 and 6 |
- *
- * The box partition is universal — it works for every tile in the region
- * whatever its valid extent — but pto-isa can only place lane 1's FIFO band at
- * its own extent (even codes) or one past it (odd codes), so lanes 8 and 5 have
- * no expressible transport. Balancing the VALID region instead makes the two
- * lanes differ by at most one by construction, which is exactly what the codes
- * express — and it splits the real work evenly rather than leaving lane 1 the
- * remainder.
- *
- * It is only sound when the whole body agrees on one logical row space, so this
- * returns null (keep the box partition) unless:
- *
- * - the body has at least one Cube -> Vector boundary and they all agree on the
- *   same static ``(box, valid)`` on the split axis;
- * - no Vector -> Cube boundary is present (the gather re-joins the lanes
- *   positionally at their own extents, which only abut when they are equal);
- * - every other split-axis tile in the body is derived from that boundary — a
- *   tile with an independent origin (a `tile.load`, a generator) spans the FULL
- *   box, which the balanced partition would not cover.
- *
- * @param stmts The pre-lowering body statements.
- * @param split_dim The partitioned tile dimension (see SplitDimension).
- * @return The balanced stride as a ConstInt, or null to keep the box partition.
- */
-ExprPtr ResolveLaneStride(const std::vector<StmtPtr>& stmts, int split_dim);
-
-/**
  * @brief The pto-isa split code a Cube -> Vector boundary op must carry.
  *
  * pto-isa derives lane 1's band inside the FIFO slot from the popped tile's own
@@ -130,8 +92,7 @@ ExprPtr ResolveLaneStride(const std::vector<StmtPtr>& stmts, int split_dim);
  * lays its rows at their box positions, so lane 1's band sits at the box half and
  * the even code points there whatever the extent turns out to be.
  * LocalizeExplicitBoundaryValid establishes that pairing for a ``pl.split_aiv``
- * region and DeferAutoRuntimeShardExtents for a ``pl.split`` body
- * (WithFullSplitAxisValid); the lane's own extent is carried by the boundary's
+ * region (WithFullSplitAxisValid); the lane's own extent is carried by the boundary's
  * consumers. A hand-written
  * ``tile.tpop_from_aic`` keeps its declared per-lane extent and is still
  * misplaced for such a boundary — see RebuildTpopWithHalvedShape.
@@ -139,7 +100,7 @@ ExprPtr ResolveLaneStride(const std::vector<StmtPtr>& stmts, int split_dim);
  * @param mode The split mode (``None`` yields ``kSplitNone``).
  * @param full_type The PRE-split (full-width) boundary tile type.
  * @param split_dim The partitioned tile dimension (see SplitDimension).
- * @param lane_stride The body's partition stride (see ResolveLaneStride); null
+ * @param lane_stride The body's partition stride (when supplied explicitly); null
  *        for the default box partition, where ``S = ceil(box / 2)``.
  * @param op_name Op name for diagnostics.
  * @param span Span for diagnostics.
@@ -247,9 +208,9 @@ bool IsReduceOnSplitAxis(const CallPtr& call, int split_dim);
  * Once a tile var has been partitioned along the split axis, downstream ops
  * (e.g. ``tile.store``, loop ``iter_args``/``return_vars``) need its halved
  * extent to re-localize their split-dim offsets. ``half_dim_size`` is that
- * extent (a ``ConstInt`` for static dims, a ``floordiv`` expression otherwise)
- * — the tile's PHYSICAL half. How far apart the two lanes' data sits is the
- * partition stride instead (see ResolveLaneStride), which equals this half
+ * capacity (which may remain unchanged when the operator rounds allocation).
+ * How far apart the two lanes' data sits is the
+ * partition stride instead (when supplied explicitly), which equals this half
  * unless the body was rebalanced onto a ragged boundary's valid region.
  */
 struct TileInfo {
@@ -258,20 +219,19 @@ struct TileInfo {
   // dim, but a reshape can migrate the split axis to another dimension (e.g. the
   // rms_norm [N,1]<->[1,N] column reshape), so each tracked tile carries its own.
   int split_dim = 0;
+  // A proven logical partition records its step even when it equals capacity;
+  // its consumers still need valid-region checks. Null is reserved for the
+  // ordinary body stride / physical-half convention. Consumers resolve this
+  // default and still check validity; null never exempts a tracked partition.
+  ExprPtr logical_step = nullptr;
+  // Tuple containers share immutable element facts through aliases and carries.
+  std::shared_ptr<const std::vector<TileInfo>> tuple_elements = nullptr;
 };
 
-/// Admission facts for a lowered data-parallel body. Broadcast roots remain
-/// neutral: allowing a replicated producer does not prove its consumers split.
-struct SplitBodyAnalysis {
-  std::unordered_set<const Var*> half_tiles;
-  std::unordered_set<const Var*> lane_scalars;
-  std::vector<std::string> full_width_vec_ops;  ///< Operator names without proven per-lane dataflow.
-  std::vector<std::string> carry_mismatches;    ///< Carry names whose backedge loses an entry shard fact.
-};
-
-SplitBodyAnalysis AnalyzeSplitBody(const std::vector<StmtPtr>& stmts, int split_dim,
-                                   const std::unordered_map<const Var*, TileInfo>& known_tiles = {},
-                                   const std::unordered_map<const Var*, VarPtr>& replacements = {});
+/// Reject automatic reassembly when a value's logical partition does not match
+/// the per-lane physical extent expected by the existing gather transport.
+void CheckGatherPartition(const CallPtr& call, const std::unordered_map<const Var*, TileInfo>& tile_vars,
+                          const std::unordered_map<const Var*, VarPtr>& var_replacements);
 
 /**
  * @brief Result of injecting the per-subblock index at the top of a body.
@@ -279,14 +239,11 @@ SplitBodyAnalysis AnalyzeSplitBody(const std::vector<StmtPtr>& stmts, int split_
  * For AIV functions, ``InjectSubblockIdx`` prepends an assignment binding a
  * fresh ``subblock_idx`` var to ``tile.get_subblock_idx()``; ``subblock_idx_expr``
  * references that var. For non-AIV functions it is null and no statement is
- * prepended. ``used_names`` is the seeded name set (params + def vars, plus the
- * freshly reserved subblock name) so callers can keep generating collision-free
- * names.
+ * prepended. The binding name is reserved against parameters and body definitions.
  */
 struct SubblockInjectionResult {
   ExprPtr subblock_idx_expr;
   std::vector<StmtPtr> body_stmts;
-  std::unordered_set<std::string> used_names;
 };
 
 /**
@@ -297,24 +254,6 @@ struct SubblockInjectionResult {
  * @return The (possibly prepended) body statements plus the subblock-idx expr.
  */
 SubblockInjectionResult InjectSubblockIdx(const FunctionPtr& func, bool is_aiv);
-
-/**
- * @brief Inject the per-subblock index binding at the head of a region body.
- *
- * Region-scoped analogue of ``InjectSubblockIdx`` for the explicit
- * ``SplitAivScopeStmt`` consumer in LowerAutoVectorSplit (pass 23). Prepends a
- * fresh ``subblock_idx = tile.get_subblock_idx()`` binding to ``region_stmts``
- * (a region is always an AIV lane, so the index is always injected) and returns
- * the rewritten body plus the index expr. ``used_names`` seeds the collision-free
- * name set (caller-supplied names plus the region's own def vars are added) so the
- * injected name never clashes with an existing binding.
- *
- * @param region_stmts The flattened statements of the region body.
- * @param used_names Externally-reserved names to avoid colliding with.
- * @return The prepended body statements plus the subblock-idx expr.
- */
-SubblockInjectionResult InjectSubblockIdxIntoStmts(const std::vector<StmtPtr>& region_stmts,
-                                                   const std::unordered_set<std::string>& used_names);
 
 /**
  * @brief A tile.transpose that swaps the split axis on a non-singleton source.
@@ -334,8 +273,8 @@ struct TransposeSplitHazard {
  * a transpose that moves the split axis migrates the per-lane data to the other
  * dimension and cannot be split correctly. A source that is statically singleton
  * on the split axis carries no split data and is safe. Shared by ExpandMixedKernel
- * (AUTO whole-function check) and LowerAutoVectorSplit (explicit per-region check);
- * each caller builds its own actionable diagnostic from the result.
+ * (function-level check) and LowerAutoVectorSplit (per-region and function-level
+ * checks); each caller builds its own actionable diagnostic from the result.
  *
  * @param body The statement tree to scan.
  * @param split_dim The partitioned tile dimension (see SplitDimension).
@@ -361,7 +300,7 @@ TransposeSplitHazard FindTransposeSplitHazard(const StmtPtr& body, int split_dim
  * @param is_aiv Whether this is an AIV lane (gates per-op halving).
  * @param subblock_idx The per-subblock index expr (null for non-AIV).
  * @param var_replacements In/out map of original vars to their rebuilt versions.
- * @param lane_stride The body's partition stride (see ResolveLaneStride); null
+ * @param lane_stride The body's partition stride (when supplied explicitly); null
  *        keeps the default box partition.
  * @return The rewritten statement list.
  */
@@ -371,16 +310,14 @@ TransposeSplitHazard FindTransposeSplitHazard(const StmtPtr& body, int split_dim
 /// carrying a full-width operand even though its init was correctly halved.
 std::vector<IterArgPtr> RepairIterArgs(const std::vector<IterArgPtr>& iter_args,
                                        std::unordered_map<const Var*, TileInfo>& tile_vars,
-                                       std::unordered_map<const Var*, VarPtr>& var_replacements,
-                                       const ExprPtr& subblock_idx, const ExprPtr& lane_stride);
+                                       std::unordered_map<const Var*, VarPtr>& var_replacements);
 
 /// Give each loop-exit return_var the tile info of its iter_arg, so a later
 /// tile.store on it gets the per-lane offset. Call AFTER lowering the body.
 std::vector<VarPtr> RepairReturnVars(const std::vector<VarPtr>& return_vars,
                                      const std::vector<IterArgPtr>& new_iter_args,
                                      std::unordered_map<const Var*, TileInfo>& tile_vars,
-                                     std::unordered_map<const Var*, VarPtr>& var_replacements,
-                                     const ExprPtr& subblock_idx, const ExprPtr& lane_stride);
+                                     std::unordered_map<const Var*, VarPtr>& var_replacements);
 
 /// Give each IfStmt merge variable the tile info its branches yield, so it stops
 /// contradicting them and a later tile.store on it gets the per-lane offset.
@@ -408,14 +345,14 @@ std::vector<VarPtr> RepairReturnVars(const std::vector<VarPtr>& return_vars,
 /// only correct answer.
 void ValidateCarryBackedge(const StmtPtr& new_body, const std::vector<IterArgPtr>& new_iter_args,
                            const std::unordered_map<const Var*, TileInfo>& tile_vars,
-                           const std::unordered_map<const Var*, VarPtr>& var_replacements, const Span& span);
+                           const std::unordered_map<const Var*, VarPtr>& var_replacements, const Span& span,
+                           const ExprPtr& lane_stride = nullptr);
 
 std::vector<VarPtr> RepairIfReturnVars(const std::vector<VarPtr>& return_vars, const StmtPtr& new_then_body,
                                        const std::optional<StmtPtr>& new_else_body,
                                        std::unordered_map<const Var*, TileInfo>& tile_vars,
                                        std::unordered_map<const Var*, VarPtr>& var_replacements,
-                                       const ExprPtr& subblock_idx, const ExprPtr& lane_stride,
-                                       const Span& span);
+                                       const ExprPtr& lane_stride, const Span& span);
 
 /// The split the pass has already applied to one operand, or nullopt when it is not
 /// lane-local. THE single answer to "did the split partition this operand, and along
@@ -443,27 +380,23 @@ ExprPtr ReplacedOperand(const ExprPtr& arg, const std::unordered_map<const Var*,
 /// EvalStmt offset-localization arm, while the trailing Substitute swaps in the
 /// halved tile regardless. Both AIV lanes then write the same rows from different
 /// data and lane 1's half is silently lost. Both lowering arms must call this, for
-/// the same reason they must call RetypeTupleProjection.
+/// the same reason they must call RetypeTrackedBinding.
 StmtPtr LocalizeReturnStores(const std::shared_ptr<const ReturnStmt>& ret,
                              const std::unordered_map<const Var*, TileInfo>& tile_vars,
                              const std::unordered_map<const Var*, VarPtr>& var_replacements,
                              const ExprPtr& subblock_idx, const ExprPtr& lane_stride);
 
-/// Retype an ``x = tup[i]`` projection whose tuple was halved, or nullptr when
-/// @p assign is not such a projection.
+/// Retype aliases of tracked tiles/tuple containers and projections of tracked
+/// tuples. Aliases share the same partition facts; a projection adopts its
+/// element's exact deduced type and recorded axis/step rather than recovering
+/// a logical partition from its physical shape.
 ///
-/// A tuple-returning op has one split axis PER ELEMENT (tile.gather_compare answers a
-/// row split with a ``dst`` halved on dim 0 and a ``cdst`` -- shaped ``[1, rows]`` --
-/// halved on dim 1), so the projection cannot inherit a single result split dim. It
-/// reads the mapping back off the halved tuple type instead, and records the axis that
-/// moved in @p tile_vars so a later ``tile.store`` offsets each lane.
-///
-/// Both lowering arms must call this: the AUTO arm's affinity gate only routes leaf
-/// *calls* into ProcessStmts, so a projection left to its "pass through unchanged"
-/// fallback keeps a full-width declared type over a halved tuple.
-StmtPtr RetypeTupleProjection(const std::shared_ptr<const AssignStmt>& assign,
-                              std::unordered_map<const Var*, TileInfo>& tile_vars,
-                              std::unordered_map<const Var*, VarPtr>& var_replacements);
+/// Both lowering arms call this before their call/affinity dispatch, since these
+/// bindings have no Call node and otherwise bypass the ordinary rewrite path.
+/// Returns nullptr when the binding carries no tracked alias or tuple projection.
+StmtPtr RetypeTrackedBinding(const std::shared_ptr<const AssignStmt>& assign,
+                             std::unordered_map<const Var*, TileInfo>& tile_vars,
+                             std::unordered_map<const Var*, VarPtr>& var_replacements);
 
 std::vector<StmtPtr> ProcessStmts(const std::vector<StmtPtr>& stmts, SplitMode mode, int split_dim,
                                   std::unordered_map<const Var*, TileInfo>& tile_vars, bool is_aiv,
@@ -505,33 +438,6 @@ std::vector<StmtPtr> ProcessStmts(const std::vector<StmtPtr>& stmts, SplitMode m
  */
 std::vector<StmtPtr> LocalizeExplicitBoundaryValid(const std::vector<StmtPtr>& stmts, int split_dim,
                                                    const Span& region_span);
-
-/**
- * @brief Give an AUTO-halved body's runtime-extent Cube -> Vector shards the full per-lane box.
- *
- * The AUTO halving types each ``tile.aiv_shard`` with its lane's own split-axis
- * extent, which pto-isa reads to place lane 1's band. That is exact only for
- * compile-time lane extents; a runtime extent must leave the shard at the full
- * box (``WithFullSplitAxisValid``), the pairing ``LocalizeExplicitBoundaryValid``
- * establishes for the explicit form.
- *
- * Unlike that walk, nothing downstream is retyped: the halving already typed
- * every consumer and loop carry from its own pre-split type. What remains is
- * (1) retyping each such shard, (2) guarding a store whose stored tile has a
- * lane-dependent, possibly-zero valid extent and whose result nothing reads (a
- * zero-row store is outside the ISA contract; a read result would be left
- * conditionally defined, so that store stays unguarded, as before), and (3) rejecting the
- * direct uses a full-box shard cannot serve: a store, a pad fill, a loop carry,
- * a branch result or a return. A body with no runtime-extent shard is returned
- * unchanged.
- *
- * @param stmts The lowered body, including the ``tile.get_subblock_idx`` binding.
- * @param split_dim The partitioned tile dimension (see SplitDimension).
- * @param span Span for the rebuilt sequence.
- * @return The rewritten statement list (input order preserved).
- */
-std::vector<StmtPtr> DeferAutoRuntimeShardExtents(const std::vector<StmtPtr>& stmts, int split_dim,
-                                                  const Span& span);
 
 /**
  * @brief Replace a shard result type's split-axis valid extent with the lane's own.

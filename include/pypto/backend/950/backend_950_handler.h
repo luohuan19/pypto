@@ -13,6 +13,7 @@
 #define PYPTO_BACKEND_950_BACKEND_950_HANDLER_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,17 +37,24 @@ class Ascend950Handler : public BackendHandler {
  public:
   static const Ascend950Handler& Instance();
 
+  [[nodiscard]] std::optional<SimtLimits> GetSimtLimits() const override {
+    return SimtLimits{{2048, 2048, 2048}, 2048, {{256, 128}, {512, 64}, {1024, 32}, {2048, 16}}};
+  }
+
   [[nodiscard]] std::string GetPtoTargetArch() const override { return "a5"; }
-  [[nodiscard]] std::string GetLaunchSpecCoreCountMethod() const override { return "set_core_num"; }
+  [[nodiscard]] const sync::ResourceCatalog& GetSyncResourceCatalog() const override;
+  [[nodiscard]] bool SupportsRegType(const ir::RegType& type) const override;
+  [[nodiscard]] std::string GetLaunchSpecCoreCountMethod() const override { return "set_block_num"; }
   [[nodiscard]] std::string GetDefaultSimPlatform() const override { return "a5sim"; }
   [[nodiscard]] std::vector<std::string> GetExtraPtoasFlags() const override { return {"--pto-arch", "a5"}; }
-  // A5 supports both legacy logical FP4 and packed FP4E2M1X2; INT4/UINT4/HF4 stay rejected.
+  // A5 supports both packed FP4 formats; INT4/UINT4/HF4 stay rejected.
   [[nodiscard]] bool SupportsIncoreDataType(const DataType& dtype) const override {
-    return dtype.GetBit() != 4 || dtype == DataType::FP4 || dtype.IsPackedFp4();
+    return dtype.GetBit() != 4;
   }
   [[nodiscard]] bool HonorsHighPrecisionAlgorithm() const override { return true; }
 
   [[nodiscard]] bool RequiresGMPipeBuffer() const override { return false; }
+  [[nodiscard]] bool SupportsC2VFixpipeEpilogue() const override { return true; }
   [[nodiscard]] bool RequiresSplitLoadTpopWorkaround() const override { return false; }
 
   // A5 dispatches all six compare modes generically over the element type.
@@ -54,27 +62,6 @@ class Ascend950Handler : public BackendHandler {
     return true;
   }
   [[nodiscard]] bool RequiresLevel3TmpScratch() const override { return false; }
-
-  // A5 sizes both select scratches as one 32-byte block, source-independent.
-  [[nodiscard]] backend::TileScratchSpec GetTselScratchSpec() const override {
-    return {DataType::UINT8, 1, 32};
-  }
-  [[nodiscard]] backend::TileScratchSpec GetTselsScratchSpec(DataType /*src_dtype*/,
-                                                             int64_t /*src_cols*/) const override {
-    return {DataType::UINT8, 1, 32};
-  }
-
-  // A5 TSELS additionally covers the 8-bit integer forms.
-  [[nodiscard]] bool SupportsTselsDataType(const DataType& src_dtype) const override {
-    return src_dtype == DataType::INT8 || src_dtype == DataType::UINT8 || src_dtype == DataType::INT16 ||
-           src_dtype == DataType::UINT16 || src_dtype == DataType::INT32 || src_dtype == DataType::UINT32 ||
-           src_dtype == DataType::FP16 || src_dtype == DataType::FP32;
-  }
-
-  // A5 TSEL covers everything TSELS does, plus bf16.
-  [[nodiscard]] bool SupportsTselDataType(const DataType& dtype) const override {
-    return SupportsTselsDataType(dtype) || dtype == DataType::BF16;
-  }
 
   [[nodiscard]] bool RequiresVtoCFractalAdapt() const override { return true; }
   [[nodiscard]] bool RequiresRuntimeSubblockBridge() const override { return false; }
@@ -140,15 +127,6 @@ class Ascend950Handler : public BackendHandler {
   [[nodiscard]] uint32_t GetL2CacheLineBytes() const override { return 512; }
   [[nodiscard]] uint32_t GetRecommendedInnermostDimBytes() const override { return 128; }
 
-  // L0 capacity (matches Create950SoC AIC core memory layout; grounded in the pto-isa
-  // hardware reference include/pto/common/buffer_limits.hpp under PTO_NPU_ARCH_A5:
-  // L0A/L0B 64 KB, L0C 256 KB (2x a2a3), Mat/CB 512 KB). These are CORRECT for a5 and
-  // are what already make a5 tile differently from a2a3 (bigger accumulator -> bigger
-  // tiles / fewer M/N splits). Only the ROOFLINE CONSTANTS below are still a2a3-derived.
-  [[nodiscard]] uint32_t GetL0aCapacityBytes() const override { return 64ULL * 1024; }
-  [[nodiscard]] uint32_t GetL0bCapacityBytes() const override { return 64ULL * 1024; }
-  [[nodiscard]] uint32_t GetL0cCapacityBytes() const override { return 256ULL * 1024; }
-  [[nodiscard]] uint32_t GetBiasCapacityBytes() const override { return 4ULL * 1024; }
   [[nodiscard]] bool SupportsMatToBiasMove(const DataType& source_dtype,
                                            const DataType& bias_dtype) const override {
     return (source_dtype == DataType::INT32 && bias_dtype == DataType::INT32) ||
@@ -156,7 +134,6 @@ class Ascend950Handler : public BackendHandler {
             (source_dtype == DataType::FP32 || source_dtype == DataType::FP16 ||
              source_dtype == DataType::BF16));
   }
-  [[nodiscard]] uint64_t GetMatCapacityBytes() const override { return 512ULL * 1024; }
 
   // a5 roofline cost-model constants -- FULLY a5-sim-CALIBRATED (all 7; raw work-cycle fit;
   // no a5 device, so a5-sim is the ground truth). Recipe (a5_cost_model_device_task.md): fit
@@ -203,7 +180,7 @@ class Ascend950Handler : public BackendHandler {
   }
 
  private:
-  Ascend950Handler() = default;
+  Ascend950Handler();
 };
 
 }  // namespace backend

@@ -1,5 +1,9 @@
 # Operator System
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../08-entry-points.md#legacy-platform-examples).
+
 Type-safe operator definitions with automatic type deduction, organized into modular categories (TensorOp, TileOp, SyncOp, CrossCoreOp).
 
 ## Operator Categories
@@ -26,6 +30,13 @@ The internal Buffer-stage GM and addition operations have no public DSL wrappers
 | `buffer.extract` | source buffer, row offset, column offset, destination buffer | Void |
 | `buffer.matmul` | Left buffer, Right buffer, Acc destination | Void |
 | `buffer.matmul_acc` | Left buffer, Right buffer, Acc buffer read and written | Void |
+| `buffer.cast` | FP16/FP32 source, destination; explicit rounding/saturation attrs | Void |
+| `buffer.cmp`, `buffer.cmps` | FP32 source, tile/scalar comparison operand, packed UINT8 destination | Void |
+| `buffer.sel`, `buffer.sels` | packed predicate, value operands, explicit scratch, destination | Void |
+| `buffer.gather` | source, INT32 indices, explicit INT32 scratch, destination | Void |
+| `buffer.scatter` | source, INT32 indices, full-valid destination (cleared before indexed writes) | Void |
+| `buffer.row_max`, `buffer.row_sum` | FP32 matrix, explicit scratch, column-vector destination | Void |
+| `buffer.row_expand_sub`, `buffer.row_expand_div` | FP32 matrix, column vector, matrix destination | Void |
 
 These use separate data/metadata effects. See [Buffer contracts](02-types.md#buffer-operator-contracts)
 for shape, dtype, valid-state, and alias requirements.
@@ -81,7 +92,7 @@ or compact mode. Their dtype contract does not inherit FP16 support from the
 native descriptor formatter. `add`/`mul` require FP16/FP32/INT32 operands.
 Automatic conversion and ordinary GM transfers support static rank-2
 FP16/BF16/FP32/INT32 descriptors; BF16 arithmetic requires a separate native
-recipe. Both Ascend910B and Ascend950 use these contracts.
+recipe. Both Ascend910 and Ascend950 use these contracts.
 
 The public `tile.full` wrapper accepts both numeric literals and parsed scalar
 constants, so positional and keyword fill values agree. Integer placeholders
@@ -255,6 +266,17 @@ exact physical M/N/K box compatibility while allowing the accumulator's valid
 M/N rectangle and the rhs valid K extent to contain the smaller rectangle PTO
 computes from lhs M/K and rhs N.
 
+For rank-2 FP32 operands on Ascend950, `matmul`, `matmul_acc`, and
+`tile.matmul_bias` accept keyword-only `tf32_mode="round_even"` or
+`tf32_mode="round_away"`. Both round inputs to HF32 (e8m10) and accumulate in
+FP32; halfway values round to even or away from zero, respectively. Omitting
+the option preserves ordinary FP32 matmul. The setting survives tensor-to-tile
+lowering and automatic L0 tiling and applies only to that operation. This
+requires PTOAS v0.72 or newer and its PTO/EmitC path; it does not enable VPTO
+lowering. Other input dtypes, non-2D operands, and Ascend910 are rejected.
+The Torch reference generator rounds both multiplicands using the requested
+mode for Tensor, Tile, and Buffer IR; bias and accumulator values stay FP32.
+
 #### Conditional accumulator initialization (`init_cond`)
 
 `tile.matmul_acc`, `tile.batch_matmul_acc`, `tensor.matmul_acc`, and
@@ -313,19 +335,20 @@ with no init operand, hence the branch. Because `matmul_acc` is in place
 (`set_output_reuses_input(0)`), both arms write the same buffer and the `scf.if`
 yields no value — no phi is materialized on the Acc tile.
 
-"Literal" covers **both** spellings a constant predicate arrives in: a DSL
-`init_cond=True`/`False` reaches the emitter as a BOOL-typed `ConstInt`, while a
-predicate an earlier pass folded reaches it as a `ConstBool` — which is what the
-generated `ko == 0` becomes when [`LowerPipelineLoops`](../passes/31-lower_pipeline_loops.md)
-replicates the K-loop *and* the enclosing loop is eliminated, so each replica's
-index is a literal. Both pick an arm outright, and an emitter that folded only
-one of the two would double the MADs of every K block it missed.
+A literal predicate is a `ConstBool`, whether the user wrote `init_cond=True`/`False`
+or a pass decided it — e.g. the generated `ko == 0` once
+[`LowerPipelineLoops`](../passes/33-lower_pipeline_loops.md) replicates the K-loop.
+The emitter also accepts a BOOL-typed `ConstInt`, the spelling of IR built directly
+through the bindings. Either picks an arm outright; an emitter that folded neither
+would double the MADs of every K block.
 
 The fold is therefore conditional on the trip count, not universal: at
 `16x512x64` the pipelined loop disappears and the emitted PTO has no `scf.if`,
-while at `16x2048x64` the replica indices stay symbolic (`ko`, `ko + 256`) and
-two `scf.if`s survive. That is not a regression — the peeled `IfStmt` this
-replaced produced the same two branches for those shapes.
+while at `16x2048x64` the main loop survives with replica indices `ko` and
+`ko + 256`. [`Simplify`](../passes/06-simplify.md#provable-comparison-in-an-operand)
+decides replica 1's predicate (`ko == -256`) false from the loop's static range and
+folds it to a `ConstBool`, while replica 0's `ko == 0` is a genuine runtime test —
+it seeds the accumulator — so exactly one `scf.if` remains.
 
 The compiler uses the idiom it recommends: `AutoTileMatmulL0` *emits* the
 predicated form for the K-loop of a plain `tile.matmul`, so the `tile.create`
@@ -394,14 +417,14 @@ spaces are resolved.
 | `tile.load` of `pl.Tensor[..., pl.MX_A_ZZ \| pl.MX_B_NN]` | The source TensorLayout carries the MX scale GM layout. Dtype is FP8E8M0, and strided sources are rejected. Public `pl.load` defaults an omitted target to `Mat`; raw IR must carry `target_memory=Mat`. |
 | `tile.move(..., target_memory=LeftScale/RightScale)` | Mat-to-Scale move with hardware-fixed row/row/32 (left) or col/col/32 (right) layout; the source Mat tile and layout overrides must match exactly. |
 | `tile.create(..., target_memory=LeftScale/RightScale)` | Not supported; load MX scale data into Mat and then move it into scale memory. |
-| `tile.matmul_mx` / `pl.matmul_mx` | `Left, LeftScale, Right, RightScale → Acc`; operand positions drive automatic placement, including Vec→Mat→LeftScale/RightScale staging for `quant_mx` scales. Both data operands reaching the op must be `FP8E4M3FN`, and scale is `FP8E8M0`; `lhs_scale` and `rhs_scale` must be distinct tiles. The supported FP4-input form is FP4 lhs × FP8 rhs with an explicit `pl.cast(fp4, pl.FP8E4M3FN)` before the op; native FP4×FP4 and FP8×FP4 are rejected. Physical M/K/N, valid K, and scale-group counts use the post-cast FP8 tile extents, never the packed x2 carrier shape. Physical `M % 16 == 0`, `K % 64 == 0`, and `N % 32 == 0`; valid K must satisfy `ceil(validK/32) == ceil(physicalK/32)`. Alignment / scale-group checks run only for constant extents; symbolic dims skip the numeric checks and fall back to the declared scale tile geometry (later PTOAS still verifies). |
+| `tile.matmul_mx` / `pl.matmul_mx` | `Left, LeftScale, Right, RightScale → Acc`; both operands must be FP8E4M3FN or packed FP4 (either format). Mixed FP4/FP8 requires an explicit cast. FP4 shapes count carriers; inference expands the contiguous axis to logical M/K/N. FP8E8M0 scales use `[M, ceil(K/32)]` / `[ceil(K/32), N]`, and FP32 Acc uses `[M, N]`; scales must be distinct tiles. Physical logical `M % 16 == 0`, `K % 64 == 0`, `N % 32 == 0` (FP4 N % 64), with boxed-tile alignment also required. Valid K must preserve the physical scale-group count. Numeric checks apply to constant extents; PTOAS verifies symbolic geometry later. Native FP4 requires PTOAS #1700; see [FP4](../fp4.md). |
 | `tile.matmul_mx_acc` / `pl.matmul_mx_acc` | `Acc, Left, LeftScale, Right, RightScale → Acc`; in-place through `set_output_reuses_input(0)`; accumulator physical and valid M/N must match the matmul output. |
 | `tile.matmul_mx_bias` / `pl.matmul_mx_bias` | `Left, LeftScale, Right, RightScale, Bias → Acc`; bias is `[1, N]` FP32. |
 | `tile.tget_scale_addr` | Compiler-generated A5 binding from `LeftScale↔Left` or `RightScale↔Right`; DPS in-place on `dst_scale`. Users write only the `matmul_mx` family. |
 
 The canonical shape is `M=128, K=64, N=64`, with FP8E4M3FN data,
 FP8E8M0 scales shaped `[128,2]` and `[2,64]`, and `mx_a_zz` / `mx_b_nn`
-host layouts. The left input may originate as FP4 only when explicitly cast to FP8 first.
+host layouts. The left input may use either packed FP4 format when explicitly cast to FP8 first.
 Align M↑16, K↑64, and N↑32.
 
 MX tensor subviews are a legacy limitation. `tensor.slice`, `tensor.reshape`,
@@ -413,24 +436,28 @@ between packed ND backing and `MX_A_ZZ` / `MX_B_NN` (used for GM staging).
 contract is implemented. `tensor.gather_row` / `tile.gather_row` likewise reject
 MX sources.
 
-FP4 Tensor/Tile shapes and `valid_shape` are logical nibble counts; the innermost extent must be positive and even, and slice origins cannot select a byte's second nibble.
-Torch/runtime carries `float4_e2m1fn_x2` in a physical x2 shape; JIT/compiled-call conversion avoids a persistent IR `storage_shape`.
+Packed FP4 Tensor/Tile shapes, `valid_shape`, strides, and offsets count byte
+carriers. Torch E2M1 x2 tensors and explicitly annotated UINT8 carriers retain
+these dimensions through JIT and compiled calls without unit conversion.
 
-An explicit left-side FP4→FP8 tile cast is legalized on A5 as
-FP4→BF16→FP32→FP8E4M3FN. Scale values are unchanged because this is a numerical
-cast of the data operand. Native packed-FP4 matmul remains unsupported; standalone MXFP4 quantization is
-out of scope for this release (`pl.quant_mx` is MXFP8-only).
+Explicit casts from either packed FP4 format to FP8 are legalized on A5 through
+BF16 and FP32. Scale values are unchanged because this numerically converts
+only the data operand. Native packed-FP4 tile matmul retains both packed operands.
+`pl.quant_mx` supports MXFP8 and E2M1 MXFP4 quantization from FP16/BF16;
+FP4 results require supported placement into Mat and Left/Right before tile matmul.
+See [FP4](../fp4.md) for
+quantization alignment and memory-planner requirements.
 
 #### MX / Ascend950: pto-isa constraints
 
 | Constraint | Detail |
 | ---------- | ------ |
 | Distinct scale buffers | Cube does not fold scales into Left/Right data. `TileType::ScaleLeft` / `ScaleRight` sidecars map to PyPTO `LeftScale` / `RightScale`. |
-| Payload | Scale is `float8_e8m0_t` / `FP8E8M0`; the emitted MX data pair is `FP8E4M3FN × FP8E4M3FN` (rejects `FP8E5M2` and native packed FP4). A logical FP4×FP8 input first casts the FP4 lhs to FP8. Physical K, valid K, and `ceil(K/32)` scale groups are measured on that post-cast FP8 tile, not the packed x2 carrier; physical `K%64==0` and fractal is 32. |
+| Payload | Scale is FP8E8M0; operands are FP8E4M3FN pairs or packed FP4 pairs (E2M1/E1M2). FP8E5M2 and mixed FP4/FP8 are rejected. K and scale-group counts use logical values; scale fractal is 32. |
 | Layouts | `mx_a_zz` is row-major ZZ; `mx_b_nn` is col-major NN; loads use `TLoadMxCube*` (AZZ2ZZ). |
 | `TMov` `CommonCheckMX` | Allows UINT8 Mat → FP8E8M0 ScaleLeft/Right; canonical path: ui8 Mat reshape then ui8→f8 Scale. |
 | Bind then fill | Fill **after** `GetScaleAddr(Left/Right)`; writing the provisional alloc address is orphaned once rebound. |
-| Alignment | Post-cast FP8 tile extents require physical `M%16==0`, `K%64==0`, and `N%32==0`; `DeduceTileMatMulMxType` enforces these for **constant** extents only. Symbolic dims skip numeric checks. |
+| Alignment | Logical physical `M%16==0`, `K%64==0`, and `N%32==0` (FP4: `N%64==0`), plus boxed carrier-tile alignment. Numeric checks apply only to constant extents. |
 
 #### MX / Ascend950: PTOAS constraints
 
@@ -442,7 +469,7 @@ out of scope for this release (`pl.quant_mx` is MXFP8-only).
 | Shape-matched Mat→Scale `tmov` | Flat `[1,G]` must `treshape` to `[M,K/32]` (or B-side shape) first. |
 | Order | PyPTO emits Mat→scaling `tmov` in source order; PTOAS `PTOA5NormalizeTMovPass` reorders `tget_scale_addr` before it (ISA bind-then-fill). |
 | `#pto.layout` / mx load | `mx_a_zz` / `mx_b_nn` / …; codegen emits logical rank-2 `make_tensor_view` (PTOAS v0.60 InferPTOLayout / EmitC map the pack). |
-| Coverage | `pto.tmatmul.mx` / `.acc` / `.bias` + `pto.tget_scale_addr`; `pto.tquant.mx` via [LowerCompositeOps](../passes/13-lower_composite_ops.md). |
+| Coverage | `pto.tmatmul.mx` / `.acc` / `.bias` + `pto.tget_scale_addr`; `pto.tquant.mx` via [LowerCompositeOps](../passes/15-lower_composite_ops.md). |
 
 ### Tile-only GEMV family (A2/A3)
 
@@ -459,11 +486,6 @@ are `INT8 x INT8 -> INT32` and same-type `FP16`, `BF16`, or `FP32` inputs to
 `FP32`; `gemv_acc` uses that output dtype for `acc`, and `gemv_bias` requires
 the same output dtype for `bias`. The bias valid shape must cover the logical
 output shape `[1, N]`; its valid N may be wider when the physical N matches.
-
-`tile.gemv`, `tile.gemv_acc`, and `tile.gemv_bias` accept `acc_phase` as
-`pl.AccPhase.Unspecified` (the default), `pl.AccPhase.Partial`, or
-`pl.AccPhase.Final`. Use `Partial` while more K chunks remain and `Final` for
-the last chunk.
 
 `tile.gemv_acc` additionally takes the optional `init_cond` predicate — see
 [Conditional accumulator initialization](#conditional-accumulator-initialization-init_cond).
@@ -483,6 +505,24 @@ acc = pl.tile.set_validshape(acc_raw, 1, N)  # then gemv_acc(..., init_cond=(k0 
 Before `init_cond`, the peel did this implicitly — a straight-line `pl.tile.gemv`
 mints a correctly typed accumulator, at the cost of a phi between the branches.
 
+### Accumulator phases (A2/A3)
+
+`tile.matmul`, `tile.matmul_acc`, `tile.gemv`, `tile.gemv_acc`, and
+`tile.gemv_bias` accept `acc_phase` as `pl.AccPhase.Unspecified` (the default),
+`pl.AccPhase.Partial`, or `pl.AccPhase.Final`. `Unspecified` preserves the
+existing behavior. Use `Partial` while more K chunks remain and `Final` for
+the last chunk. The Matmul DSL entry points make `acc_phase` keyword-only,
+so `pl.tile.matmul_acc(acc, lhs, rhs, init_cond, acc_phase=...)` retains its
+existing fourth positional `init_cond`; the IR wrapper likewise preserves
+its positional `span`. Both initialization and accumulation codegen arms
+carry the selected phase.
+
+With `AccPhase.Final`, `matmul_acc` requires the product's valid M/N rectangle
+to provably equal the accumulator's valid rectangle. A smaller update of a
+wider accumulator is rejected: its Final store would check untouched blocks
+whose unit flags the MAD did not set. Use a matching accumulator window, or
+keep the update partial until the whole valid rectangle is finalized.
+
 On a unit-flag-aware path, the final accumulator producer must be paired with
 `pl.store(..., st_phase=pl.STPhase.Final)`. The final producer sets the unit flag
 and the final store checks and clears it; a plain store intentionally keeps the
@@ -492,6 +532,24 @@ lifecycle. Compilation verifies the supported final pairing in both directions:
 bind the final producer's result and store that exact value in the same
 straight-line control-flow region. A missing or mismatched pair is rejected
 before code generation because it can otherwise stall device execution.
+Before its matching store clears the flag, a final result may only be
+forwarded through a plain SSA alias; no other operation may consume it. This
+also prevents a view or copy from hiding an unsafe accumulator reuse. A complete pair inside a branch or loop body is supported; carrying a
+pending final result across a branch, loop, or scope boundary is rejected.
+[`AutoTileMatmulL0`](../passes/20-auto_tile_matmul_l0.md) preserves this contract:
+intermediate K blocks use `Partial`, and the last block alone uses `Final`.
+Explicit phases do not remove other automatically inserted synchronization.
+
+Storage checks follow registered in-place operations and views, including
+aliases made before a Final update and straight-line tuple forwarding or
+nested tuple projections. A branch selection retains its possible sources
+without identifying independent source accumulators with each other. Tuple
+values with unresolved provenance across a branch join, loop carry, or opaque
+result are rejected when they may contain Acc storage (including unresolved
+memory spaces) and the function uses a Final protocol. Unpack those tiles into
+separate aliases or tile loop arguments. Known non-Acc tile tuples, scalar
+tuples and unphased functions are unaffected. Storage analysis is built only
+when a Final producer is encountered; unmatched Final stores are always checked.
 
 ## Python Usage
 
@@ -607,20 +665,43 @@ flat gather, valid-region semantics, tile layouts, and mask patterns.
 **Location**: `src/ir/op/sync_ops/` — `sync.cpp` (barriers), `task.cpp` (TaskId), `launch.cpp` (launch-shape queries)
 **Python API**: `from pypto.ir.op import system`
 
+The public Python barrier API is `pl.system.barrier(*, pipe, core_type=None)`,
+accepting every `pl.PipeType` member. It constructs the operand-free
+`system.bar_*` operators below — there is no `system.barrier` IR operator and no
+`pipe` IR attr — and the printer renders them back as
+`pl.system.barrier(pipe=...)`. The old `bar_v()` / `bar_m()` / `bar_all()` Python
+APIs have been removed. Barriers consume no event slot, and `ALL` orders all
+pipelines on the current core, not arrivals across cores. A barrier is
+**rejected inside `pl.pipeline`**: having no operand, it gets no def-use edge to
+hold it in place and could be ordered before the transfer it was written to
+follow — the restriction `set_flag` / `wait_flag` already carry.
+
 | Operation | Description | Kwargs |
 | --------- | ----------- | ------ |
-| `system.bar_all` | Global barrier (lowers to `pto.barrier <PIPE_ALL>`) | None |
-| `system.bar_v` | Vector barrier (lowers to `pto.barrier <PIPE_V>`) | None |
-| `system.bar_m` | Matrix barrier (lowers to `pto.barrier <PIPE_M>`) | None |
+| `system.bar_*` | Drain one hardware pipeline (`pto.barrier <PIPE_*>`). One op per `PipeType`: `bar_mte1` MTE1 (L1 → L0A/L0B), `bar_mte2` MTE2 (GM → UB load), `bar_mte3` MTE3 (UB → GM store), `bar_m` Matrix, `bar_v` Vector, `bar_s` Scalar, `bar_fix` Fix (L0C writeback), `bar_all` every pipeline on this core | `core_type` (`"aic"` \| `"aiv"`), optional — pins the barrier to one lane of a mixed kernel; omitted leaves it SHARED, i.e. in both |
 | `system.fence` | Memory barrier over global memory (lowers to `pto.fence.barrier_all #pto.fence_scope<gm>`) | None |
 | `system.cacheinvalid` | Invalidate the cache line containing a tensor sub-region's base address. Args: `tensor`, `shapes` (N-D), `offsets` (N-D). Every region size — a single element included — lowers to `pto.partition_view` + `pto.cmo.cacheinvalid %payload_view single_cache_line : !pto.partition_tensor_view<...>`; `shapes` does not make it walk every cache line. The no-argument form invalidates all GM. | None |
 | `system.syncall` | Cross-core all-participant barrier (`pto::SYNCALL`). Attr `mode` `"hard"` (FFTS, no operands) or `"soft"` (GM-polling, operands) | `core_type` (`"aiv_only"` \| `"aic_only"` \| `"mix"`), `mode` (`"hard"` \| `"soft"`) |
 | `system.sync_src` | Set sync flag | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.sync_dst` | Wait sync flag | `set_pipe`, `wait_pipe`, `event_id` |
+| `system.set_flag` / `system.wait_flag` | Explicit intra-core pipeline event | `src_pipe`, `dst_pipe`, static `event_id` or one dynamic INDEX operand; optional `core_type` |
 | `system.task_invalid` | Sentinel `TaskId::invalid()` — "no producer" seed for a TaskId carry | None |
 | `system.task_is_valid` | Test whether a `TASK_ID` value is a valid (non-sentinel) handle | None; sole positional arg is the TaskId Var |
 | `system.available_cluster_count` | This run's MIX cluster (= AIC) count, read from the device. Result `Scalar[INT32]` | None |
 | `system.available_aiv_count` | This run's standalone AIV core count, read from the device. Result `Scalar[INT32]` | None |
+
+The explicit flag calls have `UnknownType` and are retained as `EvalStmt(Call)`.
+`src_pipe` and `dst_pipe` are distinct concrete `PipeType` values (not `ALL`).
+Exactly one event form is present: a literal `event_id` in `[0, 7]`, or one
+`ScalarType(INDEX)` operand whose runtime value must stay in that range.
+`core_type` is optional `"aic"` / `"aiv"` IR metadata for mixed-kernel placement.
+Codegen emits `pto.set_flag` / `pto.wait_flag`, or the `_dyn` variants for an
+INDEX operand. A dynamic operand folded to a constant remains an operand and
+still emits the `_dyn` form; IR printing preserves it with `pl._dump.call`.
+The calls do not represent cross-core synchronization.
+The `PipelineLoopValid` verifier rejects either call inside a `ForKind::Pipeline`
+loop before pipeline scheduling. The scheduling passes also reject this placement
+when optional IR verification is disabled. Explicit flags work in ordinary loops.
 
 `system.syncall` has two modes, selected by its `mode` **IR attribute**; the Python surfaces spell them as `pl.SyncAllMode` members instead (see below). The **hard** form (attr `"hard"`, the default) emits an FFTS barrier that waits for **all** physical cores of the selected `core_type`; the kernel must be launched at full occupancy (one block per physical core) **and with `sync_start=True`** (so all blocks are co-resident — a non-sync_start launch may dispatch blocks in waves and deadlock the barrier), or it deadlocks (AICore error 507018). The **soft** form (attr `"soft"`) polls a shared GM workspace and so works at **partial** occupancy. `gm_workspace` is a shared, zero-initialized GM `INT32` tensor containing at least 16 elements (64 bytes). Pass it as a kernel parameter so all blocks share one buffer; it must occupy an exclusive cache line and be zero-initialized before its first use.
 
@@ -666,12 +747,27 @@ Use `pl.system.sync_set(event_id, pipe=..., ffts_mode=...)` and `pl.system.sync_
 
 | Operation | Args | Description | Kwargs |
 | --------- | ---- | ----------- | ------ |
-| `system.aic_initialize_pipe` | 2 | Init cross-core pipe on Cube side (positional: `c2v_consumer_buf`, `v2c_consumer_buf`, i32 SSA) | `dir_mask`, `slot_size`, optional `slot_num`, optional `local_slot_num`, optional `id` |
-| `system.aiv_initialize_pipe` | 2 | Init cross-core pipe on Vector side (positional: `c2v_consumer_buf`, `v2c_consumer_buf`, i32 SSA) | `dir_mask`, `slot_size`, optional `slot_num`, optional `local_slot_num`, optional `id` |
+| `system.aic_initialize_pipe` | 2 | Init cross-core pipe on Cube side (positional: `c2v_consumer_buf`, `v2c_consumer_buf`, i32 SSA) | `dir_mask`, `slot_size`, optional `slot_num`, optional `local_slot_num`, optional `id`, optional `c2v_dtype`, optional `pre_relu` |
+| `system.aiv_initialize_pipe` | 2 | Init cross-core pipe on Vector side (positional: `c2v_consumer_buf`, `v2c_consumer_buf`, i32 SSA) | `dir_mask`, `slot_size`, optional `slot_num`, optional `local_slot_num`, optional `id`, optional `c2v_dtype`, optional `pre_relu` |
 
 - `slot_num` (when set, must be > 0) pins the GM ring-buffer slot count; omit it to let PTOAS pick its default (8 unidirectional, 4 per direction bidirectional).
 - `local_slot_num` (a2/a3 only, must be > 0 and `<= slot_num`) pins the local slot count.
 - **Sizing the reserved/imported buffer is your responsibility and is architecture-dependent:** on **a3** use `slot_size * local_slot_num`; on **a5** use `slot_size * slot_num`.
+
+For explicit **A5 C2V-only, non-split** pipes (`dir_mask=1`, `split=0`), set
+`c2v_dtype=pl.FP32`, `pl.FP16`, or `pl.BF16` on **both** initializers. The producer
+must push an FP32 Acc tile and the consumer must pop the declared payload dtype.
+`pre_relu=True` applies ReLU before conversion on every push and requires an explicit
+`c2v_dtype`; both peers must agree. FP16/BF16 narrowing uses unscaled RNE, with no
+`pre_quant` scale. `slot_size` is measured in payload bytes: a `64 x 128` BF16 tile
+uses 16384 bytes, with a 32768-byte reserved buffer for `slot_num=2`. Release the
+popped FIFO slot only after its last consumer. Omitting these options preserves
+existing pipe behavior. Each AIC/AIV function initializes a given pipe `id` once;
+PTOAS rejects repeated initialization of that ID within the same function.
+The Torch reference also keeps queues independent by `id`. It applies the
+producer's executed initialization to subsequent pushes, including pushes delegated
+to inline helpers. When a later Group initializes a default C2V pipe with the same
+ID, the reference restores identity transport for that ID.
 
 ### Buffer Management Operations
 
@@ -681,6 +777,13 @@ Use `pl.system.sync_set(event_id, pipe=..., ffts_mode=...)` and `pl.system.sync_
 | `system.import_peer_buffer` | 0 | Import buffer from peer function (producer side) | `name`, `peer_func` |
 
 \* `base` defaults to `AUTO (-1)` for compiler-assigned address.
+
+In explicit JIT Groups, symbolic `peer_func` names resolve through inline wrappers
+around Group members and inside nested inline initializers. Each specialization of
+a helper that imports a peer must belong to one generated AIC/AIV peer pair;
+sharing it across different pairs is rejected. Helpers without peer imports may be
+shared. Names and call aliases that identify both peer members are rejected as
+ambiguous.
 
 ### DSL Example (cross-core V2C unidirectional)
 
@@ -854,3 +957,40 @@ workspace or silently turn a requested prefetch into a no-op. See
 ## References
 
 Core definitions live in `include/pypto/core/common.h` and `include/pypto/ir/`; registry and type-inference implementations are in `src/ir/`, with operator implementations grouped under `src/ir/op/{tensor_ops,tile_ops,sync_ops}/`.
+
+## Register operations
+
+The `reg.*` schemas use category `RegOp`, explicit argument effects and
+register-region requirements. See [register operations](../language/06-register-operations.md)
+for dtype, memory, conversion and ownership contracts.
+
+Ordinary RegOp extensions include unary, integer bitwise/shifts, vector-scalar,
+scalar compare, dynamic lane selection and single-lane reductions; see the linked
+register operations contract for exact dtype and mask restrictions.
+
+Fused arithmetic (`expdif`, `axpy`, `mula`, `lrelu`, `prelu`), paired results
+(`mull`, `addc`, `subc`, `addcs`, `subcs`, `intlv`, `dintlv`) and indexed UB
+access (`gather`, `scatter`) extend the initial register set. Paired operations
+declare output arity two and return a `TupleType`; scatter returns an alias of
+its destination Tile and declares argument 0 as written.
+
+`interpret_cast`, `chist`, `dhist` and `create_group_mask` are pure register
+operations with one result. Reinterpretation preserves bit capacity; histogram
+results match the UINT16 accumulator rather than the UINT8 source; grouped
+masks derive their lane count from static group geometry.
+
+## Scalar SIMT operations
+
+`pypto.ir.op.simt` exposes typed coordinate queries, `lane_id`, and scalar
+`load`/`store` on UB Tile or GM Tensor storage. `store` returns `VoidType` and
+belongs in `EvalStmt`. See [Scalar SIMT IR](11-simt.md) for the operation,
+launch, cache-policy, and validation contracts.
+
+Warp collectives include `vote_all/any/uni`, `vote_ballot`,
+`shuffle_idx/up/down/bfly` and `redux_add/min/max`. See the
+[collective contracts](11-simt.md#warp-collectives) for active-lane participation,
+supported types and shuffle widths.
+
+Atomics `atomic_add/min/max/exch/cas` return the old INT32/FP32 value from
+initialized GM/UB storage. `syncthreads`, `threadfence` and `threadfence_block`
+return void. See [atomic and synchronization contracts](11-simt.md#atomics-and-synchronization).

@@ -1,5 +1,9 @@
 # Running on Device
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../dev/08-entry-points.md#legacy-platform-examples).
+
 Keeping data resident on a worker, dispatching explicitly, measuring, and running
 distributed programs.
 
@@ -309,6 +313,14 @@ wall-clock window, *not* a partition: children may overlap (e.g. `orch`/`sched`
 run concurrently) or sit in a different clock domain (`runner_run` host wall vs
 `device_wall` on-NPU), so child durations need not sum to the parent. Drill into
 raw spans via `stats.invocations[i].by_name()[<name>].dur_us`.
+
+Legacy `chip.run.runner_run.device_boundaries` records use host-clock timestamps
+even when their attributes include `clk=dev`; they remain untagged in the tree.
+Setup-only trace groups, such as `chip.prewarm.build`, are excluded before
+discarding warmup launches, even when they share a callable hash with dispatches.
+L2 captures must then contain exactly `warmup + rounds` dispatches for the selected
+callable; otherwise `benchmark` raises `RuntimeError` before removing warmup,
+rather than returning partial or misaligned samples.
 
 `benchmark` also accepts an L3 `DistributedCompiledProgram` and opens its own
 prepared worker. Pass shared-memory host tensors; an externally allocated

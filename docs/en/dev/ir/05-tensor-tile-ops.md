@@ -41,7 +41,7 @@ rows (or one row). Strided on-chip windows are packed first: `tile.extract` for
 floating point, exact integer `tile.adds(..., 0)` for INT16/INT32. Proven packed
 computed sources are reused without a copy; unknown storage still gets packed.
 Specifying `dim` retains axis indexing (rank 2/3, any axis), and mask/compare
-forms are unchanged. See [gather lowering](../passes/11-convert_tensor_to_tile_ops.md#flat-gather-lowering).
+forms are unchanged. See [gather lowering](../passes/13-convert_tensor_to_tile_ops.md#flat-gather-lowering).
 
 For plain `TensorType` operands, the supported Tensor-scalar arithmetic
 operators (`adds`, `subs`, `muls`, `divs`, `fmods`, and scalar `maximum` or
@@ -63,7 +63,20 @@ XOR, `part_*`, broadcasting, different valid regions, and direct distributed
 window operands are not covered by this rule because their current lowering or
 combination contracts require separate handling.
 
-`pl.reinterpret_view(data, dtype, *, shape=None)` dispatches to the equivalent `pl.tensor` or `pl.tile` operator and returns the same kind. It is a zero-copy view over exactly the same bytes. General reinterpretation supports signed/unsigned 8/16/32/64-bit integers, FP16, BF16, and FP32; MX lowering additionally permits only the byte-identical INT8↔FP8E4M3FN and UINT8↔FP8E8M0 pairs. With no `shape`, ND/row-major scales the last axis and DN/col-major scales the penultimate axis by the source/target byte-width ratio. An explicit shape must be byte-equivalent and fully static unless it is provably identical to the auto-inferred shape; a partial `valid_shape` only permits that auto-equivalent shape. Zero/null padding metadata is preserved, while dtype-dependent max/min padding is cleared. The initial executable path supports packed ND in-core tensors and packed flat (`none_box`) row/col-major tiles; DN tensor inference is available but Tensor-to-Tile lowering rejects it, and orchestration tensors are unsupported.
+`pl.reinterpret_view(data, dtype, *, shape=None)` dispatches to the equivalent `pl.tensor` or `pl.tile` operator and returns the same kind. It is a zero-copy view over exactly the same bytes. General reinterpretation supports signed/unsigned 8/16/32/64-bit integers, FP16, BF16, and FP32; MX lowering additionally permits only the byte-identical INT8↔FP8E4M3FN and UINT8↔FP8E8M0 pairs; packed FP4 additionally permits either FP4 format↔UINT8/INT8. With no `shape`, ND/row-major scales the last axis and DN/col-major scales the penultimate axis by the source/target byte-width ratio. An explicit shape must be byte-equivalent and fully static unless it is provably identical to the auto-inferred shape; a partial `valid_shape` only permits that auto-equivalent shape. Zero/null padding metadata is preserved, while dtype-dependent max/min padding is cleared. The initial executable path supports packed ND in-core tensors and packed flat (`none_box`) row/col-major tiles; DN tensor inference is available but Tensor-to-Tile lowering rejects it, and orchestration tensors support only same-shape packed-FP4↔UINT8/INT8 aliases.
+
+Flat tiles may carry explicit strides when they exactly match the canonical
+row/col-major strides of the full physical shape. This includes FP8 cast results
+after FP4 decoding; no flattening reshape is needed before an INT8 byte alias.
+Noncanonical strides, nonzero or dynamic tile start offsets, and explicit
+strides on boxed MX-scale tiles remain unsupported.
+
+FP4E2M1X2 ↔ UINT8/INT8 aliases on Ascend950 preserve carrier shape and byte
+size. InCore tensors and tiles lower to dense address-backed 2D row-major Vec
+storage with static UB offsets, using PYPTO or DSA_RP memory planning.
+PTOAS Vec alias planning is unsupported; same-shape orchestration GM aliases are supported. Reshape the
+byte view separately before aliasing back. See [FP4 UB decoding](../fp4.md#decode-a-uint8-carrier-through-a-ub-alias-ascend950)
+for the contract and usage example.
 
 **Example:**
 
@@ -88,6 +101,28 @@ with ib.function("tensor_example") as f:
 
 **Design**: Uses `TileType` (not separate `BlockType`) for consistency. Namespace `tile.*` + `TileType` clearly indicates hardware-optimized tile operations.
 
+### Python implementation layout
+
+The public entry points remain `pypto.ir.op.tile` and `pypto.language.tile`.
+Their `tile_ops.py` modules re-export functions directly, preserving call
+signatures and avoiding extra stack frames in source-location capture.
+Both Python layers group implementations into the same private modules:
+
+| Module | Responsibility |
+| ------ | -------------- |
+| `_tile_memory.py` | Allocation, load/store, initialization, and shape/view operations |
+| `_tile_elementwise.py` | Element-wise arithmetic, comparisons, and scalar dispatch |
+| `_tile_linalg.py` | Matrix products and MX quantization |
+| `_tile_reduction.py` | Row/column reductions and broadcasts |
+| `_tile_indexing.py` | Indexed gather/scatter, sorting, and merge sorting |
+| `_tile_cross_core.py` | Block queries and AIV/AIC transfers |
+
+The DSL's `_tile_common.py` holds the shared tensor type parameter used by
+`store` and `mscatter`. Implementation modules must not import their own
+`tile_ops.py` facade; shared helpers stay below the facade to avoid import
+cycles. Add new operators to the matching implementation in each layer and
+re-export them through the existing public modules.
+
 ### Operations
 
 | Category | Operations | Description |
@@ -99,7 +134,7 @@ with ib.function("tensor_example") as f:
 | **Element-wise** | `tile.add/sub/mul/div` | Tile-Tile operations |
 | - | `tile.adds/subs/muls/divs` | Tile-Scalar operations. A **constant** scalar operand adopts the tile's element dtype (a bare int literal is otherwise parsed as `index`, which no `pto.t*s` op accepts) — except a float literal on an integer tile, which keeps FP32 so promotion is preserved. An explicit `pl.const(v, dtype)` is a deliberate annotation and is left as-is, as is any non-constant expression; a non-constant `index` scalar (loop var, `pl.dim`) is rejected — convert it with `pl.cast`. Same rule for `tensor.*s`. |
 | **Unary** | `tile.sqrt` | Element-wise square root |
-| **Quantization** | `tile.tquant_mx` / `pl.quant_mx` | Ascend950-only **MXFP8** block-32 dynamic quantization returning `{FP8E4M3FN quant, FP8E8M0 scale}`. `dtype` must be `FP8E4M3FN`. `group_axis` is PTOAS `grpAxis` (`1` = A-side `[M,K]`, `0` = B-side `[N,K]` with transpose). Public scale shapes are `[M,K/32]` / `[K/32,N]`; requires a full valid region and `K % 64 == 0` (plus axis1 `M % 16 == 0`, axis0 `N % 32 == 0`). [Pass 13](../passes/13-lower_composite_ops.md) emits grouped TQUANT plus X-to-ZZ TMOV. In a mixed task, results may feed `matmul_mx` directly through V2C. MXFP4 quant is deferred. |
+| **Quantization** | `tile.tquant_mx` / `pl.quant_mx` | Ascend950 block-32 quantization returning `{quant, FP8E8M0 scale}`. `dtype` is FP8E4M3FN or FP4E2M1X2 (FP16/BF16 source only). Axis1 maps `[M,K]` to FP4 `[M,K/2]`; axis0 maps `[N,K]` to `[K,N/2]`. Scales remain `[M,K/32]` / `[K/32,N]`. Requires a full valid region, `K % 64 == 0`, axis1 `M % 16 == 0`, axis0 `N % 32 == 0`; FP4 axis0 requires `N % 64 == 0` for the ISA carrier stride. `quant_scale_alg="ocp"` is the default; NV FP16/BF16 supports axis0 only. Packed FP4 uses the PYPTO or DSA_RP memory planner. [Pass 13](../passes/15-lower_composite_ops.md) emits TQUANT plus exponent X-to-ZZ TMOV. FP4 tile results need supported Mat→Left/Right placement before `matmul_mx`; tensor-level MX matmul remains FP8-only. `pl.tile.quant_mx_raw` exposes native TQUANT and UINT8 exponents without these blocked-scale alignments: axis1 allows arbitrary positive M and K%32 (native FP4 K%64); static partial valid regions are supported (axis1 requires tight physical columns). |
 | **Transform** | `tile.slice` | Extract a sub-tile with static shape, optional dynamic valid_shape, and optional `drop_dims` (numpy-style rank reduction over static unit axes; result clamped to a 2D minimum) |
 | - | `tile.extract` | Extract a sub-tile from `src` at `(index_row, index_col)` — ISA TEXTRACT Variant 1 (Mat→Left/Right, Acc→Mat). The result's layout comes from `target_memory`'s implicit view, except `Left`/`Right`, which take the TEXTRACT-side L0 formats (these differ from `tile.move`'s TMOV-side ones) |
 | - | `tile.reshape` | Reshape tile to new dimensions (element count must match). Carries the source's `valid_shape` through without widening it — see [Reshape and the valid region](#reshape-and-the-valid-region) |
@@ -118,7 +153,12 @@ On Ascend950, `quant_mx` and `matmul_mx` may share the same InCore mixed task.
 The compiler transports both quantized data and the FP8E8M0 scale directly over
 V2C while retaining the scale's logical fractal-32 layout.
 
-`tile.reshape` preserves dtype, element count, and the source's valid region (see below); `tile.reinterpret_view(data, dtype, *, shape=None)` changes dtype while preserving exact byte size. Without `shape`, it scales the physically contiguous axis using the source/target dtype byte widths and tile layout. Under PTOAS memory planning, it lowers to the aliasing PTO `treshape` primitive for both same-shape and width-changing views.
+`tile.reshape` preserves dtype, element count, and the source's valid region (see below); `tile.reinterpret_view(data, dtype, *, shape=None)` changes dtype while preserving exact byte size. Without `shape`, it scales the physically contiguous axis using the source/target dtype byte widths and tile layout. Under PTOAS memory planning, it lowers to the aliasing PTO `treshape` primitive for both same-shape and width-changing views, except packed FP4E2M1X2↔UINT8/INT8 aliases: PTOAS 0.65 rejects that dtype in `treshape`, so these pairs require PYPTO or DSA_RP.
+
+Packed `FP4E2M1X2` byte aliases require PYPTO or DSA_RP for tiles; PTOAS 0.65
+rejects FP4 `treshape`. InCore tensor reinterpret operations lower to tile
+aliases and require the same planners; same-shape orchestration FP4/byte aliases are also supported.
+See [FP4](../fp4.md) for the carrier-unit contract and supported alias paths.
 
 ### Result view of `tile.move`
 
@@ -139,13 +179,37 @@ whose implicit `blayout` is `col_major`.
 `tile.move` stamps the destination `memory_space` itself (see the `TileType`
 contract in [Types](02-types.md#tiletype)), so a result view matching the
 destination's implicit view collapses to `nullopt` — the same per-space view
-[`InferTileMemorySpace`](../passes/20-infer_tile_memory_space.md) refreshes a
+[`InferTileMemorySpace`](../passes/22-infer_tile_memory_space.md) refreshes a
 retyped tile to.
 
 `tile.move` is not in-place safe: within one memory space, its source and result
 must resolve to distinct addresses. The PyPTO and DSA-RP planners enforce this
 constraint, and baked-address PTO codegen reports an error if an explicit
 MemRef binding or hand-built IR still presents a same-address move.
+
+### Shared storage and result views
+
+Under PTOAS memory planning, variables with different shapes or layouts can
+share one MemRef. Each variable retains its own `TileType`: sharing storage
+does not make the variables' shapes identical. For ordinary tile outputs,
+including tuple outputs and copies that merge `if` branches, codegen selects a
+destination view matching the result variable's type. For example, a `[32, 1]`
+result sharing storage with a `[1, 32]` allocation is written through a
+`[32, 1]` view. Later uses of that result retain the selected view.
+
+When a new destination view is needed, codegen emits `pto.treshape` over the
+existing storage without adding an allocation. The destination's effective
+`valid_shape` must then be known at compile time, because `pto.treshape` has no
+runtime valid-extent operands. Existing compatible bindings, including those
+with dynamic valid extents, follow their original path. In-place operations,
+explicit view operations, and `tile.set_validshape` retain their own binding
+semantics. This handling does not add support for arbitrary dtype or layout
+conversions; the existing operation and PTO view restrictions still apply.
+
+Under PTOAS planning, codegen rejects a new destination `pto.treshape` if either
+the selected storage or the result uses packed `FP4E2M1X2`. Use `PYPTO` or
+`DSA_RP` addressed memory planning for these shared aliases. A destination whose
+physical configuration already matches remains usable without an additional view.
 
 ### Reshape and the valid region
 

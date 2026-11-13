@@ -20,6 +20,7 @@
 #include "pypto/codegen/distributed/distributed_codegen.h"
 #include "pypto/codegen/orchestration/orchestration_codegen.h"
 #include "pypto/codegen/pto/pto_codegen.h"
+#include "pypto/codegen/pto/pto_type_utils.h"
 
 namespace nb = nanobind;
 
@@ -35,6 +36,25 @@ void BindCodegen(nb::module_& m) {
   nb::module_ codegen_module =
       m.def_submodule("codegen", "Code generation module for converting IR to pto-isa C++");
 
+  codegen_module.def("data_type_to_mlir", &DataTypeToMLIR, nb::arg("dtype"),
+                     "Return the PTO MLIR spelling of an element data type.");
+
+  nb::class_<VFHelper>(codegen_module, "VFHelper")
+      .def_ro("kind", &VFHelper::kind)
+      .def_ro("symbol", &VFHelper::symbol)
+      .def_ro("adapter_symbol", &VFHelper::adapter_symbol)
+      .def_ro("source", &VFHelper::source)
+      .def_ro("parameter_types", &VFHelper::parameter_types)
+      .def_ro("caller_parameter_types", &VFHelper::caller_parameter_types)
+      .def_ro("parameter_effects", &VFHelper::parameter_effects)
+      .def_ro("parameter_indices", &VFHelper::parameter_indices)
+      .def_ro("capture_byte_offsets", &VFHelper::capture_byte_offsets);
+  nb::class_<PTOCodegenBundle>(codegen_module, "PTOCodegenBundle")
+      .def_ro("caller_source", &PTOCodegenBundle::caller_source)
+      .def_ro("helpers", &PTOCodegenBundle::helpers)
+      .def_ro("entry_helpers", &PTOCodegenBundle::entry_helpers,
+              "Every emitted InCore entry mapped to helper symbols in first-use order, without duplicates");
+
   // PTOCodegen - PTO assembly code generator
   nb::class_<PTOCodegen>(
       codegen_module, "PTOCodegen",
@@ -42,6 +62,9 @@ void BindCodegen(nb::module_& m) {
       "Generates PTO ISA instructions in SSA form with tile operations, control flow, and type "
       "annotations.")
       .def(nb::init<>(), "Create a PTO code generator (backend is always PTO)")
+      .def("generate_bundle", &PTOCodegen::GenerateBundle, nb::arg("program"),
+           nb::arg("emit_tile_addr") = true, nb::arg("emit_source_loc") = true,
+           "Generate an EmitC caller and separate typed-VMI helpers for A5/AIV execution.")
       .def("generate", &PTOCodegen::Generate, nb::arg("program"), nb::arg("emit_tile_addr") = true,
            nb::arg("emit_source_loc") = true,
            "Generate PTO assembly from PyPTO IR Program. Returns PTO assembly code string (.pto format) with "
@@ -50,17 +73,18 @@ void BindCodegen(nb::module_& m) {
            "physical addr operand so the ptoas PlanMemory pass allocates (--pto-level=level2). When "
            "emit_source_loc=False, operations carry no trailing MLIR loc(\"file\":line:col).");
 
+  nb::class_<KernelRegistration>(codegen_module, "KernelRegistration")
+      .def_ro("func_id", &KernelRegistration::func_id)
+      .def_ro("code_name", &KernelRegistration::code_name)
+      .def_ro("core_type", &KernelRegistration::core_type)
+      .def_ro("signature", &KernelRegistration::signature);
+
   // OrchestrationResult - result of orchestration code generation
   nb::class_<OrchestrationResult>(codegen_module, "OrchestrationResult",
                                   "Result of orchestration code generation")
       .def_ro("code", &OrchestrationResult::code, "Generated C++ orchestration code")
-      .def_ro("func_name_to_id", &OrchestrationResult::func_name_to_id,
-              "Kernel function name to func_id mapping")
-      .def_ro("func_name_to_core_type", &OrchestrationResult::func_name_to_core_type,
-              "Kernel function name to core type mapping")
-      .def_ro("func_name_to_signature", &OrchestrationResult::func_name_to_signature,
-              "Kernel function name to tensor-arg ArgDirection name list (scalars excluded), in "
-              "task-payload (tensors-first) order")
+      .def_ro("kernel_registrations", &OrchestrationResult::kernel_registrations,
+              "Runtime registrations keyed by code, core type and final tensor signature")
       .def_ro("orchestration_signature", &OrchestrationResult::orchestration_signature,
               "Orchestration entry per-tensor ArgDirection name list (scalars excluded), in "
               "orch_args tensor order; sets the ChipCallable signature");
@@ -115,6 +139,8 @@ void BindCodegen(nb::module_& m) {
                      "    expr: Tensor-shape expression (a dim from TensorType.shape).\n\n"
                      "Returns:\n"
                      "    list[Var]: Vars in first-seen DFS order, deduped within this single call.");
+  codegen_module.def("collect_tensor_shape_dyn_vars", &CollectTensorShapeDynVars, nb::arg("func"),
+                     "Return ordered trailing shape arguments, excluding explicit scalar parameters.");
 }
 
 }  // namespace python

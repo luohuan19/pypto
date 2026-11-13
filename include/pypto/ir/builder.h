@@ -163,7 +163,8 @@ class IRBuilder {
    */
   void BeginForLoop(const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop, const ExprPtr& step,
                     const Span& span, ForKind kind = ForKind::Sequential,
-                    std::vector<std::pair<std::string, std::any>> attrs = {});
+                    std::vector<std::pair<std::string, std::any>> attrs = {},
+                    HardwareLoopPolicy policy = HardwareLoopPolicy::Auto);
 
   /**
    * @brief Add an iteration argument to the current for loop
@@ -302,6 +303,17 @@ class IRBuilder {
    */
   StmtPtr EndIf(const Span& end_span);
 
+  /// Register region helpers use the same schema as DSL and raw op construction.
+  void BeginSimtScope(const std::vector<ExprPtr>& block_dims, const Span& span);
+  StmtPtr EndSimtScope(const Span& span, const std::vector<VarPtr>& private_scalars = {});
+
+  void BeginRegScope(const Span& span);
+  StmtPtr EndRegScope(const Span& span);
+  VarPtr EmitReg(const std::string& name, const std::string& op_name, const std::vector<ExprPtr>& args,
+                 const std::vector<std::pair<std::string, std::any>>& kwargs, const Span& span);
+  VarPtr EmitRegStore(const std::string& name, const ExprPtr& tile, const ExprPtr& offset,
+                      const ExprPtr& value, const ExprPtr& mask, const Span& span);
+
   // ========== Scope Building ==========
 
   /**
@@ -330,13 +342,15 @@ class IRBuilder {
    * @param end_span Source location for end of scope
    * @param devices CommDomain device indices (empty means all devices)
    * @param slots CommDomain window slots, resolved after their body definitions
+   * @param engines CommDomain async workspace engines
    * @param extra_attrs Attributes resolved after body-local definitions
    * @return The built scope statement
    * @throws RuntimeError if not inside a scope context
    */
   StmtPtr EndScope(const Span& end_span, std::vector<int64_t> devices = {},
                    std::vector<WindowBufferPtr> slots = {},
-                   std::vector<std::pair<std::string, std::any>> extra_attrs = {});
+                   std::vector<std::pair<std::string, std::any>> extra_attrs = {},
+                   std::vector<std::string> engines = {});
 
   // ========== Statement Recording ==========
 
@@ -584,7 +598,7 @@ class IRBuilder {
  */
 class BuildContext {
  public:
-  enum class Type { FUNCTION, FOR_LOOP, WHILE_LOOP, IF_STMT, SCOPE, PROGRAM };
+  enum class Type { FUNCTION, FOR_LOOP, WHILE_LOOP, IF_STMT, SCOPE, PROGRAM, SIMT_SCOPE };
 
   explicit BuildContext(Type type, Span span) : type_(type), begin_span_(std::move(span)) {}
   virtual ~BuildContext() = default;
@@ -662,13 +676,15 @@ class FunctionContext : public BuildContext {
 class ForLoopContext : public BuildContext {
  public:
   ForLoopContext(VarPtr loop_var, ExprPtr start, ExprPtr stop, ExprPtr step, Span span,
-                 ForKind kind = ForKind::Sequential, std::vector<std::pair<std::string, std::any>> attrs = {})
+                 ForKind kind = ForKind::Sequential, std::vector<std::pair<std::string, std::any>> attrs = {},
+                 HardwareLoopPolicy policy = HardwareLoopPolicy::Auto)
       : BuildContext(Type::FOR_LOOP, std::move(span)),
         loop_var_(std::move(loop_var)),
         start_(std::move(start)),
         stop_(std::move(stop)),
         step_(std::move(step)),
         kind_(kind),
+        policy_(policy),
         attrs_(std::move(attrs)) {}
 
   void AddIterArg(const IterArgPtr& iter_arg) { iter_args_.push_back(iter_arg); }
@@ -682,6 +698,7 @@ class ForLoopContext : public BuildContext {
   [[nodiscard]] const std::vector<IterArgPtr>& GetIterArgs() const { return iter_args_; }
   [[nodiscard]] const std::vector<VarPtr>& GetReturnVars() const { return return_vars_; }
   [[nodiscard]] ForKind GetKind() const { return kind_; }
+  [[nodiscard]] HardwareLoopPolicy GetPolicy() const { return policy_; }
   [[nodiscard]] const std::vector<std::pair<std::string, std::any>>& GetAttrs() const { return attrs_; }
 
  private:
@@ -690,6 +707,7 @@ class ForLoopContext : public BuildContext {
   ExprPtr stop_;
   ExprPtr step_;
   ForKind kind_;
+  HardwareLoopPolicy policy_;
   std::vector<std::pair<std::string, std::any>> attrs_;
   std::vector<IterArgPtr> iter_args_;
   std::vector<VarPtr> return_vars_;
@@ -749,6 +767,17 @@ class IfStmtContext : public BuildContext {
 /**
  * @brief Context for building a scope statement
  */
+class SimtScopeContext : public BuildContext {
+ public:
+  SimtScopeContext(std::vector<ExprPtr> block_dims, Span span)
+      : BuildContext(Type::SIMT_SCOPE, std::move(span)), block_dims_(std::move(block_dims)) {}
+  void AddStmt(const StmtPtr& stmt) override { stmts_.push_back(stmt); }
+  [[nodiscard]] const std::vector<ExprPtr>& GetBlockDims() const { return block_dims_; }
+
+ private:
+  std::vector<ExprPtr> block_dims_;
+};
+
 class ScopeContext : public BuildContext {
  public:
   ScopeContext(ScopeKind scope_kind, Span span, std::optional<Level> level = std::nullopt,

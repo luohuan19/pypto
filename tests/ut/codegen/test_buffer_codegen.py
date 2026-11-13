@@ -260,6 +260,19 @@ def test_gm_transfers_reject_incompatible_parameter_directions(name, direction):
         _emit(program)
 
 
+@pytest.mark.parametrize("name", ["buffer.load", "buffer.store"])
+def test_gm_transfers_reject_reduction_columns(name):
+    tensor = ir.Var("tensor", ir.TensorType([16, 64], DataType.FP32), SPAN)
+    buffer, allocation = _alloc("column", _type((16, 1), blayout=ir.TileLayout.col_major))
+    source, destination = (tensor, buffer) if name == "buffer.load" else (buffer, tensor)
+    program = _program(
+        [allocation, _eval(name, source, _window(0, 0), _window(16, 1), destination)],
+        [(tensor, ir.ParamDirection.InOut)],
+    )
+    with pytest.raises(ValueError, match="GM transfers do not support reduction column vectors"):
+        _emit(program)
+
+
 @pytest.mark.parametrize(
     "tensor_type,message",
     [
@@ -610,7 +623,6 @@ def test_unsigned_for_bound_fails_before_emission():
     [
         (_type(shape=(2, 16, 32)), "rank-1 or rank-2"),
         (_type(blayout=ir.TileLayout.col_major), "dense row-major Vec"),
-        (ir.BufferType([16, 32], DataType.FP4, ir.MemorySpace.Vec), "dense row-major Vec"),
     ],
 )
 def test_unsupported_physical_descriptors_fail_explicitly(descriptor, message):
@@ -791,6 +803,22 @@ def test_native_explicit_buffer_stage_handles_empty_and_scalar_only_kernels(tmp_
     assert not _allocations(text)
     assert "tile_buf" not in text
     assert ("scf.if %arg0" in text) == with_scalar_body
+    _compile_native(tmp_path, text, addressed=False)
+
+
+@pytest.mark.parametrize("dtype", [DataType.UINT8, DataType.UINT16, DataType.UINT32, DataType.UINT64])
+def test_explicit_buffer_stage_accepts_bool_to_unsigned_cast(tmp_path, dtype):
+    """The Buffer validator must admit the shared emitter's BOOL-to-unsigned recipe."""
+    flag = _scalar("flag", DataType.BOOL)
+    value = _scalar("value", dtype)
+    program = _program(
+        [ir.AssignStmt(value, ir.Cast(flag, dtype, SPAN), SPAN)],
+        [flag],
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    text = _emit(program)
+    assert "arith.extui %arg0 : i1 to i" in text
+    assert "builtin.unrealized_conversion_cast" in text
     _compile_native(tmp_path, text, addressed=False)
 
 

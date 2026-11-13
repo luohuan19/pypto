@@ -1,5 +1,9 @@
 # Compiling
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Turning a program or a `@pl.jit` kernel into device kernels and host orchestration.
 
 ## Concept
@@ -63,7 +67,7 @@ move. All are keyword-only — only `program` is positional.
 | `output_dir` | `None` | Where artifacts land; `None` means a fresh `<base>/<name>_<YYYYmmdd_HHMMSS>_<random>` per call, under `PYPTO_PROG_BUILD_DIR` or `build_output`. The timestamp is for reading; the random tail keeps concurrent compiles apart, so read `compiled.output_dir` rather than deriving it |
 | `strategy` | `Default` | The pass pipeline. `Default` is the only strategy |
 | `dump_passes` | `True` | IR snapshot after every pass — see below |
-| `backend_type` | `Ascend910B` | Target for passes and codegen (`Ascend910B` / `Ascend950`) |
+| `backend_type` | `Ascend910` | Target for passes and codegen (`Ascend910` / `Ascend950`) |
 | `platform` | `None` | Execution platform the artifact is built for; must match the worker that dispatches it |
 | `skip_ptoas` | `False` | Stop at `.pto` (MLIR) instead of building the device binary |
 | `verification_level` | `None` | `NONE` / `BASIC` / `ROUNDTRIP`; `None` defers to `PYPTO_VERIFY_LEVEL`, else `BASIC` |
@@ -73,7 +77,7 @@ move. All are keyword-only — only `program` is positional.
 | `profiling` | `False` | Per-stage compile timing into `report/pipeline_profile.{txt,json}` |
 | `distributed_config` | `None` | Compile a HOST-level program per rank ([Distributed](../distributed/index.md)) |
 | `analyze_auto_scopes_for_deps` | `False` | Compiler-derived dependencies for AUTO scopes |
-| `enable_pypto_l0c_double_buffer` | `None` | L0C double buffering |
+| `enable_pypto_l0c_double_buffer` | `None` | Legacy flag; automatic dbC is disabled for PYPTO/DSA_RP, retained for PTOAS independently of this flag |
 | `emit_source_loc` | `None` | Carry DSL source locations into the emitted `.pto` |
 | `dump_ptoas_passes` | `False` | Also dump ptoas's own pass IR |
 | `runtime` | `None` | Simpler runtime ABI to target — `TENSORMAP_AND_RINGBUFFER` or `HOST_BUILD_GRAPH` (what `@pl.jit.graph` needs — [Functions](../language/01-functions.md)); `None` inherits the active `PassContext`. The worker must match it |

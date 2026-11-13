@@ -47,13 +47,18 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/serialization/deserializer.h"
 #include "pypto/ir/serialization/serializer.h"
+#include "pypto/ir/simt.h"
+#include "pypto/ir/simt_analysis.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/op_conversion_registry.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
+#include "pypto/ir/transforms/utils/hardware_loop_analysis.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -111,10 +116,17 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
   for (auto item : kwargs_dict) {
     std::string key = nb::cast<std::string>(item.first);
 
+    if (key == kAttrExternalReturnParams && !nb::isinstance<nb::list>(item.second) &&
+        !nb::isinstance<nb::tuple>(item.second)) {
+      throw pypto::TypeError("external return parameters must be a list of parameter Vars");
+    }
+
     // Try to cast to common types
     // NOTE: Check DataType/MemorySpace/PipeType/CoreType/PadValue BEFORE int, and bool BEFORE int
     if (nb::isinstance<DataType>(item.second)) {
       kwargs.emplace_back(key, nb::cast<DataType>(item.second));
+    } else if (nb::isinstance<SimtAxis>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<SimtAxis>(item.second));
     } else if (nb::isinstance<MemorySpace>(item.second)) {
       kwargs.emplace_back(key, nb::cast<MemorySpace>(item.second));
     } else if (nb::isinstance<TensorLayout>(item.second)) {
@@ -169,6 +181,7 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
       // Lists/tuples carry exactly one element type, dispatched by attr key:
       //   - kAttrArgDirections             -> vector<ArgDirection>
       //   - kAttrArgDirectionOverrides     -> vector<int32_t>
+      //   - kSimtBlockDimsAttr            -> vector<int32_t> (derived helper metadata)
       //   - kAttrManualDepEdges /
       //     kAttrCompilerManualDepEdges /
       //     kAttrArgDirOverrideVars /
@@ -177,7 +190,7 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
       // payloads (e.g. ``manual_dep_edges=[1]``) and fail later in codegen
       // instead of raising at parse time.
       auto seq = nb::cast<nb::sequence>(item.second);
-      if (key == kAttrArgDirectionOverrides) {
+      if (key == kAttrArgDirectionOverrides || key == kSimtBlockDimsAttr) {
         std::vector<int32_t> idxs;
         for (auto elem : seq) {
           if (nb::isinstance<nb::bool_>(elem) || !nb::isinstance<nb::int_>(elem)) {
@@ -192,7 +205,7 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
         }
         kwargs.emplace_back(key, std::move(idxs));
       } else if (key == kAttrManualDepEdges || key == kAttrCompilerManualDepEdges ||
-                 key == kAttrArgDirOverrideVars || key == kAttrDumpVars) {
+                 key == kAttrArgDirOverrideVars || key == kAttrDumpVars || key == kAttrExternalReturnParams) {
         std::vector<VarPtr> vars;
         for (auto elem : seq) {
           if (!nb::isinstance<Var>(elem)) {
@@ -282,8 +295,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
             throw pypto::TypeError(
                 "Unsupported list element type for key: " + key +
                 ". A list-valued attr under an arbitrary key may hold Var (a reference) or "
-                "ArgDirection. Integer lists are accepted only for the reserved key '" +
-                std::string(kAttrArgDirectionOverrides) + "'.");
+                "ArgDirection. Integer lists are accepted only for the reserved keys '" +
+                std::string(kAttrArgDirectionOverrides) + "' and '" + kSimtBlockDimsAttr + "'.");
           }
           dirs.push_back(nb::cast<ArgDirection>(elem));
         }
@@ -349,6 +362,36 @@ void CheckSlotCount(uint64_t slots) {
 void BindIR(nb::module_& m) {
   nb::module_ ir = m.def_submodule("ir", "PyPTO IR (Intermediate Representation) module");
 
+  nb::enum_<HardwareLoopState>(ir, "HardwareLoopState")
+      .value("Eligible", HardwareLoopState::Eligible)
+      .value("Ineligible", HardwareLoopState::Ineligible)
+      .value("Unknown", HardwareLoopState::Unknown);
+  nb::class_<HardwareLoopProfile>(ir, "HardwareLoopProfile")
+      .def(nb::init<>())
+      .def_rw("supported", &HardwareLoopProfile::supported)
+      .def_rw("counter_bits", &HardwareLoopProfile::counter_bits)
+      .def_rw("allow_negative_step", &HardwareLoopProfile::allow_negative_step)
+      .def_rw("max_trip_count", &HardwareLoopProfile::max_trip_count)
+      .def_rw("max_depth", &HardwareLoopProfile::max_depth)
+      .def_rw("max_body_nodes", &HardwareLoopProfile::max_body_nodes)
+      .def_rw("allow_scalar_carry", &HardwareLoopProfile::allow_scalar_carry)
+      .def_rw("allow_reg_carry", &HardwareLoopProfile::allow_reg_carry)
+      .def_rw("allow_tile_carry", &HardwareLoopProfile::allow_tile_carry)
+      .def_rw("allowed_ops", &HardwareLoopProfile::allowed_ops);
+  nb::class_<HardwareLoopQualification>(ir, "HardwareLoopQualification")
+      .def_ro("state", &HardwareLoopQualification::state)
+      .def_ro("reason", &HardwareLoopQualification::reason)
+      .def_ro("trip_count", &HardwareLoopQualification::trip_count)
+      .def_ro("post_iv", &HardwareLoopQualification::post_iv)
+      .def_ro("loop_id", &HardwareLoopQualification::loop_id)
+      .def_ro("lower", &HardwareLoopQualification::lower)
+      .def_ro("upper", &HardwareLoopQualification::upper)
+      .def_ro("step", &HardwareLoopQualification::step);
+  ir.def("analyze_hardware_loop", &AnalyzeHardwareLoop, nb::arg("loop"), nb::arg("profile"));
+  ir.def("analyze_hardware_loops", &AnalyzeHardwareLoops, nb::arg("program"), nb::arg("profile"));
+  ir.def("verify_hardware_loop_requirement", &VerifyHardwareLoopRequirement, nb::arg("loop"),
+         nb::arg("profile"));
+
   // Span - value type, copy semantics
   nb::class_<Span>(ir, "Span", "Source location information tracking file, line, and column positions")
       .def(nb::init<std::string, int, int, int, int>(), nb::arg("filename"), nb::arg("begin_line"),
@@ -407,6 +450,16 @@ void BindIR(nb::module_& m) {
   void_type_class.def(nb::init<>(), "Create a void type");
   void_type_class.def_static("get", &GetVoidType, "Get the singleton VoidType instance");
   BindFields<VoidType>(void_type_class);
+
+  nb::enum_<RegKind>(ir, "RegKind", "Register descriptor kind")
+      .value("VecReg", RegKind::VecReg, "Vector register holding non-BOOL lanes")
+      .value("MaskReg", RegKind::MaskReg, "Predicate register holding BOOL lanes");
+  auto reg_type_class = nb::class_<RegType, Type>(ir, "RegType", "Static logical register descriptor");
+  // The lane count must be an integer, not text coerced by older nanobind releases.
+  reg_type_class.def(nb::init<int64_t, DataType, RegKind>(), nb::arg("shape").noconvert(), nb::arg("dtype"),
+                     nb::arg("kind"), "Create a register descriptor with a positive logical lane count");
+  BindFields<RegType>(reg_type_class);
+  reg_type_class.def_prop_ro("lanes", &RegType::GetLanes, "Logical lane count (alias of shape)");
 
   // ScalarType - const shared_ptr
   auto scalar_type_class = nb::class_<ScalarType, Type>(ir, "ScalarType", "Scalar type representation");
@@ -473,15 +526,19 @@ void BindIR(nb::module_& m) {
       .value("min", PadValue::min, "Min value padding")
       .export_values();
 
-  // CachePolicy enum - declared GM cache-access policy for a tensor read.
-  // nb::is_arithmetic like AtomicType: the policy rides the `tile.load` "cache"
+  // CachePolicy enum - semantic GM cache-access policy for reads and writes.
+  // nb::is_arithmetic like AtomicType: the policy rides the transfer's "cache"
   // kwarg as a plain `int`, so the DSL needs `int(policy)` to work.
   nb::enum_<CachePolicy>(ir, "CachePolicy", nb::is_arithmetic(),
-                         "GM cache-access policy declared for a tensor read")
-      .value("DEFAULT", CachePolicy::kDefault, "Ordinary cached GM access")
-      .value("BYPASS", CachePolicy::kBypass,
-             "Streaming access declared to bypass the cache: asserts this tensor has no reuse "
-             "worth caching and that nothing writes those bytes while the kernel runs")
+                         "GM cache policy; supported modes depend on target and transfer direction")
+      .value("DEFAULT", CachePolicy::kDefault)
+      .value("BYPASS", CachePolicy::kBypass)
+      .value("NORMAL_FIRST_VICTIM", CachePolicy::kNormalFirstVictim)
+      .value("NORMAL_LAST_VICTIM", CachePolicy::kNormalLastVictim)
+      .value("NORMAL_PERSISTENT", CachePolicy::kNormalPersistent)
+      .value("NOT_ALLOC_KEEP", CachePolicy::kNotAllocKeep)
+      .value("NOT_ALLOC_CLEAN", CachePolicy::kNotAllocClean)
+      .value("NOT_ALLOC_DROP", CachePolicy::kNotAllocDrop)
       .export_values();
 
   // TensorView - struct for tensor view information - must be before TensorType
@@ -595,8 +652,8 @@ void BindIR(nb::module_& m) {
       "reference to the source WindowBuffer allocation.");
   dist_tensor_type_class.def(nb::init<std::vector<ExprPtr>, DataType, std::optional<MemRefPtr>,
                                       std::optional<TensorView>, std::optional<WindowBufferPtr>>(),
-                             nb::arg("shape"), nb::arg("dtype"), nb::arg("memref"), nb::arg("tensor_view"),
-                             nb::arg("window_buffer"),
+                             nb::arg("shape"), nb::arg("dtype"), nb::arg("memref").none(),
+                             nb::arg("tensor_view").none(), nb::arg("window_buffer").none(),
                              "Create a distributed tensor type preserving all optional metadata.");
   BindFields<DistributedTensorType>(dist_tensor_type_class);
 
@@ -842,6 +899,34 @@ void BindIR(nb::module_& m) {
   comm_layout_mod.attr("WINDOW_SLOT_STRIDE") = pypto::codegen::distributed::comm_layout::kWindowSlotStride;
   comm_layout_mod.attr("COMM_CTX_SIZE") = pypto::codegen::distributed::comm_layout::kCommCtxSize;
 
+  ir.def(
+      "get_reg_memory_effect",
+      [](const CallPtr& call) {
+        const auto effect = GetRegMemoryEffect(call);
+        nb::dict result;
+        result["target"] = nb::cast(effect.target);
+        result["root"] = nb::cast(effect.root);
+        result["access"] = nb::cast(effect.access);
+        result["begin"] = nb::cast(effect.begin);
+        result["end"] = nb::cast(effect.end);
+        result["mask"] = nb::cast(effect.mask);
+        return result;
+      },
+      nb::arg("call"), "Get load/store/gather/scatter effects; indexed intervals are unknown");
+  ir.def(
+      "get_reg_op_spec",
+      [](const std::string& name) {
+        const auto& spec = OpRegistry::GetInstance().GetEntry(name).GetRegSpec();
+        CHECK(spec.has_value()) << "Expected a register schema";
+        nb::dict result;
+        result["emitter"] = spec->emitter;
+        result["requires_reg_scope"] = spec->requires_reg_scope;
+        result["output_reuses_input_arg"] =
+            nb::cast(OpRegistry::GetInstance().GetEntry(name).GetOutputReusesInputArg());
+        return result;
+      },
+      nb::arg("op_name"), "Get register scope and emitter metadata");
+
   // OpRegistry
   nb::enum_<OpIRStage>(ir, "OpIRStage", "Representation consumed and produced by an operator")
       .value("Functional", OpIRStage::Functional)
@@ -1022,7 +1107,8 @@ void BindIR(nb::module_& m) {
 
   nb::enum_<WriteChannel>(ir, "WriteChannel", "The hardware path an operator's writes travel")
       .value("Dma", WriteChannel::Dma, "MTE3 / DMA store path")
-      .value("Scalar", WriteChannel::Scalar, "Scalar D-cache write path");
+      .value("Scalar", WriteChannel::Scalar, "Scalar D-cache write path")
+      .value("Simt", WriteChannel::Simt, "SIMT lane store path");
 
   ir.def(
       "get_op_arg_effect",
@@ -1351,6 +1437,8 @@ void BindIR(nb::module_& m) {
         result[key.c_str()] = AnyCast<float>(value, "converting to Python: " + key);
       } else if (value.type() == typeid(DataType)) {
         result[key.c_str()] = AnyCast<DataType>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(SimtAxis)) {
+        result[key.c_str()] = AnyCast<SimtAxis>(value, "converting to Python: " + key);
       } else if (value.type() == typeid(MemorySpace)) {
         result[key.c_str()] = AnyCast<MemorySpace>(value, "converting to Python: " + key);
       } else if (value.type() == typeid(TensorLayout)) {
@@ -1531,54 +1619,58 @@ void BindIR(nb::module_& m) {
 
 #undef BIND_UNARY_EXPR
 
-  // Bind structural hash and equality functions
-  // structural_hash overloads share the same auto-mapping semantics:
-  //   enable_auto_mapping=True  -> variable names are ignored (x+1 and y+1 hash the same)
-  //   enable_auto_mapping=False -> variable identity is preserved deterministically
-  ir.def("structural_hash", static_cast<uint64_t (*)(const IRNodePtr&, bool)>(&structural_hash),
-         nb::arg("node"), nb::arg("enable_auto_mapping") = false,
-         "Compute deterministic structural hash of an IR node (ignores Span). "
-         "If enable_auto_mapping=True, variable names are ignored (e.g., x+1 and y+1 hash the same). "
-         "If enable_auto_mapping=False (default), different variable objects produce different hashes.");
-  ir.def("structural_hash", static_cast<uint64_t (*)(const TypePtr&, bool)>(&structural_hash),
-         nb::arg("type"), nb::arg("enable_auto_mapping") = false,
-         "Compute deterministic structural hash of a type. "
-         "enable_auto_mapping only affects variables embedded in the type (e.g., shape expressions).");
+  static nb::exception<StructuralComparisonUnsupported> unsupported(ir, "StructuralComparisonUnsupported",
+                                                                    PyExc_TypeError);
+  nb::register_exception_translator([](const std::exception_ptr& error, void*) {
+    try {
+      if (error) std::rethrow_exception(error);
+    } catch (const StructuralComparisonUnsupported& e) {
+      nb::object instance = nb::borrow<nb::object>(unsupported.ptr())(e.what());
+      instance.attr("reason") = nb::str(e.reason().c_str());
+      instance.attr("field_path") = nb::str(e.field_path().c_str());
+      PyErr_SetObject(unsupported.ptr(), instance.ptr());
+    }
+  });
 
-  ir.def("structural_equal",
-         static_cast<bool (*)(const IRNodePtr&, const IRNodePtr&, bool)>(&structural_equal), nb::arg("lhs"),
-         nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
-         "Check if two IR nodes are structurally equal. "
-         "Ignores source location (Span). Returns True if IR nodes have identical structure. "
-         "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
-         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
-         "name).");
-  ir.def("structural_equal", static_cast<bool (*)(const TypePtr&, const TypePtr&, bool)>(&structural_equal),
-         nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
-         "Check if two types are structurally equal. "
-         "Ignores source location (Span). Returns True if types have identical structure. "
-         "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
-         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
-         "name).");
+  auto bind_comparison = [&](auto pointer) {
+    using Ptr = decltype(pointer);
+    ir.def(
+        "structural_hash",
+        [](const Ptr& node, bool auto_mapping) { return structural_hash(node, auto_mapping); },
+        nb::arg("node"), nb::arg("enable_auto_mapping") = false,
+        "Hash IR structure with the same variable policy as structural_equal. "
+        "Definitions are alpha-renamed; free variables preserve identity unless auto-mapping is enabled. "
+        "Compares exact dtype and float bits, including attached storage.");
+    ir.def(
+        "structural_equal",
+        [](const Ptr& lhs, const Ptr& rhs, bool auto_mapping) {
+          return structural_equal(lhs, rhs, auto_mapping);
+        },
+        nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
+        "Compare IR structure, ignoring source locations and bound names. "
+        "Free variables preserve identity unless auto-mapping is enabled. "
+        "Compares exact dtype, float bits, operator kind and semantic fields.");
+    ir.def(
+        "assert_structural_equal",
+        [](const Ptr& lhs, const Ptr& rhs, bool auto_mapping) {
+          assert_structural_equal(lhs, rhs, auto_mapping);
+        },
+        nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
+        "Assert structural equality under the same policy as structural_equal. "
+        "Raises ValueError with a mismatch path, or StructuralComparisonUnsupported.");
+  };
+  bind_comparison(IRNodePtr{});
+  bind_comparison(TypePtr{});
+  // Preserve the original Type overload's keyword spelling as well as node=.
+  ir.def(
+      "structural_hash",
+      [](const TypePtr& type, bool auto_mapping) { return structural_hash(type, auto_mapping); },
+      nb::arg("type"), nb::arg("enable_auto_mapping") = false);
 
-  ir.def("assert_structural_equal",
-         static_cast<void (*)(const IRNodePtr&, const IRNodePtr&, bool)>(&assert_structural_equal),
-         nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
-         "Assert two IR nodes are structurally equal. "
-         "Raises ValueError with detailed error message showing the first mismatch location if they differ. "
-         "Ignores source location (Span). "
-         "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
-         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
-         "name).");
-  ir.def("assert_structural_equal",
-         static_cast<void (*)(const TypePtr&, const TypePtr&, bool)>(&assert_structural_equal),
-         nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
-         "Assert two types are structurally equal. "
-         "Raises ValueError with detailed error message showing the first mismatch location if they differ. "
-         "Ignores source location (Span). "
-         "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
-         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
-         "name).");
+  ir.def("_without_type_memref", &CloneTypeWithoutMemRef, nb::arg("type"),
+         "Remove binding-owned allocation annotations for explicit value-type compatibility checks.");
+  ir.def("verify_structural_bindings", &verify_structural_bindings, nb::arg("node"),
+         "Verify binding visibility and unique definitions; comparison itself does not validate IR.");
 
   // Serialization functions
   ir.def(
@@ -1663,6 +1755,10 @@ void BindIR(nb::module_& m) {
              "Software-pipelined loop (pre-lowering user marker + transient post-lowering marker)")
       .export_values();
 
+  nb::enum_<HardwareLoopPolicy>(ir, "HardwareLoopPolicy", "Hardware loop intent")
+      .value("Auto", HardwareLoopPolicy::Auto, "Use the default hardware-loop lowering policy")
+      .value("Require", HardwareLoopPolicy::Require, "Require hardware-loop lowering");
+
   // ForStmt - const shared_ptr
   auto for_stmt_class = nb::class_<ForStmt, Stmt>(
       ir, "ForStmt", "For loop statement: for loop_var in range(start, stop, step): body");
@@ -1671,14 +1767,15 @@ void BindIR(nb::module_& m) {
       [](ForStmt* self, const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop,
          const ExprPtr& step, const std::vector<IterArgPtr>& iter_args, const StmtPtr& body,
          const std::vector<VarPtr>& return_vars, const Span& span, ForKind kind,
-         const nb::object& attrs_or_none) {
+         const nb::object& attrs_or_none, HardwareLoopPolicy hardware_loop_policy) {
         auto attrs = ConvertAttrsFromPython(attrs_or_none);
-        new (self)
-            ForStmt(loop_var, start, stop, step, iter_args, body, return_vars, span, kind, std::move(attrs));
+        new (self) ForStmt(loop_var, start, stop, step, iter_args, body, return_vars, span, kind,
+                           std::move(attrs), {}, hardware_loop_policy);
       },
       nb::arg("loop_var"), nb::arg("start"), nb::arg("stop"), nb::arg("step"), nb::arg("iter_args"),
       nb::arg("body"), nb::arg("return_vars"), nb::arg("span"), nb::arg("kind") = ForKind::Sequential,
-      nb::arg("attrs") = nb::none(), "Create a for loop statement");
+      nb::arg("attrs") = nb::none(), nb::arg("hardware_loop_policy") = HardwareLoopPolicy::Auto,
+      "Create a for loop statement");
   BindFields<ForStmt>(for_stmt_class);
   // Custom attrs property: convert vector<pair<string, any>> to Python dict
   for_stmt_class.def_prop_ro(
@@ -1686,8 +1783,8 @@ void BindIR(nb::module_& m) {
       [](const ForStmtPtr& self) {
         nb::dict result;
         for (const auto& [key, value] : self->attrs_) {
-          result[key.c_str()] = AnyToPyObject<int, bool, std::string, double, float, DataType, MemorySpace,
-                                              TensorLayout, TileLayout, PadValue>(value, key);
+          result[key.c_str()] = AnyToPyObject<int, bool, std::string, double, float, DataType, SimtAxis,
+                                              MemorySpace, TensorLayout, TileLayout, PadValue>(value, key);
         }
         return result;
       },
@@ -1713,6 +1810,7 @@ void BindIR(nb::module_& m) {
              "Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch window buffers)")
       .value("SplitAiv", ScopeKind::SplitAiv, "Explicit AIV-split region (pl.split_aiv)")
       .value("Graph", ScopeKind::Graph, "Recordable orchestration region (pl.graph)")
+      .value("Reg", ScopeKind::Reg, "Register lexical region")
       .export_values();
 
   // SplitMode enum
@@ -1744,6 +1842,10 @@ void BindIR(nb::module_& m) {
       "Combine mode for global-memory writes — pld.tensor.put (TPUT) and tile.store (TSTORE)")
       .value("None_", AtomicType::kNone, "Plain store — overwrite the destination")
       .value("Add", AtomicType::kAdd, "Atomically add the source data into the destination");
+
+  nb::enum_<CommEngine>(ir, "CommEngine", nb::is_arithmetic(),
+                        "Async communication engine for pld.tensor.put_async / get_async")
+      .value("URMA", CommEngine::kURMA, "A5 URMA remote transfer (V1 accepts this engine only)");
 
   nb::enum_<AccPhase>(ir, "AccPhase", nb::is_arithmetic(),
                       "Producer-side unit-flag phase for GEMV accumulator operations")
@@ -1808,6 +1910,23 @@ void BindIR(nb::module_& m) {
       [kwargs_to_pydict](const std::shared_ptr<const ClusterScopeStmt>& self) {
         return kwargs_to_pydict(self->attrs_);
       },
+      scope_attrs_doc);
+
+  auto reg_scope_stmt_class =
+      nb::class_<RegScopeStmt, ScopeStmt>(ir, "RegScopeStmt", "Register lexical scope");
+  reg_scope_stmt_class.def(
+      "__init__",
+      [](RegScopeStmt* self, std::string name_hint, const StmtPtr& body, const Span& span,
+         std::vector<std::string> leading_comments, const nb::object& attrs) {
+        new (self) RegScopeStmt(std::move(name_hint), body, span, std::move(leading_comments),
+                                ConvertAttrsFromPython(attrs));
+      },
+      nb::arg("name_hint"), nb::arg("body"), nb::arg("span"),
+      nb::arg("leading_comments") = std::vector<std::string>{}, nb::arg("attrs") = nb::none(),
+      "Create a register lexical scope statement");
+  BindFields<RegScopeStmt>(reg_scope_stmt_class);
+  reg_scope_stmt_class.def_prop_ro(
+      "attrs", [kwargs_to_pydict](const RegScopeStmtPtr& self) { return kwargs_to_pydict(self->attrs_); },
       scope_attrs_doc);
 
   // GraphScopeStmt
@@ -1907,11 +2026,16 @@ void BindIR(nb::module_& m) {
       "buffers=[...]) as __comm_d<n>:`. Synthesized by MaterializeCommDomainScopes pass; no user DSL "
       "surface.");
   comm_domain_scope_stmt_class.def(
-      nb::init<std::vector<int64_t>, std::vector<WindowBufferPtr>, std::string, const StmtPtr&,
-               const Span&>(),
+      "__init__",
+      [](CommDomainScopeStmt* self, std::vector<int64_t> devices, std::vector<WindowBufferPtr> slots,
+         std::string name_hint, const StmtPtr& body, const Span& span, std::vector<std::string> engines) {
+        new (self) CommDomainScopeStmt(std::move(devices), std::move(slots), std::move(name_hint), body, span,
+                                       std::vector<std::string>{},
+                                       std::vector<std::pair<std::string, std::any>>{}, std::move(engines));
+      },
       nb::arg("devices"), nb::arg("slots"), nb::arg("name_hint") = "", nb::arg("body"), nb::arg("span"),
-      "Create a CommDomain scope statement. ``devices`` empty = all devices (resolved to "
-      "*range(world_size) at codegen).");
+      nb::arg("engines") = std::vector<std::string>{},
+      "Create a CommDomain scope with explicit async workspace engines.");
   BindFields<CommDomainScopeStmt>(comm_domain_scope_stmt_class);
   comm_domain_scope_stmt_class.def_prop_ro(
       "attrs",
@@ -1938,6 +2062,21 @@ void BindIR(nb::module_& m) {
       },
       nb::arg("index"), "Get statement by index, supports negative indexing");
   BindFields<SeqStmts>(seq_stmts_class);
+
+  auto simt_scope_class = nb::class_<SimtScopeStmt, Stmt>(
+      ir, "SimtScopeStmt", "Transient per-thread SIMT region with implicit captures");
+  simt_scope_class.def(nb::init<std::vector<ExprPtr>, StmtPtr, Span, std::vector<VarPtr>>(),
+                       nb::arg("block_dims"), nb::arg("body"), nb::arg("span"),
+                       nb::arg("private_scalars") = std::vector<VarPtr>{});
+  BindFields<SimtScopeStmt>(simt_scope_class);
+
+  auto simt_launch_class = nb::class_<SimtLaunchStmt, Stmt>(
+      ir, "SimtLaunchStmt", "Launch a void SIMT helper and define updated storage results");
+  simt_launch_class.def(nb::init<GlobalVarPtr, std::vector<ExprPtr>, std::vector<ExprPtr>,
+                                 std::vector<VarPtr>, std::vector<int>, Span>(),
+                        nb::arg("callee"), nb::arg("block_dims"), nb::arg("args"), nb::arg("results"),
+                        nb::arg("result_param_indices"), nb::arg("span"));
+  BindFields<SimtLaunchStmt>(simt_launch_class);
 
   // EvalStmt - const shared_ptr
   auto eval_stmt_class = nb::class_<EvalStmt, Stmt>(ir, "EvalStmt", "Evaluation statement: expr");
@@ -1972,6 +2111,20 @@ void BindIR(nb::module_& m) {
       .value("Functional", FunctionIRStage::Functional, "Tensor/Tile value semantics (default)")
       .value("Buffer", FunctionIRStage::Buffer, "Explicit storage handles and destination writes");
 
+  nb::class_<SimtParamAccess>(ir, "SimtParamAccess")
+      .def_ro("reads", &SimtParamAccess::reads)
+      .def_ro("writes", &SimtParamAccess::writes);
+  nb::class_<SimtResources>(ir, "SimtResources")
+      .def_ro("max_threads", &SimtResources::max_threads)
+      .def_ro("max_regs", &SimtResources::max_regs);
+  ir.def("analyze_simt_access", &AnalyzeSimtAccess, nb::arg("function"));
+  ir.def("infer_simt_resources", &InferSimtResources, nb::arg("launch"));
+
+  nb::enum_<SimtAxis>(ir, "SimtAxis", "Compile-time SIMT query axis")
+      .value("X", SimtAxis::X)
+      .value("Y", SimtAxis::Y)
+      .value("Z", SimtAxis::Z);
+
   // FunctionType enum
   nb::enum_<FunctionType>(ir, "FunctionType", "Function type classification")
       .value("Opaque", FunctionType::Opaque, "Unspecified function type (default)")
@@ -1983,6 +2136,7 @@ void BindIR(nb::module_& m) {
       .value("Spmd", FunctionType::Spmd, "SPMD data-parallel dispatch")
       .value("Inline", FunctionType::Inline, "Whole-body substitution at every call site")
       .value("Graph", FunctionType::Graph, "Recordable/replayable orchestration fragment")
+      .value("SIMT", FunctionType::SIMT, "Per-thread device helper launched inside an AIV task")
       .export_values();
 
   // Level enum — hierarchy level in the Linqu machine model
@@ -2038,6 +2192,7 @@ void BindIR(nb::module_& m) {
   // (ir.ArgDirection.InOut) to keep the two direction models cleanly separated.
 
   // IsInCoreType helper
+  ir.def("is_device_function_type", &IsDeviceFunctionType, nb::arg("func_type"));
   ir.def("is_incore_type", &IsInCoreType, nb::arg("func_type"),
          "Check if a FunctionType is an InCore variant (InCore, AIC, or AIV)");
 
@@ -2346,8 +2501,8 @@ void BindIR(nb::module_& m) {
               // Convert kwargs to Python list of (key, value) tuples
               nb::list py_kwargs_list;
               for (const auto& [key, val] : kwargs) {
-                nb::object py_val = AnyToPyObject<DataType, MemorySpace, TensorLayout, PadValue, bool, int,
-                                                  std::string, double>(val, key);
+                nb::object py_val = AnyToPyObject<DataType, SimtAxis, MemorySpace, TensorLayout, PadValue,
+                                                  bool, int, std::string, double>(val, key);
                 nb::tuple pair = nb::make_tuple(nb::cast(key), py_val);
                 py_kwargs_list.append(pair);
               }
@@ -2458,9 +2613,15 @@ void BindIR(nb::module_& m) {
       "the traversal. Seeded entries from var_map are NOT included — use the\n"
       "caller's own substitution map for those.");
 
+  ir.def("returned_param_indices", &return_lineage::ReturnedParamIndices, nb::arg("func"), nb::arg("program"),
+         "Trace each return to its external parameter.");
+
   // Cross-function call return type deduction
+  ir.def("make_call_result_type", &MakeCallResultType, nb::arg("return_types"), nb::arg("is_submit") = false,
+         "Pack declared results into a Call or Submit type without flattening nested tuples.");
+
   ir.def("deduce_call_return_type", &DeduceCallReturnType, nb::arg("callee_params"), nb::arg("args"),
-         nb::arg("return_types"),
+         nb::arg("return_types"), nb::arg("is_inline") = false,
          "Deduce return types for a cross-function call by substituting "
          "dynamic shape variables from callee params with actual arg shapes.");
 }

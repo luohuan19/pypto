@@ -69,8 +69,11 @@ inline const PassProperties kLowerHostTensorCollectivesProperties{
 //    That ordering constraint is a pipeline-position fact, not an IRProperty.
 //    The rewrite swaps one call for another within the existing vocabulary, and
 //    the synthesized function returns its InOut `target` parameter through an
-//    explicit ReturnStmt, so no property is required, produced or invalidated.
-inline const PassProperties kLowerL2TensorCollectivesProperties{};
+//    explicit ReturnStmt, so nothing is produced or invalidated. The contiguity
+//    check reads each kernel's writeback map off its ReturnStmt, hence the
+//    ReturnParamsExplicit requirement.
+inline const PassProperties kLowerL2TensorCollectivesProperties{
+    .required = {IRProperty::ReturnParamsExplicit}};
 
 // Rebuild control flow before direction/dependency/runtime-scope analysis.
 // ReturnParamsExplicit supplies the unambiguous return-slot -> parameter map.
@@ -168,8 +171,8 @@ inline const PassProperties kSimplifyProperties{};
 // degree-9 Horner polynomial), packed tile.tquant_mx, and explicit-signal InCore
 // pld.tensor.allreduce; host-level allreduce is skipped and lowered later by
 // LowerHostTensorCollectives.
-// Future composite ops add a rule to the file-local dispatch table in
-// lower_composite_ops_pass.cpp. The pass operates within existing op
+// Future composite ops add a rule to the function-local dispatch table in
+// lower_composite/lower_composite_rules.cpp. The pass operates within existing op
 // vocabularies, so it neither requires nor produces nor invalidates any
 // IRProperty.
 
@@ -189,6 +192,12 @@ inline const PassProperties kOutlineIncoreScopesProperties{
 
 inline const PassProperties kOutlineClusterScopesProperties{
     .required = {IRProperty::SSAForm}, .produced = {IRProperty::SSAForm, IRProperty::ClusterOutlined}};
+
+inline const PassProperties kDeduplicateOutlinedKernelsProperties{
+    .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::ClusterOutlined,
+                 IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::ClusterOutlined,
+                 IRProperty::NormalizedStmtStructure}};
 
 // -- Hierarchy outlining pass -------------------------------------------------
 
@@ -345,17 +354,10 @@ inline const PassProperties kResolveBackendOpLayoutsProperties{
     .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure}};
 
-// -- Auto vector-split lowering pass (RFC #1300; live, always-on) --------------
-//
-// Converts AUTO pl.split mixed InCore functions into the explicit split_aiv form
-// (aiv_shard / aic_gather + halved vector sub-region) BEFORE ExpandMixedKernel.
-// Runs unconditionally in the Default strategy. Same pre/post properties as
-// ExpandMixedKernel's required set: it rewrites the still-mixed InCore body in
-// place without changing the structural property set (and is a no-op for
-// functions with no split mode or already in explicit split_aiv form).
-//
-// Source authoring and lowered bodies have distinct contracts: the latter
-// retains regions but also admits AUTO's flat compatibility representation.
+// -- Explicit AIV-region lowering (public compatibility name retained) -------
+// Preserves authored computation and region placement, localizes explicit
+// boundary valid extents, and rejects retired mixed AUTO splitting. The lowered
+// contract also accepts hand-authored flat explicit IR with split metadata.
 inline const PassProperties kLowerAutoVectorSplitProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure,
@@ -396,9 +398,19 @@ inline const PassProperties kSplitVectorKernelProperties{
 
 // -- Memory / codegen passes --------------------------------------------------
 
+inline const PassProperties kOutlineSimtScopesProperties{.invalidated = {IRProperty::SSAForm}};
+
+inline const PassProperties kSpecializeSimtHelpersProperties{.required = {IRProperty::SSAForm},
+                                                             .produced = {IRProperty::SimtSpecialized}};
+
+inline const PassProperties kMaterializeSimtOutputsProperties{
+    .required = {IRProperty::SSAForm, IRProperty::TileMemoryInferred},
+    .produced = {IRProperty::SimtOutputsMaterialized},
+    .invalidated = {IRProperty::HasMemRefs, IRProperty::AllocatedMemoryAddr}};
+
 inline const PassProperties kInitMemRefProperties{
     .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
-                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred},
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::SimtOutputsMaterialized},
     .produced = {IRProperty::HasMemRefs, IRProperty::NormalizedStmtStructure},
     .invalidated = {IRProperty::SSAForm}};
 

@@ -207,6 +207,8 @@ for_stmt = ir.ForStmt(i, start, stop, step, [sum_iter], body, [sum_final], span)
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator 运行时区域（`SIMPLER_SCOPE`）；`manual_=true` 选择手工依赖模式 |
 | **YieldStmt** | `values_` | 在循环迭代中产出值 |
 | **EvalStmt** | `expr_` | 为副作用求值表达式 |
+| **SimtScopeStmt** | `block_dims_`, `body_` | 临时每线程执行 region，在 SSA 前提取为 helper/launch |
+| **SimtLaunchStmt** | `callee_`, `block_dims_`, `args_`, `results_` (DefField), `result_param_indices_` | 启动无返回值 SIMT helper 并定义更新后的存储版本，见[标量 SIMT IR](11-simt.md) |
 | **SeqStmts** | `stmts_` | 通用语句序列 |
 | **BreakStmt** | *(无)* | 退出循环 |
 | **ContinueStmt** | *(无)* | 跳至下一次循环迭代 |
@@ -346,7 +348,7 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
     的，因此每个区域独立减半。持有至少一个区域的函数进入**手动模式**：区域对
     向量计算的放置具有决定权，`AivSplitValid` 验证器会拒绝所有区域之外的向量
     计算（每个全宽阶段请写一个 `mode=None` 区域，参见
-    [LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md)）。顶层
+    [LowerAutoVectorSplit](../passes/25-lower_auto_vector_split.md)）。顶层
     `for aiv_id in pl.split_aiv(...)` 会被 parser 包裹在外层
     `InCoreScopeStmt` 中（以便 `OutlineIncoreScopes` 提取），即
     `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`。
@@ -483,6 +485,22 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `role_` | optional[Role] | 层次角色（对 InCore/AIC/AIV/Group/Orchestration/Graph 自动派生，详见下文） |
 | `attrs_` | list[(str, Any)] | 有序的自由形式元数据，以 `UsualField` 暴露（参与结构遍历） |
 
+### 调用结果类型
+
+`ir.make_call_result_type(return_types, is_submit=False)`（C++：
+`MakeCallResultType`）封装已声明的返回位置，不执行类型推导，也不展开 tuple
+类型的单个结果。parser 和 lowering pass 共用此规则。
+
+| 声明结果 | Call 类型 | Submit 类型 |
+| -------- | --------- | ----------- |
+| `[]` | `UnknownType` | `Tuple[TaskId]` |
+| `[T]` | `T` | `Tuple[T, TaskId]` |
+| `[T1, T2]` | `Tuple[T1, T2]` | `Tuple[T1, T2, TaskId]` |
+| `[Tuple[T1, T2]]` | `Tuple[T1, T2]` | `Tuple[Tuple[T1, T2], TaskId]` |
+
+TaskId 属于任务启动；封装不会修改被调函数签名。返回类型推导和符号 shape
+代入在封装之前完成。
+
 ### 函数体表示
 
 `FunctionIRStage` 是独立于 `FunctionType`、`level` 和 `role` 的强类型反射字段。
@@ -594,6 +612,7 @@ def sample(logits: pl.Tensor[[B, V], pl.FP32]) -> pl.Tensor[[B], pl.INT32]:
 | `Spmd` | SPMD 数据并行调度封装 |
 | `Inline` | 在每个调用点整体替换函数体；由 `InlineFunctions` 在其它 pass 之前消除 |
 | `Graph` | 可调用的编排片段，由 `host_build_graph` runtime 录制一次、之后回放 |
+| `SIMT` | 仅由 `SimtLaunchStmt` 启动的无返回值设备 helper，不携带运行时任务元数据 |
 
 `IsInCoreType(type)` / `ir.is_incore_type(type)` 对 `InCore`、`AIC` 和 `AIV` 返回 `True`。
 
@@ -633,7 +652,7 @@ add_func = program.get_function("add")  # Access by name
 | **一元运算** | 5 | Abs, Neg, Not, BitNot, Cast |
 | **调用/访问** | 2 | Call, TupleGetItemExpr |
 | **操作** | 2 | Op, GlobalVar |
-| **语句** | 17 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, SplitAivScopeStmt, GraphScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
+| **语句** | 19 | SimtScopeStmt, SimtLaunchStmt, AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, SplitAivScopeStmt, GraphScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
 | **类型** | 6 | ScalarType, TensorType, TileType, TupleType, PipeType, UnknownType |
 | **函数** | 2 | Function, Program |
 

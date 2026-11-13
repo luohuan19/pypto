@@ -12,7 +12,12 @@ N6 分布式算子族为 Python DSL 提供了对硬件跨 rank（cross-rank）�
 TPUT/TGET 在该侧只需要一段可读/可写的*本地* GM 区域。窗口绑定的一侧
 （`put.dst`、`get.src`）仍然必须是 `DistributedTensor`。
 
-共有**十五个算子**和**四个 ABI 枚举**：
+HOST 通信域分配会将每个 buffer 的物理大小向上取整到 64 字节，保留 tensor
+的精确逻辑大小。这既满足 32 字节传输对齐，也将不同 buffer 隔离在独立的标量
+缓存行（cache line）中：暂存 counts 时的 DCCI 回写不能覆盖 peer 并发写入相邻
+buffer 的 signal credit。同一个 buffer 内共享缓存行的多个 view 仍需自行同步。
+
+共有**十七个算子**和**五个 ABI 枚举**：
 
 | 算子 | 方向 | 结果 | 硬件 |
 | ---- | ---- | ---- | ---- |
@@ -21,13 +26,15 @@ TPUT/TGET 在该侧只需要一段可读/可写的*本地* GM 区域。窗口绑
 | `pld.tensor.remote_store` | push（写本地 tensor 级值 → peer）；1:1 下降为 `pld.tile.remote_store` | `Unknown`（副作用） | TSTORE |
 | `pld.tensor.get` | pull（读 peer → 本地 GM） | `Unknown`（副作用） | TGET |
 | `pld.tensor.put` | push（写本地 → peer） | `Unknown`（副作用） | TPUT |
+| `pld.tensor.get_async` | 异步拉取（peer → 本地 GM） | 与 `dst` 别名 | URMA（A5）；外部 helper + adapter |
+| `pld.tensor.put_async` | 异步推送（本地 → peer GM） | 与 `dst` 别名 | URMA（A5）；外部 helper + adapter |
 | `pld.tensor.allreduce` | collective reduce over window slices | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.barrier` | 跨 rank 同步窗口数据可见性 | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.broadcast` | 将 root rank 的数据复制到所有 rank | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.reduce_scatter` | 跨 rank 规约并分散 | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.allgather` | 从所有 rank 收集数据到窗口 | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.all_to_all` | 基于推送的对称个性化交换——每个 rank 通过 `pld.tensor.put`（TPUT）将自己的各目标 block 推送到每个对等方的窗口中，返回窗口作为结果 | `DistributedTensorType`（同 src） | composite / HOST builtin |
-| `pld.tensor.all_to_all_v` | 变长 all-to-all（MPI_Alltoallv）——按每个目标推送 `clamp(send_counts[dest], 0, MAX_RECV)` 行，写入平面 2D 暂存窗口（传输大小是运行时行数，因此填充不会经过链路），并填充 `recv_counts[src, 0]` 使接收方知道哪些行有效——builtin 内核从每个对端自己的 `send_counts` 窗口中读取自己所需的**一个字**（标量读取，无固定宽度要求）并在读取方做钳制，由两轮信用屏障守护；composite 通路则用 `pld.system.notify`（Set）发布；返回窗口作为结果（与对称 `all_to_all` 相同的窗口即结果模式） | `DistributedTensorType`（与 target 相同） | composite / HOST builtin / CHIP builtin |
+| `pld.tensor.all_to_all_v` | 变长 all-to-all（MPI_Alltoallv）——按每个目标推送 `clamp(send_counts[dest], 0, MAX_RECV)` 行，写入平面 2D 暂存窗口（传输大小是运行时行数，因此填充不会经过链路），并填充 `recv_counts[src, 0]` 使接收方知道哪些行有效——builtin 内核从每个对端自己的 `send_counts` 窗口中读取自己所需的**一个字**（标量读取，无固定宽度要求）并在读取方做钳制，由两轮信用屏障守护；composite 通路先原子清零本地计数并向所有对端宣布就绪，再逐目标等待就绪，用 `pld.system.notify`（AtomicAdd）发布非零计数并推送载荷，最后通过屏障完成交换；返回窗口作为结果（与对称 `all_to_all` 相同的窗口即结果模式） | `DistributedTensorType`（与 target 相同） | composite / HOST builtin / CHIP builtin |
 | `pld.system.notify` | 给 peer 的槽位发信号 | `Unknown`（副作用） | TNOTIFY |
 | `pld.system.wait` | 在自身槽位上阻塞 | `Unknown`（副作用） | TWAIT |
 | `pld.system.defer_wait` | 让本任务的逻辑完成等待本地 counter | `Unknown`（副作用） | Simpler completion runtime（无 PTOAS wait op） |
@@ -35,6 +42,28 @@ TPUT/TGET 在该侧只需要一段可读/可写的*本地* GM 区域。窗口绑
 七个仅有副作用（side-effect-only）的算子产生
 [`UnknownType`](ir/02-types.md)：它们因跨 rank 副作用而存在，而非为消费者读取的
 SSA 值而存在。
+
+## 异步传输校验（Async Transfer Validation）
+
+`pld.tensor.put_async` 和 `pld.tensor.get_async` 在 A5 后端下降为按 dtype 后缀命名的
+外部 helper 调用（`pypto_urma_{put,get}_async_<dtype>`）。helper 会同时校验两端张量的
+范围与通信窗口，通过 IR `engines` 字段申请 URMA workspace，并复用现有运行时入口提交；
+它从不轮询。任务完成集成（由所属任务释放消费者）尚待实现。
+两端都必须是窗口绑定、稠密行主序（dense row-major）的 `DistributedTensor`。
+结果与 `dst` 共用存储；算子返回不代表传输完成。
+
+adapter 符号与 C++ 元素类型复用公共 dtype 转换。
+
+- Python builder 要求 `engine=pld.CommEngine.URMA`（也是默认值）。
+  整数、浮点数、布尔值、字符串及其他枚举在整数转换前即被拒绝。
+  原始 IR 将 engine 存储为整数 `1`。
+- `peer` 必须是整数/index 标量。负的常量 rank 会被拒绝；
+  该检查不保证通信域内运行时 rank 的边界合法。
+- `dst_offsets`、`src_offsets` 和 `shape` 必须一起提供。区域在两端都必须连续：
+  跳过传输形状开头已知等于一的维度，再要求第一个非单元素维度之后的各维取满。
+  动态长度可能大于一，因此不能跳过。
+  所以 `[16, 64]` 中的 `[1, 32]` 和 `[2, 4, 64]` 中的 `[1, 2, 64]` 连续，
+  而对应的 `[2, 32]` 和 `[2, 1, 64]` 不连续。
 
 ## 命名空间：为何区分 `tile.*` / `tensor.*` / `system.*`
 
@@ -86,10 +115,10 @@ SSA 值而存在。
 `pld.system.wait` 刻意不加标记，原因并非 TWAIT 幂等：它会*阻塞*，出现在 cube 通路
 上是有实际作用的 —— 把它钉在向量通路上，会让 matmul 越过它本应等待的对端数据。
 
-该标记与亲和性正交（它约束的是复制而非放置位置）。它唯一的消费者是
-`LowerAutoVectorSplit` 的 `pl.split_aiv` 区域放置标记：该 pass 把区域内的
-no-duplicate 调用钉在 AIV 通路上；参见 `docs/zh/dev/ir/05-operators.md` 与
-`docs/zh/dev/passes/23-lower_auto_vector_split.md`。
+该标记与亲和性正交（它约束的是复制而非放置位置）。`ExpandMixedKernel` 在消费
+`pl.split_aiv` 区域时，将区域内核无关的 no-duplicate 调用固定在 AIV 通路上。
+软件流水分析也将这些调用视为不可复制；参见 `docs/zh/dev/ir/05-operators.md` 与
+`docs/zh/dev/passes/26-expand_mixed_kernel.md`。
 
 **写在所有区域之外的通信算子仍然会被复制到两条通路上，且没有任何诊断会提示这一点。**
 把通信阶段放进 `pl.split_aiv` 区域是作者的职责；参见
@@ -97,8 +126,8 @@ no-duplicate 调用钉在 AIV 通路上；参见 `docs/zh/dev/ir/05-operators.md
 
 ## ABI 枚举（`include/pypto/ir/comm.h`）
 
-四个枚举是**仅追加（append-only）的 ABI**。它们的底层 `int` 值被序列化为算子的
-kwarg 负载（notify 的 `op`、wait/defer_wait 的 `cmp`、put 的 `atomic`）,并在 codegen 时转
+五个枚举是**仅追加（append-only）的 ABI**。它们的底层 `int` 值被序列化为算子的
+kwarg 负载（notify 的 `op`、wait/defer_wait 的 `cmp`、put 的 `atomic`、异步传输的 `engine`）,并在 codegen 时转
 回枚举。新变体只能加在**末尾**,以保证已有 IR 和缓存程序的语义不变。
 
 ```cpp
@@ -106,6 +135,7 @@ enum class NotifyOp : int { kAtomicAdd = 0, kSet = 1 };   // pld.system.notify
 enum class WaitCmp  : int { kEq = 0,        kGe = 1 };     // pld.system.wait / defer_wait
 enum class AtomicType : int { kNone = 0,    kAdd = 1 };    // pld.tensor.put、remote_store
 enum class ReduceOp : int { kSum = 0, kMax = 1, kMin = 2, kProd = 3 };  // pld.tensor.allreduce
+enum class CommEngine : int { kURMA = 1 };  // pld.tensor.put_async / get_async
 ```
 
 | 枚举 | 变体 | 含义 |
@@ -120,17 +150,18 @@ enum class ReduceOp : int { kSum = 0, kMax = 1, kMin = 2, kProd = 3 };  // pld.t
 | `ReduceOp` | `kMax` | 对所有参与 rank 的窗口切片做最大值规约 |
 | `ReduceOp` | `kMin` | 对所有参与 rank 的窗口切片做最小值规约 |
 | `ReduceOp` | `kProd` | 对所有参与 rank 的窗口切片做乘法规约 |
+| `CommEngine` | `kURMA` | URMA 异步传输引擎 |
 
 每个枚举跨三层保持一致（C++ `enum class` → bindings 中的 `nb::enum_` → `.pyi`
-存根）,并以 `pld.NotifyOp` / `pld.WaitCmp` / `pld.AtomicType` / `pld.ReduceOp` 暴露给 DSL。
+存根）,并以 `pld.NotifyOp` / `pld.WaitCmp` / `pld.AtomicType` / `pld.ReduceOp` / `pld.CommEngine` 暴露给 DSL。
 deducer 会校验打包的 `int` 落在枚举范围内,使 codegen 无需二次保护即可转回。
 
 ## 屏障-信号协议
 
 每个 `pld.tensor.*` 集合通信算子（`allreduce`、`barrier`、`broadcast`、
-`reduce_scatter`、`allgather`、`all_to_all`）都使用同一个**自清理信用屏障**
+`reduce_scatter`、`allgather`、`all_to_all`、`all_to_all_v`）都使用同一个**自清理信用屏障**
 （self-clearing credit barrier）进行同步，该屏障由 `pld.system.notify` /
-`pld.system.wait` 构建：
+`pld.system.wait` 构建。`all_to_all_v` 使用本节末尾描述的**两轮**变体：
 
 ```text
 Body:      barrier(1); barrier(2); ...; barrier(N)   # g 在本次调用内计数
@@ -144,12 +175,12 @@ Epilogue:  for src != my_rank:
 ```
 
 `AtomicAdd` 把每个 cell 变成一个信用计数器：每次 notify 是生产者的 `+1`，尾声
-（epilogue）是唯一消费者的 `-N`。由于加法与减法是原子的且可交换，一旦所有 rank
-都完成本次调用的尾声，signal 可证明地恢复为全零 —— **signal 不携带任何超出
-单次调用生命周期的状态**，因此每次调用的 generation `g` 都从 1 重新开始，无需
-跨调用记账。慢 rank 在完成当前调用的过程中最多会让快 rank 自己的下次调用
-信用膨胀 1（有界 skew），因此计数器不会溢出，快 rank 也永远不会观察到虚假
-通过。
+（epilogue）是唯一消费者的 `-N`。原子减法只退休本次调用的信用，保留提前到达的
+下一次调用信用。所有 rank 退休本次调用后，只有在没有下一次调用信用到达时，
+signal 才为全零；generation `g` 仍从 1 重新开始，无需跨调用账本。InCore
+`all_to_all_v` 将就绪广播与按需的目标等待拆开，因此零行边允许快 peer 在慢 rank
+退休本轮两个信用之前发出下一轮的两个信用。cell 可达到 4；`AtomicAdd(-2)`
+会保留这两个提前到达的信用。
 
 `Ge`（而非 `Eq`）是关键负载：快 peer 可能在慢 rank 轮询前就把 cell 推到期望值
 之上，因此相等等待会永久阻塞。同理，`Set` 绝对不能与 `AtomicAdd` 混用在同一个
@@ -159,11 +190,14 @@ cell 上 —— set 可能会覆盖已经被推高的计数器。
 `value` 只需要 `ScalarType` —— 因此 mesh allreduce 的每块信用计数不需要在编译期
 已知。
 
-`all_to_all_v` 的 builtin 内核是唯一的**两轮**变体：其计数拉取需要保护计数的
-生命周期与接收窗口的复用，因此它在拉取前执行 Barrier A（`+1` / 等待 `Ge(1)`），
-在推送后执行 Barrier B（`+1` / 等待 `Ge(2)`），最后对每个本地槽位做一次
-`AtomicAdd(-2)` 收尾——从不重置，因此下一次调用提前到达的信用会被保留。它同样
-可在连续多次调用间复用；其 InCore composite 通路仍采用上述单轮自清理协议。
+`all_to_all_v` 的 builtin 与 InCore composite 通路都使用**两轮**变体。builtin
+在计数拉取前执行 Barrier A（`+1` / 等待 `Ge(1)`），在载荷推送后执行 Barrier B
+（`+1` / 等待 `Ge(2)`），以保护跨调用的计数生命周期与接收窗口复用。InCore
+通路先原子清零自身接收计数并向所有对端宣布就绪，再逐个等待非自身目标的
+`Ge(1)` 就绪信用，然后发布非零钳制计数并推送该目标的载荷；首次发送前不需要
+等待所有目标。零行计数保留接收方清零后的值，无须发布。Barrier B（`Ge(2)`）
+确认交换完成。两条通路都对每个本地槽位做一次 `AtomicAdd(-2)` 收尾
+——从不重置信号，因此下一次调用提前到达的信用会被保留。信号可跨顺序调用复用。
 
 **约束：**
 
@@ -172,10 +206,11 @@ cell 上 —— set 可能会覆盖已经被推高的计数器。
 | 同一个 signal 不能在 mesh（`[NR, 1]`）和 ring（`[2*(NR-1), NR]`）allreduce 之间共享 | mesh 寻址 `[rank, 0]`；ring 寻址 `[row, rank]` —— 形状不匹配，在降级时检查 |
 | 调用在中途被中止（错误/超时）会留下 signal 为非零 | 信用泄漏；在下一次 dispatch 之前通过 host 端重置（`reset_persistent_windows`）恢复 |
 
-由于协议是调用局部的，且 signal 在每次调用开始时始终为零，集合通信在 `for` /
-`while` / `if` 内都是合法的 —— 每次调用都是封闭循环，因此相同的编译期
-`expected` 值在每次迭代中复用。唯一的剩余要求是 rank 均匀执行（任何屏障的固有
-要求）：rank 分叉的控制流会死锁，由 `TWAIT` 的自旋计数断言暴露。
+由于协议是调用局部的，InCore 集合通信支持 rank 间一致执行的 `for` / `while` /
+`if` —— 每次调用都是封闭循环，因此相同的编译期 `expected` 值在每次迭代中复用。
+rank 分叉的控制流会死锁，由 `TWAIT` 的自旋计数断言暴露。
+`all_to_all_v` 的循环支持仅限 InCore：HOST 编排器仍会拒绝 `for` / `while`
+内的调用，因为编译器尚未建模循环携带的通信域窗口生命周期管理。
 
 ## 算子参考
 
@@ -251,7 +286,7 @@ Codegen：经过标准 tile pipeline 之后 tile 是 2-D（height × width）；
 也是 all-to-all combine 就地累加各 rank 贡献所需要的。该 attr 仅在 `kAdd` 时发出，
 因此普通 push 的产物与之前逐字节一致。`kAdd` 要求 dtype 为
 fp32/bf16/fp16/int32/int16/int8 —— 与 `tile.store` 强制的硬件允许列表相同 ——
-bf16 在此之上还有 Ascend910B-only 限制。
+bf16 在此之上还有 Ascend910-only 限制。
 
 `pld.tensor.put`（TPUT）**没有** tile 源形式 —— 它的 staging tile 是中转缓冲而非
 数据源。推送计算值是 `remote_store` 的职责；推送无需装入片上的大块 GM 区域则是
@@ -315,7 +350,7 @@ full-slice `put` 要求 `dst` / `src` 形状一致；subregion `put` 允许完�
 不同,只要显式传输区域不越界（仅校验静态维）；任何动态传输维都需配套静态 chunk
 （见上）。`atomic` 选择覆盖还是原子加（见 `AtomicType`）。`atomic=Add` 还要求目标为
 `FP32/BF16/FP16/INT32/INT16/INT8`（硬件原子加 dtype——TPUT 与 `tile.store` 走同一条 store
-流水落盘）；其中 `BF16` 目标进一步由 `AtomicAddDtypeValid` 属性校验器限制为 Ascend910B（A2/A3）。下降出的
+流水落盘）；其中 `BF16` 目标进一步由 `AtomicAddDtypeValid` 属性校验器限制为 Ascend910（A2/A3）。下降出的
 `pld.tile.put` verifier 要求 staging tile 在两个
 **静态**维度上都**不超过**展平后的传输范围（可以更小 —— 即一个 chunk —— 但不能
 更大；动态维由 chunk 在运行时约束）。
@@ -385,6 +420,15 @@ shape 更窄的 `valid_shape`，或同一个操作数同时充当两种角色—
 CHIP 通路上，操作数是以函数参数的形式到达的，没有这样的溯源能力，因此互不相同是
 调用方的义务。
 
+在托管 CHIP/L2 通路上，于 orchestration 中构建的操作数必须可证明为行主序，否则
+`LowerL2TensorCollectives` 会拒绝它（证明范围及原因见
+[pass 参考](passes/44-lower_l2_tensor_collectives.md#当前限制)）。作为兜底，orchestration
+codegen 在其 `rt_submit_aiv_task` 之前为每个操作数生成一条 `is_contiguous` 检查。第一个不连续的
+操作数会锁存 `SIMPLER_ERROR_INVALID_ARGS` 并给出其名称
+（`__builtin_all_to_all_v__fp32: signal must be a contiguous row-major view`），
+随后运行时丢弃该次提交。非零视图偏移是允许的——kernel 会加上 `start_offset`——
+只有非行主序的步长向量会被拒绝。
+
 `MAX_RECV = target.shape[0] // NR`。降级在运行时读取 `send_counts[dest]`、钳制到
 `[0, MAX_RECV]`，并填充接收侧计数向量 `recv_counts[src, 0]`。builtin 内核
 （HOST 与托管 CHIP/L2 通路）以**拉取**方式完成：每个 rank 先把自身的发送向量
@@ -395,8 +439,11 @@ CHIP 通路上，操作数是以函数参数的形式到达的，没有这样的
 整个交换由**两轮信用屏障**守护：Barrier A（拉取前）证明所有 rank 已暂存计数，
 且都已消费上一次调用的接收窗口；Barrier B（推送后）证明每个对端都已读完本 rank
 的计数并完成推送，方可返回。
-InCore composite 通路则把已经钳制过的计数通过 `pld.system.notify`（Set）写入
-对端 `dest` 的 `recv_counts[my_rank, 0]`。推送只传输这么多行——传输形状是运行时
+InCore composite 通路先原子清零本地接收计数，并向所有对端宣布就绪。对于每个非自身
+目标，先等待该目标就绪，再通过 `pld.system.notify`（AtomicAdd）把钳制后的正计数
+发布到其 `recv_counts[my_rank, 0]`，然后推送载荷。零行目标保留接收方清零后的值，
+无须发布计数或传输载荷。最后通过 `Ge(2)` 屏障确认交换完成。清零和发布均使用原子更新：标量存储会写回整条缓存行，可能覆盖相邻的
+计数或信号。推送只传输这么多行——传输形状是运行时
 的 `[rows, SIZE]`，而非编译期容量——因此填充行不会经过链路。调用结束之后接收方用
 `recv_counts[src, 0]` 识别有效行；其容量槽的其余部分根本不会被写入。窗口内存
 不*保证*清零，且可能在同一进程内残留，因此这些未触及的字节是未定义的。
@@ -440,6 +487,11 @@ InCore 路径是一个 `pld.tile.put`，其传输形状为运行时计数，通�
 launched_core_num=B active_lanes=min(B, stride) lanes_per_peer=K`（`B < NR` 的 stride 模式下为 `0`）以及 rank 数，位于默认日志阈值——
 因此启动宽度可直接从设备日志读出，而无需从数据通路上推断。
 
+HOST/CHIP 共用的 builtin 在每个 AIV 上使用两个 32 KiB UB 暂存缓冲区
+（共 64 KiB，与载荷 dtype 无关）。大传输通过 TPUT 双缓冲（ping-pong）
+重叠下一块的读取与上一块的写出。能放入单个缓冲区的小传输走单次搬运路径；
+两个缓冲区的有效列数都受实际载荷或尾块长度限制，不会传输未使用的容量。
+
 已准入的 block 会**划分工作**（RFC #2521 K3）：
 
 - `B >= NR` —— peer × length：每个 peer 有 `K = B / NR` 个 lane，block `idx` 拥有
@@ -460,14 +512,14 @@ InCore 复合路径只接受编译期的 `core_num = 1`，其他取值会被直�
 信息中指明 CHIP 路径。下文的 CHIP/L2 路径接受编译期的 `core_num`：它在降级时折叠出
 同一个 `B = CalAllToAllVBlocks(P, L)`，并在 `B > 1` 时把它作为启动规格
 （`core_num=B`、`sync_start`）附加到调用上。该路径暂不支持运行期 `core_num`——见
-[`40-lower_l2_tensor_collectives.md`](passes/40-lower_l2_tensor_collectives.md)。
+[`44-lower_l2_tensor_collectives.md`](passes/44-lower_l2_tensor_collectives.md)。
 
 **CHIP builtin**（`LowerL2TensorCollectives`）：同样的调用写在下一层——CHIP
 `Orchestration` 函数体中，而不是 `host_orch` 中。它会被改写成对合成 AIV kernel 的
 调用，该 kernel 由 HOST 路径使用的*同一份* builtin 模板渲染而来，因此链路行为完全
 一致，差别只在派发结构：该集合通信成为调用方自身 pipeline 中的一个 AIV task——不按
 设备扇出，也不产生嵌套 L2 dispatch——并通过普通 TensorMap 依赖与前后计算排序。参见
-[`40-lower_l2_tensor_collectives.md`](passes/40-lower_l2_tensor_collectives.md)。
+[`44-lower_l2_tensor_collectives.md`](passes/44-lower_l2_tensor_collectives.md)。
 
 **HOST builtin**（`LowerHostTensorCollectives`）：同样的 5 参数调用，在
 `host_orch` 函数中发起时，会按设备下降为 `builtin.tensor.all_to_all_v`——
@@ -483,8 +535,7 @@ notify/count 写入与内核读取竞争，control 与 control 之间是 notify 
 `signal.shape[0]` 与设备数**精确相等**的要求，也不再需要按 `MAX_RECV` 进行
 variant 混入。暂不支持在 `host_orch` 的 `for`/`while` 循环内调用——这是编译器的
 限制（动态重复调用需要循环携带的窗口生命周期管理，本编译器尚未建模），而不是
-信号本身的性质：信用屏障可跨顺序调用复用——与 `LowerCompositeOps` 在 InCore
-路径上强制的限制相同。
+信号本身的性质：信用屏障可跨顺序调用复用，InCore 调用支持 rank 间一致执行的循环。
 
 ### `pld.tensor.allreduce`
 
@@ -534,7 +585,7 @@ chunk，Pass 会保留该元数据，并沿用单矩形路径只归约这个矩�
 
 host-orchestrator 用户代码可以省略 `signal`，包括在 `for` / `while`
 循环内；
-[`SynthesizeAllReduceSignals`](passes/45-synthesize_allreduce_signals.md) 阶段会为该 call 插入 private INT32 signal window，
+[`SynthesizeAllReduceSignals`](passes/49-synthesize_allreduce_signals.md) 阶段会为该 call 插入 private INT32 signal window，
 语义 shape 为 `[world_size, core_num]`（仅 mesh 模式 — `mode="ring"` 必须显式传入
 signal）。该阶段会先插入 standalone `world_size = pld.world_size()` binding，
 再用该变量构造 buffer size 和 window shape。自清理协议（参见
@@ -542,10 +593,12 @@ signal）。该阶段会先插入 standalone `world_size = pld.world_size()` bin
 因此 `for` / `while` 循环内的调用与其他集合通信一样受支持。显式 `signal`
 仍然是 InCore lowering 和内部测试使用的形态。通信域物化会把该 signal buffer
 保留在与 `src` 相同的 comm-domain 中，即使它没有传给用户自定义
-chip kernel。mesh、ring 和
-host builtin 路径均支持 FP16、FP32，以及任意正元素数量下的
-`ReduceOp.Sum`、`Max`、`Min` 和 `Prod`。InCore lowering 使用受 UB 上限约束的
-分块，host builtin 使用 256 元素分块。InCore mesh 和 ring 只把 FP16 remote
+chip kernel。InCore mesh、InCore ring 和 host builtin mesh 路径均支持
+FP16、FP32，以及任意正元素数量下的 `ReduceOp.Sum`、`Max`、`Min` 和 `Prod`。
+唯一的例外是 **host builtin ring**（`mode="ring"` 降级为
+`builtin.tensor.allreduce_ring`），目前只支持 `ReduceOp.Sum` 配合
+`dtype=FP32` —— 该路径尚不支持 `Max`/`Min`/`Prod` 和 FP16。InCore lowering
+使用受 UB 上限约束的分块，host builtin 使用 256 元素分块。InCore mesh 和 ring 只把 FP16 remote
 尾块的物理范围向上对齐到 32 字节；host builtin 会把 FP16 和 FP32 的 ragged load
 范围都对齐到 32 字节。两者都保留逻辑 valid shape。host builtin 接受 rank-1
 `[world_size]` 或 rank-2 `[world_size, signal_stride]` signal。Ring 模式
@@ -595,6 +648,58 @@ lane，会直接退出而不参与 barrier；由于各 rank 的 `signal_stride` 
 grid 避免了这两个问题 —— `require_sync_start` 让所有 block 一起准入，
 `block_idx` 在每个 rank 上给出确定且互相匹配的划分。它是单卡准入保证而非跨 rank
 的全局同时启动；跨 rank 的启动偏差由 ready barrier 吸收。
+
+### `pld.tensor.allgather`
+
+```text
+pld.tensor.allgather(local_data, target, signal) -> DistributedTensorType(target)
+```
+
+从每个 rank 收集一个 `[1, SIZE]` 本地分块到窗口绑定的 `target` 并返回它——即**窗口即结果**
+（window-as-result）形式。与 `allreduce` 不同，`target` 不是本 rank 的切片：它是完整的
+聚合矩阵，因此其首个维度是 rank 数，末维度是一个分块。
+
+```text
+local_data : Tensor[[1, SIZE]]                 -- 本 rank 的分块
+ target    : DistributedTensor[[NR, SIZE]]     -- 聚合结果
+ signal    : DistributedTensor[[NR, 1]] INT32
+```
+
+**形状约定。** 推导器按结构（而非编译期常量）比较 `target.shape[1]` 与
+`local_data.shape[1]`，因此两侧共享的符号是可接受的——运行时分块宽度亦然。轨道的
+`[TP, width * D]` 形式因此合法；`[TP * width, D]` 则不然，会在 IR 构造阶段以
+*"target SIZE must equal input SIZE"* 被拒绝。
+
+**下降（Lowering）。** 基于推送：每个对端一次 `pld.tile.put`，把本 rank 的分块写入
+该对端 `target` 的第 `my_rank` 行，随后一次屏障，再是自清除的收尾。没有任何拉取。
+中转暂存块被限制在一个 16 KiB 分块内，传输由 `pld.tile.put` 自身分块，因此 composite
+不产生自己的分块循环，运行时范围的分块方式与静态范围完全一致（分块规则见
+[`pld.tensor.allreduce`](#pldtensorallreduce)）。任何符号范围都必须由内核标量、循环
+变量或物理张量形状参数在运行时绑定；仅类型元数据的符号会在 PTO codegen 阶段被拒绝。
+
+**类型约定。** 推导器由两条执行路径共用，因此接受两者所需的形式：`local_data`
+可以是普通 `Tensor` **或** `DistributedTensor`（HOST builtin 经 `[1, SIZE]` 的
+`DistributedTensor` 暂存窗口提交；InCore 传入普通分块）；`target` 必须是窗口绑定的
+`DistributedTensor`，形状 `[NR, SIZE]`；`signal` 可以是 **`[NR]` 或 `[NR, 1]`**
+的 INT32；且 `local_data` 与 `target` 必须是不同缓冲区——让二者别名会造成跨进程
+数据竞争。
+
+InCore 下降在一点上比推导器更严格：其屏障按 rank 索引一格，因此要求 `signal`
+为二维 `[NR, 1]`（`ValidateMeshSignalShape`）。所以 `[NR, 1]` 同时满足两条路径，
+而一维 `[NR]` 仅适用于 HOST。为 ring `allreduce` 设计的信号（`[2*(NR-1), NR]`）
+在两条路径上都不能与本集合通信算子共用，应给它独立的窗口。
+
+### `pld.tensor.reduce_scatter`
+
+```text
+pld.tensor.reduce_scatter(target, signal, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensorType(target)
+```
+
+`target` 形状为 `[NR, SIZE]`，每个 rank 在调用前暂存全部 `NR` 个 chunk；调用后 rank `r` 的行 `[r, 0:SIZE]` 持有所有 rank 上 chunk `r` 的逐元素归约结果（按 `ReduceOp` 取 Sum/Max/Min/Prod）。signal 形状为 `[NR, 1]`。
+
+该行按不超过 16 KiB 的 UB chunk 遍历。静态且按 32 字节对齐的 `SIZE` 能放进一个 chunk 时沿用单 tile 路径（ready 屏障、peer 循环、post-reduce 屏障、store、尾声）；更大的 `SIZE`、未按 32 字节对齐的 `SIZE` 或符号化 `SIZE` 走分块路径：一个 ready 屏障，随后每个 chunk 在 generation `2 + chunk_index` 上做一次自己的读完成屏障，末尾不整齐的 chunk 以 `valid_shape = min(chunk_cols, SIZE - offset)` 承载。两种路径都用自清理尾声恢复 signal（见[屏障-信号协议](#屏障-信号协议)），因此同一个 signal 可用于连续调用。
+
+分块是让大 `SIZE`、未对齐 `SIZE` 或符号化 `SIZE` 得以表达的前提：单 tile 形式会把整行分配成一个 VEC tile，真实负载下会超出 VEC 预算，且行字节宽度不是 32 字节对齐时会被 PTOAS 拒绝。因此，小于一个 chunk 但未按 32 字节对齐的静态 `SIZE` 也走分块路径：它把物理 chunk 宽度向上取整到对齐范围，并用 `valid_shape` 保留逻辑宽度。符号化 `SIZE` 必须由 kernel 标量、循环变量或物理 tensor 形状参数在运行时绑定。
 
 ### `pld.system.notify`（TNOTIFY）
 
@@ -680,10 +785,14 @@ peer 算术；而*远程*操作数
 ## 流水线集成
 
 通信域与其槽位分配由
-[`MaterializeCommDomainScopes`](passes/46-materialize_comm_domain_scopes.md) pass 完成。该 pass 将每个
+[`MaterializeCommDomainScopes`](passes/50-materialize_comm_domain_scopes.md) pass 完成。该 pass 将每个
 host_orch 函数体包裹进嵌套的 `CommDomainScopeStmt` 节点（按推断出的通信域逐层嵌套），并产生运行时据以
 绑定物理缓冲的按窗口 `WindowBuffer` 记录。
-随后 [`LowerHostTensorCollectives`](passes/47-lower_host_tensor_collectives.md) 会在最终
+分布式 codegen 将每个槽位的物理分配向上取整到 64 字节，并对补齐后的大小求和作为通信域窗口大小。
+`CommBufferSpec.count` 和 `DistributedTensor` 的 shape 保留逻辑范围。这使独立槽位位于不同的 A2/A3 数据缓存行：
+标量写入后的 DCCI 会写回整条 64 字节缓存行，不应覆盖相邻 signal 槽位的 credit。
+该补齐同时满足 32 字节远端传输的对齐和尾部空间要求。
+随后 [`LowerHostTensorCollectives`](passes/51-lower_host_tensor_collectives.md) 会在最终
 `Simplify` 之前把 host-level tensor collectives 降为内部 builtin chip dispatch。
 
 ## 测试
@@ -699,6 +808,11 @@ host_orch 函数体包裹进嵌套的 `CommDomainScopeStmt` 节点（按推断�
   `test_l3_reduce_scatter.py`、`test_l3_broadcast.py`（三者同样采用动态 NR，
   P=2/P=4）、`test_l3_tensor_allreduce_intrinsic.py`、
   `test_l3_tensor_allreduce_ring_intrinsic.py`、
+  `test_l3_tensor_allgather_runtime_width.py`（运行时范围的 composite allgather：
+  一次编译在三种不同范围上执行）、
+  `test_l3_tensor_reduce_scatter_intrinsic.py`、
+  `test_l3_tensor_reduce_scatter_chunked.py`、
+  `test_l3_tensor_reduce_scatter_runtime_size.py`（一次编译在运行时范围 1001 / 12288 / 12289 上执行）、
   `test_l3_allreduce_ring.py`（手写 ring RS+AG）、
   `test_l3_host_tensor_allreduce.py`、`test_l3_host_tensor_allreduce_ring.py`、
   `test_l3_ep_dispatch_combine.py`、`test_l3_notify_wait.py`、

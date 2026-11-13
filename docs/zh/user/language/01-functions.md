@@ -39,6 +39,7 @@ def entry(
 | 行 | 作用 |
 | -- | ---- |
 | `@pl.jit.incore` | 标记设备 kernel —— 执行面，算子住在这里 |
+| `@pl.jit.aiv` | 显式 AIV 设备核函数，供 `pl.simt_scope` 使用 |
 | `@pl.jit` | 标记芯片级入口 —— 控制面，负责派发 |
 | `add_kernel(a, b, out)` | 一次普通调用；装饰器会发现被调方并接进来 |
 | `out: pl.Out[...]` | 声明方向，编译器据此给任务定序 |
@@ -55,10 +56,18 @@ def entry(
 | ------ | ------- | ---- |
 | `@pl.jit` | `Orchestration` | chip 级入口，派发 InCore 工作 |
 | `@pl.jit.host` | `level=HOST, role=Orchestrator` | HOST 级入口 —— 分配 window buffer、按 rank 派发 chip 编排器 |
-| `@pl.jit.incore` | `InCore` | 设备 kernel（可接受 `level=` 指定层级） |
+| `@pl.jit.incore` | `InCore`、`AIC`、`AIV` 或 `Group` | 设备 kernel；显式 `level=AIC` / `AIV` 选择相应核类型，`level=CORE_GROUP` 协同派发显式对端 |
 | `@pl.jit.inline` | `Inline` | 由 `InlineFunctions` 在每个调用点展开的辅助函数 |
 | `@pl.jit.opaque` | `Opaque` | 独立 IR 函数，可包含编排循环与 `pl.at` 作用域 |
 | `@pl.jit.graph` | `Graph` | 可录制的编排片段 —— `host_build_graph` runtime 在首次调用时录制其 task 拓扑、之后回放，因此 N 次调用只付一次建图代价。需要在 `RuntimeKind.HOST_BUILD_GRAPH` 下编译 |
+
+不提供层级（或指定 `level=pl.Level.CHIP_DIE`）时，`@pl.jit.incore` 保持普通 `InCore` 类型。
+手写跨核协议时，可分别用 `@pl.jit.incore(level=pl.Level.AIC)` 和 `level=pl.Level.AIV` 定义
+两端，再由 `@pl.jit.incore(level=pl.Level.CORE_GROUP)` 辅助函数调用它们。在 `@pl.jit` 入口中
+派发一次该组（例如放在 `pl.spmd(...)` 内），两端就作为同一个任务协同执行。显式管道初始化因此
+可以经过正常的 JIT 特化与编译链路。
+工厂函数生成同名对端时，JIT 在各自 Group 内解析 `peer_func`，并将其改写为对应的生成函数名，
+也支持组内通过别名调用对端。
 
 `@pl.jit.graph` 有一种作用域形式：`with pl.graph("name"):` 就地标记一个区域，而不必把它
 拆成独立函数。两者编译结果相同 —— 区域会被外提为一个以 `name` 命名的 Graph 函数 ——
@@ -77,6 +86,29 @@ def decode(w: pl.Tensor, hidden: pl.InOut[pl.Tensor]):
 名字是必填的，并且成为所录制图的身份，因此请保持稳定。Graph 区域不能嵌套在另一个 Graph
 区域内，也不能嵌套在 `pl.at` / `pl.cluster` / `pl.spmd` 内 —— 后者会变成单个设备 task，
 而 Graph 区域录制的是 task 的拓扑。三种情况都是编译期错误。
+
+编排代码生成目前支持有界的 `for ... in pl.range(...)` 循环，
+但不支持 `while`，包括在其中提交 Graph。动态循环可放在 InCore kernel 内。
+
+在 `@pl.program` 类的手动作用域中，可以通过
+`pl.submit(self.layer, ..., deps=[producer])` 提交 Graph 方法。这种 Submit
+写法要求 `self.<kernel>` 方法引用。在 JIT 入口里，`pl.submit(layer, ..., deps=[producer])`
+可直接使用由 `@pl.jit.graph` 修饰的依赖，JIT 会将其转为方法引用。
+内联区域可以使用 `with pl.graph("layer", deps=[producer]) as done:`
+表达依赖并取得完成号。
+`pl.submit` 的末尾 `TASK_ID` 结果与作用域的 `done` 均表示外层 Graph 任务；首次录制时也有效，只有整个调用完成后才完成。
+显式前驱约束的是这次调用的外层任务，不会进入已录制 Definition 的内部边。
+Graph 函数仍然写入调用方提供的张量，不能向调用方返回新计算的值或图内任务号。
+Definition 只在一次 orchestration run 内复用，不跨独立 L2 调用持久保存。
+
+传给 `pl.submit` 或 `pl.spmd_submit` 的 JIT 依赖也会被发现；callee 的 constexpr
+参数参与特化，`deps` 等提交元数据仍保留在提交操作上。
+
+首次提交也可省略由运行时分配的 Out 参数，但其完整张量注解必须能确定 shape 和 dtype；
+constexpr 使用本次调用的绑定值。JIT 优先使用特化后的返回值元数据，并用完整注解补充无法推导的槽位。
+真正无返回值的 callee 不会额外产生张量结果。Submit 在 callee 各结果后追加一个 TaskId。
+单变量 tuple 绑定及常量投影会保留张量元数据，也支持直接作为调用实参的投影；
+TaskId 槽位不会被当成张量。
 
 子函数依赖（`.incore` / `.inline` / `.opaque` / `.graph`）从入口函数体自动发现 —— 按名字调用即可。这里的名字在入口函数自身的命名空间中解析，因此别名导入（`from kernels import matmul as mm`，或普通的 `mm = matmul` 重绑定）与其他绑定一样能被发现；生成的程序仍以其 `def` 名字命名该函数。当两个不同的子函数同名时 —— 两个模块各自定义了 `helper`，或同一个工厂产出的两个 kernel —— 后生成的那个会被加上后缀（`helper`、`helper__2`），从而两份特化都得以保留；入口函数始终保留自己的名字。`@pl.jit.host` 入口还会额外发现 `@pl.jit`（chip 编排）依赖，因此一个完整的分布式程序无需任何 `@pl.program` 类。
 
@@ -109,6 +141,17 @@ def host_orch(
 
 `@pl.jit.host` 拒绝 `level=`（HOST 是隐含的）。
 
+### Graph 范围的显式依赖
+
+使用 `with pl.graph("layer", deps=[ready]) as done:` 等待前驱任务，并捕获整个
+Graph 的完成任务号。它复用 `pl.at`/`pl.spmd` 已有的 Submit 元数据；首次录制和
+同一次 orchestration run 内的缓存调用都能得到有效的外层完成号。
+
+录制体使用的 TaskId 数组应留在 Graph 内部。用 `deps` 传入外部就绪条件，在
+范围之后用 `done` 更新调用者的就绪状态。录制内部的 TaskId 和计算返回值仍
+不得跨界。编译产物可以用新参数再次调用，但 Definition 缓存属于每次
+orchestration run，不属于 Python callable 的整个生命周期。
+
 ### 子函数返回的张量会保留 shape 和 dtype
 
 特化会给每个生成的参数打上具体的 shape 和 dtype，因此子函数返回的张量必须能追溯到某个来源。
@@ -139,15 +182,46 @@ def entry(x: pl.Tensor[[1, 8], pl.FP32], out: pl.Out[pl.Tensor[[1, 8], pl.FP32]]
 设备 kernel（`@pl.jit.incore`）不能分配内存，所以它只能用第二种写法 —— `pl.create_tensor`
 属于控制平面。`@pl.jit.inline` helper 会被拼接进调用方，两种写法都可以用。
 
+NZ 张量的完整一维视图也能保留可推断的元数据。例如，对于
+`w: pl.Tensor[[256, 512], pl.INT8, pl.NZ]`，`w_flat = pl.reshape(w, [131072])`
+可以传给声明为 `src: pl.Tensor` 的 helper；特化后参数为
+`src: pl.Tensor[[131072], pl.INT8]`（ND）。reshape 在现有物理字节上建立视图，不进行布局转换或复制。
+源张量的每个维度和目标长度都必须是静态值，且目标长度必须等于源张量的元素总数。
+其他 NZ reshape 目标形状和符号维度的 NZ 展平仍不受支持。
+
 特化器无法静态计算某个维度本身**不是**问题。由只有设备才知道的值决定尺寸的
 `pl.create_tensor` —— `pl.tensor.read(cfg, [0])`、`pld.world_size()` —— 会变成一个动态
 维度并继续向下传递，之后由共享的 pass 流水线来判定程序对它做了什么（例如把整个张量作为
 tile 加载，就会得到 `InitMemRef requires static shape` —— 与等价的 `@pl.program` 写法
 报出的错误完全相同）。
 
-真正无法解析的情况是：返回张量的 shape 特化器根本**触及不到** —— 例如目标 shape 非静态的
-`pl.reshape`（reshape 受源张量元素总数约束，因此不能用动态维度顶替），或者经过特化器未
-建模的操作重新绑定的结果。它会在**下一个**消费该张量的调用处报出
+当目标维度由已知张量维度和整数算术（`+`、`-`、`*`、`//` 及一元 `-`）组成时，
+`pl.reshape` 也会保留元数据。例如，`pl.reshape(src, [src.shape[0] * src.shape[1]])`
+在任一源维度为动态维度时保留动态尺寸。消费该结果的 JIT 函数从 reshape 后张量的描述符中
+读取实际尺寸。原始 reshape 表达式仍保留在 IR 中，现有的 reshape 校验保持不变。
+`pl.tensor.dim` 支持 `tensor`/`axis` 关键字参数以及静态常量轴和负轴；未知运行时轴仍无法推导。
+shape 下标使用非负整数字面量索引；负轴请使用 `pl.tensor.dim(src, -1)`。动态一元 `+` 仍不受支持。
+
+中间标量别名也适用：先写 `total = src.shape[0] * src.shape[1]`，再写
+`flat = pl.reshape(src, [total])`，仍会保留动态尺寸。标量计算仍是标量，推导时保存不可变的
+表达式快照，到记录张量 shape 时才创建动态轴符号。后续重绑定源变量不会改变已经计算好的
+别名。`total = half = total // 2` 这类目标均为普通
+变量名的链式赋值只计算一次右侧，并在解析前拆成逐条赋值。静态整数别名正常折叠；未知运行时值和无效
+算术仍然无法解析。在条件分支或循环中被重绑定的别名跨越控制流边界时采用保守推导，
+不会把一次语法遍历中的值当作确定结果。
+张量变量重新赋值后，shape 读取使用当前值，包括整 shape 解包和张量算子的返回结果。
+`shape=src.shape` 和 `dtype=src.dtype` 等参数同样使用当前张量的类型。
+无关的分支和循环会保留既有别名；循环迭代之间传递的别名暂时视为未知，直到当前迭代中的
+确定赋值重新建立其推导结果。
+互斥的 `if`/`elif`/`else` 分支从同一组入口标量绑定和张量元数据开始推导；分支汇合后，
+条件写入的标量仍视为未知。两臂均建立的相同张量元数据可以继续使用；冲突或缺失的张量
+元数据仍视为未知。
+复用 Python 变量或多次调用 helper 时，元数据推导会区分不同结果的独立派生维度。
+请使用 `n = n + step` 等显式赋值；增强赋值（如 `n += step`）仍不受支持。
+
+真正无法解析的情况是：返回张量的 shape 特化器根本**触及不到** —— 例如用未知运行时标量
+（如 `pl.tensor.read(cfg, [0])`）决定尺寸的 `pl.reshape`，或者经过特化器未建模的操作
+重新绑定的结果。它会在**下一个**消费该张量的调用处报出
 `missing inferred tensor metadata for parameter '<name>'` —— 错误指向的是消费方，但要改的
 是生产方：让产生该张量的语句具有可静态推导的 shape，或者把缓冲区作为 `pl.Out[...]`
 参数传入。
@@ -285,7 +359,7 @@ print("artifacts in:", compiled.output_dir)
 
 ```python
 program = my_kernel.specialize(sample_x, sample_w, sample_out)
-ir.compile(program, output_dir="build/out", backend_type=BackendType.Ascend910B)
+ir.compile(program, output_dir="build/out", backend_type=BackendType.Ascend910)
 ```
 
 它不接受 `config=`：这里不跑任何 Pass，`RunConfig` 没有可配置的东西。只有当每个张量参数都带完整形状注解时才能省略采样实参 —— 裸 `pl.Tensor` 没有形状可读。
@@ -324,5 +398,5 @@ ir.compile(program, output_dir="build/out", backend_type=BackendType.Ascend910B)
 - [控制流](02-control-flow.md) —— 这些函数体里的循环与条件。
 - [作用域与放置](04-scopes.md) —— `pl.at` 与其余放置作用域。
 - [快速上手](../02-quickstart.md) —— 同样的装饰器在一个完整例子里的用法。
-- [InlineFunctions](../../dev/passes/01-inline_functions.md) —— `Inline` 体如何被拼接。
+- [InlineFunctions](../../dev/passes/02-inline_functions.md) —— `Inline` 体如何被拼接。
 - [集成手写 C++ Kernel](../../dev/language/04-external-kernels.md) —— 调用外部 kernel。

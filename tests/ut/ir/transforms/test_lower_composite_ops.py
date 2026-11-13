@@ -25,8 +25,9 @@ import re
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
-from pypto import DataType, ir, passes
+from pypto import DataType, backend, ir, passes
 from pypto.backend import BackendType
+from pypto.ir import OptimizationStrategy, PassManager
 from pypto.ir.op import tile as _ir_ops_tile
 from pypto.language.parser.diagnostics.exceptions import ParserError
 from pypto.pypto_core import ir as _ir_core
@@ -716,12 +717,14 @@ def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_
 
 
 class _StmtProbe(ir.IRVisitor):
-    """Collect ForStmt ``stop`` expressions and AssignStmt values."""
+    """Collect loop bounds, assignments, and evaluated expressions in order."""
 
     def __init__(self) -> None:
         super().__init__()
         self.for_stops: list[ir.Expr] = []
         self.assign_values: list[ir.Expr] = []
+        self.assignments: list[ir.AssignStmt] = []
+        self.values: list[ir.Expr] = []
 
     def visit_for_stmt(self, op: ir.ForStmt) -> None:
         self.for_stops.append(op.stop)
@@ -734,6 +737,11 @@ class _StmtProbe(ir.IRVisitor):
 
     def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
         self.assign_values.append(op.value)
+        self.assignments.append(op)
+        self.values.append(op.value)
+
+    def visit_eval_stmt(self, op: ir.EvalStmt) -> None:
+        self.values.append(op.expr)
 
     def _walk_stmt(self, stmt: ir.Stmt) -> None:
         # The nanobind trampoline does not redispatch nested statement
@@ -747,6 +755,8 @@ class _StmtProbe(ir.IRVisitor):
             self.visit_if_stmt(stmt)
         elif isinstance(stmt, ir.AssignStmt):
             self.visit_assign_stmt(stmt)
+        elif isinstance(stmt, ir.EvalStmt):
+            self.visit_eval_stmt(stmt)
 
 
 def _probe_stmts(prog) -> _StmtProbe:
@@ -842,28 +852,42 @@ def test_all_to_all_v_push_loop_is_bounded_by_runtime_send_counts():
 
 
 class _GuardProbe(ir.IRVisitor):
-    """Record Call op names by whether they sit inside an ``IfStmt`` body."""
+    """Record calls and their enclosing conditions and destination loops."""
 
     def __init__(self) -> None:
         super().__init__()
         self.guarded: list[str] = []
         self.unguarded: list[str] = []
-        self._if_depth = 0
+        self.guarded_calls: list[ir.Call] = []
+        self.unguarded_calls: list[ir.Call] = []
+        self.call_guards: dict[int, tuple[ir.Expr, ...]] = {}
+        self.call_loops: dict[int, tuple[ir.ForStmt, ...]] = {}
+        self._guards: list[ir.Expr] = []
+        self._loops: list[ir.ForStmt] = []
 
     def visit_for_stmt(self, op: ir.ForStmt) -> None:
+        self._loops.append(op)
         self._walk_stmt(op.body)
+        self._loops.pop()
 
     def visit_if_stmt(self, op: ir.IfStmt) -> None:
-        self._if_depth += 1
+        self._guards.append(op.condition)
         self._walk_stmt(op.then_body)
         if op.else_body is not None:
             self._walk_stmt(op.else_body)
-        self._if_depth -= 1
+        self._guards.pop()
 
     def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
-        if isinstance(op.value, ir.Call):
-            bucket = self.guarded if self._if_depth > 0 else self.unguarded
-            bucket.append(op.value.op.name)
+        value = op.value
+        if isinstance(value, ir.Call):
+            bucket = self.guarded if self._guards else self.unguarded
+            bucket.append(value.op.name)
+            self.call_guards[id(value)] = tuple(self._guards)
+            self.call_loops[id(value)] = tuple(self._loops)
+            if self._guards:
+                self.guarded_calls.append(value)
+            else:
+                self.unguarded_calls.append(value)
 
     def _walk_stmt(self, stmt: ir.Stmt) -> None:
         # Same trampoline caveat as _StmtProbe: nested statement callbacks are
@@ -942,14 +966,8 @@ def test_all_to_all_v_row_count_is_clamped_below_by_zero():
     )
 
 
-def test_all_to_all_v_count_notify_is_not_inside_the_push_guard():
-    """The push is guarded on ``rows > 0``; the count notify is not.
-
-    A destination receiving zero rows still needs ``recv_counts = 0`` published,
-    or it reads a stale count from a previous invocation. So the guard must wrap
-    the ``pld.tile.put`` only. This asserts the notify survives outside any
-    conditional.
-    """
+def test_all_to_all_v_zero_rows_skip_count_publication_and_payload():
+    """Receiver reset preserves zero when the sender skips an empty transfer."""
     After = passes.lower_composite_ops()(_build_all_to_all_v_before())
     probe = _GuardProbe()
     probe.visit_program(After)
@@ -958,9 +976,146 @@ def test_all_to_all_v_count_notify_is_not_inside_the_push_guard():
     notify_op = ir.get_op("pld.system.notify").name
 
     assert put_op in probe.guarded, "the pld.tile.put must sit inside the rows > 0 guard"
-    assert notify_op in probe.unguarded, (
-        "the recv_counts notify must stay OUTSIDE the rows > 0 guard — a zero-row "
-        "destination would otherwise read a stale recv_counts"
+    count_notifies = [
+        call
+        for call in probe.unguarded_calls
+        if call.op.name == notify_op
+        and isinstance(call.args[0], ir.Var)
+        and call.args[0].name_hint == "recv_counts"
+    ]
+    assert len(count_notifies) == 1, "receiver reset must execute even for an empty transfer"
+    publications = [
+        call
+        for call in probe.guarded_calls
+        if call.op.name == notify_op
+        and isinstance(call.args[0], ir.Var)
+        and call.args[0].name_hint == "recv_counts"
+    ]
+    assert len(publications) == 1, "count publication must be guarded together with the payload"
+    put = next(call for call in probe.guarded_calls if call.op.name == put_op)
+    guards = probe.call_guards[id(publications[0])]
+    assert len(guards) == 1 and isinstance(guards[0], ir.Gt)
+    assert isinstance(guards[0].right, ir.ConstInt) and guards[0].right.value == 0
+    shape = put.args[6]
+    assert isinstance(shape, ir.MakeTuple)
+    ir.assert_structural_equal(guards[0].left, shape.elements[0])
+    assert probe.call_guards[id(put)] == guards, "the same rows > 0 guard must cover both operations"
+    assert all(call.kwargs["op"] == int(pld.NotifyOp.AtomicAdd) for call in (*count_notifies, *publications))
+
+
+def test_all_to_all_v_resets_counts_before_atomic_publication():
+    """Announce every reset before waiting only for the current destination."""
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before())
+    probe = _probe_stmts(After)
+    calls = [value for value in probe.values if isinstance(value, ir.Call)]
+    notify_op = ir.get_op("pld.system.notify").name
+    wait_op = ir.get_op("pld.system.wait").name
+    read_op = ir.get_op("tensor.read").name
+    count_updates = [
+        call
+        for call in calls
+        if call.op.name == notify_op
+        and isinstance(call.args[0], ir.Var)
+        and call.args[0].name_hint == "recv_counts"
+    ]
+    assert len(count_updates) == 2
+    reset, publish = count_updates
+
+    def definition(expr: ir.Expr) -> ir.Expr:
+        while isinstance(expr, ir.Var):
+            value = next((stmt.value for stmt in probe.assignments if stmt.var is expr), None)
+            if value is None:
+                break
+            expr = value
+        return expr
+
+    # Negating INT32_MIN in INT32 would overflow before the atomic delta is
+    # formed. The reset must widen the old value before negation, then narrow.
+    delta = definition(reset.args[3])
+    assert isinstance(delta, ir.Cast)
+    assert isinstance(delta.type, ir.ScalarType) and delta.type.dtype == DataType.INT32
+    negated = definition(delta.operand)
+    assert isinstance(negated, ir.Neg)
+    assert isinstance(negated.type, ir.ScalarType) and negated.type.dtype == DataType.INT64
+    widened = definition(negated.operand)
+    assert isinstance(widened, ir.Cast)
+    assert isinstance(widened.type, ir.ScalarType) and widened.type.dtype == DataType.INT64
+    old_count = definition(widened.operand)
+    assert isinstance(old_count, ir.Call) and old_count.op.name == read_op
+    assert old_count.args[0] is reset.args[0]
+    ir.assert_structural_equal(old_count.args[1], reset.args[2])
+    rank = definition(reset.args[1])
+    assert isinstance(rank, ir.Call) and rank.op.name == ir.get_op("pld.system.rank").name
+
+    invalidations = [call for call in calls if call.op.name == ir.get_op("system.cacheinvalid").name]
+    assert len(invalidations) == 1 and not invalidations[0].args, "invalidate all cached GM reads"
+    waits = [call for call in calls if call.op.name == wait_op]
+    assert _static_wait_expectations(After) == [1, 2]
+    put = next(call for call in calls if call.op.name == ir.get_op("pld.tile.put").name)
+    ready = next(
+        call
+        for call in calls
+        if call.op.name == notify_op
+        and isinstance(call.args[0], ir.Var)
+        and call.args[0].name_hint == "signal"
+    )
+    guards = _GuardProbe()
+    guards.visit_program(After)
+    destination_loop = guards.call_loops[id(publish)][-1]
+    assert guards.call_loops[id(waits[0])][-1] is destination_loop
+    assert guards.call_loops[id(ready)][-1] is not destination_loop, (
+        "all peers must be notified before entering the destination wait/send loop"
+    )
+    ready_offsets = waits[0].args[1]
+    assert isinstance(ready_offsets, ir.MakeTuple)
+    assert ready_offsets.elements[0] is publish.args[1], (
+        "readiness must be checked for the destination being written"
+    )
+    positions = {id(call): i for i, call in enumerate(calls)}
+    assert (
+        positions[id(invalidations[0])]
+        < positions[id(old_count)]
+        < positions[id(reset)]
+        < positions[id(ready)]
+        < positions[id(waits[0])]
+        < positions[id(publish)]
+        < positions[id(put)]
+        < positions[id(waits[1])]
+    )
+    assert all(call.kwargs["op"] == int(pld.NotifyOp.AtomicAdd) for call in count_updates)
+    assert ir.get_op("tensor.write").name not in {call.op.name for call in calls}
+    epilogue = [call for call in calls if call.op.name == notify_op][-1]
+    assert epilogue.kwargs["op"] == int(pld.NotifyOp.AtomicAdd)
+    assert isinstance(epilogue.args[3], ir.ConstInt) and epilogue.args[3].value == -2
+
+
+def test_all_to_all_v_waits_preserve_acquires_and_put_release():
+    """Readiness and completion waits retain the standard acquire behavior."""
+    lowered = passes.lower_composite_ops()(_build_all_to_all_v_before())
+
+    reparsed = pl.parse_program(ir.python_print(lowered))
+    ir.assert_structural_equal(lowered, reparsed)
+
+    fenced = passes.insert_comm_fence()(reparsed)
+    calls = [value for value in _probe_stmts(fenced).values if isinstance(value, ir.Call)]
+    invalidations = [
+        call for call in calls if call.op.name == ir.get_op("system.cacheinvalid").name and not call.args
+    ]
+    assert len(invalidations) == 3, "entry reset, readiness wait, and completion wait must invalidate GM"
+    put_position = next(i for i, call in enumerate(calls) if call.op.name == ir.get_op("pld.tile.put").name)
+    assert calls[put_position + 1].op.name == ir.get_op("system.fence").name, (
+        "outgoing payload must retain its release fence"
+    )
+    ready_wait, final_wait = _collect_barrier_calls(fenced).waits
+    positions = {id(call): i for i, call in enumerate(calls)}
+    assert calls[positions[id(ready_wait)] + 1] is invalidations[1]
+    assert (
+        positions[id(invalidations[0])]
+        < positions[id(ready_wait)]
+        < positions[id(invalidations[1])]
+        < put_position
+        < positions[id(final_wait)]
+        < positions[id(invalidations[2])]
     )
 
 
@@ -2228,6 +2383,174 @@ def test_reduce_scatter_supports_all_reduce_ops():
         )
 
 
+def _build_reduce_scatter_sized(size, dtype=pl.FP32):
+    """Build an InCore reduce_scatter with a literal extent ``size``."""
+    nr = _REDUCE_SCATTER_NRANKS
+
+    @pl.program
+    class ReduceScatterSized:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[nr, size], dtype]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, size], dtype]:
+            data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    return ReduceScatterSized
+
+
+def test_reduce_scatter_chunks_an_extent_larger_than_one_chunk(default_pass_manager, ascend_backend):
+    """An extent past one 16-KiB chunk walks the row in chunks.
+
+    The single-tile path loads the whole ``[1, SIZE]`` row into one Vec tile. For
+    FP32 the chunk budget is 4096 elements, so SIZE=8192 would reserve 32 KiB; the
+    chunked path must bound the tile at one chunk and loop instead. The
+    small-static path stays on the old route and is pinned separately by
+    ``test_reduce_scatter_emits_for_and_if_control_flow`` (SIZE=16 -> 6 ForStmts).
+    """
+    from pypto import codegen  # noqa: PLC0415
+
+    # 8192 FP32 elements = two 16-KiB chunks.
+    After = _run_default_pipeline(default_pass_manager, _build_reduce_scatter_sized(8192))
+
+    op_names = set(_collect_op_names(After))
+    assert "pld.tensor.reduce_scatter" not in op_names
+    # Markers of the chunked route: a ragged load whose padding is zeroed and a
+    # narrowed alias before store. Neither appears on the single-tile path.
+    assert "tile.fillpad_inplace" in op_names
+    assert "tile.set_validshape" in op_names
+
+    # 7 ForStmts against the single-tile path's 6: the chunk loop is added, and the
+    # two whole-row barriers collapse into one ready barrier plus one per chunk.
+    collector = _StmtKindCollector()
+    collector.visit_program(After)
+    assert collector.for_count == 7, f"expected 7 ForStmts, got {collector.for_count}"
+
+    func = After.get_function("reduce_step")
+    assert func is not None
+    mlir = codegen.PTOCodegen().generate(ir.Program([func], func.name, After.span))
+
+    # The accumulator is one chunk wide, not SIZE wide -- this is the whole fix.
+    assert "cols=4096" in mlir, mlir
+    assert "cols=8192" not in mlir, mlir
+    assert "scf.for" in mlir
+
+
+def test_reduce_scatter_rounds_a_small_unaligned_extent(default_pass_manager, ascend_backend):
+    """A sub-chunk extent that is not 32-byte aligned must leave the single-tile path.
+
+    The single-tile allocation is ``SIZE``-wide, so 1001 FP32 elements (4004 B) is not a
+    legal PTO tile row and PTOAS rejects it. The chunked route rounds the physical width
+    up to 1008 elements and declares 1001 as its valid extent, so the allocation is legal
+    and the data moved is exact.
+    """
+    from pypto import codegen  # noqa: PLC0415
+
+    After = _run_default_pipeline(default_pass_manager, _build_reduce_scatter_sized(1001))
+
+    op_names = set(_collect_op_names(After))
+    assert "pld.tensor.reduce_scatter" not in op_names
+    assert "tile.fillpad_inplace" in op_names
+    assert "tile.set_validshape" in op_names
+
+    func = After.get_function("reduce_step")
+    assert func is not None
+    mlir = codegen.PTOCodegen().generate(ir.Program([func], func.name, After.span))
+    assert "cols=1008" in mlir, mlir
+    assert "cols=1001" not in mlir, mlir
+    assert "scf.for" in mlir
+
+
+def _collect_calls_named(prog, wanted):
+    """Collect every ``Call`` whose operator name is in ``wanted``."""
+
+    class _NamedCallCollector(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name in wanted:
+                self.calls.append(op)
+            super().visit_call(op)
+
+    collector = _NamedCallCollector()
+    collector.visit_program(prog)
+    return collector.calls
+
+
+def test_reduce_scatter_fp16_tail_widens_the_remote_read(default_pass_manager, ascend_backend):
+    """An FP16 ragged tail reads at the tile alignment, not its logical width.
+
+    A2/A3 peer MTE transfers must end on a 32-byte boundary, so the final FP16
+    chunk -- a single element at ``SIZE = 8193`` -- cannot be remote-loaded at
+    its logical width. The chunked path must widen the physical read to the
+    aligned element count, let it spill into the window's reserved tail, and
+    re-narrow before reduction.
+
+    This is invisible to an FP32 sweep: 32 bytes divides evenly by an FP32
+    element, so the FP32 path needs no widening and stays correct without it.
+    Comparing the two dtypes is what makes the guard real rather than assumed.
+    """
+    # FP16 chunk budget is 8192 elements (16 KiB / 2 B); 8193 is chunk + 1, so
+    # the final chunk has a one-element tail -- the reported failure shape.
+    fp16 = _run_default_pipeline(default_pass_manager, _build_reduce_scatter_sized(8193, dtype=pl.FP16))
+    fp32 = _run_default_pipeline(default_pass_manager, _build_reduce_scatter_sized(8193, dtype=pl.FP32))
+
+    fp16_loads = _collect_calls_named(fp16, {"pld.tile.remote_load"})
+    assert fp16_loads, "chunked FP16 lowering emitted no remote_load"
+    assert all(call.kwargs.get("allow_physical_tail_padding") is True for call in fp16_loads), (
+        f"FP16 remote_load must declare the physical tail: {[call.kwargs for call in fp16_loads]}"
+    )
+
+    # FP32 depends on the widening NOT happening: an unaligned FP32 span is
+    # already valid, and padding it would read past a window that reserves none.
+    fp32_loads = _collect_calls_named(fp32, {"pld.tile.remote_load"})
+    assert fp32_loads, "chunked FP32 lowering emitted no remote_load"
+    assert all("allow_physical_tail_padding" not in call.kwargs for call in fp32_loads), (
+        f"FP32 remote_load must not widen its read: {[call.kwargs for call in fp32_loads]}"
+    )
+
+
+def test_reduce_scatter_accepts_a_dynamic_extent(default_pass_manager, ascend_backend):
+    """A symbolic extent lowers instead of requiring a static, chunk-sized SIZE.
+
+    Modelled on ``test_allreduce_dynamic_mesh_lowering_reaches_pto_codegen``: a
+    runtime extent takes the full chunk bound and reaches PTO codegen with a
+    dynamic transfer, so the caller no longer has to know the extent at compile
+    time.
+    """
+    from pypto import codegen  # noqa: PLC0415
+
+    n = pl.dynamic("REDUCE_SCATTER_DYNAMIC_N")
+    nr = _REDUCE_SCATTER_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[nr, n], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, n], pl.FP32]:
+            data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    After = _run_default_pipeline(default_pass_manager, Before)
+
+    assert "pld.tensor.reduce_scatter" not in set(_collect_op_names(After))
+
+    func = After.get_function("reduce_step")
+    assert func is not None
+    mlir = codegen.PTOCodegen().generate(ir.Program([func], func.name, After.span))
+
+    assert "scf.for" in mlir
+    # A runtime extent takes the full chunk bound.
+    assert "cols=4096" in mlir, mlir
+
+
 # ============================================================================
 # pld.tensor.allreduce ring mode lowering
 #
@@ -2858,6 +3181,31 @@ def _build_two_all_to_all_program():
     return Before
 
 
+def _build_two_all_to_all_v_program():
+    SIZE = _AAV_SIZE
+    nr = _AAV_NRANKS
+    total = _AAV_TOTAL
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def exchange_twice(
+            self,
+            first: pl.Tensor[[total, SIZE], pl.FP32],
+            second: pl.Tensor[[total, SIZE], pl.FP32],
+            first_counts: pl.Tensor[[nr, 1], pl.INT32],
+            second_counts: pl.Tensor[[nr, 1], pl.INT32],
+            data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+            recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+            data = pld.tensor.all_to_all_v(first, data, signal, first_counts, recv_counts)
+            data = pld.tensor.all_to_all_v(second, data, signal, second_counts, recv_counts)
+            return data
+
+    return Before
+
+
 def _build_two_allgather_program():
     SIZE = _PROTOCOL_SIZE
     nr = _PROTOCOL_NRANKS
@@ -2938,22 +3286,35 @@ def _build_two_ring_allreduce_program():
 
 
 # One builder per collective, with the wait expectations each back-to-back pair
-# must produce. Every call restarts at generation 1 — the epilogue resets the
-# signal to all-zero at the end of each call — so two calls repeat the same
-# sequence rather than accumulating. reduce_scatter barriers twice per call
-# (ready + post-reduce): [1, 2, 1, 2]. The ring allreduce's arbitrary-length
-# schedule (#2161) barriers twice per subchunk (ready + read-complete); at
+# must produce. Every call restarts at generation 1 — the epilogue removes the
+# call's own credits while preserving early next-call credits — so two calls
+# repeat the same sequence rather than accumulating. all_to_all_v (destination readiness +
+# completion) and reduce_scatter (ready + post-reduce) use two credit rounds
+# per call: [1, 2, 1, 2].
+# The ring allreduce's arbitrary-length schedule (#2161) barriers twice per
+# subchunk (ready + read-complete); at
 # NR=2 there is one reduce-scatter round and one allgather round, each with
 # one subchunk, so one call already produces [1, 2, 1, 2] and two calls repeat
 # it.
 _BACK_TO_BACK_CASES = {
     "barrier": (_build_two_barriers_program, [1, 1]),
     "all_to_all": (_build_two_all_to_all_program, [1, 1]),
+    "all_to_all_v": (_build_two_all_to_all_v_program, [1, 2, 1, 2]),
     "allgather": (_build_two_allgather_program, [1, 1]),
     "broadcast": (_build_two_broadcast_program, [1, 1]),
     "reduce_scatter": (_build_two_reduce_scatter_program, [1, 2, 1, 2]),
     "ring_allreduce": (_build_two_ring_allreduce_program, []),
 }
+
+
+def test_all_to_all_v_two_calls_retire_both_barrier_credits():
+    After = passes.lower_composite_ops()(_build_two_all_to_all_v_program())
+    resets = [
+        call.args[3].value
+        for call in _collect_barrier_calls(After).notifies
+        if isinstance(call.args[3], ir.ConstInt) and call.args[3].value < 0
+    ]
+    assert resets == [-2, -2], "each call must remove both reset and completion credits"
 
 
 @pytest.mark.parametrize("collective", sorted(_BACK_TO_BACK_CASES))
@@ -3511,19 +3872,14 @@ def test_allgather_stage_tile_is_capped_to_one_chunk(size):
 @pytest.mark.parametrize(
     "size,expected_cols",
     [
-        (34, 34),  # even, below one 64-element packed row: documented unrounded gap
-        (66, 64),  # even, just past one packed 32-byte row: floor, never round up
-        (65536, 32768),  # full 16-KiB packed-FP4 chunk, not the GetByte() ceiling
+        (17, 17),  # below one 32-byte carrier row: retain the short transfer extent
+        (33, 32),  # floor to one 32-byte carrier row
+        (65536, 16384),  # one 16-KiB chunk contains 16384 byte carriers
     ],
 )
-def test_allgather_fp4_stage_uses_physical_storage_width(size, expected_cols):
-    """Packed FP4 geometry uses 4 physical bits per logical element.
-
-    A 16-KiB stage therefore holds 32768 FP4 elements, not 16384 as
-    ``DataType.get_byte()``'s byte-ceiling would imply. Packed last
-    dimensions must be even; 66 is the short aligned-floor case (64), and
-    34 is below one 32-byte packed row so it stays unrounded.
-    """
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+def test_allgather_fp4_stage_uses_carrier_storage_width(size, expected_cols, dtype):
+    """A 16-KiB stage stores 16384 byte carriers of either packed format."""
     nr = 2
 
     @pl.program
@@ -3531,10 +3887,10 @@ def test_allgather_fp4_stage_uses_physical_storage_width(size, expected_cols):
         @pl.function(type=pl.FunctionType.InCore)
         def gather_step(
             self,
-            inp: pl.Tensor[[1, size], pl.FP4],
-            data: pl.InOut[pld.DistributedTensor[[nr, size], pl.FP4]],
+            inp: pl.Tensor[[1, size], dtype],
+            data: pl.InOut[pld.DistributedTensor[[nr, size], dtype]],
             signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ) -> pld.DistributedTensor[[nr, size], pl.FP4]:
+        ) -> pld.DistributedTensor[[nr, size], dtype]:
             return pld.tensor.allgather(inp, data, signal)
 
     After = passes.lower_composite_ops()(Before)
@@ -3749,7 +4105,8 @@ def test_tile_select_keeps_a_narrowed_tail_on_a_materialized_scalar_branch():
 
 
 @pytest.mark.parametrize("form", ["mask-tile-scalar", "mask-scalar-tile", "mask-tile-tile"], ids=lambda f: f)
-def test_tile_select_survives_the_default_pipeline(form, default_pass_manager, ascend_backend):
+@pytest.mark.parametrize("enabled", [None, False])
+def test_tile_select_survives_the_default_pipeline(form, ascend_backend, enabled):
     """Every operand form reaches the end of the pipeline, not just this pass.
 
     `LowerCompositeOps` runs at slot 13 and `FlattenTileNdTo2D` at 14, so an
@@ -3757,11 +4114,22 @@ def test_tile_select_survives_the_default_pipeline(form, default_pass_manager, a
     Checking this pass in isolation is not enough -- the rank-3 case below lowers
     cleanly here and only the full run proves the flattener takes what it emits.
     """
-    optimized = default_pass_manager.run_passes(_build_select_before(form=form))
+    options = {} if enabled is None else {"enable_buffer_ir": enabled}
+    with passes.PassContext([], **options):
+        manager = PassManager.get_strategy(OptimizationStrategy.Default)
+        optimized = manager.run_passes(_build_select_before(form=form))
     names = _collect_op_names(optimized)
 
     assert _OP_TILE_SELECT not in names
-    assert (_OP_TILE_SEL in names) or (_OP_TILE_SELS in names)
+    # Supported FP32 composite selections now reach Buffer IR by default;
+    # disabling Buffer keeps the original Tile lowering contract observable.
+    use_buffer = enabled is not False and ascend_backend == BackendType.Ascend910
+    stage = ir.FunctionIRStage.Buffer if use_buffer else ir.FunctionIRStage.Functional
+    kernels = [f for f in optimized.functions.values() if ir.is_incore_type(f.func_type)]
+    assert kernels and all(f.ir_stage == stage for f in kernels)
+    dialect = "buffer" if use_buffer else "tile"
+    suffix = "sels" if form == "mask-tile-scalar" else "sel"
+    assert ir.get_op(f"{dialect}.{suffix}").name in names
 
 
 @pytest.mark.parametrize("form", ["mask-tile-scalar", "mask-scalar-tile", "mask-tile-tile"], ids=lambda f: f)
@@ -3792,7 +4160,7 @@ def test_tile_select_rank_3_falls_back_to_tsel_and_survives_the_pipeline(
 @pytest.mark.parametrize(
     ("ascend_backend", "expected_scratch"),
     [
-        (BackendType.Ascend910B, ((1, 128), pl.FP16)),
+        (BackendType.Ascend910, ((1, 128), pl.FP16)),
         (BackendType.Ascend950, ((1, 32), pl.UINT8)),
     ],
     indirect=["ascend_backend"],
@@ -3807,7 +4175,7 @@ def test_tile_select_takes_the_tsels_scratch_geometry_from_the_backend(ascend_ba
     assert expected_scratch in _select_scratch_shapes(After)
 
 
-@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B], indirect=True, ids=["a2a3"])
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910], indirect=True, ids=["a2a3"])
 def test_tile_select_rejects_8bit_on_a2a3_where_no_instruction_exists(ascend_backend):
     """A2/A3 has no 8-bit select at all, so say so instead of emitting dead IR.
 
@@ -3834,6 +4202,114 @@ def test_tile_select_keeps_8bit_on_tsels_on_a5(ascend_backend):
     assert _OP_TILE_SELS in names
     assert _OP_TILE_FULL not in names
     assert ((1, 32), pl.UINT8) in _select_scratch_shapes(After)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
+def test_tile_select_bf16_uses_registered_tsel_fallback(ascend_backend):
+    """Neither TSELS implementation accepts BF16; a scalar must be materialized."""
+    after = passes.lower_composite_ops()(_build_select_before(dtype=pl.BF16))
+    names = _collect_op_names(after)
+    assert ir.get_op("tile.sels").name not in names
+    assert ir.get_op("tile.sel").name in names
+    assert ir.get_op("tile.full").name in names
+    target = backend.get_backend_instance(backend.get_backend_type())
+    plan = target.plan_op_scratch("tile.sel", DataType.BF16)
+    assert plan is not None and plan.spec is not None
+    assert ((plan.spec.rows, plan.spec.cols), plan.spec.dtype) in _select_scratch_shapes(after)
+
+
+# ---------------------------------------------------------------------------
+# pld.tensor.allgather over a runtime extent
+#
+# The InCore allgather deducer compares ``input.shape[1]`` with ``target.shape[1]``
+# structurally rather than requiring a compile-time constant, so one symbol shared
+# by both sides is expected to satisfy it. Nothing tested that: the allgather
+# coverage was static-only (``test_allgather_stage_tile_is_capped_to_one_chunk``),
+# while allreduce and broadcast each already had a dynamic counterpart.
+# ---------------------------------------------------------------------------
+
+_ALLGATHER_DYNAMIC_NR = 2
+
+
+def _run_default_pipeline(pm, program):
+    """Run the production Default strategy with pass verification.
+
+    A dynamic dimension that appears only on ``DistributedTensor`` is not yet
+    self-contained in Python printer roundtrips, so the global RoundtripInstrument
+    is replaced with a before/after verification instrument -- the same workaround
+    ``test_allreduce_dynamic_mesh_lowering_reaches_pto_codegen`` and
+    ``test_broadcast_accepts_dynamic_target_shape`` already rely on.
+    """
+    from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+    ctx = _core_passes.PassContext(
+        [_core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)]
+    )
+    with ctx:
+        return pm.run_passes(program)
+
+
+def test_allgather_accepts_runtime_transfer_extent(default_pass_manager, ascend_backend):
+    """An InCore allgather over a runtime transfer extent reaches PTO codegen.
+
+    Written in the re-viewed-window form rather than as a bare symbolic target,
+    because that is what a caller actually needs: the rail declares a
+    ``[TP * width, D]`` window and views it as ``[TP, width * D]``, where
+    ``width`` is known only at run time (``attention_tp.py::decode_tp_input_all_gather``).
+    Routing it through ``tensor.view`` still covers the plain symbolic-extent case,
+    since the view's trailing dim is the same symbol product the deducer compares,
+    and additionally pins that the view keeps its window binding.
+    """
+    d = 64
+    nr = _ALLGATHER_DYNAMIC_NR
+    w = pl.dynamic("ALLGATHER_RUNTIME_W")
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gather_step(
+            self,
+            inp: pl.Tensor[[1, w * d], pl.BF16],
+            data: pl.InOut[pld.DistributedTensor[[nr * w, d], pl.BF16]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, w * d], pl.BF16]:
+            viewed = pl.tensor.view(data, [nr, w * d])
+            result = pld.tensor.allgather(inp, viewed, signal)
+            return result
+
+    After = _run_default_pipeline(default_pass_manager, Before)
+
+    # A runtime extent takes the full chunk bound rather than a rounded-down
+    # width: 16 KiB / 2 B per BF16 element.
+    assert (1, 8192) in _stage_tile_shapes(After)
+    assert "pld.tensor.allgather" not in set(_collect_op_names(After))
+    # The lowering is push-based; nothing pulls.
+    assert _OP_PLD_TILE_REMOTE_LOAD not in set(_collect_op_names(After))
+
+    from pypto import codegen  # noqa: PLC0415
+
+    func = After.get_function("gather_step")
+    assert func is not None
+    single = ir.Program([func], func.name, After.span)
+    mlir = codegen.PTOCodegen().generate(single)
+
+    # The runtime extent survives the view and reaches the transfer: source and
+    # peer destination both carry a dynamic extent, the bounce stage is bounded
+    # with a dynamic valid extent, and `tput` still targets the original window
+    # rather than a fresh buffer.
+    remote_put = next(line for line in mlir.splitlines() if "pto.comm.tput" in line)
+    assert len(re.findall(r"1x\?xbf16", remote_put)) == 2, remote_put
+    assert "cols=8192" in remote_put, remote_put
+    assert "v_row=?" in remote_put and "v_col=?" in remote_put, remote_put
+
+    # Every loop in the emission is a rank loop, not a chunk loop: the transfer is
+    # a single `tput` per peer over the whole runtime extent, so all of the loops
+    # share one bound -- the rank count. A chunk loop would add a distinct second
+    # bound. Assert it that way rather than against a specific SSA name, which
+    # shifts with the program's value numbering.
+    loop_bounds = re.findall(r"scf\.for [^=]+= %c0_index to (%\w+) step", mlir)
+    assert loop_bounds, mlir
+    assert len(set(loop_bounds)) == 1, loop_bounds
 
 
 if __name__ == "__main__":

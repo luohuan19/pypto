@@ -46,10 +46,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from pypto._external_source import kernel_binary_cache_path
+from pypto._external_source import external_source_digest, kernel_binary_cache_path
 from pypto.pypto_core.passes import RuntimeKind, runtime_kind_to_name
 
-from . import _callable_identity
+from . import _callable_identity, _vpto
 from ._binary_cache import (
     BinaryCacheContext,
     binary_context_lock,
@@ -105,6 +105,35 @@ def _load_binary(path: Path) -> bytes | None:
         return None
 
 
+_GeneratedCodeKey = tuple[str, str, str, tuple[str, ...], str]
+
+
+def _generated_code_key(kernel: dict[str, Any]) -> _GeneratedCodeKey | None:
+    """Code identity within one chip/compiler context; legacy/external entries stay separate."""
+    if kernel.get("external", False) or kernel.get("builtin", False) or not kernel.get("code_name"):
+        return None
+    return (
+        kernel["code_name"],
+        str(Path(kernel["source"]).resolve()),
+        kernel["core_type"],
+        tuple(kernel.get("extra_include_dirs") or ()),
+        external_source_digest(_vpto.source_paths(kernel.get("vpto_sources")))
+        if kernel.get("vpto_sources")
+        else "",
+    )
+
+
+def _generated_cache_identity(kernel: dict[str, Any]) -> str | int:
+    key = _generated_code_key(kernel)
+    if key is None:
+        return kernel.get("func_id", "anon")
+    # Artifact relocation must not change code identity. The source filename and
+    # code symbol identify generated files; the enclosing binary context checks
+    # runtime, toolchain, target and PTO-ISA revisions before any cache lookup.
+    contract = (key[0], Path(key[1]).name, key[2], key[3])
+    return external_source_digest([kernel["source"]], metadata=(repr(contract),), include_dirs=key[3])[:24]
+
+
 def _kernel_cache_file(
     cache_dir: Path,
     kernel: dict[str, Any],
@@ -115,23 +144,30 @@ def _kernel_cache_file(
 ) -> Path:
     """Return a collision-free cache path for one compiled kernel binary."""
     include_dirs = []
-    if kernel.get("external", False):
+    if kernel.get("external", False) or kernel.get("builtin", False):
         include_dirs = [
             *compiler.get_incore_include_dirs(),
             *compiler.get_kernel_include_dirs(runtime_name),
             *(kernel.get("extra_include_dirs") or ()),
         ]
-    return kernel_binary_cache_path(
+    helpers = _vpto.source_paths(kernel.get("vpto_sources"))
+    if helpers:
+        _vpto.validate_target(platform, kernel["core_type"])
+    path = kernel_binary_cache_path(
         cache_dir,
         source=kernel["source"],
         core_type=kernel["core_type"],
-        func_id=kernel.get("func_id", "anon"),
+        func_id=_generated_cache_identity(kernel),
         platform=platform,
-        external=bool(kernel.get("external", False)),
+        external=bool(kernel.get("external", False) or kernel.get("builtin", False)),
         pto_isa_root=pto_isa_root,
         runtime_name=runtime_name,
         include_dirs=include_dirs,
     )
+    if helpers:
+        identity = compiler.vpto_cache_identity(helpers, kernel["core_type"])
+        path = path.with_name(f"{path.stem}_vpto_{identity[:24]}{path.suffix}")
+    return path
 
 
 def _clean_git_revision(repo_root: Path) -> tuple[bool, str | None]:
@@ -292,19 +328,32 @@ def _compile_single_kernel(
     """
     source = Path(kernel["source"])
     core_type = kernel["core_type"]
+    helpers = _vpto.source_paths(kernel.get("vpto_sources"))
+    if helpers:
+        _vpto.validate_target(platform, core_type)
 
     ext = ".so" if platform.endswith("sim") else ".o"
-    is_external = bool(kernel.get("external", False))
+    # Templates and external sources keep per-registration compilation contracts.
+    # Neither may race on a source-adjacent output when signatures differ.
+    is_external = bool(kernel.get("external", False) or kernel.get("builtin", False))
     output_file = None if is_external else source.with_suffix(ext)
+    if _generated_code_key(kernel) is not None:
+        output_file = source.with_name(f"{source.stem}_{_generated_cache_identity(kernel)}{ext}")
+    # Helper builds use only the final content/toolchain-keyed cache. Legacy
+    # source-adjacent outputs do not prove which helper objects they contain.
+    if helpers:
+        output_file = None
 
     raw = None if force_rebuild or output_file is None else _load_binary(output_file)
     if raw is None:
+        helper_options: dict[str, Any] = {"vpto_sources": helpers} if helpers else {}
         raw = compiler.compile_incore(
             kernel["source"],
             core_type=core_type,
             pto_isa_root=pto_isa_root,
             runtime_name=runtime_name,
             extra_include_dirs=kernel.get("extra_include_dirs"),
+            **helper_options,
         )
         if output_file is not None:
             _save_binary(raw, output_file)
@@ -572,9 +621,7 @@ def _compile_and_assemble_locked(
 
     # --- Parallel compilation ---
 
-    def _compile_one_kernel(kernel: dict[str, Any]) -> tuple[int, CoreCallable, bytes]:
-        func_id = kernel["func_id"]
-
+    def _compile_one_kernel(kernel: dict[str, Any]) -> bytes:
         # Check cache/ for pre-stripped binary (written by prebuild_binaries)
         prebuild_cache = work_dir / "cache"
         cache_file = _kernel_cache_file(
@@ -588,8 +635,7 @@ def _compile_and_assemble_locked(
         # GENERATED carries source identity, not proof for inherited mutable binaries.
         cached_bin = None if save_prebuilt else _load_binary(cache_file)
         if cached_bin is not None:
-            sig = kernel.get("signature", [])
-            return (func_id, CoreCallable.build(signature=sig, binary=cached_bin), cached_bin)
+            return cached_bin
 
         # Compile via shared function and populate the content-addressed cache.
         _, kernel_bin = _compile_single_kernel(
@@ -602,8 +648,7 @@ def _compile_and_assemble_locked(
             force_rebuild=save_prebuilt,
         )
 
-        sig = kernel.get("signature", [])
-        return (func_id, CoreCallable.build(signature=sig, binary=kernel_bin), kernel_bin)
+        return kernel_bin
 
     def _compile_orchestration() -> bytes:
         source = Path(orchestration["source"])
@@ -624,13 +669,28 @@ def _compile_and_assemble_locked(
             force_rebuild=save_prebuilt,
         )
 
-    max_workers = min(64, 1 + len(kernels))
+    # Submit one compilation per code unit. Registration construction happens
+    # only after every future succeeds, with no executor task waiting on a child.
+    code_units: dict[_GeneratedCodeKey | tuple[int], dict[str, Any]] = {}
+    registration_keys: list[_GeneratedCodeKey | tuple[int]] = []
+    for index, kernel in enumerate(kernels):
+        key = _generated_code_key(kernel) or (index,)
+        registration_keys.append(key)
+        code_units.setdefault(key, kernel)
+    max_workers = min(64, 1 + len(code_units))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         fut_orch = executor.submit(_compile_orchestration)
-        fut_kernels = [executor.submit(_compile_one_kernel, k) for k in kernels]
-
+        futures = {key: executor.submit(_compile_one_kernel, k) for key, k in code_units.items()}
         orch_so_binary = fut_orch.result()
-        kernel_binaries = [f.result() for f in fut_kernels]
+        binaries = {key: future.result() for key, future in futures.items()}
+    kernel_binaries = [
+        (
+            kernel["func_id"],
+            CoreCallable.build(signature=kernel.get("signature", []), binary=binaries[key]),
+            binaries[key],
+        )
+        for kernel, key in zip(kernels, registration_keys, strict=True)
+    ]
 
     # Assemble ChipCallable
     orch_sig = orchestration.get("signature", [])
@@ -691,6 +751,7 @@ def _execute_on_device(  # pyright: ignore[reportUnusedFunction]  # noqa: PLR091
     enable_scope_stats: bool = False,
     config: RunConfig | None = None,
     runtime_env: dict[str, str] | None = None,
+    host_tensor_indices: tuple[int, ...] | list[int] = (),
 ) -> None:
     """Execute *chip_callable* on device via Simpler's unified ``Worker``.
 
@@ -826,11 +887,14 @@ def _execute_on_device(  # pyright: ignore[reportUnusedFunction]  # noqa: PLR091
         if active is not None:
             from .runner import _coerced_to_orch_args  # noqa: PLC0415
 
-            wire_args = _coerced_to_orch_args(orch_args, active._impl)
+            wire_args = _coerced_to_orch_args(orch_args, active._impl, host_tensor_indices)
             active._run_chip(chip_callable, wire_args, cfg)
             return
         # The one-shot path opens its own device context, so it takes the same
         # lock ChipWorker.init() does -- see _device_init_lock's rationale.
+        from ._execution_mode import claim_program_mode  # noqa: PLC0415
+
+        claim_program_mode()
         with _device_init_lock:
             worker = Worker(
                 level=level,
@@ -846,7 +910,7 @@ def _execute_on_device(  # pyright: ignore[reportUnusedFunction]  # noqa: PLR091
         try:
             from .runner import _coerced_to_orch_args  # noqa: PLC0415
 
-            wire_args = _coerced_to_orch_args(orch_args, worker)
+            wire_args = _coerced_to_orch_args(orch_args, worker, host_tensor_indices)
             # Simpler's L2 ABI now dispatches by callable id (see runtime PR #710);
             # register the callable, run it, then close — close() runs finalize()
             # so explicit unregister is unnecessary here.

@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -72,7 +74,8 @@ namespace {
 // also returns `target` in-place (args_[1]) — same aliasing discipline as
 // IsTensorAllToAll above.
 [[nodiscard]] bool IsTensorAllToAllV(const CallPtr& call) {
-  return call && call->op_ && IsOp(call, "pld.tensor.all_to_all_v");
+  return call && call->op_ &&
+         (IsOp(call, "pld.tensor.all_to_all_v") || IsOp(call, "pld.tensor.indexed_all_to_all_v"));
 }
 
 /// Device coverage descriptor inferred from a dispatch ``device=`` expression.
@@ -368,6 +371,8 @@ class DispatchAnalyzer : public IRVisitor {
 
   void AnalyzeCollective(const CallPtr& op) {
     if (!op || !op->op_) return;
+    CHECK_SPAN(!IsOp(op, "pld.tensor.indexed_all_to_all_v"), op->span_)
+        << "indexed_all_to_all_v supports only L2 orchestration on A5 URMA; HOST is unsupported";
 
     if (IsOp(op, "pld.tensor.allreduce") || IsOp(op, "pld.tensor.broadcast") ||
         IsOp(op, "pld.tensor.reduce_scatter")) {
@@ -436,17 +441,15 @@ class DispatchAnalyzer : public IRVisitor {
       //                          to this pass's comm-domain scoping)
       INTERNAL_CHECK_SPAN(op->args_.size() == 6, op->span_)
           << "MaterializeCommDomainScopes: pld.tensor.all_to_all_v expects exactly 6 args";
-      // LowerCompositeOps' CheckAllReduceLoopUse guards the InCore path but
-      // never runs for a HOST-orch call (LowerCompositeOps just defers it
-      // there). This is the HOST-side equivalent, using repeating_scope_depth_
-      // (tracked across both ForStmt and WhileStmt — see the VisitStmt_
-      // overrides above).
+      // HOST-orch calls still need loop-carried comm-domain window lifetime
+      // management, even though the credit barrier supports rank-uniform
+      // InCore loops. Track HOST repetition across both ForStmt and WhileStmt
+      // with repeating_scope_depth_ (see the VisitStmt_ overrides above).
       CHECK_SPAN(repeating_scope_depth_ == 0, op->span_)
           << "pld.tensor.all_to_all_v is not supported inside a for/while loop in a HOST "
              "orchestrator yet: dynamic re-invocation needs loop-carried comm-domain window "
              "lifetime management this compiler does not model (the credit-based signal "
-             "itself is reusable across sequential calls). Same restriction LowerCompositeOps "
-             "enforces on the InCore path via CheckAllReduceLoopUse.";
+             "itself is reusable across sequential calls and rank-uniform InCore loops).";
       auto* data_alloc = ResolveWindowAlloc(op->args_[1], "pld.tensor.all_to_all_v", "target");
       auto* signal_alloc = ResolveWindowAlloc(op->args_[2], "pld.tensor.all_to_all_v", "signal");
       auto* recv_counts_alloc = ResolveWindowAlloc(op->args_[4], "pld.tensor.all_to_all_v", "recv_counts");
@@ -614,7 +617,7 @@ class DefiningCallRetyper : public IRMutator {
 
     auto retyped = std::make_shared<const DistributedTensorType>(
         call_dt->shape_, call_dt->dtype_, call_dt->memref_, call_dt->tensor_view_, var_dt->window_buffer_);
-    if (!structural_equal(retyped, var_dt)) return base;
+    if (!structural_equal(CloneTypeWithoutMemRef(retyped), CloneTypeWithoutMemRef(var_dt))) return base;
 
     auto new_call =
         std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_, retyped, call->span_);
@@ -661,7 +664,8 @@ class DefiningCallRetyper : public IRMutator {
       cur = AsVarLike(call->args_[1]);
       continue;
     }
-    if (call && IsOp(call, "pld.tensor.all_to_all_v") && call->args_.size() > 1) {
+    if (call && (IsOp(call, "pld.tensor.all_to_all_v") || IsOp(call, "pld.tensor.indexed_all_to_all_v")) &&
+        call->args_.size() > 1) {
       cur = AsVarLike(call->args_[1]);
       continue;
     }
@@ -675,13 +679,40 @@ class DefiningCallRetyper : public IRMutator {
 /// with type-updated copies, and wrap the body in a chain of
 /// ``CommDomainScopeStmt`` (one per inferred comm domain, outer = first
 /// declared, inner = last declared).
-FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string, FunctionPtr>& chip_orchs) {
+FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string, FunctionPtr>& chip_orchs,
+                            const std::vector<std::string>& engines) {
   // Idempotence: if this function's body is already wrapped in a
   // CommDomainScopeStmt, the pass has run on it before — skip to avoid
   // double-wrapping the body and minting a fresh set of WindowBuffer
   // instances that would shadow the existing ones on every view.
   if (func->body_ && As<CommDomainScopeStmt>(func->body_)) {
-    return func;
+    // Preserve materialized slots, but refresh requirements if the Program
+    // acquired another engine use since its domains were materialized.
+    class EngineUpdater : public IRMutator {
+     public:
+      explicit EngineUpdater(const std::vector<std::string>& engines) : engines_(engines) {}
+      StmtPtr VisitStmt_(const CommDomainScopeStmtPtr& op) override {
+        auto updated = As<CommDomainScopeStmt>(IRMutator::VisitStmt_(op));
+        auto required = updated->engines_;
+        for (const auto& engine : engines_) {
+          if (std::find(required.begin(), required.end(), engine) == required.end()) {
+            required.push_back(engine);
+          }
+        }
+        if (required == updated->engines_) return updated;
+        auto result = MutableCopy(updated);
+        result->engines_ = std::move(required);
+        return result;
+      }
+
+     private:
+      const std::vector<std::string>& engines_;
+    } updater(engines);
+    auto body = updater.VisitStmt(func->body_);
+    if (body == func->body_) return func;
+    auto result = MutableCopy(func);
+    result->body_ = std::move(body);
+    return result;
   }
 
   StmtPtr materialization_body = func->body_;
@@ -841,8 +872,9 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   for (size_t i = pending.size(); i-- > 0;) {
     auto& g = pending[i];
     std::string name_hint = "comm_d" + std::to_string(i);
-    new_body = std::make_shared<const CommDomainScopeStmt>(g.desc.ToDevices(), std::move(g.slots),
-                                                           std::move(name_hint), new_body, g.span);
+    new_body = std::make_shared<const CommDomainScopeStmt>(
+        g.desc.ToDevices(), std::move(g.slots), std::move(name_hint), new_body, g.span,
+        std::vector<std::string>{}, std::vector<std::pair<std::string, std::any>>{}, engines);
   }
 
   if (new_body.get() == func->body_.get()) return func;
@@ -857,6 +889,34 @@ namespace pass {
 
 Pass MaterializeCommDomainScopes() {
   auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
+    // Conservative program-wide policy: one URMA use provisions every domain.
+    // Precise domain attribution belongs here in a future refinement, not in codegen.
+    class EngineCollector : public IRVisitor {
+     public:
+      bool uses_urma = false;
+      void Record(const OpPtr& op) {
+        // LowerL2TensorCollectives may already have replaced the registered op
+        // with a synthesized builtin function (not a registry operator).
+        if (op && (IsOp(op, "pld.tensor.indexed_all_to_all_v") || IsOp(op, "pld.tensor.put_async") ||
+                   IsOp(op, "pld.tensor.get_async") ||
+                   op->name_.rfind("__builtin_indexed_all_to_all_v__", 0) == 0)) {
+          uses_urma = true;
+        }
+      }
+      void VisitExpr_(const CallPtr& op) override {
+        Record(op->op_);
+        IRVisitor::VisitExpr_(op);
+      }
+      void VisitExpr_(const SubmitPtr& op) override {
+        Record(op->op_);
+        IRVisitor::VisitExpr_(op);
+      }
+    } collector;
+    for (const auto& [gv, func] : program->functions_) {
+      if (func && func->body_) collector.VisitStmt(func->body_);
+    }
+    const std::vector<std::string> engines =
+        collector.uses_urma ? std::vector<std::string>{"urma"} : std::vector<std::string>{};
     // Index chip-level Orchestration functions by name so the dispatch
     // analyzer can recognise host → chip Calls.
     std::map<std::string, FunctionPtr> chip_orchs;
@@ -872,7 +932,7 @@ Pass MaterializeCommDomainScopes() {
         new_functions[gvar] = func;
         continue;
       }
-      auto new_func = ProcessHostOrch(func, chip_orchs);
+      auto new_func = ProcessHostOrch(func, chip_orchs, engines);
       new_functions[gvar] = new_func;
       if (new_func.get() != func.get()) modified = true;
     }

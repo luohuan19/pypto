@@ -89,14 +89,19 @@ defaulting to `Read`. `no_arg_writes()` records the all-arguments verdict
 explicitly, and combining it with `set_arg_effect` is rejected as
 contradictory.
 
-`set_write_channel` records whether the writes travel the MTE3/DMA path or the
-scalar D-cache path. PyPTO cannot order the two against one GM tensor, so a
+`set_write_channel` distinguishes MTE3/DMA, scalar D-cache, and SIMT lane writes.
+PyPTO cannot order DMA and scalar D-cache stores against one GM tensor, so a
 function mixing them on one buffer is rejected; the channel lets that diagnostic
 read the registry instead of re-listing operators.
 
-Declare it only for an operator whose writes really are one of those two paths,
+`simt.store` declares `WriteChannel::Simt`. It participates in enclosing-kernel
+InOut propagation without being misclassified as a DMA or controller D-cache
+store. This classification does not claim hardware synchronization between
+SIMT and other write paths; that belongs to the device lowering contract.
+
+Declare it only for an operator whose writes really are one of those paths,
 and leave it unset otherwise — an unset channel keeps the operator out of that
-diagnostic, which is where an operator belongs when neither path describes it:
+diagnostic, which is where an operator belongs when none describes it:
 
 - `pld.system.notify` emits `pto.comm.tnotify`, a distinct comm instruction.
   Claiming either channel would let the diagnostic reject a valid program.
@@ -131,10 +136,10 @@ Its sibling `pld.system.wait` stays **unmarked**, and deliberately so: TWAIT
 vector lane would let the matmul race past the peer data it waits on. Read the
 flag as "must not run on a second core", not as "not idempotent".
 
-`IsNoDuplicate()` reads the axis. Its only consumer is `LowerAutoVectorSplit`'s
-`pl.split_aiv` region placement stamp (pass 23), which pins exactly the
-no-duplicate calls inside a region to the AIV lane. No verifier rejects anything
-on this axis.
+`IsNoDuplicate()` reads the axis. During explicit-region consumption,
+`ExpandMixedKernel` pins core-agnostic no-duplicate calls inside a `pl.split_aiv`
+region to the AIV lane. Software-pipeline analysis also treats these calls as
+non-replicable. No verifier rejects calls solely on this axis.
 
 An op pinned to one lane by `set_core_affinity(...)` is never duplicated in the
 first place and needs no flag. The flag exists precisely for the core-agnostic

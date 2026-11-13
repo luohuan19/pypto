@@ -19,9 +19,10 @@ The assertions that matter most are the ones covering silent failures. A
 boundary scalar converted to an integer loses the parameter origin the runtime
 uses to track it, and the value is frozen at its first-call number on every
 later replay. Preserve the runtime's InheritableScalar wrapper instead.
+
+Runtime-header integration checks also cover builtin orchestration templates.
 """
 
-import os
 import re
 import shutil
 import subprocess
@@ -30,10 +31,18 @@ from pathlib import Path
 from unittest import mock
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
-from _orchestration_codegen_common import _out_of_scope_tensor_refs
+from _orchestration_codegen_common import (
+    _assert_orchestration_compiles,
+    _generate_orch_code,
+    _out_of_scope_tensor_refs,
+    _runtime_include_args,
+)
+from pypto import backend
+from pypto.backend import BackendType, pto_backend
 from pypto.ir.compile import compile as ir_compile
-from pypto.pypto_core import passes
+from pypto.pypto_core import codegen, passes
 
 # ``kernel_config.py`` is only written when ptoas is not skipped, but these tests
 # are about the emitted orchestration and manifest, not kernel compilation. Stub
@@ -178,9 +187,8 @@ def test_derived_scalar_is_computed_at_the_call_site(orch):
     assert entry.count("add_scalar") == 2  # layer_idx and the hoisted base
 
 
-def test_graph_result_is_not_chained(orch):
-    # rt_submit_graph yields a valid task id only on a cache hit, so the call
-    # site must not bind or depend on its result.
+def test_unused_graph_completion_is_not_captured(orch):
+    # Plain calls without dependency consumers need no completion handle.
     entry = _entry_body(orch)
     assert "= rt_submit_graph" not in entry
 
@@ -212,38 +220,6 @@ def test_artifact_targets_the_graph_runtime(artifacts):
 # ---------------------------------------------------------------------------
 
 
-def _runtime_include_args(repo_root: Path) -> list[str]:
-    """``-I`` flags for the a2a3 host_build_graph orchestration headers.
-
-    The same directories, in the same order, that simpler's own kernel compiler
-    puts on an orchestration TU: ``get_orchestration_include_dirs`` followed by
-    the runtime's ``build_config`` ``orchestration.include_dirs``. Handing the
-    compiler every directory that holds a header instead lets a runtime that is
-    not under test shadow the one that is -- ``common/hierarchical/types.h``
-    wins over ``host_build_graph/types.h`` and drags in
-    ``task_interface/buffer.h``, whose global ``Tensor`` then collides with the
-    runtime's own ``Tensor`` alias. The tree root comes last, for the includes
-    spelled with a directory prefix (``common/host_phase_kind.h``).
-    """
-    src = repo_root / "runtime" / "src"
-    runtime_dir = src / "a2a3" / "runtime" / "host_build_graph"
-    return [
-        f"-I{path}"
-        for path in (
-            runtime_dir / "runtime",
-            runtime_dir / "orchestration",
-            runtime_dir / "common",
-            src / "a2a3" / "runtime",
-            src / "common" / "host_build_graph",
-            src / "common" / "task_interface",
-            src / "common",
-            src / "a2a3" / "platform" / "include",
-            src / "common" / "platform" / "include",
-            src,
-        )
-    ]
-
-
 def test_generated_orchestration_compiles_against_the_pinned_runtime(artifact_root):
     """Type-check the emitted file — the only check that covers the graph ABI.
 
@@ -259,46 +235,63 @@ def test_generated_orchestration_compiles_against_the_pinned_runtime(artifact_ro
     _assert_orchestration_compiles(artifact_root / "orchestration" / "main.cpp")
 
 
-def _assert_orchestration_compiles(main_cpp: Path) -> None:
-    """Type-check generated orchestration against the checked-out runtime."""
-    repo_root = Path(__file__).resolve().parents[3]
-    assert main_cpp.is_file(), f"no orchestration emitted at {main_cpp}"
+@pytest.mark.parametrize(
+    "runtime", [passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER, passes.RuntimeKind.HOST_BUILD_GRAPH]
+)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
+def test_collective_builtins_compile_against_runtime(tmp_path, runtime, ascend_backend):
+    """Compile actual builtin specs, including their runtime-specific launch API."""
 
-    if not (repo_root / "runtime" / "src" / "a2a3" / "runtime" / "host_build_graph").is_dir():
-        pytest.skip("runtime submodule not checked out")
-    candidates = (os.environ.get("CXX"), "g++-15", "g++", "c++")
-    compiler = next(
-        (found for name in candidates if name and (found := shutil.which(name))),
-        None,
-    )
-    if compiler is None:
-        pytest.skip("no C++ compiler available")
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pld.DistributedTensor[[8, 64], pl.FP32],
+            data: pld.DistributedTensor[[8, 64], pl.FP32],
+            signal: pld.DistributedTensor[[4, 8], pl.INT32],
+            counts: pld.DistributedTensor[[4, 1], pl.INT32],
+            recv: pld.DistributedTensor[[4, 1], pl.INT32],
+        ):
+            return data
 
-    result = subprocess.run(
-        [
-            compiler,
-            "-std=c++17",
-            "-fsyntax-only",
-            "-Werror=deprecated-declarations",
-            *_runtime_include_args(repo_root),
-            str(main_cpp),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode == 0:
-        return
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * 8 * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp = pld.window(input_buf, [8, 64], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, 64], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4, 8], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [4, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp, data, signal, counts, recv, device=r)
+            pld.tensor.all_to_all_v(inp, data, signal, counts, recv, core_num=4)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, core_num=4)
+            return 0
 
-    # A missing header means this environment's include layout differs from the
-    # one the flags above assume — not a codegen defect, so do not fail on it.
-    # Anything the compiler blames on the generated file is.
-    if "fatal error:" in result.stderr and str(main_cpp) not in result.stderr.split("fatal error:")[0][-200:]:
-        pytest.skip(f"runtime headers not resolvable here: {result.stderr.strip().splitlines()[0]}")
-    blamed = [line for line in result.stderr.splitlines() if "error:" in line]
-    raise AssertionError(
-        "generated orchestration does not compile against the pinned runtime:\n" + "\n".join(blamed[:15])
-    )
+    with passes.PassContext([], runtime=runtime):
+        context = passes.PassContext.current()
+        program = passes.materialize_comm_domain_scopes()(Prog)
+        program = passes.lower_host_tensor_collectives()(program)
+        program = passes.materialize_dist_tensor_ctx()(program)
+        program = passes.derive_call_directions()(program)
+        program = passes.classify_iter_arg_carry()(passes.materialize_runtime_scopes()(program))
+        # Lowering and builtin codegen must target the same runtime ABI.
+        files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True, runtime=runtime)
+        assert passes.PassContext.current() is context
+    arch = "a5" if ascend_backend == BackendType.Ascend950 else "a2a3"
+    for variant in ("all_to_all_v__fp32", "allreduce__sum__fp32"):
+        entry_cpp = tmp_path / f"{variant}.cpp"
+        entry_cpp.write_text(
+            files[f"next_levels/builtin.tensor.{variant}/orchestration/builtin_tensor_{variant}.cpp"]
+        )
+        _assert_orchestration_compiles(
+            entry_cpp, runtime_name=passes.runtime_kind_to_name(runtime), arch=arch
+        )
 
 
 @pl.program
@@ -499,7 +492,7 @@ class _RegionAllocs:
         return c
 
 
-def _compile_orch(program) -> str:
+def _compile_orch(program, *, platform: str = "a2a3") -> str:
     """Compile one program for host_build_graph and return orchestration/main.cpp."""
     out_dir = tempfile.mkdtemp()
     with (
@@ -509,7 +502,7 @@ def _compile_orch(program) -> str:
         ),
         passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH),
     ):
-        ir_compile(program, skip_ptoas=False, platform="a2a3", output_dir=out_dir, dump_passes=False)
+        ir_compile(program, skip_ptoas=False, platform=platform, output_dir=out_dir, dump_passes=False)
     return (Path(out_dir) / "orchestration" / "main.cpp").read_text()
 
 
@@ -572,18 +565,162 @@ def test_graph_scalar_value_reads_compile_and_preserve_task_forwarding(tmp_path)
     _assert_orchestration_compiles(main_cpp)
 
     body = _graph_body(orch)
-    for name, cpp_type in (
-        ("start", "int64_t"),
-        ("n", "int64_t"),
-        ("step", "int64_t"),
-        ("enabled", "bool"),
-        ("scale", "float"),
+    for slot, (name, cpp_type) in enumerate(
+        (("start", "int64_t"), ("n", "int64_t"), ("step", "int64_t"), ("enabled", "bool"), ("scale", "float"))
     ):
-        assert f"{name}.to<{cpp_type}>()" in body, body
+        assert f"from_u64<{cpp_type}>(_pypto_graph_config.scalar_{slot})" in body, body
+        assert f".scalar_{slot} = to_u64({name})" in _entry_body(orch), orch
     # Reading a value elsewhere must not discard its origin when forwarding it.
-    assert re.search(r"float \w+ = scale\.to<float>\(\);", body), body
+    assert re.search(r"float \w+ = from_u64<float>\(_pypto_graph_config.scalar_4\);", body), body
     assert ".add_scalar(n)" in body, body
     assert ".add_scalar(scale)" in body, body
+
+
+@pl.program
+class _MixedScalarUses:
+    @pl.function(type=pl.FunctionType.Graph)
+    def layer(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP32],
+        n: pl.Scalar[pl.INDEX],
+        c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        scale: pl.Scalar[pl.FP32],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        for _ in pl.range(n):
+            pass
+        with pl.at(level=pl.Level.CORE_GROUP):
+            t = pl.load(a, [0, 0], [128, 128])
+            t = pl.mul(t, scale)
+            pl.store(t, [0, 0], c)
+        return c
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP32],
+        n: pl.Scalar[pl.INDEX],
+        c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        scale: pl.Scalar[pl.FP32],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        c = self.layer(a, n, c, scale)
+        return c
+
+
+def test_graph_scalar_declarations_and_forwarding_execute_against_runtime(tmp_path):
+    """Exercise generated scalar packing with the real runtime's Config keys and inherited handles."""
+    orch = _compile_orch(_MixedScalarUses)
+    main_cpp = tmp_path / "main.cpp"
+    main_cpp.write_text(orch)
+    _assert_orchestration_compiles(main_cpp)
+    body = _graph_body(orch)
+    assert "from_u64<int64_t>(_pypto_graph_config.scalar_0)" in body
+    assert ".add_scalar(scale)" in body
+    assert "_pypto_graph_config.scalar_1" not in body
+
+    boundary = re.search(r"GraphTaskArgs (\w+);(.*?)rt_submit_graph", _entry_body(orch), re.DOTALL)
+    assert boundary is not None, orch
+    scalar_packing = "\n".join(
+        line for line in boundary[2].splitlines() if re.search(r"\.add_(?:static_)?scalar\(", line)
+    )
+    assert scalar_packing.count(";") == 2, scalar_packing
+    config_definition = re.search(
+        r"struct (\w+Config) : simpler::hbg::ConfigBase \{.*?\n\};", orch, re.DOTALL
+    )
+    assert config_definition is not None, orch
+    config_packing = "\n".join(line for line in boundary[2].splitlines() if "_config" in line)
+    config_preamble = orch[
+        orch.index("static std::vector<uint64_t> pypto_graph_boundary_layout") : orch.index(
+            "static void pypto_graph_"
+        )
+    ]
+    source = tmp_path / "scalar_contract.cpp"
+    source.write_text(
+        f"""#include <cassert>
+#include "types.h"
+#include "graph_config.h"
+#include "host_build_graph/host/graph_boundary_match.h"
+{config_preamble}
+
+int main() {{
+    uint64_t previous_hash = 0;
+    for (int invocation = 0; invocation < 2; ++invocation) {{
+        int64_t n = 3 + invocation;
+        float scale = invocation == 0 ? 1.25f : -2.5f;
+        GraphTaskArgs {boundary[1]};
+        {scalar_packing}
+        {config_packing}
+        const auto config = {boundary[1]}_config;
+        assert(from_u64<int64_t>(config.scalar_0) == n);
+        assert(config == config);
+        assert(config.hash() != previous_hash);
+        previous_hash = config.hash();
+        auto changed = config;
+        changed.scalar_0 = to_u64(n + 1);
+        assert(!(config == changed));
+        assert(config.hash() != changed.hash());
+        GraphTaskArgs args;
+        args.gen_scalar_params_from_args({boundary[1]});
+        const auto forwarded_scale = args.scalar(1);
+        CoreTaskArgs task;
+        task.add_scalar(forwarded_scale);
+        assert(task.scalar(0).origin() == args.scalar(1).origin());
+        uint64_t bits[1];
+        task.pack_scalars(bits);
+        assert(from_u64<float>(bits[0]) == scale);
+    }}
+    auto layout = [](uint64_t address, uint64_t start, uint64_t view_offset,
+                     uint32_t view_shape, bool alias) {{
+        simpler::hbg::Tensor whole{{}};
+        whole.buffer.addr = address;
+        whole.buffer.size = 256;
+        whole.ndims = 1;
+        whole.shapes[0] = 32;
+        whole.strides[0] = 1;
+        whole.start_offset = start;
+        simpler::hbg::Tensor view = whole;
+        view.buffer.addr = alias ? address : address + 4096;
+        view.start_offset = start + view_offset;
+        view.shapes[0] = view_shape;
+        GraphTaskArgs boundary;
+        boundary.add_input(whole);
+        boundary.add_input(view);
+        return pypto_graph_boundary_layout(boundary);
+    }};
+    {config_definition[1]} first, relocated, different_view, different_alias, different_shape;
+    first.boundary = layout(4096, 0, 32, 8, true);
+    relocated.boundary = layout(8192, 16, 32, 8, true);
+    different_view.boundary = layout(4096, 0, 64, 8, true);
+    different_alias.boundary = layout(4096, 0, 32, 8, false);
+    different_shape.boundary = layout(4096, 0, 32, 4, true);
+    assert(first == relocated && first.hash() == relocated.hash());
+    assert(!(first == different_view) && first.hash() != different_view.hash());
+    assert(!(first == different_alias) && first.hash() != different_alias.hash());
+    assert(!(first == different_shape) && first.hash() != different_shape.hash());
+}}
+"""
+    )
+    repo_root = Path(__file__).resolve().parents[3]
+    compiler = shutil.which("g++") or shutil.which("c++")
+    if compiler is None:
+        pytest.skip("no C++ compiler available")
+    binary = tmp_path / "scalar_contract"
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            *_runtime_include_args(repo_root),
+            str(source),
+            str(repo_root / "runtime/src/common/task_interface/assert_compat.cpp"),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    result = subprocess.run([str(binary)], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def test_graph_helper_defines_the_dynamic_dims_its_body_reads():
@@ -821,6 +958,539 @@ def test_a_boundary_writeback_never_becomes_a_block_scoped_rename():
     # No alias is minted at all: writer and post-block reader name the parameter.
     assert not re.search(r"const Tensor&\s+c__\w+\s*=", body), body
     assert body.count("add_inout(c);") == 3, body
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+@pytest.mark.parametrize("scope", [False, True], ids=["explicit", "scope"])
+@pytest.mark.parametrize("context", ["external", "local", "prior", "sequential", "inout"])
+def test_graph_existing_output_keeps_call_site_dependency_semantics(tmp_path, platform, scope, context):
+    """Write-only Graph signatures must not force every call to InOut.
+
+    Both authoring forms must reach the existing direction rules: fresh outputs
+    use add_output(Tensor), while prior writers, sequential reuse and explicit
+    caller InOut preserve ordering. Compile against each platform's runtime ABI.
+    """
+    output_type = "pl.InOut" if context == "inout" else "pl.Out"
+    output_param = "" if context == "local" else f", out: {output_type}[pl.Tensor[[128, 128], pl.FP32]]"
+    prefix = "        out = pl.create_tensor([128, 128], dtype=pl.FP32)\n" if context == "local" else ""
+    if context == "prior":
+        prefix += "        out = self.copy(a, out)\n"
+    if scope:
+        launch = '        with pl.graph("layer"):\n            result = self.copy(a, out)\n'
+    else:
+        launch = "        result = self.layer(a, out)\n"
+    if context == "sequential":
+        launch = "        for i in pl.range(2):\n" + "".join(f"    {line}\n" for line in launch.splitlines())
+        launch += "            out = result\n"
+    returned = "out" if context == "sequential" else "result"
+    graph = (
+        ""
+        if scope
+        else """
+    @pl.function(type=pl.FunctionType.Graph)
+    def layer(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP32],
+        out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        result = self.copy(a, out)
+        return result
+"""
+    )
+    program = pl.parse_program(f"""@pl.program
+class P:
+    @pl.function(type=pl.FunctionType.InCore)
+    def copy(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP32],
+        out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        x = pl.load(a, [0, 0], [128, 128])
+        return pl.store(x, [0, 0], out)
+{graph}
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, a: pl.Tensor[[128, 128], pl.FP32]{output_param}) -> pl.Tensor[[128, 128], pl.FP32]:
+{prefix}{launch}        return {returned}
+""")
+    orch = _compile_orch(program, platform=platform)
+    entry = _entry_body(orch)
+    launch_args = re.search(r"GraphTaskArgs (\w+);(.*?)rt_submit_graph", entry, re.S)
+    assert launch_args is not None, entry
+    methods = re.findall(rf"{launch_args.group(1)}\.add_(input|output|inout)\(", launch_args.group(2))
+    expected = "output" if context in {"external", "local"} else "inout"
+    assert methods == ["input", expected], entry
+    assert "TensorCreateInfo" not in launch_args.group(2), entry
+    main_cpp = tmp_path / "main.cpp"
+    main_cpp.write_text(orch)
+    _assert_orchestration_compiles(main_cpp, arch=platform)
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+@pytest.mark.parametrize("inout", [False, True])
+def test_graph_hoisted_write_only_view_remains_an_existing_output(tmp_path, platform, inout):
+    """A late-hoisted Out view must publish a writer, never become add_input.
+
+    Any dependency promotion on the original root remains present alongside
+    the added view. Changing the caller contract must not change view ownership.
+    """
+    output_type = "pl.InOut" if inout else "pl.Out"
+    program = pl.parse_program(f"""@pl.program
+class P:
+    @pl.function(type=pl.FunctionType.InCore)
+    def copy(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP32],
+        out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        x = pl.load(a, [0, 0], [128, 128])
+        return pl.store(x, [0, 0], out)
+
+    @pl.function(type=pl.FunctionType.Graph)
+    def layer(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP32],
+        out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+        row: pl.Scalar[pl.INDEX],
+    ) -> pl.Tensor[[256, 128], pl.FP32]:
+        view = pl.slice(out, [128, 128], [row, 0])
+        result = self.copy(a, view)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP32],
+        out: {output_type}[pl.Tensor[[256, 128], pl.FP32]],
+    ) -> pl.Tensor[[256, 128], pl.FP32]:
+        result = self.layer(a, out, 128)
+        return result
+""")
+    orch = _compile_orch(program, platform=platform)
+    entry = _entry_body(orch)
+    launch_args = re.search(r"GraphTaskArgs (\w+);(.*?)rt_submit_graph", entry, re.S)
+    assert launch_args is not None, entry
+    methods = re.findall(rf"{launch_args.group(1)}\.add_(input|output|inout)\(", launch_args.group(2))
+    assert methods == ["input", "inout" if inout else "output", "output"], entry
+    main_cpp = tmp_path / "main.cpp"
+    main_cpp.write_text(orch)
+    _assert_orchestration_compiles(main_cpp, arch=platform)
+
+
+@pytest.mark.parametrize("record_graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("manual", [False, True], ids=["spmd-scope", "manual-submit"])
+def test_gm_pipe_capacity_follows_each_launch_through_graph_boundary(tmp_path, record_graph, manual):
+    """Hoisted pipe storage keeps its own layout and SPMD block count.
+
+    These are deliberately different groups: sizing both caller allocations from
+    one group, or losing the block count after Graph hoisting, must fail here.
+    The eager cases keep the existing allocation contract as a control.
+    """
+    scope_type = "Graph" if record_graph else "Inline"
+    launches = (
+        """        with pl.manual_scope():
+            out, small_done = pl.spmd_submit(self.small_group, out, core_num=8)
+            out, large_done = pl.spmd_submit(self.large_group, out, core_num=2, deps=[small_done])
+"""
+        if manual
+        else """        with pl.spmd(8):
+            out = self.small_group(out)
+        with pl.spmd(2):
+            out = self.large_group(out)
+"""
+    )
+    program = pl.parse_program(f"""@pl.program
+class PipeCapacities:
+    @pl.function(type=pl.FunctionType.AIC)
+    def small_cube(self):
+        buf = pl.reserve_buffer(name="small_v2c_slot_buffer", size=4096, base=pl.AUTO)
+        pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf, dir_mask=2, slot_size=512)
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def small_vector(self, out: pl.InOut[pl.Tensor[[64, 64], pl.FP32]]) -> pl.Tensor[[64, 64], pl.FP32]:
+        peer = pl.import_peer_buffer(name="small_v2c_slot_buffer", peer_func="small_cube")
+        pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=512)
+        tile = pl.load(out, [0, 0], [64, 64])
+        out = pl.store(pl.add(tile, 1.0), [0, 0], out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Group)
+    def small_group(self, out: pl.InOut[pl.Tensor[[64, 64], pl.FP32]]) -> pl.Tensor[[64, 64], pl.FP32]:
+        self.small_cube()
+        out = self.small_vector(out)
+        return out
+
+    @pl.function(type=pl.FunctionType.AIC)
+    def large_cube(self):
+        buf0 = pl.reserve_buffer(name="large_v2c_slot_buffer_0", size=8192, base=pl.AUTO)
+        buf1 = pl.reserve_buffer(name="large_v2c_slot_buffer_1", size=16384, base=pl.AUTO)
+        pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf0, dir_mask=2, slot_size=1024, id=0)
+        pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf1, dir_mask=2, slot_size=2048, id=1)
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def large_vector(self, out: pl.InOut[pl.Tensor[[64, 64], pl.FP32]]) -> pl.Tensor[[64, 64], pl.FP32]:
+        peer0 = pl.import_peer_buffer(name="large_v2c_slot_buffer_0", peer_func="large_cube")
+        peer1 = pl.import_peer_buffer(name="large_v2c_slot_buffer_1", peer_func="large_cube")
+        pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer0, dir_mask=2, slot_size=1024, id=0)
+        pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer1, dir_mask=2, slot_size=2048, id=1)
+        tile = pl.load(out, [0, 0], [64, 64])
+        out = pl.store(pl.add(tile, 1.0), [0, 0], out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Group)
+    def large_group(self, out: pl.InOut[pl.Tensor[[64, 64], pl.FP32]]) -> pl.Tensor[[64, 64], pl.FP32]:
+        self.large_cube()
+        out = self.large_vector(out)
+        return out
+
+    @pl.function(type=pl.FunctionType.{scope_type})
+    def layer(self, out: pl.InOut[pl.Tensor[[64, 64], pl.FP32]]) -> pl.Tensor[[64, 64], pl.FP32]:
+{launches}
+        return out
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, out: pl.InOut[pl.Tensor[[64, 64], pl.FP32]]) -> pl.Tensor[[64, 64], pl.FP32]:
+        out = self.layer(out)
+        return out
+""")
+    with (
+        mock.patch("pypto.backend.pto_backend._compile_pto_module", lambda *_a, **_kw: _STUB_PTOAS_OUTPUT),
+        passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH),
+    ):
+        ir_compile(
+            program,
+            skip_ptoas=False,
+            backend_type=BackendType.Ascend910,
+            output_dir=str(tmp_path),
+            dump_passes=False,
+        )
+    source = tmp_path / "orchestration/main.cpp"
+    orch = source.read_text()
+    entry = _entry_body(orch)
+    body = _graph_body(orch) if record_graph else entry
+    if record_graph:
+        assert "alloc_tensors(" not in body, body
+        graph_args = re.search(r"GraphTaskArgs (\w+);", entry)
+        assert graph_args is not None, entry
+        caller_tensors = _task_args(entry, f"GraphTaskArgs {graph_args.group(1)}")
+    allocations = set()
+    # Default slot_num=8, one direction, FP32 storage: 512*8/4 and
+    # (1024*8+2048*8)/4 elements per block, respectively.
+    for group, per_block, core_num in [("small_group", 1024, 8), ("large_group", 6144, 2)]:
+        launch = re.search(rf"// Group {group}: MixedKernels(.*?)rt_submit_task\(\w+, (\w+)\);", body, re.S)
+        assert launch is not None, body
+        params = launch.group(2)
+        assert f"{params}.launch_spec.set_block_num({core_num});" in launch.group(1), body
+        pipe = re.search(rf"{params}\.add_output\((gm_pipe_buffer_\w+)\);", launch.group(1))
+        assert pipe is not None, launch.group(1)
+        caller_pipe = pipe.group(1)
+        if record_graph:
+            binding = re.search(rf"const Tensor& {caller_pipe} = args.tensor\((\d+)\).ref\(\);", body)
+            assert binding is not None, body
+            caller_pipe = caller_tensors[int(binding.group(1))]
+        allocations.add(caller_pipe)
+        shape = re.search(rf"{caller_pipe}_ci_shapes\[1\]\s*=\s*\{{([^}}]+)\}};", entry)
+        assert shape is not None, entry
+        expression = re.sub(r"\s+", "", shape.group(1)).replace("static_cast<uint32_t>", "")
+        factors = expression.replace("(", "").replace(")", "").split("*")
+        assert all(factor.isdigit() for factor in factors), expression
+        capacity = 1
+        for factor in factors:
+            capacity *= int(factor)
+        assert capacity == per_block * core_num, (group, expression, per_block, core_num)
+    assert len(allocations) == 2, orch
+    _assert_orchestration_compiles(source)
+
+
+@pytest.mark.parametrize("trip_count", [2, 8])
+def test_unrolled_graph_hoists_have_distinct_parameter_names(tmp_path, trip_count):
+    """Unrolled locals have distinct identities but may share their name hint.
+
+    Graph boundary legalization hoists each derived row offset into a parameter.
+    Naming every parameter after that shared hint emitted duplicate C++ bindings.
+    Check all offsets survive and type-check the actual orchestration headers.
+    """
+
+    @pl.program
+    class UnrolledGraph:
+        @pl.function(type=pl.FunctionType.Graph)
+        def stage(
+            self,
+            a: pl.Tensor[[512, 128], pl.FP32],
+            c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+            layer: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[128, 128], pl.FP32]:
+            for offset in pl.unroll(trip_count):
+                base = layer * 128 + offset * 16
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    value: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [base, 0], [128, 128])
+                    pl.store(value, [0, 0], c)
+            return c
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            a: pl.Tensor[[512, 128], pl.FP32],
+            c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        ) -> pl.Tensor[[128, 128], pl.FP32]:
+            c = self.stage(a, c, 0)
+            return c
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        ir_compile(
+            UnrolledGraph,
+            skip_ptoas=True,
+            platform="a2a3",
+            output_dir=str(tmp_path),
+        )
+    main_cpp = tmp_path / "orchestration/main.cpp"
+    names = re.findall(r"const auto (\w+) = args.scalar\(", main_cpp.read_text())
+    assert len(names) == trip_count + 1
+    assert len(set(names)) == len(names)
+    _assert_orchestration_compiles(main_cpp)
+
+
+def test_graph_specialization_suffixes_keep_distinct_cpp_symbols(tmp_path):
+    @pl.program
+    class Variants:
+        @pl.function(type=pl.FunctionType.Graph)
+        def stage(
+            self, a: pl.Tensor[[16, 32], pl.FP32], out: pl.InOut[pl.Tensor[[16, 32], pl.FP32]]
+        ) -> pl.Tensor[[16, 32], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                value = pl.load(a, [0, 0], [16, 32])
+                pl.store(pl.mul(value, 2), [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Graph)
+        def stage__2(
+            self, a: pl.Tensor[[16, 32], pl.FP32], out: pl.InOut[pl.Tensor[[16, 32], pl.FP32]]
+        ) -> pl.Tensor[[16, 32], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                value = pl.load(a, [0, 0], [16, 32])
+                pl.store(pl.mul(value, 3), [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self, a: pl.Tensor[[16, 32], pl.FP32], out: pl.InOut[pl.Tensor[[16, 32], pl.FP32]]
+        ) -> pl.Tensor[[16, 32], pl.FP32]:
+            out = self.stage(a, out)
+            out = self.stage__2(a, out)
+            return out
+
+    source = _compile_orch(Variants)
+    symbols = re.findall(r"static void (pypto_graph_\w+)\(", source)
+    assert len(symbols) == 2
+    assert len(set(symbols)) == 2
+    generated = tmp_path / "variants.cpp"
+    generated.write_text(source)
+    _assert_orchestration_compiles(generated)
+
+
+def test_graph_dynamic_extent_uses_unique_parameter_binding(tmp_path):
+    extent = pl.dynamic("N")
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kernel(
+            self,
+            left: pl.Tensor[[16, 32], pl.FP32],
+            right: pl.Tensor[[extent, 32], pl.FP32],
+            size: pl.Scalar[pl.INDEX],
+        ):
+            pass
+
+        @pl.function(type=pl.FunctionType.Graph)
+        def layer(
+            self,
+            a__ssa_v0: pl.Tensor[[16, 32], pl.FP32],
+            a__ssa_v1: pl.Tensor[[extent, 32], pl.FP32],
+        ):
+            self.kernel(a__ssa_v0, a__ssa_v1, extent)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            left: pl.Tensor[[16, 32], pl.FP32],
+            right: pl.Tensor[[extent, 32], pl.FP32],
+        ):
+            self.layer(left, right)
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910)
+    try:
+        with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+            source = _generate_orch_code(Prog)
+        body = source[
+            source.index("static void pypto_graph_layer") : source.index("aicpu_orchestration_entry")
+        ]
+        declaration = re.search(r"int64_t N\s*=\s*([^;]+);", body)
+        assert declaration is not None, body
+        assert "a_1.shapes[0]" in declaration.group(1), body
+        cpp = tmp_path / "main.cpp"
+        cpp.write_text(source)
+        _assert_orchestration_compiles(cpp)
+    finally:
+        backend.reset_for_testing()
+
+
+def test_graph_distributed_context_is_replay_linked(tmp_path):
+    """A new window context must reach kernels on replay, not freeze at record."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Graph)
+        def publish(self, signal: pld.DistributedTensor[[16], pl.INT32]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pld.system.notify(
+                    target=signal,
+                    peer=0,
+                    offsets=[0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+            return signal
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, signal: pld.DistributedTensor[[16], pl.INT32]):
+            signal = self.publish(signal)
+            return signal
+
+    orch = _compile_orch(Prog)
+    body = orch[orch.index("static void pypto_graph_publish") : orch.index("aicpu_orchestration_entry")]
+    assert "const auto signal_ctx = args.scalar(0);" in body
+    assert re.search(r"\.add_scalar\(signal_ctx\)", body)
+    # Encoding the pointer as a construction value would make every window
+    # address a distinct recording, or retain the first address on replay.
+    assert "from_u64<uint64_t>" not in body
+    cpp = tmp_path / "main.cpp"
+    cpp.write_text(orch)
+    _assert_orchestration_compiles(cpp)
+
+
+def test_graph_communication_context_alias_is_replay_linked(tmp_path):
+    # Start at the post-MaterializeDistTensorCtx boundary: each device
+    # DistributedTensor has exactly one companion CommCtx argument.
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.AIV)
+        def notify(self, signal: pld.DistributedTensor[[16], pl.INT32], signal_ctx: pld.CommCtx):
+            peer = pld.system.rank(signal_ctx)
+            pld.system.notify(signal, peer, [0], 1, op=pld.NotifyOp.AtomicAdd)
+
+        @pl.function(type=pl.FunctionType.Graph)
+        def publish(self, signal: pld.DistributedTensor[[16], pl.INT32], signal_ctx: pld.CommCtx):
+            ctx = signal_ctx
+            forwarded = ctx
+            self.notify(signal, forwarded)
+            return signal
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, signal: pld.DistributedTensor[[16], pl.INT32], signal_ctx: pld.CommCtx):
+            signal = self.publish(signal, signal_ctx)
+            return signal
+
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        directed = passes.derive_call_directions()(Prog)
+        legalized = passes.legalize_graph_boundary()(directed)
+        lowered = passes.materialize_runtime_scopes()(legalized)
+        main = lowered.get_function("main")
+        assert main is not None
+        orch = codegen.generate_orchestration(lowered, main).code
+
+    body = orch[orch.index("static void pypto_graph_publish") : orch.index("aicpu_orchestration_entry")]
+    assert "const auto signal_ctx = args.scalar(0);" in body
+    assert re.search(r"\.add_scalar\(signal_ctx\)", body)
+    assert "from_u64<uint64_t>" not in body
+    cpp = tmp_path / "main.cpp"
+    cpp.write_text(orch)
+    _assert_orchestration_compiles(cpp)
+
+
+def test_graph_submit_keeps_completion_and_manual_dependency_edges(tmp_path):
+    """A manual producer, recorded Graph, and consumer chain through TaskIds.
+
+    The Graph returns an alias of caller-owned storage. Its additional submit
+    result is the OUTER completion id, including on the first recording, so no
+    recorded-internal TaskId or array escapes the region.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def increment(self, c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]) -> pl.Tensor[[128, 128], pl.FP32]:
+            t = pl.load(c, [0, 0], [128, 128])
+            return pl.store(pl.add(t, 1.0), [0, 0], c)
+
+        @pl.function(type=pl.FunctionType.Graph)
+        def layer(self, c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]) -> pl.Tensor[[128, 128], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                t = pl.load(c, [0, 0], [128, 128])
+                pl.store(pl.add(t, 1.0), [0, 0], c)
+            return c
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]) -> pl.Tensor[[128, 128], pl.FP32]:
+            with pl.manual_scope():
+                c, producer = pl.submit(self.increment, c)
+                c, graph_done = pl.submit(self.layer, c, deps=[producer])
+                c, _ = pl.submit(self.increment, c, deps=[graph_done])
+            return c
+
+    with (
+        mock.patch("pypto.backend.pto_backend._compile_pto_module", lambda *_a, **_kw: _STUB_PTOAS_OUTPUT),
+        passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH),
+    ):
+        ir_compile(Before, skip_ptoas=False, platform="a2a3", output_dir=str(tmp_path), dump_passes=False)
+    source = tmp_path / "orchestration/main.cpp"
+    _assert_orchestration_compiles(source)
+    entry = _entry_body(source.read_text())
+    assert "rt_submit_graph(&pypto_graph_layer" in entry
+    assert "TaskOutputTensors task_1_outs;" in entry
+    assert "task_1_outs.set_task_id(rt_submit_graph(" in entry
+    assert "params_t1.set_dependencies(" in entry
+    assert "TaskId graph_done = task_1_outs.task_id();" in entry
+
+
+@pytest.mark.parametrize("arch", ["a2a3", "a5"])
+def test_graph_scope_captures_outer_completion_and_keeps_dependencies(tmp_path, arch):
+    """Scope syntax reaches the existing Graph Submit codegen, not a new ABI."""
+
+    @pl.program
+    class ScopeChain:
+        @pl.function(type=pl.FunctionType.InCore)
+        def increment(self, c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]) -> pl.Tensor[[128, 128], pl.FP32]:
+            t = pl.load(c, [0, 0], [128, 128])
+            return pl.store(pl.add(t, 1.0), [0, 0], c)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]) -> pl.Tensor[[128, 128], pl.FP32]:
+            with pl.manual_scope():
+                c, seed = pl.submit(self.increment, c)
+                with pl.graph("layer", deps=[seed]) as done:
+                    c, first = pl.submit(self.increment, c)
+                    c, second = pl.submit(self.increment, c, deps=[first])
+                c, consumer = pl.submit(self.increment, c, deps=[done])
+            return c
+
+    with (
+        mock.patch("pypto.backend.pto_backend._compile_pto_module", lambda *_a, **_kw: _STUB_PTOAS_OUTPUT),
+        passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH),
+    ):
+        ir_compile(
+            ScopeChain,
+            skip_ptoas=False,
+            backend_type=BackendType.Ascend910 if arch == "a2a3" else BackendType.Ascend950,
+            output_dir=str(tmp_path),
+            dump_passes=False,
+        )
+    source = tmp_path / "orchestration/main.cpp"
+    _assert_orchestration_compiles(source, arch=arch)
+    entry = _entry_body(source.read_text())
+    launch = re.search(r"GraphTaskArgs (\w+);(.*?)rt_submit_graph\(&pypto_graph_layer", entry, re.S)
+    assert launch is not None, entry
+    assert f"{launch.group(1)}.set_dependencies(" in launch.group(2), entry
+    assert re.search(r"TaskId done\w* = task_\d+_outs\.task_id\(\);", entry), entry
 
 
 if __name__ == "__main__":

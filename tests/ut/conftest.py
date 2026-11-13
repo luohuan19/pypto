@@ -32,6 +32,7 @@ import pytest
 from pypto import LogLevel, get_log_level, set_log_level
 from pypto import backend as _backend
 from pypto.backend import BackendType
+from pypto.backend._ptoas_locate import check_ptoas_version, find_ptoas_binary
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import _clear_thread_log_level, passes
 
@@ -39,6 +40,31 @@ from pypto.pypto_core import _clear_thread_log_level, passes
 # mutate it — so every unit test starts from whatever PYPTO_LOG_LEVEL / the
 # build-type default selected for this session. See `_reset_log_level`.
 _INITIAL_LOG_LEVEL: Final[LogLevel] = get_log_level()
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--require-ptoas",
+        action="store_true",
+        help="Fail before running tests if a supported PTOAS compiler is unavailable.",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register compilation coverage and fail CI before optional checks can skip."""
+    config.addinivalue_line(
+        "markers",
+        "ptoas_compile: invokes PTOAS compilation to check generated-code regressions",
+    )
+    if not config.getoption("--require-ptoas"):
+        return
+    binary = find_ptoas_binary()
+    if binary is None:
+        raise pytest.UsageError("--require-ptoas requires PTOAS; set PTOAS_ROOT to its installation.")
+    try:
+        check_ptoas_version(binary)
+    except RuntimeError as exc:
+        raise pytest.UsageError(str(exc)) from exc
 
 
 @pytest.fixture
@@ -165,13 +191,13 @@ def stub_device_runner():
 def ascend_backend(request):
     """Configure an Ascend backend for the duration of a test, then reset.
 
-    Use either as a plain fixture (defaults to ``Ascend910B``) or via
+    Use either as a plain fixture (defaults to ``Ascend910``) or via
     ``pytest.mark.parametrize("ascend_backend", [...], indirect=True)`` to
     cycle through multiple backends. Replaces the per-test
     ``backend.reset_for_testing()`` + ``backend.set_backend_type(...)`` pair
     that is otherwise duplicated across pass / codegen tests.
     """
-    backend_type = getattr(request, "param", BackendType.Ascend910B)
+    backend_type = getattr(request, "param", BackendType.Ascend910)
     _backend.reset_for_testing()
     _backend.set_backend_type(backend_type)
     try:
@@ -289,3 +315,73 @@ def pass_verification_context(pass_verification_instruments):
     """Enable the configured checks for all pass executions."""
     with passes.PassContext(pass_verification_instruments):
         yield
+
+
+@pytest.fixture
+def kernel_env(monkeypatch, tmp_path):
+    """Isolate the process manager and mock only the Worker/device boundary."""
+    from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities  # noqa: PLC0415
+    from pypto.ir._artifact_metadata import ArtifactMetadata  # noqa: PLC0415
+    from pypto.ir.compiled_artifact import CompiledArtifact  # noqa: PLC0415
+    from pypto.runtime import _execution_mode  # noqa: PLC0415
+    from pypto.runtime.kernel import context  # noqa: PLC0415
+    from pypto.runtime.kernel.session import KernelConfig  # noqa: PLC0415
+
+    monkeypatch.setattr(_execution_mode, "_gate", _execution_mode._ModeGate())
+    calls = SimpleNamespace(workers=[], inits=[], prepares=[], closes=[])
+
+    class FakeWorker:
+        def __init__(self, config, state):
+            calls.workers.append(self)
+
+        def init(self, config):
+            calls.inits.append(config)
+
+        def check_context(self):
+            pass
+
+        def on_owner_thread(self):
+            return False
+
+        def prepare(self, callable_):
+            calls.prepares.append(callable_)
+            return object()  # Opaque handle; neither a slot nor convertible to int.
+
+        def wait(self, ticket):
+            ticket.wait()
+
+        def close(self):
+            calls.closes.append(self)
+
+    monkeypatch.setattr(context, "_BorrowedWorkerSession", FakeWorker)
+    state = context._ProcessKernelState()
+    monkeypatch.setattr(context, "_process", SimpleNamespace(state=state))
+
+    def artifact(key=b"kernel"):
+        meta = ArtifactMetadata(
+            (),
+            (),
+            0,
+            "a2a3",
+            BackendType.Ascend910,
+            (),
+            ExecutionCapabilities((ArtifactExecutionMode.KERNEL,)),
+        )
+        result = CompiledArtifact(tmp_path / key.hex(), "a2a3", meta)
+        monkeypatch.setattr(
+            result,
+            "_artifact_runtime",
+            SimpleNamespace(
+                load=lambda: {".": (key, "tensormap_and_ringbuffer", {})},
+                handle=SimpleNamespace(key=key),
+            ),
+        )
+        return result
+
+    return SimpleNamespace(
+        state=state,
+        config=KernelConfig("a2a3", "tensormap_and_ringbuffer", 0),
+        calls=calls,
+        worker_cls=FakeWorker,
+        artifact=artifact,
+    )

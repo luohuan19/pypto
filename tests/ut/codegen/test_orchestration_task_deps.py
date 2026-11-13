@@ -14,12 +14,13 @@ import re
 import pypto.language as pl
 import pytest
 from _orchestration_codegen_common import (
+    _assert_orchestration_compiles,
     _generate_orch_code,
     _generate_orch_from_transformed_program,
     _generate_orch_full_pipeline,
 )
 from pypto import backend, passes
-from pypto.backend import BackendType
+from pypto.backend import BackendType, pto_backend
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
@@ -206,9 +207,9 @@ def test_cross_scope_task_id_is_hoisted_for_set_dependencies():
             return b
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
     with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
-        transformed = passes.derive_call_directions()(P)
+        transformed = passes.derive_call_directions()(passes.normalize_return_order()(P))
         code = _generate_orch_from_transformed_program(transformed)
 
     assert re.search(r"TaskId\s+scoped_tid_tid\s*=\s*TaskId::invalid\(\);", code), code
@@ -250,7 +251,7 @@ def test_cross_scope_plain_auto_call_captures_task_id_when_hoisted():
             return out
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
     with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
         transformed = passes.derive_call_directions()(P)
         transformed = passes.auto_derive_task_dependencies(analyze_auto_scopes=True)(transformed)
@@ -292,7 +293,7 @@ def test_compiler_derived_deps_for_fire_and_forget_call_capture_task_id_when_hoi
             return out
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
     # This intentionally models a lowered fire-and-forget output-existing
     # producer shape. Source-level code should normally read the returned
     # post-call tensor, but codegen still has to handle this IR form because
@@ -315,7 +316,7 @@ def test_compiler_derived_deps_for_mixed_group_call_capture_task_id_when_hoisted
     """MixedKernels producers must capture TaskIds when compiler deps use their output."""
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     @pl.program
     class P:
@@ -376,7 +377,7 @@ def test_compiler_derived_deps_for_fixed_trip_loop_fan_in_capture_task_ids():
     """Fixed-trip loop producers should fan in all iteration TaskIds to a later consumer."""
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     @pl.program
     class P:
@@ -426,7 +427,7 @@ def test_compiler_derived_deps_for_dynamic_trip_loop_fan_in_falls_back():
     """Dynamic-trip loop fan-in should fall back instead of allocating vectors."""
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     @pl.program
     class P:
@@ -471,7 +472,7 @@ def test_compiler_derived_deps_for_dynamic_trip_tensor_carrier_falls_back():
     """Dynamic-trip tensor carriers should fall back instead of allocating vectors."""
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     @pl.program
     class P:
@@ -524,7 +525,7 @@ def test_descending_parallel_loop_emits_descending_cpp_loop():
     """
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     def build(start, stop, step):
         @pl.program
@@ -577,7 +578,7 @@ def test_zero_step_loop_emits_a_terminating_condition():
     """
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     @pl.program
     class P:
@@ -609,7 +610,7 @@ def test_compiler_derived_deps_for_dynamic_parallel_tensor_carriers_share_phase_
     """Dynamic parallel tensor producers in one phase should share one dummy barrier."""
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     @pl.program
     class P:
@@ -695,7 +696,7 @@ def test_compiler_derived_deps_for_dynamic_trip_tuple_output_tensor_carrier_fall
     """Dynamic-trip tuple-output tensor carriers should fall back instead of allocating vectors."""
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     @pl.program
     class P:
@@ -746,7 +747,7 @@ def test_compiler_auto_manual_scope_is_not_tied_to_function_name():
     """
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     @pl.program
     class P:
@@ -1073,7 +1074,8 @@ def test_spmd_submit_group_emits_mixed_kernels_and_launch_spec():
 
     @pl.program
     class P:
-        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        # split_aiv marks outliner-produced InCore IR, as required by the placement verifier.
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN, "split_aiv": True})
         def kernel(
             self,
             a: pl.Tensor[[64, 64], pl.FP32],
@@ -1086,9 +1088,11 @@ def test_spmd_submit_group_emits_mixed_kernels_and_launch_spec():
             tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
             tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
             tile_mm = pl.matmul(tile_a_l0a, tile_b_l0b)
-            tile_bias = pl.load(bias, [0, 0], [64, 64])
-            tile_out = pl.add(tile_mm, tile_bias)
-            out = pl.store(tile_out, [0, 0], out)
+            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                half = pl.aiv_shard(tile_mm)
+                tile_bias = pl.load(bias, [lane * 32, 0], [32, 64])
+                tile_out = pl.add(half, tile_bias)
+                out = pl.store(tile_out, [lane * 32, 0], out)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1254,7 +1258,7 @@ def test_spmd_submit_aic_direct_dispatch():
     """spmd_submit of a directly-declared AIC (cube) kernel routes through the
     direct dispatch path: rt_submit_aic_task + launch spec (910B)."""
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     @pl.program
     class P:
@@ -1323,9 +1327,15 @@ def test_spmd_submit_core_num_variable_emits_var_reference():
     assert not m.group(1).strip().isdigit(), f"core_num was constant-folded, expected a var: {m.group(1)!r}"
 
 
-def test_spmd_submit_950_backend_emits_set_core_num():
-    """On Ascend950 the launch spec uses set_core_num (vs set_block_num on 910B),
-    via the backend handler's GetLaunchSpecCoreCountMethod()."""
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+        passes.RuntimeKind.HOST_BUILD_GRAPH,
+    ],
+)
+def test_spmd_submit_950_backend_uses_block_count_api(tmp_path, runtime):
+    """Both A5 runtimes must compile with Simpler's unified block-count API."""
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend950)
 
@@ -1333,25 +1343,37 @@ def test_spmd_submit_950_backend_emits_set_core_num():
     class P:
         @pl.function(type=pl.FunctionType.AIV)
         def k(
-            self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
-        ) -> pl.Tensor[[128], pl.FP32]:
-            t = pl.load(x, [0], [128])
-            out = pl.store(t, [0], out)
+            self, x: pl.Tensor[[1, 128], pl.FP32], out: pl.Out[pl.Tensor[[1, 128], pl.FP32]]
+        ) -> pl.Tensor[[1, 128], pl.FP32]:
+            t = pl.load(x, [0, 0], [1, 128])
+            out = pl.store(t, [0, 0], out)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
         def main(
-            self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
-        ) -> pl.Tensor[[128], pl.FP32]:
+            self, x: pl.Tensor[[1, 128], pl.FP32], out: pl.Out[pl.Tensor[[1, 128], pl.FP32]]
+        ) -> pl.Tensor[[1, 128], pl.FP32]:
             with pl.manual_scope():
                 out, _ = pl.spmd_submit(self.k, x, out, core_num=4)
             return out
 
     # Property-only verification (see test_spmd_submit_aic_direct_dispatch).
-    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)], runtime=runtime
+    ):
         code = _generate_orch_code(P)
-    assert "params_t0.launch_spec.set_core_num(4);" in code, code
-    assert "set_block_num" not in code, code
+    main_cpp = tmp_path / "main.cpp"
+    main_cpp.write_text(code)
+    _assert_orchestration_compiles(main_cpp, runtime_name=passes.runtime_kind_to_name(runtime), arch="a5")
+    assert "params_t0.launch_spec.set_block_num(4);" in code, code
+
+    # Lower with the requested runtime, then exercise Python codegen after that
+    # context has ended: selecting the setter no longer needs a codegen context.
+    with passes.PassContext([], runtime=runtime):
+        program = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(P)
+    files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True, runtime=runtime)
+    main_cpp.write_text(files["orchestration/main.cpp"])
+    _assert_orchestration_compiles(main_cpp, runtime_name=passes.runtime_kind_to_name(runtime), arch="a5")
 
 
 def test_compiler_dep_carry_array_sized_by_outer_loop_trip_count():
@@ -1368,7 +1390,7 @@ def test_compiler_dep_carry_array_sized_by_outer_loop_trip_count():
     use ``EvalConstTripCount`` of the outer loop for compiler-dep carries.
     """
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
 
     M, N = 4, 8
 
@@ -1481,7 +1503,7 @@ def test_user_written_task_dummy_with_in_scope_dep_still_wires():
             return b
 
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     code = _generate_orch_code(pm.run_passes(P))
 

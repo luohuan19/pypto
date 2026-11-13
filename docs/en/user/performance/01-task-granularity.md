@@ -1,5 +1,9 @@
 # Task Granularity
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Dispatch is not free. Sizing InCore functions so the cores spend their time computing
 rather than waiting to be told what to compute.
 
@@ -195,17 +199,17 @@ everywhere else.
 **Cost:** the merged task holds every intermediate live at once.
 
 > **Merging across engines is not this.** Putting a cube op and a vector op in one scope
-> additionally needs a split mode — without `pl.split(...)` the buffers do not fit and the
-> compiler refuses the scope. That case is [a mixed
-> kernel](02-runtime-overhead.md#build-a-mixed-kernel); read it before merging a `matmul`
-> with the vector op that consumes it.
+> creates a mixed kernel with cross-core transfers. If the full-width vector work exceeds
+> the buffer budget, author `pl.split_aiv` regions with explicit shard/gather boundaries
+> and per-lane shapes and offsets. See [mixed kernels](02-runtime-overhead.md#build-a-mixed-kernel)
+> before merging a `matmul` with the vector op that consumes it.
 
 **How to confirm:** the merged task disappears from `deps.json` as a separate node, and the
 GM traffic for the intermediate disappears from the kernel.
 
 ## The other direction: too coarse
 
-Granularity is not monotone. A single card has a fixed number of cores — on Ascend910B,
+Granularity is not monotone. A single card has a fixed number of cores — on Ascend910,
 **48 vector and 24 cube** — and a task occupies one of them.
 
 ```text

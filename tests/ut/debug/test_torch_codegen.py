@@ -238,6 +238,91 @@ def test_tensor_matmul_respects_out_dtype():
     assert "torch.matmul(a, b).to(torch.float32)" in code
 
 
+@pytest.mark.parametrize("mode", ["round_even", "round_away"])
+@pytest.mark.parametrize(
+    "op_name", ["tensor.matmul", "tensor.matmul_acc", "tile.matmul", "tile.matmul_acc", "tile.matmul_bias"]
+)
+def test_hf32_matmul_reference_rounds_inputs_per_operation(mode, op_name):
+    """HF32 must round both inputs, while bias/accumulator and later FP32 ops stay exact."""
+    tensor_op = op_name.startswith("tensor.")
+    var = _tensor_var if tensor_op else _tile_var
+    a, b = var("a", [2, 2]), var("b", [2, 2])
+    seed = var("seed", [1, 2] if op_name.endswith("bias") else [2, 2])
+    init = _scalar("init", DataType.BOOL)
+    params = [a, b]
+    args: list[ir.Expr] = [a, b]
+    if op_name.endswith("acc"):
+        args = [seed, a, b, init]
+        params += [seed, init]
+    elif op_name.endswith("bias"):
+        args += [seed]
+        params += [seed]
+    # Exercise transposed, noncontiguous Tensor inputs as well as Tile handlers.
+    kwargs = {"a_trans": True, "b_trans": True} if tensor_op else {}
+    call = _op_call(op_name, args, {**kwargs, "tf32_mode": mode})
+    result, plain = var("result", [2, 2]), var("plain", [2, 2])
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(result, call, _span()),
+            ir.AssignStmt(plain, _op_call(op_name.split(".")[0] + ".matmul", [a, b], kwargs), _span()),
+            ir.ReturnStmt([result, plain], _span()),
+        ],
+        _span(),
+    )
+    namespace = {}
+    exec(torch_codegen(_simple_function("hf32", params, body, [result.type, plain.type])), namespace)  # noqa: S102
+    lhs = torch.tensor([[1 + 2**-11, -1], [-1 - 3 * 2**-11, 1]], dtype=torch.float32)
+    rhs = torch.tensor([[1024, 1 + 2**-11], [1024, 1 + 3 * 2**-11]], dtype=torch.float32)
+    # Hand-rounded ties include positive/negative values and even/odd retained LSBs.
+    rounded_one = 1 if mode == "round_even" else 1 + 2**-10
+    rounded_lhs = torch.tensor([[rounded_one, -1], [-1 - 2**-9, 1]])
+    rounded_rhs = torch.tensor([[1024, rounded_one], [1024, 1 + 2**-9]])
+    product = rounded_lhs @ rounded_rhs
+    plain_expected = lhs @ rhs
+    seed_data = torch.full((1, 2) if op_name.endswith("bias") else (2, 2), 3 + 2**-11)
+    for initialize in (False, True):
+        inputs: list[Any] = [lhs.T, rhs.T] if tensor_op else [lhs, rhs]
+        expected = product
+        if op_name.endswith("acc"):
+            inputs += [seed_data, initialize]
+            expected = product if initialize else seed_data + product
+        elif op_name.endswith("bias"):
+            inputs += [seed_data]
+            expected = product + seed_data
+        actual, plain_actual = namespace["hf32"](*inputs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(plain_actual, plain_expected, rtol=0, atol=0)
+        assert actual.dtype == torch.float32
+
+
+@pytest.mark.parametrize("mode", ["round_even", "round_away"])
+def test_hf32_rounding_boundaries(mode):
+    """Rounding must preserve special values and carry across fraction/exponent boundaries."""
+    namespace = {}
+    exec(torch_codegen_module._PREAMBLE, namespace)  # noqa: S102
+    values = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            float("inf"),
+            -float("inf"),
+            float("nan"),
+            2 - 2**-11,
+            1 + 2**-12,
+            1 + 3 * 2**-12,
+            -1 - 2**-11,
+            -1 - 3 * 2**-11,
+        ]
+    )
+    negative_tie = -1 if mode == "round_even" else -1 - 2**-10
+    expected = torch.tensor(
+        [0.0, -0.0, float("inf"), -float("inf"), float("nan"), 2, 1, 1 + 2**-10, negative_tie, -1 - 2**-9]
+    )
+    actual = namespace["_hf32_round"](values, mode)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(torch.signbit(actual[:2]), torch.signbit(values[:2]))
+
+
 def test_tensor_cast():
     """tensor.cast should emit .to(dtype)."""
     a = _tensor_var("a", [64])
@@ -787,7 +872,14 @@ def test_if_else_with_return_vars():
 
 @pytest.mark.parametrize(
     "op_name",
-    ["system.sync_src", "system.sync_set", "system.sync_wait", "system.set_ffts"],
+    [
+        "system.sync_src",
+        "system.sync_set",
+        "system.sync_wait",
+        "system.set_flag",
+        "system.wait_flag",
+        "system.set_ffts",
+    ],
 )
 def test_system_ops_are_noops(op_name):
     """System ops should emit no-op comments."""
@@ -796,6 +888,12 @@ def test_system_ops_are_noops(op_name):
         call = _op_call(op_name, [], {"set_pipe": 4, "wait_pipe": 5, "event_id": 0})
     elif op_name in ("system.sync_set", "system.sync_wait"):
         call = _op_call(op_name, [], {"pipe": ir.PipeType.MTE2, "event_id": 0})
+    elif op_name in ("system.set_flag", "system.wait_flag"):
+        call = _op_call(
+            op_name,
+            [],
+            {"src_pipe": ir.PipeType.MTE2, "dst_pipe": ir.PipeType.V, "event_id": 0},
+        )
     else:
         workspace = _tensor_var("workspace", [256], DataType.INT64)
         params = [workspace]
@@ -948,7 +1046,8 @@ def test_group_cross_core_left_right_c2v_runs_with_runtime_scheduler():
     assert torch.allclose(out, src)
 
 
-def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler():
+@pytest.mark.parametrize("pipe_id", [0, 7])
+def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler(pipe_id):
     """No-split bidirectional path should run concurrently without deadlock."""
 
     @pl.program
@@ -960,10 +1059,10 @@ def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler():
             out: pl.Out[pl.Tensor[[4, 2], pl.FP32]],
         ):
             recv: pl.Tile[[4, 2], pl.FP32, pl.MemorySpace.Mat] = pl.tpop_from_aiv(
-                shape=[4, 2], dtype=pl.FP32, split=0
+                shape=[4, 2], dtype=pl.FP32, split=0, id=pipe_id
             )
             twice: pl.Tile[[4, 2], pl.FP32, pl.MemorySpace.Mat] = pl.add(recv, recv)
-            pl.tpush_to_aiv(twice, split=0)
+            pl.tpush_to_aiv(twice, split=0, id=pipe_id)
 
         @pl.function(type=pl.FunctionType.AIV)
         def cross_aiv(
@@ -972,9 +1071,9 @@ def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler():
             out: pl.Out[pl.Tensor[[4, 2], pl.FP32]],
         ) -> pl.Tensor[[4, 2], pl.FP32]:
             tile: pl.Tile[[4, 2], pl.FP32, pl.MemorySpace.Vec] = pl.load(inp, [0, 0], [4, 2])
-            pl.tpush_to_aic(tile, split=0)
+            pl.tpush_to_aic(tile, split=0, id=pipe_id)
             recv: pl.Tile[[4, 2], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(
-                shape=[4, 2], dtype=pl.FP32, split=0
+                shape=[4, 2], dtype=pl.FP32, split=0, id=pipe_id
             )
             out = pl.store(recv, [0, 0], out)
             return out
@@ -999,12 +1098,157 @@ def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler():
 
     code = torch_codegen(NoSplitBidirectProgram)
     assert "_run_group_call('cross'" in code
+    if pipe_id:
+        assert code.count(f"pipe_id={pipe_id})") == 4
     ns: dict = {}
     exec(code, ns)  # noqa: S102
     src = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     dst = torch.zeros_like(src)
     out = ns["main"](src, dst)
     assert torch.allclose(out, src * 2)
+
+
+@pytest.mark.parametrize("pipe_id", [0, 7])
+@pytest.mark.parametrize("explicit_fp32", [False, True])
+@pytest.mark.parametrize("check_shapes", [False, True])
+def test_ordinary_groups_reset_c2v_epilogue(pipe_id, explicit_fp32, check_shapes):
+    """A default pipe after BF16/ReLU preserves FP32 values across ordinary groups."""
+    plain_options = ", c2v_dtype=pl.FP32" if explicit_fp32 else ""
+    source = f"""@pl.program
+class SequentialGroups:
+    @pl.function(type=pl.FunctionType.AIC)
+    def producer(self, a: pl.Tensor[[64, 128], pl.FP32],
+                 b: pl.Tensor[[128, 128], pl.FP32],
+                 out: pl.Out[pl.Tensor[[64, 128], pl.BF16]],
+                 raw: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        peer = pl.import_peer_buffer(name="rounded", peer_func="consumer")
+        pl.aic_initialize_pipe(c2v_consumer_buf=peer, dir_mask=1,
+            slot_size=16384, slot_num=2, id={pipe_id}, c2v_dtype=pl.BF16, pre_relu=True)
+        a_mat = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        left = pl.move(a_mat, target_memory=pl.Mem.Left)
+        right = pl.move(b_mat, target_memory=pl.Mem.Right)
+        acc = pl.matmul(left, right)
+        pl.tpush_to_aiv(acc, split=0, id={pipe_id})
+        pl.store(acc, [0, 0], raw)
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def consumer(self, a: pl.Tensor[[64, 128], pl.FP32],
+                 b: pl.Tensor[[128, 128], pl.FP32],
+                 out: pl.Out[pl.Tensor[[64, 128], pl.BF16]],
+                 raw: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        buf = pl.reserve_buffer(name="rounded", size=32768)
+        pl.aiv_initialize_pipe(c2v_consumer_buf=buf, dir_mask=1,
+            slot_size=16384, slot_num=2, id={pipe_id}, c2v_dtype=pl.BF16, pre_relu=True)
+        value = pl.tpop_from_aic(shape=[64, 128], dtype=pl.BF16, split=0, id={pipe_id})
+        pl.store(value, [0, 0], out)
+        pl.tfree_to_aic(value, id={pipe_id})
+
+    @pl.function(type=pl.FunctionType.Group)
+    def rounded(self, a: pl.Tensor[[64, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 128], pl.BF16]],
+                raw: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        self.producer(a, b, out, raw)
+        self.consumer(a, b, out, raw)
+
+    @pl.function(type=pl.FunctionType.AIC)
+    def plain_producer(self, a: pl.Tensor[[64, 128], pl.FP32],
+                       b: pl.Tensor[[128, 128], pl.FP32],
+                       out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        peer = pl.import_peer_buffer(name="plain", peer_func="plain_consumer")
+        pl.aic_initialize_pipe(c2v_consumer_buf=peer, dir_mask=1,
+            slot_size=32768, slot_num=2, id={pipe_id}{plain_options})
+        a_mat = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        left = pl.move(a_mat, target_memory=pl.Mem.Left)
+        right = pl.move(b_mat, target_memory=pl.Mem.Right)
+        acc = pl.matmul(left, right)
+        pl.tpush_to_aiv(acc, split=0, id={pipe_id})
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def plain_consumer(self, a: pl.Tensor[[64, 128], pl.FP32],
+                       b: pl.Tensor[[128, 128], pl.FP32],
+                       out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        buf = pl.reserve_buffer(name="plain", size=65536)
+        pl.aiv_initialize_pipe(c2v_consumer_buf=buf, dir_mask=1,
+            slot_size=32768, slot_num=2, id={pipe_id}{plain_options})
+        value = pl.tpop_from_aic(shape=[64, 128], dtype=pl.FP32, split=0, id={pipe_id})
+        pl.store(value, [0, 0], out)
+        pl.tfree_to_aic(value, id={pipe_id})
+
+    @pl.function(type=pl.FunctionType.Group)
+    def plain(self, a: pl.Tensor[[64, 128], pl.FP32],
+              b: pl.Tensor[[128, 128], pl.FP32],
+              out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        self.plain_producer(a, b, out)
+        self.plain_consumer(a, b, out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, a: pl.Tensor[[64, 128], pl.FP32],
+             b: pl.Tensor[[128, 128], pl.FP32],
+             rounded_out: pl.Out[pl.Tensor[[64, 128], pl.BF16]],
+             plain_out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+             raw: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        self.rounded(a, b, rounded_out, raw)
+        self.plain(a, b, plain_out)
+"""
+    namespace: dict[str, Any] = {}
+    exec(torch_codegen(pl.parse(source), check_shapes=check_shapes), namespace)  # noqa: S102
+    assert namespace["_GROUP_META"] == {}
+    a = torch.zeros(64, 128)
+    a[:, :2] = 1
+    b = torch.zeros(128, 128)
+    b[0] = torch.tensor([1.0, 1.0078125, -1.0, -1.0078125] * 32)
+    b[1] = torch.tensor([2**-8, 2**-11, -(2**-8), -(2**-11)] * 32)
+    expected = a @ b
+    rounded = torch.empty_like(expected, dtype=torch.bfloat16)
+    plain = torch.empty_like(expected)
+    raw = torch.empty_like(expected)
+    for _ in range(3):
+        namespace["main"](a, b, rounded, plain, raw)
+        torch.testing.assert_close(rounded, expected.clamp_min(0).to(torch.bfloat16), rtol=0, atol=0)
+        torch.testing.assert_close(plain, expected, rtol=0, atol=0)
+        torch.testing.assert_close(raw, expected, rtol=0, atol=0)
+        assert namespace["_cross_core_rt"].snapshot(pipe_id)["to_aiv"] == 0
+
+
+@pytest.mark.parametrize("pipe_id", [0, 7])
+@pytest.mark.parametrize("dir_mask", [1, 3])
+def test_default_c2v_initializer_keeps_other_pipe_epilogues(pipe_id, dir_mask):
+    """Reset one payload contract without dropping queued data or another pipe's epilogue."""
+    namespace: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, namespace)  # noqa: S102
+    runtime = namespace["_cross_core_rt"]
+    other_id = 7 if pipe_id == 0 else 0
+    runtime.initialize_c2v_pipe(torch.bfloat16, True, pipe_id)
+    runtime.initialize_c2v_pipe(torch.bfloat16, True, other_id)
+    acc = torch.tensor([[-1.00390625, 1.00390625]], dtype=torch.float32)
+    original = acc.clone()
+    runtime.push_to_aiv(acc, 0, pipe_id=other_id)
+    code = torch_codegen_module._handle_aic_initialize_pipe([], {"dir_mask": dir_mask, "id": pipe_id})
+    exec(code, namespace)  # noqa: S102
+    runtime.push_to_aiv(acc, 0, pipe_id=pipe_id)
+    torch.testing.assert_close(runtime.pop_from_aic(0, pipe_id), original, rtol=0, atol=0)
+    torch.testing.assert_close(
+        runtime.pop_from_aic(0, other_id), original.clamp_min(0).to(torch.bfloat16), rtol=0, atol=0
+    )
+    torch.testing.assert_close(acc, original, rtol=0, atol=0)
+
+
+def test_v2c_only_initializer_preserves_c2v_epilogue():
+    """A V2C-only initializer does not replace the C2V contract on the same ID."""
+    namespace: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, namespace)  # noqa: S102
+    runtime = namespace["_cross_core_rt"]
+    runtime.initialize_c2v_pipe(torch.bfloat16, True, 7)
+    code = torch_codegen_module._handle_aic_initialize_pipe([], {"dir_mask": 2, "id": 7})
+    exec(code, namespace)  # noqa: S102
+    acc = torch.tensor([[-1.00390625, 1.00390625]], dtype=torch.float32)
+    runtime.push_to_aiv(acc, 0, pipe_id=7)
+    torch.testing.assert_close(
+        runtime.pop_from_aic(0, 7), acc.clamp_min(0).to(torch.bfloat16), rtol=0, atol=0
+    )
 
 
 def test_split_mode_to_int_invalid_value_raises():
@@ -1142,6 +1386,39 @@ def test_cross_core_no_split_dual_dispatch_runtime_pipe_pairing():
     paired = rt.pop_from_aiv(0)
     assert torch.equal(paired, lane0_tile)
     assert rt.snapshot()["to_aic_dual_nosplit"] == {0: 0, 1: 0}
+
+
+@pytest.mark.parametrize("split,dual", [(0, False), (0, True), (1, False), (2, False)])
+def test_cross_core_pipe_ids_isolate_queues_in_both_directions(split, dual):
+    """Reverse pipe order must not exchange payloads, including per-lane queues."""
+    ns: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, ns)  # noqa: S102
+    rt = ns["_cross_core_rt"]
+    set_lane = ns["_set_subblock_idx"]
+    rt.reset(no_split_dual_aiv_dispatch=dual)
+    payloads = {0: torch.full((4, 4), 1.0), 7: torch.full((4, 4), -3.0)}
+    for pipe_id, payload in payloads.items():
+        rt.push_to_aiv(payload, split, pipe_id=pipe_id)
+    for pipe_id in (7, 0):
+        for lane in range(2 if split or dual else 1):
+            set_lane(lane)
+            actual = rt.pop_from_aic(split, pipe_id=pipe_id)
+            expected = payloads[pipe_id]
+            if split:
+                expected = rt._split_tile(expected, split)[lane]
+            torch.testing.assert_close(actual, expected)
+
+    for pipe_id, payload in payloads.items():
+        parts = rt._split_tile(payload, split) if split else (payload, payload)
+        for lane in range(2 if split or dual else 1):
+            set_lane(lane)
+            rt.push_to_aic(parts[lane], split, pipe_id=pipe_id)
+    for pipe_id in (7, 0):
+        actual = rt.pop_from_aiv(split, pipe_id=pipe_id)
+        torch.testing.assert_close(actual, payloads[pipe_id])
+    rt.reset()
+    assert rt.snapshot(7)["to_aiv"] == 0
+    assert rt.snapshot(7)["to_aic"] == 0
 
 
 def test_mixed_kernel_timeout_cancels_waiters_and_runtime_recovers():
@@ -1454,6 +1731,14 @@ def test_unsupported_op_raises():
     assign = ir.AssignStmt(out, call, _span())
     func = _simple_function("f", [a], assign)
     with pytest.raises(ValueError, match="Unsupported op 'fake.nonexistent_op'"):
+        torch_codegen(func)
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP4E2M1X2, DataType.FP4E1M2X2])
+def test_fp4_debug_reference_rejects_instead_of_emitting_float32(dtype):
+    src = _tensor_var("src", [32, 64], dtype)
+    func = _simple_function("fp4_identity", [src], ir.ReturnStmt([src], _span()), [src.type])
+    with pytest.raises(ValueError, match="does not implement packed FP4 encoding or decoding"):
         torch_codegen(func)
 
 

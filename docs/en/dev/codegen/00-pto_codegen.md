@@ -14,7 +14,7 @@ Codegen must be a **strict 1-to-1 translation** from IR to generated code. Each 
 
 **Why:** Codegen that embeds analysis becomes fragile — it duplicates logic that passes already handle, and it's harder to test in isolation. Keeping codegen a straightforward translation ensures it stays predictable and maintainable.
 
-**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/28-normalize_return_order.md) pass.
+**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/30-normalize_return_order.md) pass.
 
 ## Overview
 
@@ -29,6 +29,14 @@ Codegen must be a **strict 1-to-1 translation** from IR to generated code. Each 
 
 ### Generation Order
 
+Floating-point constants use decimal scientific notation for finite values and
+target-width hexadecimal bit patterns for NaN and infinity. For example,
+`pl.const(math.nan, pl.FP32)` emits `arith.constant 0x7FC00000 : f32`;
+`math.inf` and `-math.inf` emit `0x7F800000` and `0xFF800000`. Non-finite
+constants support FP32, FP16, and BF16. Narrowing preserves the sign and high
+NaN payload bits, retaining a nonzero payload if all payload bits would be lost.
+Other dtypes receive a diagnostic rather than an invalid floating-point literal.
+
 The codegen generates MLIR in the following fixed order:
 
 1. **Constants**: `arith.constant` for index and float values
@@ -40,6 +48,45 @@ The tensor-view and allocation prologue is rendered into a buffer *before* the
 constants block is finalized, so a constant that appears only inside a shape or
 stride expression — e.g. the `2` in a composite parameter dim `M * 2` — is still
 declared in the constants block before its use.
+
+Shape expressions may retain `tensor.dim(x, axis)`. Codegen emits the selected
+declared extent as an INDEX operand, including constant, symbolic and composite
+extents; it does not require an existing tensor view for `x` or a prior IR fold.
+Only scalar symbols in that extent become dynamic-dimension ABI arguments, not
+the tensor operand itself. Printed type annotations preserve these reads when
+parsed again, without evaluating parameter references as Python values. Shape-only
+assignment annotations replace an inferred shape only when direct dimension-read temporaries
+prove structural equivalence; otherwise the inferred runtime shape is retained.
+Constant extents are emitted directly as INDEX, including unsigned constants.
+
+### Dynamic shape arguments across outlined boundaries
+
+An outlined scope captures scalar symbols needed by its tensor parameter types,
+even when the kernel body never reads them directly. A bare axis such as `[B, 16]`
+binds `B` through its tensor descriptor. Supported invertible axes such as
+`[B * 2, 16]` also retain descriptor extraction, so the caller need not have a
+separate scalar binding for `B`. A composite axis such as
+`[(B + 15) // 16 * 16 + T * 4, 16]` does not bind either symbol: the outliner
+conservatively adds explicit `B` and `T` parameters and passes their caller values.
+These symbols must have caller-side runtime bindings: scalar parameters, body
+value definitions, or bare dimensions of tensor parameters. A symbol appearing
+only inside a non-invertible type expression is rejected during outlining,
+before it can become an undeclared orchestration argument.
+It keeps the expression intact; it does not replace it with a new `ROWS` symbol.
+
+IR scalar parameters precede annotations that reference them. Runtime dispatch
+and the native kernel signature instead use tensor pointers first, then explicit
+scalar payloads, then any remaining descriptor-derived dimensions. PTO codegen
+and the wrapper share `collect_tensor_shape_dyn_vars` for this last group. An
+explicit scalar wins over descriptor extraction, deduplicated by Var identity,
+so a symbol used by both a shape and the body is forwarded exactly once.
+
+For authored kernels, descriptor extraction still supports bare dimensions and
+single-symbol addition, subtraction, and nonzero constant multiplication.
+Floor division has no general inverse: `B // 5 == 2` does not prove `B == 10`.
+Pass such symbols explicitly or expose them through another supported dimension;
+otherwise wrapper generation reports an error. Existing runtime descriptors and
+scalar packing are unchanged.
 
 ## Architecture
 
@@ -149,7 +196,7 @@ class MyKernel:
 output_dir = compile(
     MyKernel,
     strategy=OptimizationStrategy.Default,
-    backend_type=BackendType.Ascend910B,
+    backend_type=BackendType.Ascend910,
 )
 ```
 
@@ -176,7 +223,7 @@ print(pto_code)
 | `tile.load(tensor, [row, col], [h, w])` | `pto.partition_view` + `pto.tload` |
 | `tile.store(tile, [row, col], tensor)` | `pto.partition_view` + `pto.tstore` |
 | `tile.slice(tile, [h, w], [row, col][, valid_shape=...])` | `pto.subview` (zero-copy view; `valid [...]` clause emitted only when `valid_shape` is supplied) |
-| `tile.assemble(target, source, [row, col])` | (optional) `pto.tmov target -> dst` + `pto.subview dst[row, col] sizes [src.rows, src.cols]` + `pto.tmov src -> dst_view` |
+| `tile.assemble(target, source, [row, col])` | (optional) `pto.tmov target -> dst`, then `pto.tinsert` for supported ND Vec copies / FIXPIPE writebacks; otherwise `pto.subview` + `pto.tmov` |
 | `tile.set_validshape(tile, vr, vc)` | `pto.set_validshape`; a view operand is rejected (see below) |
 | `tile.mul(lhs, rhs)` | `pto.tmul` |
 | `tile.addc(src0, src1, carry)` | `pto.taddc` (`src0 + src1 + carry`) |
@@ -189,8 +236,8 @@ print(pto_code)
 | `tile.xor(lhs, rhs, tmp)` / `tile.xors(lhs, scalar, tmp)` | `pto.txor` / `pto.txors`; scalar is same-width signless `iN` |
 | `tile.fillpad_expand(src, shape)` | `pto.tfillpad_expand ins(%src) outs(%dst)` (the `shape` tuple is type-deduction only; the larger `dst` and its pad come from the result type) |
 
-**`tile.slice` / `tile.assemble` lowering details.**  Both ops are lowered
-through `pto.subview`, which is a pure view alias of the source tile (no
+**`tile.slice` / `tile.assemble` lowering details.** `tile.slice` and the
+fallback `tile.assemble` path use `pto.subview`, a pure alias of the source tile (no
 data movement, no extra `pto.alloc_tile`).  `pto.subview` requires the
 result `tile_buf` to share `dtype`, `memory_space`, `blayout`, `slayout`,
 `fractal`, `pad`, and `compact` with the source — `DeduceTileSliceType` propagates
@@ -206,9 +253,19 @@ satisfies the constraints by construction.  Backend codegen also runs a
 
 For `tile.assemble`, the leading `pto.tmov target → dst` is only emitted
 when buffer reuse did not collapse `target` and the destination buffer; in
-that case it preserves any data outside the insertion window.  The
-trailing `pto.tmov src → dst_view` is the actual data write into the
-sub-window carved out by `pto.subview`.
+that case it preserves any data outside the insertion window. ND (`row_major`,
+`none_box`) Vec-to-Vec copies of FP32, FP16, and BF16 use
+`pto.tinsert` with the original destination and explicit offsets. This preserves
+the destination row pitch and copies only the source's valid region, leaving
+the rest of the target intact. A `subview + tmov` is insufficient for column
+insertion on A2/A3: PTOAS resolves the view to its parent's physical dimensions,
+then rejects the unequal source/destination shapes (#2717). Other copies retain
+the `pto.subview + pto.tmov` path. A2/A3 PTOAS rejects INT16/INT32 TINSERT,
+and the pinned ISA rejects INT8/UINT8 TINSERT with dynamic valid columns;
+existing whole-tile integer TMOV copies are preserved.
+On A2/A3, the insertion column offset must be 32-byte aligned (8 FP32 or
+16 FP16/BF16 elements). Codegen diagnoses a constant offset violating this
+restriction; callers must preserve it for dynamic offsets too.
 
 **FIXPIPE epilogue on the Acc writeback.**  A *converting* `Acc → Mat` assemble
 and every `Acc → GM` store are the cube's fix-pipe draining L0C, which can
@@ -223,7 +280,7 @@ in `tests/st/runtime/ops/test_fixpipe_epilogue.py` measures it on a2a3.
 The scale also *selects* the lowering — an `INT32` accumulator reaches an `FP16`
 Mat tile only because it carries one (`DEQF16`) — so one predicate,
 `ir::CubeMatWritebackUsesFixpipe`, decides it for the emitter and
-`FixpipeEpilogueValid` alike; a same-dtype assemble converts nothing, stays a
+`FixpipeEpilogueValid` alike; a same-dtype Acc-to-Mat assemble converts nothing, stays a
 plain `pto.tmov`, and carries no epilogue. `pto.tinsert` and `pto.tstore` spell
 the packed scale operand differently, neither form guessable from the other —
 both pinned with their provenance at the emission sites. See
@@ -259,12 +316,28 @@ or call `set_validshape` on the source tile before taking the view.
 | `tile.tpop_from_aiv(split=N[, id=I])` | `%buf = pto.tpop_from_aiv {[id = I, ]split = N} -> type` | Pop from Vector pipe |
 | `system.tfree_to_aic(tile_from_tpop[, id=I])` | `pto.tfree_from_aic {[id = I, ]split = N}` | Release a consumer slot back to Cube |
 | `system.tfree_to_aiv(tile_from_tpop[, id=I])` | `pto.tfree_from_aiv {[id = I, ]split = N}` | Release a consumer slot back to Vector |
-| `system.aic_initialize_pipe(...)` | `pto.aic_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Cube pipe init (`slot_num`/`local_slot_num` emitted only when set; otherwise PTOAS uses its defaults) |
-| `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Vector pipe init (`slot_num`/`local_slot_num` emitted only when set; otherwise PTOAS uses its defaults) |
+| `system.aic_initialize_pipe(...)` | `pto.aic_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L][, nosplit = true, acc_push_epilogue = E]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Cube pipe init (`slot_num`/`local_slot_num` emitted only when set; otherwise PTOAS uses its defaults) |
+| `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L][, nosplit = true, acc_push_epilogue = E]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Vector pipe init (`slot_num`/`local_slot_num` emitted only when set; otherwise PTOAS uses its defaults) |
 | `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = false, base = B} -> i32` | Reserve buffer (`auto = true`, `base` omitted under `memory_planner=PTOAS`) |
 | `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | Import peer buffer |
 | `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | Cross-core all-participant barrier (hard/FFTS form) |
 | `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_ptr[, %used] : !pto.ptr<i32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | Current PTO-ISA soft/GM-polling barrier (partial occupancy; at least 64-byte GM workspace; explicit `N=0` derives the count from device launch registers and omits `%used`) |
+
+With explicit `c2v_dtype` on an A5 C2V-only initializer, codegen additionally
+emits `nosplit = true` and `acc_push_epilogue`. For `c2v_dtype=pl.BF16,
+pre_relu=True`, the extra attribute is:
+
+```text
+acc_push_epilogue = #pto.acc_push_epilogue<layout = nz2nd, quant = f32_bf16, relu = normal_relu>
+```
+
+PTOAS lowers this to `FixpipeParams<NZ2ND, F322BF16, NormalRelu>` on `TPUSH`;
+`TPOP` receives a BF16 Vec tile. FP16 selects `f32_f16`, FP32 selects
+`no_convert`, and `pre_relu=False` selects `no_relu`. Both initializers carry
+the same contract. Unsupported targets/directions, non-FP32 Acc producers and
+mismatched pop dtypes are rejected; PTOAS checks peer and split compatibility.
+The reserved buffer and FIFO slot sizes must describe the transmitted dtype,
+not the FP32 accumulator. The accumulator itself remains FP32 for other users.
 
 **Notes:**
 
@@ -285,8 +358,8 @@ or call `set_validshape` on the source tile before taking the view.
 
   `eL` is lane `L`'s **runtime** valid extent on the split axis — the ISA reads it off the popped
   tile (`popVecTileFromGMFiFo`), so the even codes require `e0 == e1` and the odd ones
-  `e0 == e1 + 1`. [LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md) materializes those
-  extents and [ExpandMixedKernel](../passes/24-expand_mixed_kernel.md) picks the matching code.
+  `e0 == e1 + 1`. [LowerAutoVectorSplit](../passes/25-lower_auto_vector_split.md) materializes those
+  extents and [ExpandMixedKernel](../passes/26-expand_mixed_kernel.md) picks the matching code.
 - The Cube-to-Vector FIFO carries a compacted rectangle: the producer stores its `valid_row` x
   `valid_col` block at a `valid_col` row pitch, and each consumer lane reads its band back with the
   same pitch (`gmStrideR = valid_col`, doubled for the left-right codes). A partial valid shape on
@@ -298,7 +371,7 @@ or call `set_validshape` on the source tile before taking the view.
   tpop result is not a locally bound PTOAS tile, so `pto.set_validshape` cannot restore it in place).
   The split-axis extent is one exception: it stays per-lane on the TPOP operands, because that is
   what tells the ISA where lane 1's band begins — which is also why a per-lane extent the compiler
-  could not verify must never get there. A `pl.split` or `pl.split_aiv` boundary whose split-axis extent is a
+  could not verify must never get there. An explicit `pl.split_aiv` boundary whose split-axis extent is a
   runtime value keeps the FULL box on the popped tile (`split_axis::WithFullSplitAxisValid`) so the
   even code's band lands on the box half, and carries the lane's own extent on the consumers
   instead.
@@ -444,7 +517,7 @@ three modes, so must-alias buffers survive. In `PTOAS` mode, ptoas `PlanMemory`
 (which `level2` requires, rejecting any `addr` operand) performs lifetime reuse
 and address assignment.
 
-> **Caveat:** `PTOAS` mode skips the Ascend910B `load + tpop_from_aic` in-place
+> **Caveat:** `PTOAS` mode skips the Ascend910 `load + tpop_from_aic` in-place
 > hazard guard (part of `MemoryReuse`) and reserve-buffer base resolution
 > (`AllocateMemoryAddr`); those are deferred to ptoas. `compile()` emits a
 > warning — verify affected kernels on-device.
@@ -460,23 +533,26 @@ the function head and one slot selection per use:
 %l0c_mb = pto.alloc_multi_tile valid_row = %c64_index valid_col = %c64_index
         : !pto.multi_tile_buf<!pto.tile_buf<loc=vec, dtype=f32, rows=64, cols=64, ...>, count=2>
 scf.for %i = %c0_index to %c4_index step %c1_index {
-  %0 = arith.remsi %i, %c2_index : index
-  %t = pto.multi_tile_get %l0c_mb[%0]
+  %slot = arith.remsi %i, %c2_index : index
+  %t = pto.multi_tile_get %l0c_mb[%slot]
      : !pto.multi_tile_buf<..., count=2> -> !pto.tile_buf<loc=vec, ...>
   ...
 }
 ```
+
+Signed integer and `INDEX` slots use [corrected floor remainders](../passes/32-lower_pipeline_to_slots.md#generated-pto-ir), preserving Python's `%` semantics. The correction is skipped — as it is above — when the dividend is provably non-negative and the divisor a positive constant, because `arith.remsi` already agrees with floor-modulo there.
 
 Two properties matter:
 
 - **No `addr`.** ptoas `PlanMemory` places the region and is forbidden to merge
   its slots, which is what carries the author's separation into `level2`.
 - **The operand is the slot index, not the byte offset** `InitMemRef` derived from
-  it. ptoas matches the index's affine form (`i % 2`) to decide which accesses can
-  share a slot, and that is what earns the rotation per-slot (dynamic) event ids —
+  it. The corrected remainder feeds `multi_tile_get` directly; it is never scaled
+  by the slot's byte size. ptoas recognizes the index (`i % 2`) to decide which
+  accesses can share a slot, and that earns the rotation per-slot (dynamic) event ids —
   iteration *i*'s load overlapping iteration *i-1*'s compute.
 
-`PlanMultiBufferRegions` decides eligibility before the body walk; a shape ptoas
+Under the PTOAS planner, `PlanMultiBufferRegions` decides eligibility before the body walk; a shape ptoas
 cannot describe (slots holding differently shaped tiles, slots declaring
 different valid shapes, two slots live at once inside a loop, a space other than
 Vec / Mat / Acc, a runtime valid shape, a slot carried out of an `if` or loop as
@@ -492,22 +568,28 @@ top of each other.
 | Two slots filled and read in the same iteration | ≤ 0.55 guards only the first `multi_tile_get`; the second load races the next iteration's write (measured wrong on device with 0.54). 0.56+ guards the body with one static event for the whole region — correct, but none of the per-slot overlap the region form exists for | [PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118), fixed in 0.56 |
 | Prefetch: slot 0 filled before the loop, then each iteration fills slot `(i+1) % 2` while reading slot `i % 2` | ≤ 0.62 primes and drains both slots' events as for a one-slot rotation, off by one here: wrong data for an even trip count, a device hang for an odd one. 0.63 primes only the slot the loop writes first; 0.64 and 0.65 prime both again | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519), fixed in 0.63, regressed in 0.64 |
 
-`CoLiveSlotCollector` counts slot selections per loop body, so it cannot tell the
-two forms apart, and the second bug is back after its fix. Measured on device, the
-prefetch form runs correctly under 0.63, but under 0.64 and 0.65 it returns a later
-block's data for an even trip count and hangs for an odd one; the same-iteration
-form runs correctly under 0.65. Codegen therefore refuses both and points at the
-PyPTO planner, whose baked-address `alloc_tile` path runs the same-iteration form
-correctly on device.
-Straight-line code is unaffected — with no loop there is no cross-iteration reuse
-to guard. Lifting the restriction is one condition in `PlanMultiBufferRegions`;
-it needs a pinned ptoas that runs the prefetch form correctly on device.
+`CoLiveSlotCollector` retains the conservative rejection on the legacy PTOAS
+planner path. The prefetch regression recorded above remains a toolchain
+constraint; enabling software pipelining is not a toolchain correctness guarantee.
+With the PyPTO planner, codegen recognizes slots marked by software-pipeline
+lowering in the IR; generating an already lowered program requires no additional
+option. It accepts canonical co-live Vec slots after validating static, uniform
+geometry, the fixed region base, slot stride and alignment. The slot expression must be a constant or
+a nonnegative loop induction variable plus a nonnegative constant, modulo the
+slot count, with index-typed arithmetic throughout. These slot remainders reuse
+the scalar expression emitter to generate `arith.remui`.
 
-Under `PYPTO` no region is emitted at all: a region at `--pto-level=level3` needs
-an explicit base `addr`, which codegen does not emit yet. ptoas is not the limit —
-given a constant `addr` it has derived the same per-slot sync at level3 as at
-level2 since 0.55 ([PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106),
-closed).
+At level3, schedules with at most one live slot per loop iteration may use
+`pto.alloc_multi_tile addr = <base>`. Co-live prefetch slots, including static
+loops, and runtime or predicated schedules use addressed parent buffers and
+`pto.subview` to avoid the multi-tile synchronization regression above.
+Both preserve the complete slot allocation owned by PyPTO. Dynamic subviews
+currently receive conservative synchronization in stock PTOAS
+([#1587](https://github.com/hw-native-sys/PTOAS/issues/1587)). Unsupported user-declared regions keep
+the ordinary fixed-address `alloc_tile` path, which preserves their separation.
+Untransformed programs continue to use that original path.
+See [LowerPipelineToSlots](../passes/32-lower_pipeline_to_slots.md) for the
+preload/main/drain transformation and its whole-loop fallback rules.
 
 ### Load Operation Transformation
 
@@ -661,7 +743,7 @@ through — the per-variable declaration, the hoisted `extra_alloc_tiles`, and t
 control-flow paths alike — so the check sees exactly what is emitted and cannot
 drift from it. A tensor-level `pl.matmul` / `pl.matmul_acc` never trips it *on
 its M axis*, which is boxed for the user in
-[`ConvertTensorToTileOps`](../passes/11-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing).
+[`ConvertTensorToTileOps`](../passes/13-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing).
 The axes that remain the user's responsibility are `K` and `N`.
 
 ## Complete Example
@@ -791,6 +873,25 @@ The codegen:
 | `DataType::INT8` | `i8` |
 | `DataType::UINT8` | `ui8` |
 
+### Scalar Boolean Casts
+
+`pl.cast(flag, dtype)` maps scalar `False` to numeric zero and `True` to numeric
+one, for both literals and runtime values. BOOL uses MLIR `i1`, but must not be
+interpreted as a signed one-bit integer during conversion.
+
+| Destination | Lowering |
+| ----------- | -------- |
+| Signed integer | `arith.extui` from `i1` to the destination width |
+| Unsigned integer | `arith.extui` to signless `iN`, then bridge to `uiN` |
+| INDEX | `arith.index_castui` |
+| Floating point | Zero-extend to `i32`, then `arith.sitofp` |
+| BOOL | Identity |
+
+The floating-point path uses an integer carrier because direct `(float)bool`
+casts emitted by PTOAS are rejected by A3's device compiler. Ordinary signed
+integer widening still uses sign extension. These rules apply to scalar casts;
+tensor and tile conversion operators have their own lowering.
+
 ### Memory Space Mapping
 
 | PyPTO MemorySpace | PTO Address Space |
@@ -873,173 +974,7 @@ PTO-ISA on either a2a3 or a5, so a runtime-narrowed accumulator consumed by `til
 
 ## Kernel Wrapper Generation (PTO Backend)
 
-When compiling with the PTO backend via `ir.compile()`, a kernel wrapper is automatically generated for each InCore function to bridge the ptoas output to the orchestration calling convention.
-
-### Pipeline
-
-```text
-InCore Function → PTOCodegen → .pto → ptoas → .cpp → kernel_wrapper → kernels/aiv/<name>.cpp
-```
-
-Each InCore function is compiled independently through ptoas. The final wrapper file combines:
-
-1. **Preprocessed ptoas code** (with `__global__ AICORE` → `static`)
-2. **`kernel_entry(__gm__ int64_t* args)`** wrapper that unpacks the args array and forwards to the ptoas function
-
-### Output Structure
-
-When the program contains an Orchestration function, the PTO backend generates the following output structure:
-
-```text
-output_dir/
-├── passes_dump/                     # IR after each pass
-├── ptoas_passes/                    # Optional ptoas IR after each pass
-│   └── <kernel-or-group>/            # ptoas/MLIR-managed dump tree
-├── ptoas/                           # Intermediates
-│   ├── <func_name>.pto              # MLIR from PTOCodegen
-│   └── <func_name>.cpp              # C++ from ptoas
-├── kernels/aiv/
-│   └── <func_name>.cpp              # Final wrapper
-├── orchestration/
-│   └── <orch_func_name>.cpp         # simpler runtime orchestration code
-└── kernel_config.py                 # Runtime/orchestration/kernel config
-```
-
-`ptoas_passes/` is emitted only when `ir.compile(...,
-dump_ptoas_passes=True)` or `RunConfig(dump_ptoas_passes=True)` is used.
-
-The orchestration codegen generates identical orchestration C++ code using the simpler runtime API (`rt_submit_task`, `make_tensor_external`, etc.).
-
-### Runtime configuration (`kernel_config.py`)
-
-`kernel_config.py` exposes a `RUNTIME_CONFIG` dict that the dispatch path reads to launch the program. Stable keys:
-
-| Key | When emitted | Notes |
-| --- | ------------ | ----- |
-| `runtime` | Always | `"tensormap_and_ringbuffer"` (default) or `"host_build_graph"` — the wire name of the `RuntimeKind` selected by `ir.compile(runtime=...)`, or by wrapping the call in `PassContext([], runtime=...)`. |
-| `aicpu_thread_num` | Always (`0`) | `0` selects the runtime's architecture default (a2a3: 4; a5: 5); callers may explicitly override it. |
-
-The runtime is carried by `PassContext` as an `ir::RuntimeKind`, not by a
-codegen-only argument, so passes that must legalize IR for a specific runtime
-switch on `PassContext::GetRuntime()` rather than comparing strings. It is an
-enum rather than a name because the set is closed — one enumerator per
-implementation under `runtime/src/<arch>/runtime/` — so a typo is a compile
-error instead of a value that surfaces much later as an opaque CCEC error about
-a nonexistent include directory.
-
-The wire name crosses the ABI boundary in exactly one place each way:
-`ir::RuntimeKindToName` when writing `kernel_config.py`, and
-`ir::RuntimeKindFromName` when reading one back. Both are re-exported to Python
-as `passes.runtime_kind_to_name` / `passes.runtime_kind_from_name`.
-
-The runtime is also part of the `@pl.jit` cache key, so a `host_build_graph`
-call cannot reuse an artifact compiled for `tensormap_and_ringbuffer`, whose
-`kernel_config.py` names a runtime no matching worker would bind.
-
-### Argument Unpacking
-
-The wrapper unpacks `int64_t* args` following the standard convention:
-
-| Parameter Type | Unpacking Pattern |
-| -------------- | ----------------- |
-| `TensorType` | `ChipTensor*` → `buffer.addr` → typed pointer |
-| `ScalarType` | `uint64_t` → union decode → typed value |
-
-### SPMD Identity Parameters
-
-`tile.get_block_idx()`, `tile.get_block_num()`, and `tile.get_subblock_idx()`
-lower to synthetic `i32` parameters that PTOCodegen appends at the **end** of
-the `func.func` signature using named SSAs (`%__pypto_spmd_block_idx`,
-`%__pypto_spmd_block_num`, `%__pypto_spmd_subblock_idx`). The IR contract for
-these ops is unchanged — the synthetic params live only in the generated
-MLIR / C++ and never appear in `Function.params`. They are appended in the
-canonical order `block_idx, block_num, subblock_idx`, each gated
-independently on the ops the function actually uses.
-
-```mlir
-func.func @spmd_kernel(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>,
-                       %__pypto_spmd_block_idx: i32,
-                       %__pypto_spmd_block_num: i32)
-                       attributes { ... } {
-  %0 = arith.index_cast %__pypto_spmd_block_idx : i32 to index
-  // ... use %0 as the block index ...
-}
-```
-
-The kernel wrapper resolves the runtime values once from
-`intrinsic.h::get_block_idx(args)` / `get_block_num(args)` and forwards them
-as the trailing two call args:
-
-```cpp
-extern "C" __aicore__ __attribute__((always_inline))
-void kernel_entry(__gm__ int64_t* args) {
-    // Read logical SPMD block identity from runtime dispatch payload
-    int32_t __pypto_spmd_block_idx = get_block_idx(args);
-    int32_t __pypto_spmd_block_num = get_block_num(args);
-
-    // ... tensor / scalar / dyn-dim unpacking ...
-
-    // Forward to ptoas-generated function (block args at the end)
-    spmd_kernel(a, out, __pypto_spmd_block_idx, __pypto_spmd_block_num);
-}
-```
-
-**subblock_idx (AIV lane).** `tile.get_subblock_idx()` uses the same
-synthetic-param channel: the wrapper resolves it from
-`intrinsic.h::get_sub_block_id(args)` (the runtime per-core lane id the
-scheduler stores in `GlobalContext.sub_block_id`) and appends
-`__pypto_spmd_subblock_idx` after any block-identity args. It deliberately
-reads the runtime lane id rather than the ccec `get_subblockid()` register,
-which returns a stale value under the `tensormap_and_ringbuffer` dispatch.
-
-Split AIV FIFO endpoints use that runtime value even when the tensor program
-does not call `tile.get_subblock_idx()`: after PTOAS lowers a split endpoint,
-the wrapper backend forwards the lane as the third argument of PTO-ISA's
-explicit `TPUSH(pipe, tile, subblock_id)` / `TPOP(...)` overload. If the
-function has no synthetic subblock parameter already, the backend adds a
-private trailing parameter to the generated function. The explicit overload
-derives the byte offset from each call's actual tile type, so one automatic
-pipe can safely carry differently sized sequential transfers. Like block
-identity, the wrapper resolves the runtime lane unconditionally because
-`GlobalContext.sub_block_id` is populated by the scheduler on every platform.
-The endpoint argument is build-guarded: device builds pass the lane to the
-explicit overload, while CPU simulation and in-core cost-model builds retain
-PTO-ISA's normal two-argument endpoint because those implementations already
-model their lane context and do not expose the device-only explicit-lane
-overload.
-
-**Detection scope.** Both layers detect SPMD usage on a per-function basis:
-
-- `MemRefCollectorVisitor::UsesSpmdBlockOps` / `UsesSubblockOp` (C++,
-  `src/codegen/pto/pto_codegen.cpp`) drive whether PTOCodegen appends the
-  block / subblock params to a given function's signature.
-- `_uses_spmd_block_ops` / `_uses_dynamic_subblock_id` (Python,
-  `python/pypto/backend/pto_backend.py`) drive whether the wrapper appends the
-  matching locals to the inner call site. Split `TPUSH` / `TPOP` endpoints are
-  additionally detected by `_runtime_split_fifo_endpoint_counts`; they reuse
-  that subblock argument or request the private one described above.
-
-For non-SPMD sibling functions in an SPMD group (`group_uses_spmd=True` but
-the function itself does not call `tile.get_block_*`), the wrapper still
-declares the two block locals because the `__gm_pipe_buffer` sharding logic in
-`_generate_arg_unpacking` consumes them — but it does **not** append them to
-the inner call, matching the function's MLIR signature.
-
-This replaces the earlier macro-shadow + `[[block_local]] static` /
-`static thread_local` bridge plus `#pragma push_macro` / `#undef` /
-`pop_macro` dance. Block and lane identity now flow through the call graph like
-every other per-launch value (tensor pointers, scalar args, dynamic dims).
-
-### Implementation
-
-**Module**: `python/pypto/backend/pto_backend.py`
-
-Key functions:
-
-- `generate()` — entry point: produces all PTO backend files (kernels + orchestration + config)
-- `_preprocess_ptoas_output()` — strips duplicate includes, makes functions static
-- `_generate_arg_unpacking()` — generates C++ unpacking code from IR parameter types
-- `_generate_kernel_wrapper()` — assembles the complete wrapper file
+The PTO backend wraps each ptoas-generated InCore function for runtime dispatch. See [PTO Kernel Wrapper Generation](02-kernel_wrapper.md) for the output layout, runtime configuration, argument unpacking, and SPMD identity parameters.
 
 ## See Also
 

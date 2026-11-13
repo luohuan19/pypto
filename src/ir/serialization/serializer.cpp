@@ -41,6 +41,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/reflection/field_visitor.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/simt.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/type.h"
@@ -90,6 +91,7 @@ class FieldSerializerVisitor {
   result_type VisitLeafField(const FunctionType& field);
   result_type VisitLeafField(const FunctionIRStage& field);
   result_type VisitLeafField(const ForKind& field);
+  result_type VisitLeafField(const HardwareLoopPolicy& field);
   result_type VisitLeafField(const InlineLanguage& field);
 
   result_type VisitLeafField(const ScopeKind& field);
@@ -113,6 +115,9 @@ class FieldSerializerVisitor {
   result_type VisitLeafField(const std::vector<TypePtr>& field);
   result_type VisitLeafField(const std::vector<std::pair<std::string, std::any>>& field);
   result_type VisitLeafField(const std::vector<int64_t>& field);
+  result_type VisitLeafField(const std::vector<int>& field) {
+    return VisitLeafField(std::vector<int64_t>(field.begin(), field.end()));
+  }
 
   // Field kind hooks
   template <typename FVisitOp>
@@ -232,8 +237,11 @@ class IRSerializer::Impl {
     SERIALIZE_FIELDS(RuntimeScopeStmt);
     SERIALIZE_FIELDS(CommDomainScopeStmt);
     SERIALIZE_FIELDS(GraphScopeStmt);
+    SERIALIZE_FIELDS(RegScopeStmt);
     SERIALIZE_FIELDS(SeqStmts);
     SERIALIZE_FIELDS(EvalStmt);
+    SERIALIZE_FIELDS(SimtLaunchStmt);
+    SERIALIZE_FIELDS(SimtScopeStmt);
     SERIALIZE_FIELDS(BreakStmt);
     SERIALIZE_FIELDS(ContinueStmt);
     SERIALIZE_FIELDS(InlineStmt);
@@ -427,7 +435,11 @@ class IRSerializer::Impl {
     std::map<std::string, msgpack::object> type_map;
     type_map["type_kind"] = msgpack::object(type->TypeName(), zone);
 
-    if (auto scalar_type = As<ScalarType>(type)) {
+    if (auto reg = As<RegType>(type)) {
+      type_map["shape"] = msgpack::object(reg->shape_, zone);
+      type_map["dtype"] = msgpack::object(reg->dtype_.Code(), zone);
+      type_map["kind"] = msgpack::object(static_cast<uint8_t>(reg->kind_), zone);
+    } else if (auto scalar_type = As<ScalarType>(type)) {
       type_map["dtype"] = msgpack::object(scalar_type->dtype_.Code(), zone);
     } else if (type->GetKind() == ObjectKind::TensorType ||
                type->GetKind() == ObjectKind::DistributedTensorType) {
@@ -643,6 +655,10 @@ msgpack::object FieldSerializerVisitor::VisitLeafField(const FunctionIRStage& fi
   return msgpack::object(static_cast<uint8_t>(field), zone_);
 }
 
+msgpack::object FieldSerializerVisitor::VisitLeafField(const HardwareLoopPolicy& field) {
+  return msgpack::object(static_cast<uint8_t>(field), zone_);
+}
+
 msgpack::object FieldSerializerVisitor::VisitLeafField(const ForKind& field) {
   return msgpack::object(static_cast<uint8_t>(field), zone_);
 }
@@ -820,6 +836,11 @@ msgpack::object FieldSerializerVisitor::VisitLeafField(
       tile_layout_map["type"] = msgpack::object("TileLayout", zone_);
       tile_layout_map["value"] = msgpack::object(TileLayoutToString(layout), zone_);
       kwargs_msgs.push_back(make_pair(key, msgpack::object(tile_layout_map, zone_)));
+    } else if (value.type() == typeid(SimtAxis)) {
+      std::map<std::string, msgpack::object> axis_map;
+      axis_map["type"] = msgpack::object("SimtAxis", zone_);
+      axis_map["value"] = msgpack::object(SimtAxisToString(AnyCast<SimtAxis>(value, key)), zone_);
+      kwargs_msgs.push_back(make_pair(key, msgpack::object(axis_map, zone_)));
     } else if (value.type() == typeid(PadValue)) {
       auto pad = AnyCast<PadValue>(value, "serializing kwarg: " + key);
       std::map<std::string, msgpack::object> pad_map;

@@ -37,7 +37,7 @@ values = pl.gather(src, index=indices)  # Physical [1, 16], valid [1, 8].
 浮点使用 `tile.extract`，INT16/INT32 使用保持数值不变的整数 `tile.adds(..., 0)`。
 已证明紧凑的计算结果直接复用，不再复制；存储情况未知时仍进行紧凑物化。
 指定 `dim` 时仍按维索引（二维/三维、任意轴），mask/compare
-形式保持不变。详见 [gather 下沉](../passes/11-convert_tensor_to_tile_ops.md#扁平-gather-下沉)。
+形式保持不变。详见 [gather 下沉](../passes/13-convert_tensor_to_tile_ops.md#扁平-gather-下沉)。
 
 对于普通 `TensorType` 操作数，已支持的 Tensor-scalar 算术算子（`adds`、
 `subs`、`muls`、`divs`、`fmods` 以及 scalar `maximum` 或 `minimum`）和
@@ -55,7 +55,16 @@ Scalar 比较与 XOR（`cmp` 和 `xors`）仍不在此规则的支持范围内�
 元数据。比较、XOR、`part_*`、广播、不同有效区域，以及直接使用 distributed
 window 的操作数不在这条规则范围内，因为它们当前的下降或合并契约需要单独处理。
 
-`pl.reinterpret_view(data, dtype, *, shape=None)` 会根据输入分派到等价的 `pl.tensor` 或 `pl.tile` 算子，并保持返回类型种类不变。它是覆盖完全相同字节的零拷贝视图。通用路径支持有/无符号 8/16/32/64 位整数、FP16、BF16 与 FP32；MX 下降额外只允许 INT8↔FP8E4M3FN 和 UINT8↔FP8E8M0 两对等字节 alias。省略 `shape` 时，ND/row-major 缩放最后一轴，DN/col-major 按源/目标字节宽度比例缩放倒数第二轴。显式 shape 必须字节数相等；除非能证明它与自动推导 shape 等价，否则必须完全静态。部分有效的 `valid_shape` 只能使用与自动推导结果等价的 shape。零值/null padding 元数据会保留，依赖 dtype 的 max/min padding 则会清除。初始可执行路径支持 packed ND in-core tensor 及 packed、flat（`none_box`）row/col-major tile；DN tensor 可做类型推导但 Tensor-to-Tile 下降会拒绝，编排层 tensor 暂不支持。
+`pl.reinterpret_view(data, dtype, *, shape=None)` 会根据输入分派到等价的 `pl.tensor` 或 `pl.tile` 算子，并保持返回类型种类不变。它是覆盖完全相同字节的零拷贝视图。通用路径支持有/无符号 8/16/32/64 位整数、FP16、BF16 与 FP32；MX 下降额外只允许 INT8↔FP8E4M3FN 和 UINT8↔FP8E8M0 两对等字节 alias；packed FP4 额外允许任一 FP4 格式↔UINT8/INT8。省略 `shape` 时，ND/row-major 缩放最后一轴，DN/col-major 按源/目标字节宽度比例缩放倒数第二轴。显式 shape 必须字节数相等；除非能证明它与自动推导 shape 等价，否则必须完全静态。部分有效的 `valid_shape` 只能使用与自动推导结果等价的 shape。零值/null padding 元数据会保留，依赖 dtype 的 max/min padding 则会清除。初始可执行路径支持 packed ND in-core tensor 及 packed、flat（`none_box`）row/col-major tile；DN tensor 可做类型推导但 Tensor-to-Tile 下降会拒绝，编排层 tensor 仅支持 shape 相同的打包 FP4↔UINT8/INT8 别名。
+
+Flat tile 可以携带显式步长（stride），但必须与完整物理 shape 的规范 row/col-major
+步长完全一致。这包括 FP4 解码后得到的 FP8 cast 结果，无需先执行展平 reshape
+即可建立 INT8 字节 alias。非规范步长、非零或动态 tile 起始偏移（start offset），
+以及 boxed MX-scale tile 的显式步长仍不支持。
+
+Ascend950 上的 FP4E2M1X2 ↔ UINT8/INT8 alias 保持 carrier shape 和字节数不变。
+InCore tensor 和 tile 均下降为连续、带地址的二维 row-major Vec 存储，要求静态
+UB offset，使用 PYPTO 或 DSA_RP 内存规划器。PTOAS Vec 别名规划不支持；编排层支持 shape 相同的 GM 别名。需要变形时先单独 reshape 字节视图，再转换回 packed alias。契约与用法示例见 [FP4 UB 解码](../fp4.md#通过-ub-别名解码-uint8-载体ascend950)。
 
 **示例：**
 
@@ -80,6 +89,26 @@ with ib.function("tensor_example") as f:
 
 **设计**：使用 `TileType`（而非单独的 `BlockType`）以保持一致性。命名空间 `tile.*` + `TileType` 清楚地表示硬件优化的 Tile 操作。
 
+### Python 实现布局
+
+公开入口仍为 `pypto.ir.op.tile` 和 `pypto.language.tile`。
+两层的 `tile_ops.py` 模块直接重新导出函数，保留调用签名，并避免给源码位置捕获
+增加调用栈层级。两层 Python 实现采用相同的私有模块分类：
+
+| 模块 | 职责 |
+| ---- | ---- |
+| `_tile_memory.py` | 分配、load/store、初始化及形状/视图操作 |
+| `_tile_elementwise.py` | 逐元素算术、比较及标量分派 |
+| `_tile_linalg.py` | 矩阵乘积及 MX 量化 |
+| `_tile_reduction.py` | 行列归约与广播 |
+| `_tile_indexing.py` | 索引 gather/scatter、排序及归并排序 |
+| `_tile_cross_core.py` | Block 查询及 AIV/AIC 数据交换 |
+
+DSL 的 `_tile_common.py` 保存 `store` 和 `mscatter` 共用的张量类型参数。
+实现模块不得导入自身所属层的 `tile_ops.py` 入口模块；共享辅助逻辑位于入口模块
+下层，以避免循环导入。新增算子时，在两层对应的实现模块中添加定义，并通过
+原有公开模块重新导出。
+
 ### 操作列表
 
 | 分类 | 操作 | 描述 |
@@ -91,7 +120,7 @@ with ib.function("tensor_example") as f:
 | **逐元素** | `tile.add/sub/mul/div` | Tile-Tile 操作 |
 | - | `tile.adds/subs/muls/divs` | Tile-Scalar 操作。**常量**标量操作数会采用 tile 的元素 dtype（裸整数字面量否则会被解析为 `index`，而任何 `pto.t*s` 算子都不接受它）——但整数 tile 上的浮点字面量仍保持 FP32，以保留类型提升语义。显式的 `pl.const(v, dtype)` 属于用户的有意标注，与任何非常量表达式一样保持不变；非常量的 `index` 标量（循环变量、`pl.dim`）会被拒绝——需用 `pl.cast` 转换。`tensor.*s` 同理。 |
 | **一元** | `tile.sqrt` | 逐元素平方根 |
-| **量化** | `tile.tquant_mx` / `pl.quant_mx` | 仅 Ascend950 支持的 **MXFP8** block-32 动态量化，返回 `{FP8E4M3FN quant, FP8E8M0 scale}`；`dtype` 必须为 `FP8E4M3FN`。`group_axis` 对齐 PTOAS `grpAxis`（`1` = A 侧 `[M,K]`，`0` = B 侧 `[N,K]` 并转置）。公开 scale shape 为 `[M,K/32]` / `[K/32,N]`；要求完整有效区域和 `K % 64 == 0`（axis1 还要求 `M % 16 == 0`，axis0 还要求 `N % 32 == 0`）。[Pass 13](../passes/13-lower_composite_ops.md) 生成分组 TQUANT 和 X-to-ZZ TMOV。在 mixed task 内，结果可直接经 V2C 供 `matmul_mx` 使用。MXFP4 quant 暂缓。 |
+| **量化** | `tile.tquant_mx` / `pl.quant_mx` | Ascend950 block-32 量化，返回 `{quant, FP8E8M0 scale}`。`dtype` 为 FP8E4M3FN 或 FP4E2M1X2（后者输入仅 FP16/BF16）。axis1 将 `[M,K]` 转为 FP4 `[M,K/2]`；axis0 将 `[N,K]` 转为 `[K,N/2]`。scale 仍为 `[M,K/32]` / `[K/32,N]`。要求完整有效区域、`K % 64 == 0`、axis1 `M % 16 == 0`、axis0 `N % 32 == 0`；FP4 axis0 因 ISA carrier 行跨度还要求 `N % 64 == 0`。默认 `quant_scale_alg="ocp"`；FP16/BF16 的 NV 仅支持 axis0。Packed FP4 使用 PYPTO 或 DSA_RP 内存规划器。[Pass 13](../passes/15-lower_composite_ops.md) 生成 TQUANT 和指数 X-to-ZZ TMOV。FP4 tile 结果需经受支持的 Mat→Left/Right 放置后用于 `matmul_mx`；tensor 级 MX 矩阵乘仍仅支持 FP8。 `pl.tile.quant_mx_raw` 暴露原生 TQUANT 和 UINT8 指数，无上述 scale 分块对齐限制：axis1 允许任意正 M 和 K%32（原生 FP4 K%64）；支持静态部分有效区域（axis1 物理列须等于有效列）。 |
 | **变换** | `tile.slice` | 提取子 tile，静态 shape，可选动态 valid_shape |
 | - | `tile.extract` | 从 `src` 在 `(index_row, index_col)` 处提取子 tile —— ISA TEXTRACT Variant 1（Mat→Left/Right，Acc→Mat）。结果 layout 取自 `target_memory` 的隐式 view；`Left`/`Right` 例外，使用 TEXTRACT 侧的 L0 格式（与 `tile.move` 的 TMOV 侧不同） |
 | - | `tile.reshape` | 重塑 tile 维度（元素总数须一致）。会把源的 `valid_shape` 带到结果上，且绝不扩大 —— 见[reshape 与有效区域（valid region）](#reshape-与有效区域valid-region) |
@@ -110,7 +139,12 @@ with ib.function("tensor_example") as f:
 中。编译器会把量化数据与 FP8E8M0 scale 直接经 V2C 传递，同时保留 scale
 的逻辑 fractal-32 布局。
 
-`tile.reshape` 保持 dtype、元素总数以及源的有效区域（见下）；`tile.reinterpret_view(data, dtype, *, shape=None)` 改变 dtype，但要求前后总字节数完全相同。省略 `shape` 时，它会根据源/目标 dtype 字节宽度和 tile layout 缩放物理连续轴。在 PTOAS 内存规划下，无论 shape 是否变化，都会下降为保持别名关系的 PTO `treshape` 原语。
+`tile.reshape` 保持 dtype、元素总数以及源的有效区域（见下）；`tile.reinterpret_view(data, dtype, *, shape=None)` 改变 dtype，但要求前后总字节数完全相同。省略 `shape` 时，它会根据源/目标 dtype 字节宽度和 tile layout 缩放物理连续轴。在 PTOAS 内存规划下，无论 shape 是否变化，都会下降为保持别名关系的 PTO `treshape` 原语；packed FP4E2M1X2↔UINT8/INT8 alias 是例外：PTOAS 0.65 的 `treshape` 拒绝此 dtype，因此这些类型对仅支持 PYPTO 或 DSA_RP。
+
+Packed `FP4E2M1X2` 的 tile 字节别名需要 PYPTO 或 DSA_RP；PTOAS 0.65
+拒绝 FP4 `treshape`。InCore Tensor reinterpret 会降低为 tile 别名，因此有相同的
+planner 要求；编排层另支持 shape 相同的 FP4/字节别名。
+Carrier 单位约定与可用路径见 [FP4](../fp4.md)。
 
 ### tile.move 的结果 view
 
@@ -130,12 +164,31 @@ layout 来自目标，因为它描述的是目标缓冲区如何分块，由
 `tile.move` 自己把目标 `memory_space` 打到推导出的类型上（参见
 [类型](02-types.md#tiletype) 中的 `TileType` 契约），因此当结果 view 与目标 space 的
 implicit view 一致时会折叠为 `nullopt` —— 这与
-[`InferTileMemorySpace`](../passes/20-infer_tile_memory_space.md) 为重新定型的 tile
+[`InferTileMemorySpace`](../passes/22-infer_tile_memory_space.md) 为重新定型的 tile
 刷新的 per-space implicit view 是同一套。
 
 `tile.move` 不支持原地执行：在同一 memory space 内，源和结果必须解析到不同地址。
 PyPTO 与 DSA-RP 规划器会落实该约束；如果显式 MemRef 绑定或手工构造的 IR 仍留下
 同地址 move，baked-address PTO codegen 会直接报错。
+
+### 共享存储与结果视图
+
+在 PTOAS 内存规划下，shape 或 layout 不同的变量可以共享一个 MemRef。每个变量
+仍保留自己的 `TileType`：共享存储不意味着变量的 shape 相同。对于普通 tile 输出，
+包括 tuple 输出和合并 `if` 分支结果的复制，codegen 会选择符合结果变量类型的
+目标视图。例如，`[32, 1]` 的结果与 `[1, 32]` 的 allocation 共享存储时，仍通过
+`[32, 1]` 的视图写入。后续使用该结果时继续使用选定的视图。
+
+需要新建目标视图时，codegen 在原存储上生成 `pto.treshape`，不增加 allocation。
+此时目标的有效 `valid_shape` 必须在编译时已知，因为 `pto.treshape` 没有传入
+运行时有效范围的 operand。已有类型兼容的绑定继续使用原路径，包括有效范围为
+动态值的情况。原地操作、显式视图操作和 `tile.set_validshape` 保留各自的绑定
+语义。此处理不增加任意 dtype 或 layout 转换的支持；既有算子及 PTO 视图的限制
+仍然适用。
+
+在 PTOAS 内存规划下，如果选中的存储或结果使用打包类型 `FP4E2M1X2`，codegen
+会拒绝新建目标 `pto.treshape`。这类共享别名应使用 `PYPTO` 或 `DSA_RP`
+显式地址内存规划。物理配置已经匹配的目标仍可直接使用，无需额外视图。
 
 ### reshape 与有效区域（valid region）
 

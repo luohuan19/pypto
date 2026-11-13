@@ -34,7 +34,284 @@ PyPTO programs, start with the [User Manual](../user/index.md).
 | [Compile and Execution Entry Points](08-entry-points.md) | Every compile and execution entry point, the layer it belongs to, and when to reach for it |
 | [Distributed Operators](distributed_ops.md) | The N6 distributed op family — typed DSL access to collectives and primitives |
 | [PTOAS Op Status Matrix](ptoas-op-status.md) | Which public and compatibility PTOAS ops the compiler currently emits |
-| [FP4](fp4.md) | Logical vs packed FP4, cast policy, and hand-written `FP4E2M1X2` guidance |
+| [FP4](fp4.md) | Packed E2M1x2/E1M2x2 types, byte-carrier ABI, and existing E2M1 operator support |
+
+## Comment-triggered full CI
+
+The PR-only `CI` workflow (`ci.yml`) runs `changes`, `toolchain`, `pre-commit`
+and `clang-tidy`, followed by a lightweight `lint-gate`. The separate `Docs / build` check also runs. Documentation-only
+PRs retain the automatic `clang-tidy` exemption. No device tests or wheel builds
+start automatically for PRs. Heavy jobs are defined only in `CI Full`
+(`ci-full.yml`), so automatic PR runs do not create skipped heavy-test checks.
+The shared preparation and lint job definitions live in `ci-full.yml`;
+`python tests/lint/generate_ci_lint.py --write` regenerates the PR workflow.
+Pre-commit verifies that the generated file is current, preserving identical
+lint behavior for PRs and main without maintaining two implementations.
+
+Automatic PR runs, including forks, always select lint and load their controller
+from the trusted PR base SHA. Editing `ci_control.py` in the PR therefore does
+not change tier selection. The helper must already exist on main. Tier selection
+does not depend on repository variables, which can be empty in fork PR runs.
+
+This is a scheduling convention for the existing `pull_request` flow, not a
+complete protection against malicious runner use. A PR can still modify its
+workflow, remove a job condition, or add a job that targets an available runner.
+The `/ci full` command validates the PR revision, and its result publisher
+verifies the trusted dispatch, but neither restricts arbitrary PR-authored workflows.
+Enforcing that boundary requires separate GitHub runner access policies and
+trusted workflow restrictions. Those administrative settings are unchanged.
+
+Anyone who can comment on a PR, including external contributors without
+repository write access, can post exactly this comment in the PR conversation:
+
+```text
+/ci full
+```
+
+The `CI Command` workflow requires an open PR targeting this repository's `main`
+branch and dispatches `CI Full` from trusted `main`. It fixes the PR head, base and test-merge SHAs and
+verifies both GitHub's current test-merge SHA and its parents before any tests start. Fork PRs are supported.
+The full-test base is read from the actual test merge's first parent, not the
+PR's cached `base.sha` or an assumed current main. Its second parent must match
+the current PR head. An existing GitHub merge snapshot may be used when its base
+is an ancestor of live `refs/heads/main` and is **0–4 commits behind**; a snapshot
+5 or more commits behind, rewritten history, or an unknown distance is rejected.
+The dispatch inputs and run title record this actual tested base. Lint selection
+uses the newest automatic run for the same PR head whose base remains in main history.
+Before allowing full CI, the command compares the pinned PR head with live main:
+**0–4 commits behind is allowed; 5 or more is rejected**. Only commits present on
+main but missing from the PR count; the PR's own commits do not. A rejected
+comment receives a reply with the count and instructions to rebase onto latest
+main, wait for lint, and post `/ci full` again. The check runs before dispatch or
+writing pending, and full preparation repeats it so manual PR dispatch cannot
+bypass the limit. Automatic lint and main push CI are unaffected.
+When GitHub is still computing the merge or its parents do not match the PR
+head, the command polls every five seconds within a 60-second retry window on a
+GitHub-hosted runner. An eligible older-base snapshot is accepted immediately.
+The initial head and live main ref remain fixed during that wait: a changed
+revision, closed PR, invalid target or confirmed conflict stops the request.
+Full preparation verifies the exact pinned merge and base again, including
+mergeability and both distances against live main. Conflicts require updating
+the branch, waiting for lint and posting `/ci full` again. API errors, invalid
+revisions, and ineligible snapshot bases are not retried as merge computation.
+If validation or dispatch fails, a separate job replies in the PR with the
+reason and a link to the command run's logs. Only that job has comment-write
+permission; the admission job remains read-only. The reply is deduplicated for
+each command run attempt. If failure occurs before the script can report a
+reason, the reply points to the logs. The Actions summary also records the error.
+After a timeout, post a new `/ci full` comment; editing an existing comment does
+not trigger the command. Check whether dispatch already created a full run before
+retrying an API failure.
+An identical request already queued/running is not dispatched again. The command
+validates the run linked by the current status before searching run history,
+so a bound request is honored even before the run list indexes it. This also
+recognizes a native rerun while the status still shows its previous failure,
+including when main has advanced.
+A verified successful full result for the same head that still meets the freshness
+limit also makes the comment a no-op,
+so another commenter cannot reset a green gate. Comment
+access allows users to request device tests; it does not grant repository write
+or merge permission, and duplicate detection is not a general rate limit.
+After PR and revision checks, the command writes `ci/full=pending`
+before dispatching, clearing any previous success while the publisher is queued.
+A read-only admission job validates the PR and pins the head before joining
+the publisher's PR/head queue. Inside that queue, the command checks the PR
+and its revision again, writes pending, dispatches, and binds the pending status to
+the returned run ID. A moved head is rejected rather than written under the wrong lock.
+If the initial status write fails, no run is dispatched. If dispatch or run-ID
+binding fails, the pending marker and full run title share the command run ID
+and attempt. An accepted run can therefore publish its own result even after a
+lost response; older runs cannot clear a newer command's marker. If no run was
+created, retry `/ci full`. Legacy markers without a request ID still require
+manual recovery. Publishers preserve the bound newer run even when run-history
+searches have not yet indexed it.
+
+The comment opens the downstream test stage after `pre-commit` and `clang-tidy`
+have passed in the latest matching automatic PR run. Matching includes the PR
+number, head SHA, workflow identity and fork identity. Event base snapshots may
+differ; only bases that are ancestors of live main are eligible. The newest
+eligible run wins, including failures and cancellations, so rewritten main
+history cannot reuse orphaned lint. A docs-only PR
+may reuse a skipped `clang-tidy` after its changed paths are verified. Missing,
+running or failed lint rejects the request; it does not reserve a runner while
+waiting. Changes to the PR head require matching lint again. Main advancing
+without a head change does not rerun lint; full tests use the pinned main merge
+while reusing lint for that head.
+
+The downstream run skips both lint jobs. A lightweight gate verifies their
+reuse before tests start; revision checks and toolchain preparation still run.
+Full includes the reused lint result, wheel warm-up, unit, example, codegen, system, distributed,
+pypto-lib and A5 tests (including the distributed lane), plus simulator tests. Core tests execute even for documentation-only
+PRs. `docs-examples` applies when documentation changes; `serving-guard` applies
+when `PTOAS_VERSION` changes. A failed wheel warm-up is advisory because test
+jobs build locally if necessary; every applicable test must succeed.
+
+### Results and retries
+
+The PR keeps its original lint checks and displays each downstream job as an
+independent `full / <job name>` commit status in the PR checks list, including
+matrix legs and direct links to the original job logs. These are not jobs added
+to the lint workflow. Commit statuses avoid the check-suite grouping and
+overridden Details links of check runs created with Actions' `GITHUB_TOKEN`.
+Queued and running jobs both display pending, with the phase in the description;
+skipped/neutral jobs display success with their actual conclusion in the description.
+Only `ci/full` determines whether the required tests passed.
+`CI Full Progress` reads GitHub metadata on a GitHub-hosted runner and refreshes
+these statuses roughly once a minute for one active full run, without executing PR code or giving test jobs write tokens. No
+monitor runs while waiting for a comment. Polling slows down with concurrent
+monitors and the shared API budget, reserving 200 requests for gate writers and
+other automation; transient API errors, including initial run-ID resolution,
+use bounded backoff. Each live monitor is bounded to five
+hours; the finalizer explicitly dispatches reconciliation even after a monitor
+failure or timeout. Progress checks are informational: require `ci/full` for
+merge, not every `full / ...` check (some tests are conditional or advisory).
+
+Native reruns publish to the same `full / ...` contexts, including results retained
+from earlier attempts. GitHub displays the latest value once per context; its
+status history is append-only. Unchanged results are not posted repeatedly.
+The full workflow retains execution history, and each status links to its effective
+job. A trusted router serializes progress writers per PR commit, so old runs cannot
+overwrite newer writers. Historical check runs from the previous publisher remain
+on their original commit; update the PR branch to get a clean status-only display.
+
+`ci/full` is a commit status on the PR head, initialized by `CI Command` and
+updated by `CI Full Status`. After binding the full run ID, `CI Command` explicitly
+dispatches `CI Full Progress`. The monitor requests status publication when it
+exits after identifying a trusted PR-full source; ordinary manual main CI does
+not request a PR status publisher. The source ID is retained if later monitoring
+fails, so that failure still requests reconciliation. The isolated `full-result`
+job also dispatches both publishers, including
+after failed tests and native reruns. Its status request waits for the source
+run to complete before entering the writer queue, retrying failed status reads
+within its five-minute polling window. Failure to dispatch informational job
+checks does not change the test result. This avoids relying on
+`workflow_run` delivery for runs dispatched with `GITHUB_TOKEN`; those events
+remain a supplementary path. No additional token or App configuration is needed.
+It stays pending while full runs and succeeds only after the `full-result`
+job confirms all applicable tests passed. Skipped, missing, failed or cancelled
+required tests cannot satisfy it. The publisher runs on a fresh GitHub-hosted
+runner, reads GitHub metadata, and never executes PR code or downloads artifacts.
+Before joining the status writer concurrency group, the router validates the
+event's main branch, workflow identity and repository, then reads its exact run
+attempt through REST to resolve the full-run title. Webhook display titles are
+not used as job-level filters. The router passes the validated identity to the
+writer, which re-reads live state before publishing. Unrelated
+runs cannot displace a pending publisher. Commands and publishers use the same
+`queue: max` concurrency group, so older events cannot replace an already queued
+completion writer. GitHub permits 100 waiting jobs per group; excess arrivals are
+cancelled, and a cancelled command or completion publisher must be retried.
+
+If tests passed but `ci/full` remains pending because publication was missed,
+run **Actions → CI Full Status → Run workflow** on `main`, supplying the existing
+full workflow run ID as `run_id`. This only reconciles metadata; it does not
+dispatch tests or use a device runner. It uses the same PR/head/base checks and
+writer queue, preserves newer requests, and cannot turn an obsolete or failed
+run green. This recovery entry becomes available after the updated workflow is
+merged into main. Missing per-job checks can similarly be reconciled with
+**Actions → CI Full Progress → Run workflow** and the same `run_id`.
+
+Test jobs do not hold status-write or Actions-write tokens. Both `CI` and `CI Full`
+workflows declare `cache-mode: read`: GitHub's cache service prevents cache
+writes, including direct API calls from PR code. Hosted wheel sharing uses
+artifacts from the same run, with separate names for each producer attempt.
+Expired/missing artifacts fall back to building locally. This also makes CI's
+main-branch cache access read-only; other workflows and self-hosted disk caches
+retain their existing policies.
+
+Use **Re-run failed jobs** on the full run in GitHub Actions. The original test
+revision is preserved; the finalizer combines successful dependencies from the
+previous attempt with rerun results. If only the finalizer is missing, rerun that
+job too. The finalizer explicitly requests result publication, and the publisher
+ignores superseded requests. Reruns made after the live monitor has exited
+reconcile per-job checks when the finalizer finishes; to resume live progress,
+dispatch `CI Full Progress` with the existing run ID. Rerunning an old run keeps
+its original workflow code, so runs created before this fix still need the
+manual recovery entry. A previously successful run may retain its green status
+during a native rerun if no start event is delivered; use a new PR revision when
+a fresh merge-gating evaluation is required.
+If the router's run lookup fails but the event's origin and full PR title can
+still be verified, it queues a failure-only update so an old green gate cannot
+survive that lookup failure. This path preserves verified newer writers and
+cannot grant success from event data. Events without a verifiable PR identity
+are rejected; per-job progress retains its API retry behavior.
+If publication finds that the PR has moved to another head, closed, or changed
+its target, it invalidates the original tested head unless a verified newer request owns its
+status. Resetting or reopening the PR cannot revive an old green rerun result.
+Only dispatches from `main` can block a
+duplicate request or supersede an earlier one; feature-ref dispatches are ignored.
+Duplicate detection scans all statuses together from the PR creation time, splitting
+creation-time ranges at GitHub’s search limit. Moving between unfinished statuses
+cannot hide an existing request from that scan.
+A rerun of an old request cannot cancel a
+newer request. A new commit needs a new `/ci full` comment. If main advances during
+the run, per-job results keep syncing and `ci/full` remains pending until completion.
+A successful result applies the same limit to both the PR head and the actual
+tested base: 0–4 missing main commits is allowed; 5 or more for either fails with
+a rebase explanation in the status description.
+Rewritten main history that no longer contains the tested base also fails.
+Repeated comments preserve an ongoing run for the same head, or a successful result
+that still meets this limit. This check is made at publication time; an already
+published success is not automatically invalidated by a later main push. Requiring
+an up-to-date branch at merge time is a separate ruleset policy, unchanged here.
+Changed-path classification compares the pinned base and head SHAs, so later
+PR pushes cannot change which conditional tests run. If the comparison fails
+or reaches GitHub’s 300-file limit, all conditional checks are enabled.
+
+If the live-run lookup fails, the publisher validates the GitHub event’s workflow,
+repository, branch, and run identity before invalidating the gate. Event data
+can never grant success; a verified newer published request or later attempt of
+the same run is still preserved. Later attempts are verified through their exact
+attempt metadata, not trusted solely from the status URL.
+If a run-history lookup hits GitHub's search limit, or workflow/PR/job metadata cannot
+be read, the publisher preserves a verifiably newer published request or attempt; otherwise
+it marks `ci/full` failed. An old
+green result must not survive an unverifiable rerun. Post `/ci full` again to
+create a recent request with a small history window.
+The external `pr-rerun` service remains unchanged: it can still rerun eligible
+ordinary PR CI, but does not discover/authorize these dispatched full runs.
+
+`main` pushes and manual full runs without PR inputs execute `CI Full`.
+Daily CI and Codex Review keep their existing policies. Manual PR inputs are
+intended for the comment handler; leave all four empty to run CI against main.
+Publishers accept full runs created in either `ci-full.yml` or the former
+combined `ci.yml`, verifying each path against its workflow ID. Older run IDs
+remain recoverable, and native reruns keep their original workflow. Newer-run
+ordering across the split uses original creation times, not the independent
+workflow run counters. Automatic lint runs can never publish full success.
+
+### Operator rollout
+
+The old repository variable `CI_COMMENT_TIERS_ENABLED` is no longer used as an
+activation switch. PR runs always use lint; setting, clearing or changing that
+variable does not enable automatic full CI. No GitHub App secret, public webhook
+endpoint or service update is needed.
+
+1. Ensure the main ruleset requires `ci/full`, keeping `pre-commit`, `clang-tidy`
+   and existing review requirements. Select the GitHub Actions source where
+   available. Keep the former heavy-test requirements until the checks below
+   pass. The comment handler and controller must already be installed on main
+   so the rollout PR can satisfy `ci/full` before merging.
+2. Merge the updated workflows and helpers onto `main`.
+   Update the test PR branch to include this version and let its automatic lint
+   finish. Older runs without the PR/head/base lint title cannot be reused. Existing
+   historical skipped checks are not deleted; the clean job list applies to new
+   runs using the split workflows. The `ci.yml` identity and lint job names stay
+   unchanged, allowing the rollout PR to reuse lint through the old main controller.
+3. On a test PR, post `/ci full`. Validate fork checkout, an actual failing test,
+   **Re-run failed jobs**, and the resulting `ci/full` commit status. Confirm
+   external commenters can trigger full, invalid PRs cannot launch it, and
+   stale-head results cannot approve a newer revision.
+   Do not require the dispatch job `full-result`
+   itself: it belongs to the main workflow revision, not the PR head.
+4. Once `ci/full` is required, remove the former individual heavy-test contexts
+   from the required list, including the `unit-tests` matrix context. They may
+   be skipped or absent in lint runs; coverage is now enforced by `ci/full`.
+
+For rollback, restore automatic full CI in the workflow/controller code; clearing
+the old variable has no effect. Keep the `ci/full` requirement until the previous
+heavy-test requirements have been restored and verified on a new run.
+This implementation targets the current PR merge flow, not merge queues;
+`merge_group` support is required before enabling a merge queue.
 
 ## Automated PR Review
 
@@ -139,6 +416,22 @@ close event, so a reopened PR starts fresh and delayed cleanup preserves its
 new session while removing older volumes. A queued review of a closed, draft,
 or superseded head skips without publishing an artifact. GitHub state can
 change after a read; queued review and cleanup jobs recheck under the lock.
+
+Ephemeral review containers and private networks carry repository, run and attempt
+labels. Their identities are recorded before startup. Shell traps and a separate
+`always()` step remove this attempt's containers, private network and credential
+snapshots, including when the review is cancelled. Session volumes and the shared
+egress network/relay are preserved.
+
+Before starting another review, trusted host code reconciles leftover resources
+under the same runner lock. It queries GitHub with **Actions: read** permission
+and removes resources only when their exact owning attempt is `completed` and
+its repository and workflow identity match. Discovery uses ownership labels only;
+legacy resources without complete labels require a one-time manual cleanup.
+Active attempts and other repositories' resources are retained; API failures stop
+startup before any stale-resource deletion. A runner outage can prevent the
+`always()` step; reconciliation recovers Docker resources on the next review
+on that host. It does not recover temporary credential files left by a host outage.
 
 Administrators enable or disable reviews with the repository Actions variable
 `CODEX_REVIEW_ENABLED`. Set it to `true` to enable reviews; unset it or use any

@@ -318,6 +318,39 @@ class ScalarType(Type):
             dtype: Data type
         """
 
+class RegKind(enum.Enum):
+    """Register descriptor kind."""
+
+    VecReg = 0
+    """Vector register holding non-BOOL lanes."""
+
+    MaskReg = 1
+    """Predicate register holding BOOL lanes."""
+
+class RegType(Type):
+    """Static logical register descriptor, independent of ShapedType storage."""
+
+    shape: Final[int]
+    """Logical register lane count as declared by the shape argument."""
+
+    lanes: Final[int]
+    """Logical lane count (alias of shape)."""
+
+    dtype: Final[DataType]
+    """Register element data type."""
+
+    kind: Final[RegKind]
+    """Register descriptor kind."""
+
+    def __init__(self, shape: int, dtype: DataType, kind: RegKind) -> None:
+        """Create a register descriptor with a positive logical lane count.
+
+        Args:
+            shape: Logical lane count.
+            dtype: Register element data type.
+            kind: Register descriptor kind.
+        """
+
 class ShapedType(Type):
     """Base class for shaped types (tensors and tiles)."""
 
@@ -392,22 +425,20 @@ class PadValue(enum.Enum):
     """Min value padding."""
 
 class CachePolicy(enum.IntEnum):
-    """GM cache-access policy declared for a tensor read.
+    """GM cache policy. Supported modes depend on target and transfer direction.
 
-    A semantic contract the author states, never a hint the compiler invents.
-    Stored as ``int`` in the ``tile.load`` ``cache`` kwarg.
+    DEFAULT/BYPASS retain IDs 0/1. The six A5 modes use semantic IDs,
+    not raw ISA encodings. KEEP and DROP are load-only.
     """
 
     DEFAULT = 0
-    """Ordinary cached GM access."""
-
     BYPASS = 1
-    """Streaming access declared to bypass the cache.
-
-    Asserts this tensor has no reuse worth caching and that nothing writes
-    those bytes while the kernel runs — mixing a cached write and a bypassing
-    read of the same bytes is a coherency bug.
-    """
+    NORMAL_FIRST_VICTIM = 2
+    NORMAL_LAST_VICTIM = 3
+    NORMAL_PERSISTENT = 4
+    NOT_ALLOC_KEEP = 5
+    NOT_ALLOC_CLEAN = 6
+    NOT_ALLOC_DROP = 7
 
 class CompactMode(enum.Enum):
     """Partial-tile compact mode enumeration."""
@@ -824,6 +855,27 @@ class FunctionType(enum.Enum):
 
     Graph = ...
     """Recordable/replayable orchestration fragment."""
+
+    SIMT = ...
+    """Per-thread device helper launched inside an AIV task, returning void."""
+
+class SimtParamAccess:
+    reads: bool
+    writes: bool
+
+class SimtResources:
+    max_threads: int
+    max_regs: int
+
+def analyze_simt_access(function: Function) -> list[SimtParamAccess]: ...
+def infer_simt_resources(launch: SimtLaunchStmt) -> SimtResources: ...
+
+class SimtAxis(enum.Enum):
+    """Compile-time axis for SIMT thread, block, and grid queries."""
+
+    X = ...
+    Y = ...
+    Z = ...
 
 class Level(enum.Enum):
     """Hierarchy level in the Linqu machine model.
@@ -2122,6 +2174,15 @@ class ReturnStmt(Stmt):
         """
         ...
 
+class HardwareLoopPolicy(enum.Enum):
+    """Hardware loop intent."""
+
+    Auto = 0
+    """Use the default hardware-loop lowering policy."""
+
+    Require = 1
+    """Require hardware-loop lowering."""
+
 class ForStmt(Stmt):
     """For loop statement: for loop_var in range(start, stop, step): body."""
 
@@ -2149,6 +2210,9 @@ class ForStmt(Stmt):
     kind: Final[ForKind]
     """Loop kind (Sequential, Parallel, or Unroll)."""
 
+    hardware_loop_policy: Final[HardwareLoopPolicy]
+    """Persistent hardware-loop intent."""
+
     attrs: Final[dict[str, object]]
     """Loop-level attributes (key-value metadata)."""
 
@@ -2164,6 +2228,7 @@ class ForStmt(Stmt):
         span: Span,
         kind: ForKind = ForKind.Sequential,
         attrs: dict[str, object] | list[tuple[str, object]] | None = None,
+        hardware_loop_policy: HardwareLoopPolicy = HardwareLoopPolicy.Auto,
     ) -> None:
         """Create a for loop statement.
 
@@ -2178,6 +2243,7 @@ class ForStmt(Stmt):
             span: Source location
             kind: Loop kind (default: Sequential)
             attrs: Loop-level attributes (default: empty)
+            hardware_loop_policy: Hardware-loop intent (default: Auto)
         """
 
 class WhileStmt(Stmt):
@@ -2241,6 +2307,9 @@ class ScopeKind(enum.Enum):
     Graph = 8
     """Recordable orchestration region (pl.graph, outlined into a Graph function)."""
 
+    Reg = 9
+    """Register lexical region."""
+
 class SplitMode(enum.Enum):
     """Split mode for cross-core data transfer."""
 
@@ -2291,6 +2360,16 @@ class AtomicType(enum.IntEnum):
 
     Add = 1
     """Atomically add the source data into the destination."""
+
+class CommEngine(enum.IntEnum):
+    """Async communication engine for ``pld.tensor.put_async`` / ``get_async``.
+
+    Stored as ``int`` in the op's ``engine`` kwarg. V1 accepts ``URMA`` only;
+    the value matches PTOAS's ``DmaEngine::URMA``.
+    """
+
+    URMA = 1
+    """A5 URMA remote transfer."""
 
 class AccPhase(enum.IntEnum):
     """Producer-side unit-flag phase for GEMV accumulator operations.
@@ -2399,6 +2478,19 @@ class GraphScopeStmt(ScopeStmt):
     def __init__(self, name_hint: str, *, body: Stmt, span: Span) -> None:
         """Create a Graph scope statement (``name_hint`` is the region name)."""
 
+class RegScopeStmt(ScopeStmt):
+    """Register lexical region with common ScopeStmt fields only."""
+
+    def __init__(
+        self,
+        name_hint: str,
+        body: Stmt,
+        span: Span,
+        leading_comments: list[str] = [],
+        attrs: dict[str, object] | list[tuple[str, object]] | None = None,
+    ) -> None:
+        """Create a register lexical scope statement."""
+
 class HierarchyScopeStmt(ScopeStmt):
     """Hierarchy scope: distributed-hierarchy region."""
 
@@ -2496,6 +2588,9 @@ class CommDomainScopeStmt(ScopeStmt):
     the scope directly without rerunning materialization.
     """
 
+    engines: Final[list[str]]
+    """Required async workspace engines, materialized by the compiler pass."""
+
     devices: Final[list[int]]
     """Covered worker indices (ascending). Empty list = all devices
     (resolved at codegen to ``*range(world_size)``)."""
@@ -2511,6 +2606,7 @@ class CommDomainScopeStmt(ScopeStmt):
         *,
         body: Stmt,
         span: Span,
+        engines: list[str] = [],
     ) -> None:
         """Create a CommDomain scope statement.
 
@@ -2520,6 +2616,7 @@ class CommDomainScopeStmt(ScopeStmt):
             name_hint: Handle name hint (codegen derives ``__comm_d<n>``).
             body: Inner statement block.
             span: Source location.
+            engines: Required async workspace engines.
         """
 
 class SeqStmts(Stmt):
@@ -2565,6 +2662,38 @@ class SeqStmts(Stmt):
         Raises:
             IndexError: If index is out of range
         """
+
+class SimtScopeStmt(Stmt):
+    """Transient per-thread region; outlined before ordinary SSA conversion."""
+
+    block_dims: list[Expr]
+    body: Stmt
+    private_scalars: list[Var]
+
+    def __init__(
+        self, block_dims: list[Expr], body: Stmt, span: Span, private_scalars: Sequence[Var] = ()
+    ) -> None: ...
+
+class SimtLaunchStmt(Stmt):
+    """Launch a void SIMT helper; results name logical storage updates."""
+
+    callee: GlobalVar
+    block_dims: list[Expr]
+    args: list[Expr]
+    results: list[Var]
+    result_param_indices: list[int]
+
+    def __init__(
+        self,
+        callee: GlobalVar,
+        block_dims: list[Expr],
+        args: list[Expr],
+        results: list[Var],
+        result_param_indices: list[int],
+        span: Span,
+    ) -> None:
+        """Create a launch with three block dimensions and explicit result mappings."""
+        ...
 
 class EvalStmt(Stmt):
     """Evaluation statement: expr."""
@@ -2644,7 +2773,11 @@ class Function(IRNode):
     """Function role (None = unspecified)."""
 
     attrs: Final[dict[str, Any]]
-    """Function-level attributes (key-value metadata)."""
+    """Function-level attributes (key-value metadata).
+
+    ``external_return_params`` holds an ordered ``list[Var]`` referencing this
+    external function's parameters, one per returned tensor.
+    """
 
     ir_stage: Final[FunctionIRStage]
     """Function body representation; defaults to Functional."""
@@ -2829,71 +2962,95 @@ class WindowBuffer(Var):
     ) -> None:
         """Create a WindowBuffer wrapping the given Ptr ``base`` Var."""
 
+def _without_type_memref(type: Type) -> Type:
+    """Remove allocation annotations from shaped and tuple value types."""
+    ...
+
+def verify_structural_bindings(node: IRNode) -> None:
+    """Verify local definition uniqueness and lexical visibility; allow open captures."""
+    ...
+
+class StructuralComparisonUnsupported(TypeError):
+    """Structural comparison cannot safely represent the input; this is not inequality."""
+
+    reason: str
+    field_path: str
+
 @overload
-def structural_hash(node: IRNode, enable_auto_mapping: bool = False) -> int: ...
+def structural_hash(
+    node: IRNode,
+    enable_auto_mapping: bool = False,
+) -> int: ...
 @overload
-def structural_hash(node: Type, enable_auto_mapping: bool = False) -> int: ...
-def structural_hash(node: IRNode | Type, enable_auto_mapping: bool = False) -> int:
-    """Compute deterministic structural hash of an IR node or type.
+def structural_hash(
+    node: Type,
+    enable_auto_mapping: bool = False,
+) -> int: ...
+@overload
+def structural_hash(
+    *,
+    type: Type,
+    enable_auto_mapping: bool = False,
+) -> int:
+    """Compute a process-local structural hash; equal structures have equal hashes.
 
-    Hashes based on node structure; variable identity is part of the hash unless
-    auto-mapping is enabled. The hash is deterministic within a single process run.
-    For IR nodes: ignores source location (Span).
-    If enable_auto_mapping=True, variable names are ignored (e.g., x+1 and y+1 hash the same).
-    If enable_auto_mapping=False (default), different variable objects produce different hashes.
-    For types: enable_auto_mapping only affects variables embedded in the type (e.g., shape expressions).
-
-    Args:
-        node: IR node or type to compute hash for
-        enable_auto_mapping: Whether to ignore variable identity and auto-map variables
-
-    Returns:
-        Hash value of the object structure
+    Bound variables are alpha-renamed. Free variables preserve identity unless
+    enable_auto_mapping is True. Span, function names and bound names are ignored.
+    Compares exact dtype, float bits, operator kind and semantic fields;
+    Storage is included. Unsupported attribute payloads raise StructuralComparisonUnsupported.
+    Always use identical options for hashing and equality.
     """
 
 @overload
-def structural_equal(lhs: IRNode, rhs: IRNode, enable_auto_mapping: bool = False) -> bool: ...
+def structural_equal(
+    lhs: IRNode,
+    rhs: IRNode,
+    enable_auto_mapping: bool = False,
+) -> bool: ...
 @overload
-def structural_equal(lhs: Type, rhs: Type, enable_auto_mapping: bool = False) -> bool: ...
-def structural_equal(lhs: IRNode | Type, rhs: IRNode | Type, enable_auto_mapping: bool = False) -> bool:
-    """Check if two IR nodes or types are structurally equal.
+def structural_equal(
+    lhs: Type,
+    rhs: Type,
+    enable_auto_mapping: bool = False,
+) -> bool: ...
+def structural_equal(
+    lhs: IRNode | Type,
+    rhs: IRNode | Type,
+    enable_auto_mapping: bool = False,
+) -> bool:
+    """Check structural equality under the selected comparison policy.
 
-    Ignores source location (Span). Returns True if objects have identical structure.
-    If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1).
-    If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same name).
-
-    Args:
-        lhs: Left-hand side IR node or type
-        rhs: Right-hand side IR node or type
-        enable_auto_mapping: Whether to automatically map variables
-
-    Returns:
-        True if objects are structurally equal, False otherwise
+    Bound variables are alpha-renamed. Free variables preserve identity unless
+    enable_auto_mapping is True. Span, function names and bound names are ignored.
+    Compares exact dtype, float bits, operator kind and semantic fields;
+    Storage is included. Unsupported attribute payloads raise StructuralComparisonUnsupported.
+    Always use identical options for hashing and equality.
     """
 
 @overload
-def assert_structural_equal(lhs: IRNode, rhs: IRNode, enable_auto_mapping: bool = False) -> None: ...
-@overload
-def assert_structural_equal(lhs: Type, rhs: Type, enable_auto_mapping: bool = False) -> None: ...
 def assert_structural_equal(
-    lhs: IRNode | Type, rhs: IRNode | Type, enable_auto_mapping: bool = False
+    lhs: IRNode,
+    rhs: IRNode,
+    enable_auto_mapping: bool = False,
+) -> None: ...
+@overload
+def assert_structural_equal(
+    lhs: Type,
+    rhs: Type,
+    enable_auto_mapping: bool = False,
+) -> None: ...
+def assert_structural_equal(
+    lhs: IRNode | Type,
+    rhs: IRNode | Type,
+    enable_auto_mapping: bool = False,
 ) -> None:
-    """Assert two IR nodes or types are structurally equal.
+    """Assert structural equality, raising ValueError with the first mismatch path.
 
-    Like structural_equal but raises ValueError with detailed error message showing
-    the first mismatch location and Python-printed IR context. Useful for debugging.
-
-    Ignores source location (Span).
-    If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1).
-    If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same name).
-
-    Args:
-        lhs: Left-hand side IR node or type
-        rhs: Right-hand side IR node or type
-        enable_auto_mapping: Whether to automatically map variables
-
-    Raises:
-        ValueError: If objects are not structurally equal, with detailed diagnostic message
+    Bound variables are alpha-renamed. Free variables preserve identity unless
+    enable_auto_mapping is True. Span, function names and bound names are ignored.
+    Compares exact dtype, float bits, operator kind and semantic fields;
+    Storage is included. Unsupported attribute payloads raise StructuralComparisonUnsupported.
+    Always use identical options for hashing and equality.
     """
 
 def attach_leading_comments(stmt: Stmt, comments: list[str]) -> Stmt:
@@ -3050,7 +3207,7 @@ def create_op_call(op_name: str, args: Sequence[Expr], span: Span) -> Call:
 def create_op_call(
     op_name: str,
     args: Sequence[Expr],
-    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue | SimtAxis],
     span: Span,
 ) -> Call:
     """Create a Call expression with args and kwargs.
@@ -3072,7 +3229,7 @@ def create_op_call(
 def _create_internal_op_call(
     op_name: str,
     args: Sequence[Expr],
-    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue | SimtAxis],
     span: Span,
 ) -> Call:
     """Create a Call expression for a compiler-internal operator. **Private.**
@@ -3104,7 +3261,7 @@ def _create_internal_op_call(
 def _create_internal_op_call(
     op_name: str,
     args: Sequence[Expr],
-    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue | SimtAxis],
     type: Type,
     span: Span,
 ) -> Call:
@@ -3129,6 +3286,10 @@ def set_call_attrs(call: Call, attrs: Mapping[str, object]) -> Call:
     Returns:
         A new Call with the given attrs
     """
+
+def is_device_function_type(func_type: FunctionType) -> bool:
+    """Whether this function executes device IR, including a SIMT helper."""
+    ...
 
 def is_incore_type(func_type: FunctionType) -> bool:
     """Check if a FunctionType is an InCore variant (InCore, AIC, or AIV).
@@ -3287,6 +3448,9 @@ class WriteChannel(enum.Enum):
 
     Scalar = ...
     """Scalar D-cache write path (tensor.write)."""
+
+    Simt = ...
+    """SIMT lane stores, separate from controller scalar stores and DMA."""
 
 def get_op_arg_effect(op_name: str, arg_index: int, **kwargs: Any) -> ArgEffect:
     """Effect an operator has on one positional argument.
@@ -3472,6 +3636,28 @@ class IRBuilder:
     def __init__(self) -> None:
         """Create an IR builder."""
 
+    def begin_simt_scope(self, block_dims: Sequence[Expr], span: Span) -> None:
+        """Begin a transient SIMT region with implicit captures."""
+
+    def end_simt_scope(self, span: Span, private_scalars: Sequence[Var] = ()) -> SimtScopeStmt:
+        """End the transient SIMT region."""
+
+    def begin_reg_scope(self, span: Span) -> None:
+        """Begin an implicit-capture register region."""
+
+    def end_reg_scope(self, span: Span) -> Stmt:
+        """End a register region and return the built RegScopeStmt."""
+
+    def emit_reg(
+        self, name: str, op_name: str, args: Sequence[Expr], kwargs: dict[str, Any], span: Span
+    ) -> Var:
+        """Infer, validate and assign a register operation inside the open RegScope."""
+
+    def emit_reg_store(
+        self, name: str, tile: Expr, offset: Expr, value: Expr, mask: Expr | None, span: Span
+    ) -> Var:
+        """Assign a register store's Tile alias result."""
+
     # Function building
     def begin_function(
         self,
@@ -3558,6 +3744,7 @@ class IRBuilder:
         span: Span,
         kind: ForKind = ForKind.Sequential,
         attrs: dict[str, object] | list[tuple[str, object]] | None = None,
+        hardware_loop_policy: HardwareLoopPolicy = HardwareLoopPolicy.Auto,
     ) -> None:
         """Begin building a for loop.
 
@@ -3569,6 +3756,8 @@ class IRBuilder:
             span: Source location for loop definition
             kind: Loop kind (default: Sequential)
             attrs: Loop-level attributes (default: empty)
+            hardware_loop_policy: Auto (default) or Require. Require needs a Sequential
+                loop inside RegScope, INDEX start=0 and step=1, and empty attrs.
         """
 
     def add_iter_arg(self, iter_arg: IterArg) -> None:
@@ -3714,6 +3903,7 @@ class IRBuilder:
         devices: Sequence[int] = (),
         slots: Sequence[WindowBuffer] = (),
         attrs: dict[str, Any] | list[tuple[str, Any]] | None = None,
+        engines: Sequence[str] = (),
     ) -> ScopeStmt:
         """End building a scope statement.
 
@@ -3721,6 +3911,7 @@ class IRBuilder:
             end_span: Source location for end of scope
             devices: Device indices for a communication-domain scope.
             slots: Window allocations for a communication-domain scope.
+            engines: Required async workspace engines.
             attrs: Additional metadata resolved after body-local definitions.
 
         Returns:
@@ -4175,10 +4366,19 @@ def deep_clone(
         cloned by the traversal. Seeded entries from var_map are NOT included.
     """
 
+def make_call_result_type(return_types: Sequence[Type], is_submit: bool = False) -> Type:
+    """Pack declared results, appending TaskId for Submit without flattening tuples.
+
+    A plain call with no results has UnknownType; one result keeps its type;
+    multiple results form a TupleType. Submit always returns a TupleType.
+    """
+    ...
+
 def deduce_call_return_type(
     callee_params: Sequence[Var],
     args: Sequence[Expr],
     return_types: Sequence[Type],
+    is_inline: bool = False,
 ) -> list[Type]:
     """Deduce return types for a cross-function call.
 
@@ -4189,6 +4389,8 @@ def deduce_call_return_type(
         callee_params: Callee function parameter variables
         args: Actual call argument expressions
         return_types: Callee's declared return types
+        is_inline: Keep conflicting generic Tile physical extents provisional
+            until inline expansion recovers each actual result type
 
     Returns:
         Substituted return types (unchanged if no dynamic vars found)
@@ -4265,6 +4467,7 @@ class IRVisitor:
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> None: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> None: ...
     def visit_graph_scope_stmt(self, op: GraphScopeStmt) -> None: ...
+    def visit_reg_scope_stmt(self, op: RegScopeStmt) -> None: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> None: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> None: ...
     def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> None: ...
@@ -4274,6 +4477,8 @@ class IRVisitor:
     def visit_yield_stmt(self, op: YieldStmt) -> None: ...
     def visit_return_stmt(self, op: ReturnStmt) -> None: ...
     def visit_eval_stmt(self, op: EvalStmt) -> None: ...
+    def visit_simt_launch_stmt(self, op: SimtLaunchStmt) -> None: ...
+    def visit_simt_scope_stmt(self, op: SimtScopeStmt) -> None: ...
     def visit_break_stmt(self, op: BreakStmt) -> None: ...
     def visit_continue_stmt(self, op: ContinueStmt) -> None: ...
     def visit_inline_stmt(self, op: InlineStmt) -> None: ...
@@ -4348,6 +4553,7 @@ class IRMutator:
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> Stmt: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> Stmt: ...
     def visit_graph_scope_stmt(self, op: GraphScopeStmt) -> Stmt: ...
+    def visit_reg_scope_stmt(self, op: RegScopeStmt) -> Stmt: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> Stmt: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> Stmt: ...
     def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> Stmt: ...
@@ -4357,6 +4563,64 @@ class IRMutator:
     def visit_yield_stmt(self, op: YieldStmt) -> Stmt: ...
     def visit_return_stmt(self, op: ReturnStmt) -> Stmt: ...
     def visit_eval_stmt(self, op: EvalStmt) -> Stmt: ...
+    def visit_simt_launch_stmt(self, op: SimtLaunchStmt) -> Stmt: ...
+    def visit_simt_scope_stmt(self, op: SimtScopeStmt) -> Stmt: ...
     def visit_break_stmt(self, op: BreakStmt) -> Stmt: ...
     def visit_continue_stmt(self, op: ContinueStmt) -> Stmt: ...
     def visit_inline_stmt(self, op: InlineStmt) -> Stmt: ...
+
+def returned_param_indices(func: Function, program: Program) -> list[int | None]:
+    """Trace each return to its external parameter."""
+    ...
+
+def get_reg_memory_effect(call: Call) -> dict[str, Any]:
+    """Get load/store/gather/scatter effects; indexed begin/end are unknown."""
+    ...
+
+def get_reg_op_spec(op_name: str) -> dict[str, Any]:
+    """Get register schema scope and emitter requirements."""
+    ...
+
+class HardwareLoopState(enum.Enum):
+    """Static qualification, independent of final artifact evidence."""
+
+    Eligible = 0
+    Ineligible = 1
+    Unknown = 2
+
+class HardwareLoopProfile:
+    """Target resource and dependency-preservation contract with unsigned counters."""
+
+    supported: bool
+    counter_bits: int
+    allow_negative_step: bool
+    max_trip_count: int
+    max_depth: int
+    max_body_nodes: int
+    allow_scalar_carry: bool
+    allow_reg_carry: bool
+    allow_tile_carry: bool
+    allowed_ops: list[str]
+    def __init__(self) -> None: ...
+
+class HardwareLoopQualification:
+    state: Final[HardwareLoopState]
+    reason: Final[str]
+    trip_count: Final[int | None]
+    post_iv: Final[int | None]
+    loop_id: Final[str]
+    lower: Final[int | None]
+    upper: Final[int | None]
+    step: Final[int | None]
+
+def analyze_hardware_loop(loop: ForStmt, profile: HardwareLoopProfile) -> HardwareLoopQualification:
+    """Reanalyze current loop and profile without persistent caches."""
+    ...
+
+def analyze_hardware_loops(program: Program, profile: HardwareLoopProfile) -> list[HardwareLoopQualification]:
+    """Analyze a program in one bottom-up walk, with deterministic loop IDs."""
+    ...
+
+def verify_hardware_loop_requirement(loop: ForStmt, profile: HardwareLoopProfile) -> None:
+    """Reject unqualified Require or missing hardware evidence, except static empty loops."""
+    ...

@@ -24,7 +24,7 @@ acc[t0 : t0 + R, :] = pl.matmul_acc(
 
 第一个 K 步只覆盖该窗口，后续步骤在该窗口内累加，其他窗口保留原值。
 编译器可将局部累加器中大小一致的行窗口打包为连续的 L0C 窗口；参见
-[累加器逻辑行窗口](../passes/14-flatten_tile_nd_to_2d.md#累加器逻辑行窗口)。
+[累加器逻辑行窗口](../passes/16-flatten_tile_nd_to_2d.md#累加器逻辑行窗口)。
 
 ### If 语句 (SSA 风格)
 
@@ -105,16 +105,16 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | 形式 | Scope 类型 | 说明 |
 | ---- | ---------- | ---- |
 | `pl.at(level=pl.Level.CORE_GROUP)` | `InCore` | CORE_GROUP 级固定边界 outline |
-| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(MODE)])` | `InCore` | InCore + 跨核 split 提示 |
+| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(MODE)])` | `InCore` | 旧式 split 元数据；混合 kernel 的非 NONE 分片会被拒绝 |
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.cross_core_slot(slot_num=N)])` | `InCore` | InCore + 跨核 pipe 槽位数 |
 | `pl.at(level=pl.Level.HOST)`（或任意非 `CORE_GROUP` 级别） | `Hierarchy` | 分布式层级作用域 |
 | `pl.cluster()` | `Cluster` | AIC+AIV 协同调度组 |
-| `pl.graph("name")` | `Graph` | 可录制的编排区域；名字必填，并成为提取函数的名字 —— 见 [OutlineGraphScopes](../passes/08-outline_graph_scopes.md) |
+| `pl.graph("name", deps=[...]) as done` | `Graph` | 可录制的编排区域；deps/capture 是可选的外层任务元数据，必填名字标识提取函数 —— 见 [OutlineGraphScopes](../passes/09-outline_graph_scopes.md) |
 | `with pl.spmd(N)` / `for i in pl.spmd(N)` | `Spmd`（for-form 内嵌 `InCore`） | SPMD 多 block 派发——见 [pl.spmd](#plspmd-多-block-派发) |
-| `pl.spmd(N, optimizations=[pl.split(MODE)])` | `Spmd(InCore(split=MODE))` | split 提示作用于内层 InCore（两种形式均适用） |
-| `pl.spmd(N, optimizations=[pl.cross_core_slot(slot_num=N)])` | `Spmd(InCore(slot_num=N))` | 槽位数作用于内层 InCore（两种形式均适用），可与 `pl.split(MODE)` 组合 |
+| `pl.spmd(N, optimizations=[pl.split(MODE)])` | `Spmd(InCore(split=MODE))` | 旧式 split 元数据作用于内层 InCore；混合 kernel 的非 NONE 分片会被拒绝 |
+| `pl.spmd(N, optimizations=[pl.cross_core_slot(slot_num=N)])` | `Spmd(InCore(slot_num=N))` | 槽位数作用于内层 InCore（两种形式均适用），可与显式 `pl.split_aiv` 区域组合 |
 | `pl.scope(mode=pl.ScopeMode.MANUAL)` / `pl.manual_scope()` | `Runtime(manual=true)` | orchestrator 的 MANUAL scope——由用户管理任务排序。两种 `auto_scope` 模式下都可用（它是依赖语义选择）。见[手工依赖原语](02-manual_dependencies.md#手工依赖原语) |
-| `pl.scope()` | `Runtime(manual=false)` | orchestrator 的 AUTO scope（`SIMPLER_SCOPE()`）。手写它需要 `@pl.function(auto_scope=False)`（默认 `auto_scope=True` 下由编译器决定 AUTO 放置）。见 [MaterializeRuntimeScopes](../passes/50-materialize_runtime_scopes.md) |
+| `pl.scope()` | `Runtime(manual=false)` | orchestrator 的 AUTO scope（`SIMPLER_SCOPE()`）。手写它需要 `@pl.function(auto_scope=False)`（默认 `auto_scope=True` 下由编译器决定 AUTO 放置）。见 [MaterializeRuntimeScopes](../passes/54-materialize_runtime_scopes.md) |
 
 `pl.scope(..., name_hint="label")` 和 `pl.manual_scope(name_hint="label")`
 接受可选的字符串字面量，默认值为 `""`。print/parse 精确保留该标签，包括空白和转义字符。
@@ -139,18 +139,24 @@ IR 结构相等和哈希契约，因此不会被规范化删除。与提取作�
 除非算术分析能证明个数为正，否则每个 Out/InOut Tensor 都必须由调用方提供。
 遗漏输出会产生包含 Tensor 名称和参数位置的编译错误。空路径保留返回 Tensor
 已有的内容，不执行初始化。参见
-[LegalizeSpmdLaunches](../passes/41-legalize_spmd_launches.md)。
+[LegalizeSpmdLaunches](../passes/45-legalize_spmd_launches.md)。
 
-可选 `optimizations=[...]`。各条目彼此正交，可在同一列表中组合
-（例如 `[pl.split(MODE), pl.cross_core_slot(slot_num=4)]`）：
+可选 `optimizations=[...]`。混合 kernel 使用 `pl.split_aiv` 区域、显式
+shard/gather 和用户编写的每 lane 计算；通过
+`optimizations=[pl.cross_core_slot(slot_num=4)]` 独立设置 pipe 容量：
 
 | 条目 | 适用形式 | 作用 |
 | ---- | -------- | ---- |
-| `pl.split(MODE)` | 两种均适用 | 给内层 InCore 设置 `split_` 字段（跨核数据搬运提示，由 `ExpandMixedKernel` / `MemoryReuse` 消费）。with-form 会在原 call 外多包一层 `InCoreScopeStmt` 来承载该字段。 |
+| `pl.split(MODE)` | 两种均适用 | 设置旧式内层 InCore split 元数据。混合 kernel 的 UP_DOWN/LEFT_RIGHT 会被拒绝；独立 AIV/AIC 分片仍受支持。即使 MODE=NONE，也不能与显式分片区域共存。 |
 | `pl.cross_core_slot(slot_num=N)` | 两种均适用 | 给内层 InCore 设置 `slot_num` 属性——自动跨核 pipe 的槽位数（环深），由 `ExpandMixedKernel` 消费。它只决定数据通道大小，**不**划分计算，因此可与 `pl.split_aiv` 区域共存（而 `pl.split(...)` 不能）。省略时沿用默认深度：每个活跃方向 2 个槽位。 |
 
-> `pl.split(MODE, slot_num=N)` 是该槽位数的已废弃别名，会发出警告——参见
-> [ExpandMixedKernel](../passes/24-expand_mixed_kernel.md#覆盖槽位数slot_num)。
+`pl.cross_core_slot(slot_num=N, local_slot_num=L)` 还可设置 A2/A3 本地消费者深度
+（`1 <= L <= N`）。省略 `L` 时，reserve 仍按环深度分配。A5 不支持显式本地深度。
+详见 [ExpandMixedKernel](../passes/26-expand_mixed_kernel.md)。
+
+> `pl.split(MODE, slot_num=N)` 已废弃，且不会恢复混合 kernel 的隐式分片。
+> 使用 `pl.cross_core_slot(slot_num=N)`——参见
+> [ExpandMixedKernel](../passes/26-expand_mixed_kernel.md#覆盖槽位数slot_num)。
 
 示例参见 [作用域与放置](../../user/language/04-scopes.md)。
 
@@ -234,3 +240,47 @@ sum_final: pl.INT64 = sum  # captures final value
 - [Python IR 语法规范](00-python_syntax.md) —— 类型与表达式
 - [手工依赖原语](02-manual_dependencies.md) —— 退出自动依赖跟踪
 - [函数与程序结构](03-functions.md) —— 函数类型与参数方向
+
+## 强制硬件循环
+
+`pl.range` 对应 `HardwareLoopPolicy.Auto`。
+`pl.hardware_loop(stop, *, init_values=None)` 对应 `Require`，创建 `[0, stop)` 的
+Sequential 循环，固定 `start=0`、`step=1`。仅接受 `stop` 和可选的循环携带初始值
+`init_values`；拒绝 start、step 和 attrs 参数。`init_values` 重载保留携带值的类型推导。
+`Require` 只能位于外层 `pl.reg_scope()` 内，包括空循环。循环体内部的作用域不能满足
+这一要求。普通 `pl.range` 循环仍可在寄存器作用域外使用。
+
+```python
+@pl.jit.incore
+def required_loop(x: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+    with pl.reg_scope():
+        for i, (acc,) in pl.hardware_loop(8, init_values=(x,)):
+            _result = pl.yield_(acc + i)
+    return x
+```
+
+该 API 表达意图。A5 检查规范循环资格，并在生成的 PTO 中保留循环，
+见 [VF 执行](../codegen/03-vpto-vf-integration.md#required-hardware-loops)。其他目标和未支持的循环形式仍会被拒绝。
+`ir.analyze_hardware_loop(loop, profile)` 区分 Eligible、Ineligible 和 Unknown；
+Eligible 表示 IR 资格，不等于机器码层面的硬件证据。
+动态整数 `stop` 无需静态范围证明，也不插入运行时范围检查；其迭代次数和终止归纳变量
+保持未知，但仍检查循环体、嵌套及后端能力。浮点及其他非整数上界会被拒绝。
+动态步长或未知效应保持 Unknown；Auto 在三态下均保持普通循环语义。
+
+静态零次 Sequential 循环豁免资格和证据要求，由 Simplify 消除并返回初始 iter_args；
+可能为空的动态循环不豁免。Require 在单次循环中也不能丢失意图。
+Builder 和手工构造的 IR 同样必须使用常量 `start=0`、`step=1`，零次循环也不例外。
+静态上界按无符号 16 位计数器检查：`stop=65535` 合法，`stop=65536` 超出范围。
+动态上界由调用者保证在目标支持的范围内，资格分析不要求提供范围证明。
+当 `stop=65535` 时，循环执行 65535 次，归纳变量依次为 0 至 65534，
+终止时归纳变量为 65535。
+
+目标 profile 定义无符号计数器、次数、嵌套和资源限制以及允许的循环携带类型。
+未显式认证的操作按未知处理。分析在当前 IR 上重新计算，结果不进入序列化
+和结构哈希。`passes.PassContext([], report_hardware_loops=True)` 可启用 codegen 报告，
+由 `context.get_hardware_loop_reports()` 读取；报告不是可复用的正确性证明。
+此可选 profile 分析独立于 A5 codegen 准入。A5 backend 当前未提供经过认证的
+hardware-loop profile，因此即使 codegen 接受某个非空循环，报告仍可能为
+`Unknown` / `HWL_UNSUPPORTED_PROFILE`。循环是否能生成 PTO 应以 codegen 诊断为准。
+硬件循环候选内部的嵌套 `for` 也必须使用同一 profile 进行资格分析。内层循环即使保持
+`Auto`，只要满足资格即可；内层循环若为 Ineligible 或 Unknown，外层硬件循环也不能通过资格分析。

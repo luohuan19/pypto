@@ -21,6 +21,32 @@ float_type = ir.ScalarType(DataType.FP32)
 >
 > **注意：** `TASK_ID` 是一个不透明的 64-bit handle（类型代码 `0x50`），表示 runtime 的 `TaskId`。它**不是**数值类型——上面没有任何算术运算。`Scalar[TASK_ID]` 值由 `with pl.manual_scope():` 内的 `pl.submit(...)` 产生（它返回的二元组第二个元素命名 producer task）。Python 字面量 `None` 是 "暂无 producer" 的哨兵——它用作 TaskId 循环 iter_arg 的种子，也可作为 `deps=[None]` 条目；当 `None` 出现在 TaskId 位置时，会下沉为 [`system.task_invalid`](05-operators.md) builtin → `TaskId::invalid()`。TaskId 值通过 `pl.submit(...)` 的 `deps=[tid1, tid2]` kwarg 传入。codegen 把 `TASK_ID` 下沉为 `TaskId`。
 
+### 寄存器 IR 描述符
+
+`RegType(shape, dtype, kind)` 直接继承 `Type`。shape 是表示逻辑 lane 数的单个
+正整数，与物理向量宽度无关；`lanes` 直接返回该整数。`RegKind.VecReg` 禁止
+`BOOL`，`RegKind.MaskReg` 必须使用 `BOOL`。非法 shape、未知 dtype 和未知 kind 在构造或
+反序列化时立即失败。
+
+```python
+vector = ir.RegType(64, DataType.FP32, ir.RegKind.VecReg)
+mask = ir.RegType(64, DataType.BOOL, ir.RegKind.MaskReg)
+```
+
+标注形式为 `pl.Reg[64, pl.FP32]`（默认 VecReg）和
+`pl.Reg[64, pl.BOOL, pl.RegKind.MaskReg]`。这些描述符、无专属字段的
+`ir.RegScopeStmt(name_hint, body, span, leading_comments=[], attrs=None)` 和
+`ir.ForStmt.hardware_loop_policy` 属于 IR 基础设施，支持直接构造、visitor/mutator
+遍历、结构比较和二进制序列化。P0 寄存器操作和 `pl.reg_scope()` 支持经过验证的
+DSL 构造和文本往返；参见[寄存器操作](../language/06-register-operations.md)。
+VF 代码生成仍由 PR3 实现。
+
+`HardwareLoopPolicy.Auto` 是新循环及缺少该字段的旧序列化循环的默认值。
+`Require` 是持久化的语义字段，不能被静默重置为 Auto；未知序列化 policy
+必须失败。本次基础设施改动不实现 hardware loop 分析或生成。
+
+`Simplify` 可消除已证明零次执行的 Sequential Require 循环，并返回初始携带值；非空 Require（包括单次循环）必须保留。
+
 ### 内部 Buffer 类型
 
 `BufferType` 描述最终设备 IR 中的可变片上缓冲区，直接继承 `Type`，
@@ -48,10 +74,12 @@ Void call 应放在 `EvalStmt` 中，不能绑定变量、用作操作数、放�
 `Call` 和 `Submit` 的 attrs、kwargs 中的表达式值同样遵循此规则，
 在构造时即进行校验，通过 `ir.set_call_attrs` 附加属性时也会校验。
 
-这些类型是 Buffer IR 的初始基础设施，自动 tile-to-buffer lowering 尚未
-启用，公开 Tile DSL 和默认流水线仍使用 `TileType`。直接 PTO 代码生成支持
+公开 Tile DSL 使用 `TileType`；默认完整 kernel 选择通过
+[LowerTileToBuffer](../passes/58-lower_tile_to_buffer.md) 转换支持的函数。直接 PTO 代码生成也支持
 显式构造的 buffer 程序：一维或二维、稠密 row-major Vec FP16/BF16/FP32/INT32
-描述符，标量参数与控制流，以及下文的 buffer 算子。普通 GM 参数支持
+描述符，以及 `R` 为 8 的倍数、valid 为正静态值的 FP32 列优先 `[R,1]` 描述符，
+用于 [cast/compare/select 配方](../passes/58-lower_tile_to_buffer.md) 的 UINT8 谓词和 UINT32 工作空间描述符，
+标量参数与控制流，以及下文的 buffer 算子。普通 GM 参数支持
 物理形状静态、列数大于一的稠密 ND 二维 FP16/BF16/FP32/INT32 Tensor。
 算术配方分别施加更窄的 dtype 契约。规范化后的 Tensor
 返回值是这些参数的别名，原生内核仍返回 void。Buffer 参数 ABI、原生函数
@@ -127,7 +155,7 @@ destination 并返回 `VoidType`，目前要求所有参数的 Vec buffer 描述
 分配操作数；旧 `emit_tile_addr` 标志不能删除或补充 buffer 地址。
 动态操作数保留在其词法作用域内，不重建逻辑 `TileType` 或 `MemRef`，
 也不运行隐式 tile 分配逻辑。设置 `enable_buffer_ir=True` 后，流水线在发射前通过
-[LowerTileToBuffer](../passes/54-lower_tile_to_buffer.md) 转换 Tile IR。
+[LowerTileToBuffer](../passes/58-lower_tile_to_buffer.md) 转换 Tile IR。
 
 静态存储视图 (static storage view) 在同一 Buffer 阶段使用普通 SSA 别名边：
 
@@ -145,11 +173,12 @@ destination 并返回 `VoidType`，目前要求所有参数的 Vec buffer 描述
 存储根上整行的 `UINT8[N,32]`
 字节窗口是其中的静态特例。
 `buffer.reshape` 保持物理字节数完全相同，支持静态、紧密行主序的二维
-Vec FP16、BF16、FP32、INT16、INT32 和 UINT8 描述符，每个物理行的字节数必须为 32 的倍数。
+Vec FP16、BF16、FP32、INT16、INT32、UINT8 和 UINT32 描述符，每个物理行的字节数必须为 32 的倍数。
 在 Mat、Left、Right 和 Acc 中，它只在同一空间内重新标注一个完整分形窗口
 （例如 NZ 到 ZN），要求元素类型、字节数相同且 valid extent 为静态值。
 两者均声明 `Alias(0)`、无数据访问和源元数据读效应，不分配存储，
-也不初始化数据。每个中间结果的形状、dtype 和 valid extent 均由结果
+也不初始化数据。FP32 列向量 reshape 保留物理 `[R,1]` 形状和列优先布局，只允许
+正静态 valid 行数不同；这不开放列向量 subview。每个中间结果的形状、dtype 和 valid extent 均由结果
 类型显式表达。`buffer.set_validshape` 不能修改这些静态视图句柄。
 
 运行时偏移的窗口只知道位于源窗口之内，因此 `BufferIR` 在证明不重叠时使用整个源范围，
@@ -211,7 +240,7 @@ Tensor 返回类型及规范化的输出参数返回值保留在 IR 中供编排
 及其他传输布局需要后续发射规则，目前均明确拒绝。
 
 初始 emitter 支持将无符号标量直接作为分配地址、GM 偏移量或 valid extent，扩展位宽时
-保留其无符号数值。无符号算术以及除 index 到整数、同位宽整数转换之外的
+保留其无符号数值。无符号算术以及除 BOOL 到整数、index 到整数、同位宽整数转换之外的
 无符号转换，需要后续补充原生发射规则，目前会在发射前拒绝。For 循环要求
 归纳变量为 `INDEX`，边界为 `INDEX` 或有符号整数，步长必须可证明为正的常量。
 运行时步长、零步长和负步长均在发射前拒绝。这些是 emitter 的限制，
@@ -360,7 +389,7 @@ Packed canonical 公式（`BuildLogicalStridesFromLayout`，见
 | ------ | ---------------- |
 | `ND` | `stride[n-1] = 1; stride[k] = stride[k+1] * shape[k+1]` |
 | `DN`（`n ≥ 2`） | `stride[n-2] = 1`；`stride[n-1] = shape[n-2]`；`stride[n-3] = shape[n-2] * shape[n-1]`；外层按行主序 |
-| `NZ` | 对*分块*后的 rank-5 shape `[B, C/c0, R/16, 16, c0]` 求行主序 —— 见 [BlockNzTensorViews](../passes/15-block_nz_tensor_views.md) |
+| `NZ` | 对*分块*后的 rank-5 shape `[B, C/c0, R/16, 16, c0]` 求行主序 —— 见 [BlockNzTensorViews](../passes/17-block_nz_tensor_views.md) |
 
 **同一 canonical TensorView 的两种写法**：
 
@@ -368,7 +397,7 @@ Packed canonical 公式（`BuildLogicalStridesFromLayout`，见
   stride 为空，消费者按对应 layout 的 packed canonical 解释。
 - **显式** —— 每个维度的 stride 都已写出。
 
-[`MaterializeTensorStrides`](../passes/33-materialize_tensor_strides.md) Pass
+[`MaterializeTensorStrides`](../passes/35-materialize_tensor_strides.md) Pass
 将所有隐式形态展开为显式 packed canonical，让 codegen 看到单一契约。
 `TensorViewCanonical` IRProperty + verifier 强制此不变量：
 

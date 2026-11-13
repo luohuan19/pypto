@@ -20,6 +20,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -72,6 +73,38 @@ namespace codegen {
  */
 std::vector<ir::VarPtr> CollectVarsFromShapeExpr(const ir::ExprPtr& expr);
 
+/// Ordered trailing shape arguments shared by PTO codegen and its wrapper.
+/// Explicit scalar parameters take precedence; identity, not name, deduplicates.
+std::vector<ir::VarPtr> CollectTensorShapeDynVars(const ir::FunctionPtr& func);
+
+/// Backend artifacts, not IR nodes. The adapter retains capture order. The
+/// caller retains storage handles for PTOAS sync; the separate VPTO helper
+/// receives UB/GM pointers. Effects conservatively cover the entire storage.
+struct VFHelper {
+  /// Execution family; both VF and SIMT exports use the device helper bundle.
+  std::string kind = "vf";
+  std::string symbol;
+  std::string adapter_symbol;
+  std::string source;
+  std::vector<std::string> parameter_types;
+  std::vector<std::string> caller_parameter_types;
+  std::vector<std::string> parameter_effects;
+  /// Helper argument -> caller argument; VF collapses memory onto one UB base,
+  /// while SIMT retains each storage pointer and scalar argument in ABI order.
+  std::vector<size_t> parameter_indices;
+  /// VF byte offsets from its shared UB base; zero for scalars and SIMT pointers.
+  std::vector<int64_t> capture_byte_offsets;
+};
+
+struct PTOCodegenBundle {
+  std::string caller_source;
+  std::vector<VFHelper> helpers;
+  /// Every emitted InCore entry, including entries without helpers. Keys are
+  /// sorted; values name helpers in first-use order without duplicates. SIMT
+  /// definitions/adapters are not entries. A shared helper may have many users.
+  std::map<std::string, std::vector<std::string>> entry_helpers;
+};
+
 /**
  * @brief PTO MLIR code generator
  *
@@ -103,7 +136,10 @@ class PTOCodegen : public CodegenBase {
   /**
    * @brief Warn that `high_precision=True` will not run on the target backend.
    *
-   * Call this wherever a `precisionType` attribute is written. Two emitters do:
+   * Call this for precision attributes governed by HonorsHighPrecisionAlgorithm.
+   * rsqrt is excluded: high_precision=True supplies scratch for A2/A3 and a
+   * selector for A5, so both backends honour it regardless of this hook.
+   * Two emitters handle the remaining precision attributes:
    * the Tile op callbacks in `pto_ops_elementwise.cpp` and the Buffer IR
    * emitter in `pto_buffer_codegen.cpp`. Both lower the same `tile.div` /
    * `tile.log` / `tile.recip` onto the same `pto.*` op, so a backend that
@@ -144,6 +180,11 @@ class PTOCodegen : public CodegenBase {
    */
   std::string Generate(const ir::ProgramPtr& program, bool emit_tile_addr = true,
                        bool emit_source_loc = true);
+
+  /// Separate explicit RegScopes into A5/AIV no-Bridge helpers for execution.
+  /// Generate() retains the combined typed-VMI diagnostic representation.
+  PTOCodegenBundle GenerateBundle(const ir::ProgramPtr& program, bool emit_tile_addr = true,
+                                  bool emit_source_loc = true);
 
   // CodegenBase interface (unified API for operator codegen callbacks)
   [[nodiscard]] std::string GetCurrentResultTarget() const override;
@@ -248,17 +289,6 @@ class PTOCodegen : public CodegenBase {
   std::string GetOrEmitConstant(double value, DataType dt);
 
   /**
-   * @brief Expand packed FP4E2M1X2 make_tensor_view last-axis shape/strides
-   *        from IR carrier units to pto-isa nibble units (see docs/en/dev/fp4.md).
-   *        MX layouts are skipped. Mutates shape_ssas / stride_ssas in place.
-   */
-  void ExpandPackedFp4MakeTensorViewDims(DataType dtype, ir::TensorLayout layout,
-                                         const std::vector<ir::ExprPtr>& shape_exprs,
-                                         std::vector<std::string>& shape_ssas,
-                                         const std::vector<ir::ExprPtr>* stride_exprs,
-                                         std::vector<std::string>& stride_ssas);
-
-  /**
    * @brief Emit arith.index_cast if var is not already index type
    *
    * Valid_shape vars may be INT64/INT32 (from pl.min(...)), but pto.alloc_tile
@@ -295,6 +325,19 @@ class PTOCodegen : public CodegenBase {
    * @return SSA name of the i32-typed value (original if already i32)
    */
   std::string EmitCastToI32(const ir::ExprPtr& expr, const std::string& mlir_name);
+
+  /**
+   * @brief Emit the integer cast that widens an expression to i64
+   *
+   * Rank coordinates carried across the device boundary are i64 in the helper
+   * ABI. Narrowing a wider value to i32 first would truncate a rank index
+   * instead of rejecting it, so callers cast to the full width.
+   *
+   * @param expr IR expression whose type determines the cast
+   * @param mlir_name Current MLIR SSA name for the expression value
+   * @return SSA name of the i64-typed value (original if already i64)
+   */
+  std::string EmitCastToI64(const ir::ExprPtr& expr, const std::string& mlir_name);
 
   /**
    * @brief Register a variable to an MLIR SSA name
@@ -470,6 +513,19 @@ class PTOCodegen : public CodegenBase {
     std::shared_ptr<const ir::TileType> tile_type;  ///< Its TileType, MemRef resolved
   };
 
+  /// Resolve a preselected storage handle to the result variable's own physical
+  /// shape/configuration. The returned name and annotation always describe the
+  /// same SSA definition; this does not allocate or change the storage mapping.
+  [[nodiscard]] TupleOutput PrepareTileDestination(const ir::VarPtr& var, const std::string& storage,
+                                                   const std::string& op_name);
+
+  /// Define a typed, zero-copy view of an existing SSA. Backend view helpers
+  /// delegate here so all views register their definition and physical type.
+  std::string EnsureTileView(
+      const std::string& source, const std::string& source_type,
+      const std::shared_ptr<const ir::TileType>& tile_type, const std::string& name_hint,
+      std::optional<std::pair<std::string, std::string>> mutable_valid_shape = std::nullopt);
+
   /**
    * @brief Resolve and allocate every DPS destination of a multi-output call
    *
@@ -493,22 +549,27 @@ class PTOCodegen : public CodegenBase {
    * @param buf New result buffer SSA name
    */
   void SetCurrentResultBuf(const std::string& buf);
-  void RegisterTileBufType(const std::string& ssa_name, const std::string& type_string);
+  void RegisterTileBufType(const std::string& ssa_name, const std::string& type_string,
+                           const std::shared_ptr<const ir::TileType>& tile_type = nullptr);
   std::string GetSSATileBufType(const std::string& ssa_name) const;
   /// Record `ssa_name` as a tile *view* — the result of a `pto.subview` or a
   /// `pto.treshape`, which reinterprets another handle's bytes.
-  void RegisterTileViewName(const std::string& ssa_name);
+  /// Only a full-span treshape may pass its source; subviews keep a distinct origin.
+  void RegisterTileViewName(const std::string& ssa_name, const std::string& reshape_source = "");
   /// Whether `ssa_name` was emitted as a tile view.
   ///
-  /// A view carries its valid extent in its own type and has no `valid_row` /
-  /// `valid_col` operands, so `pto.set_validshape` cannot mutate one and ptoas
-  /// rejects the attempt. Every other tile handle — an alloc, an `scf.if` result,
-  /// a cross-core pop slot — does accept it.
+  /// Most views carry static valid extents or are not rooted in a local
+  /// allocation, so PTOAS cannot mutate their validity. Explicitly initialized
+  /// dynamic reshape aliases are the exception; see IsMutableTileName.
   ///
   /// View-ness has to be tracked, not inferred from the rendered valid dims: a
   /// `tile.slice` given a runtime `valid_shape` renders `v_row=?, v_col=?`, the
   /// same way an alloc-backed handle does.
   bool IsTileViewName(const std::string& ssa_name) const;
+  /// Record a local dynamic-valid allocation or an initialized dynamic reshape
+  /// of such a handle. Subviews and control-flow arguments are not eligible.
+  void RegisterMutableTileName(const std::string& ssa_name);
+  bool IsMutableTileName(const std::string& ssa_name) const;
   struct SubviewMaterializationInfo {
     std::string source_ssa;
     std::string source_type;
@@ -556,7 +617,7 @@ class PTOCodegen : public CodegenBase {
   /**
    * @brief Record the SSA name of the __gm_pipe_buffer function parameter
    *
-   * On Ascend910B (a2a3), the GM slot buffer is a function parameter used as
+   * On Ascend910 (a2a3), the GM slot buffer is a function parameter used as
    * intermediary for cross-core pipe communication. The codegen emits it as
    * a gm_slot_buffer operand in initialize_pipe instructions.
    */
@@ -598,11 +659,12 @@ class PTOCodegen : public CodegenBase {
   /**
    * @brief SSA name of the synthetic raw dispatch-args pointer parameter.
    *
-   * Functions containing ``pld.system.defer_wait`` receive one hidden
+   * Functions containing ``pld.system.defer_wait`` or an async URMA transfer
+   * (``pld.tensor.put_async`` / ``get_async``) receive one hidden
    * ``!pto.ptr<i64>`` parameter after dynamic dimensions and before other
    * runtime-owned parameters. The kernel wrapper forwards its ``args`` pointer
-   * through this slot so deferred-completion lowering can reach the runtime's
-   * per-task AsyncCtx. Returns empty for functions without deferred waits.
+   * through this slot so deferred-completion and URMA-transfer lowering can
+   * reach the runtime's per-task AsyncCtx. Returns empty otherwise.
    */
   [[nodiscard]] std::string GetDeferredCompletionRawArgsSSA() const {
     return fs_.deferred_completion_raw_args_ssa;
@@ -618,6 +680,21 @@ class PTOCodegen : public CodegenBase {
    * @return Stable adapter symbol name.
    */
   std::string RegisterDeferredCompletionAdapter();
+
+  /**
+   * @brief Register the module-level URMA async transfer adapter.
+   *
+   * ``pld.tensor.put_async`` / ``get_async`` lowering calls this when it emits
+   * a helper call. The symbol is dtype-suffixed
+   * (``pypto_urma_put_async_f32`` / ``pypto_urma_get_async_f32``) because the
+   * external helper takes typed base pointers. The declaration is emitted once
+   * at module scope and implemented by the generated C++ kernel wrapper.
+   *
+   * @param is_put True for the put helper, false for get.
+   * @param dtype Element data type of the transfer.
+   * @return The adapter symbol to call.
+   */
+  std::string RegisterUrmaTransferAdapter(bool is_put, DataType dtype);
 
   /**
    * @brief SSA name of the synthetic SPMD block_idx param.
@@ -731,19 +808,30 @@ class PTOCodegen : public CodegenBase {
   std::string EmitCommRemoteOffsetInline(const std::string& ctx_ssa, const std::string& peer_ssa,
                                          const DataType& dtype);
 
-  /// Increase/decrease the current indentation level (used by op codegen helpers that emit scf.for blocks)
-  void IncreaseIndent() { indent_level_++; }
-  void DecreaseIndent() { indent_level_--; }
+  /// Enter/leave an emitted MLIR region, tracking indentation and allocation dominance.
+  void IncreaseIndent();
+  void DecreaseIndent();
 
   /**
    * @brief Return the GM slot buffer SSA region for one frontend pipe.
    *
-   * Ascend910B uses a single function parameter as the backing GM FIFO
+   * Ascend910 uses a single function parameter as the backing GM FIFO
    * workspace. Multiple frontend pipe ids in one function must point at
    * disjoint byte ranges within that parameter.
    */
   [[nodiscard]] std::string GetGMSlotBufferSSAForPipe(int pipe_id, int dir_mask);
 
+  /// Emitter-only, function-local contract from an explicit pipe initializer.
+  /// NoConvert in PTOAS also accepts INT32; retain the declared dtype so a pop
+  /// cannot silently disagree with the Python API's c2v_dtype.
+  void RecordC2VPipeDtype(int pipe_id, DataType dtype) {
+    fs_.c2v_payload_dtypes.insert_or_assign(pipe_id, dtype);
+  }
+  [[nodiscard]] std::optional<DataType> GetC2VPipeDtype(int pipe_id) const {
+    auto found = fs_.c2v_payload_dtypes.find(pipe_id);
+    if (found == fs_.c2v_payload_dtypes.end()) return std::nullopt;
+    return found->second;
+  }
   /**
    * @brief Whether physical addresses are baked into the emitted PTO.
    *
@@ -752,6 +840,10 @@ class PTOCodegen : public CodegenBase {
    * `pto.reserve_buffer` is emitted as `auto = true` with no `base`.
    */
   [[nodiscard]] bool EmitTileAddr() const { return emit_tile_addr_; }
+  /// Test MemRef-base ownership, including views derived from Tile parameters.
+  /// Caller-backed storage must keep its incoming handle/address instead of
+  /// receiving a new local allocation or an unrelated view handle.
+  [[nodiscard]] bool IsParameterBackedTile(const std::shared_ptr<const ir::TileType>& tile_type) const;
 
   /**
    * @brief Check if the current function is an AIC (Cube) function
@@ -783,14 +875,53 @@ class PTOCodegen : public CodegenBase {
 
   // Override visitor methods for code generation - Statements
   void VisitStmt_(const ir::AssignStmtPtr& op) override;
+  void VisitStmt_(const ir::RegScopeStmtPtr& op) override;
   void VisitStmt_(const ir::ForStmtPtr& op) override;
   void VisitStmt_(const ir::IfStmtPtr& op) override;
   void VisitStmt_(const ir::WhileStmtPtr& op) override;
   void VisitStmt_(const ir::YieldStmtPtr& op) override;
   void VisitStmt_(const ir::EvalStmtPtr& op) override;
+  void VisitStmt_(const ir::SimtScopeStmtPtr& op) override;
+  void VisitStmt_(const ir::SimtLaunchStmtPtr& op) override;
+
+  /// Emit a registered RegOp as typed VMI SSA; return false for ordinary calls
+  /// so assignment emission can fall back to the normal Tile/scalar path.
+  /// RegOps require a named result inside their owning RegScope.
+  bool TryEmitRegCall(const ir::CallPtr& call, const ir::VarPtr& result);
+  /// Validate backend support and spell a vector or predicate-mask VMI type.
+  std::string GetRegTypeString(const ir::RegTypePtr& type) const;
+  /// Accessed Tile variable -> UB pointer SSA hoisted before pto.vecscope.
+  /// Store-result aliases may share one pointer; cleared after each RegScope.
+  std::map<const ir::Var*, std::string> reg_addresses_;
+  /// Tuple SSA values have no aggregate MLIR representation. Keep each result
+  /// independently addressable, including when only one projection is consumed.
+  std::map<const ir::Var*, std::vector<std::string>> reg_tuple_values_;
+  /// Lexical emission guard for RegOps and nested scopes, not memory ownership.
+  bool inside_reg_scope_ = false;
+  bool separate_vf_ = false;
+  bool supported_vf_entries_ = false;
+  std::vector<VFHelper> vf_helpers_;
+  std::map<std::string, std::vector<std::string>> entry_helpers_;
+  /// Separate membership index preserves first-use order without linear scans.
+  std::set<std::pair<std::string, std::string>> entry_helper_uses_;
+  void RecordEntryHelperUse(const std::string& symbol);
+  std::string GenerateImpl(const ir::ProgramPtr& program, bool emit_tile_addr, bool emit_source_loc);
+  void EmitVFHelperCall(const ir::RegScopeStmtPtr& scope);
+  void EmitVFAdapter(const VFHelper& helper);
+  /// SIMT functions borrow storage through a pointer ABI, never Tile values.
+  bool inside_simt_function_ = false;
+  std::map<std::string, ir::FunctionPtr> simt_functions_;
+  std::map<std::string, std::vector<std::string>> simt_effects_;
+  std::map<std::pair<std::string, std::vector<std::string>>, size_t> simt_artifacts_;
+  std::set<std::string> used_simt_functions_;
+  std::string GenerateSimtFunction(const ir::FunctionPtr& function);
+  std::string SimtParameterType(const ir::TypePtr& type);
+  bool TryEmitSimtCall(const ir::CallPtr& call);
+  std::string SimtElementOffset(const ir::ExprPtr& storage, const ir::MakeTuplePtr& indices);
 
   // Override visitor methods for code generation - Expressions
   void VisitExpr_(const ir::CallPtr& op) override;
+  void VisitExpr_(const ir::TupleGetItemExprPtr& op) override;
   void VisitExpr_(const ir::VarPtr& op) override;
   void VisitExpr_(const ir::IterArgPtr& op) override;
   void VisitExpr_(const ir::ConstIntPtr& op) override;
@@ -822,6 +953,7 @@ class PTOCodegen : public CodegenBase {
   void VisitExpr_(const ir::FloatDivPtr& op) override;
   void VisitExpr_(const ir::MinPtr& op) override;
   void VisitExpr_(const ir::MaxPtr& op) override;
+  void VisitExpr_(const ir::PowPtr& op) override;
   // Unary
   void VisitExpr_(const ir::NotPtr& op) override;
   void VisitExpr_(const ir::NegPtr& op) override;
@@ -829,6 +961,35 @@ class PTOCodegen : public CodegenBase {
   void VisitExpr_(const ir::BitNotPtr& op) override;
 
  private:
+  /// Shared implementation for `EmitCastToI32` / `EmitCastToI64`.
+  std::string EmitCastToInt(const ir::ExprPtr& expr, const std::string& mlir_name, unsigned target_bits,
+                            const char* api_name);
+
+  /// Whether `expr` cannot be negative at run time, evaluated at `dtype` -- the
+  /// width the enclosing operation is emitted at, since `EmitArithOperand`
+  /// narrows operands into it.
+  ///
+  /// A conservative syntactic check, not a bound analysis: it answers `false`
+  /// whenever it is unsure, and a `false` only costs the cheaper lowering. It
+  /// recognises just the shapes a slot index is built from -- a literal, an
+  /// induction variable whose loop starts at a non-negative literal, that
+  /// variable minus a non-negative literal no greater than the start, and floor
+  /// divisions or remainders of those by a positive literal.
+  ///
+  /// Sums and products are deliberately **not** recognised. Non-negative
+  /// operands do not give a non-negative fixed-width result: over an INDEX loop
+  /// `0, 1, 2`, `i * 4611686018427387904` wraps to INT64_MIN at i == 2. Every
+  /// shape above is closed under its own range instead -- a quotient or
+  /// remainder by a positive literal cannot exceed its dividend, and
+  /// `iv - start` with `0 <= start <= iv` stays in `[0, iv]` -- so none of them
+  /// can overflow.
+  ///
+  /// The point is FloorDiv/FloorMod: both follow the divisor's sign, which
+  /// costs a conditional correction over the hardware's truncating ops. With a
+  /// non-negative dividend and a positive divisor the two agree exactly, so the
+  /// correction is dead code.
+  [[nodiscard]] bool IsProvablyNonNegative(const ir::ExprPtr& expr, DataType dtype) const;
+
   /**
    * @brief Generate PTO-ISA MLIR for a single function
    */
@@ -840,7 +1001,8 @@ class PTOCodegen : public CodegenBase {
   void GenerateBufferFunction(const ir::FunctionPtr& func);
   bool TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& result = nullptr);
   std::string EmitBufferIntegerOperand(const ir::ExprPtr& expr, DataType target);
-  std::string BufferInsOutsClause(const std::vector<ir::ExprPtr>& inputs, const ir::ExprPtr& destination);
+  std::string BufferInsOutsClause(const std::vector<ir::ExprPtr>& inputs, const ir::ExprPtr& destination,
+                                  const std::string& attributes = "");
 
   /**
    * @brief Collect deterministic GM slot buffer byte offsets for frontend pipe ids in a module.
@@ -849,6 +1011,9 @@ class PTOCodegen : public CodegenBase {
 
   /// Emit the external declaration implemented by the generated kernel wrapper.
   void EmitDeferredCompletionAdapterDeclaration();
+
+  /// Emit the external URMA async transfer helper declarations.
+  void EmitUrmaTransferAdapterDeclarations();
 
   /**
    * @brief Build variable identity to MemRef mapping from function body
@@ -883,22 +1048,27 @@ class PTOCodegen : public CodegenBase {
    * (deferred allocs via AllocNewTileBuf).
    */
   struct AllocTileFields {
-    std::string type_str;       ///< pto.tile_buf<...> type string
-    std::string addr_ssa;       ///< Optional addr operand SSA value
-    std::string valid_row_ssa;  ///< valid_row operand SSA value (always emitted)
-    std::string valid_col_ssa;  ///< valid_col operand SSA value (always emitted)
+    std::string type_str;                           ///< pto.tile_buf<...> type string
+    std::string addr_ssa;                           ///< Optional addr operand SSA value
+    std::string valid_row_ssa;                      ///< valid_row operand SSA value (always emitted)
+    std::string valid_col_ssa;                      ///< valid_col operand SSA value (always emitted)
+    std::shared_ptr<const ir::TileType> tile_type;  ///< Physical configuration of the declaration
   };
 
   /// One author-declared multi-slot allocation (`pl.MemRef(slots=N)`), lowered to
   /// a ptoas `pto.alloc_multi_tile` region whose slots are selected per use by
-  /// `pto.multi_tile_get`. PTOAS-planner mode only — see PlanMultiBufferRegions.
+  /// `pto.multi_tile_get`. Also used with fixed addresses by software pipelines.
   struct MultiBufferRegion {
-    std::string region_ssa;     ///< The `%mb` handle the slots are taken from
-    std::string mtb_type_str;   ///< `!pto.multi_tile_buf<<slot>, count=N>`
-    std::string slot_type_str;  ///< The single-slot `!pto.tile_buf<...>` type
+    std::string region_ssa;       ///< The `%mb` handle the slots are taken from
+    std::string mtb_type_str;     ///< `!pto.multi_tile_buf<<slot>, count=N>`
+    std::string slot_type_str;    ///< The single-slot `!pto.tile_buf<...>` type
+    std::string parent_type_str;  ///< Optional flat parent for ordinary slot subviews
+    std::string flat_slot_type_str;
+    int64_t slot_elements = 0;
+    std::string addr_ssa;       ///< Constant base address under the PyPTO planner
     std::string valid_row_ssa;  ///< valid_row operand (shared by every slot)
     std::string valid_col_ssa;  ///< valid_col operand (shared by every slot)
-    uint64_t count = 1;         ///< Slot count, in [2, 16] (the ptoas bound)
+    uint64_t count = 1;         ///< Slots per backend region, in [2, 16]
   };
 
   /**
@@ -920,14 +1090,20 @@ class PTOCodegen : public CodegenBase {
                                          bool use_physical_valid_shape = false);
 
   /**
-   * @brief The tile_buf handle already bound to the buffer `memref` denotes.
+   * @brief The tile_buf handle already bound to the buffer `tile_type` denotes.
    *
    * Only meaningful under the PTOAS memory planner (`emit_tile_addr_ == false`),
    * where variables denoting the same buffer must share one handle because
    * there is no baked `addr` to alias through. Returns "" when addresses are
-   * baked, when `memref` is null, or when no handle is bound yet.
+   * baked, when `tile_type` has no MemRef, or when no handle is bound yet. Mixed
+   * view types can reuse a declared tile handle only when its declaration
+   * dominates the current region, both branch yields already share it in the
+   * result's known memory space, and its actual SSA type matches `expected_type`.
    */
-  [[nodiscard]] std::string TryGetSharedTileBufHandle(const ir::MemRefPtr& memref) const;
+  [[nodiscard]] std::string TryGetSharedTileBufHandle(const std::shared_ptr<const ir::TileType>& tile_type,
+                                                      const std::string& expected_type,
+                                                      const ir::VarPtr& then_value,
+                                                      const ir::VarPtr& else_value) const;
 
   /**
    * @brief Declare `ssa_name`'s `pto.alloc_tile` in the function head.
@@ -954,27 +1130,21 @@ class PTOCodegen : public CodegenBase {
    * region and derive per-slot (dynamic event id) synchronization from the slot
    * expression. Emitting N unrelated `alloc_tile`s instead throws that away.
    *
-   * Runs only under the PTOAS memory planner (`emit_tile_addr_ == false`). Under
-   * the PyPTO planner, ptoas runs at `--pto-level=level3`, where a region needs an
-   * explicit `addr` base that codegen does not emit, so the baked-address
-   * `alloc_tile` path stays. ptoas itself handles such a region: given a constant
-   * `addr`, it has derived the same per-slot sync at level3 as at level2 since 0.55
-   * (hw-native-sys/PTOAS#1106, closed).
+   * Runs under the PTOAS planner or, when software pipelining is enabled, with
+   * a constant region base assigned by the PyPTO planner.
    *
    * A region is eligible when every tile bound to that allocation selects a slot,
    * the slots share one tile_buf type and one static valid extent, at most one of
    * them is live per loop iteration, the memory space is a local one ptoas supports
-   * for multi_tile_buf (vec / mat / acc), and the count is within ptoas's `[2, 16]`.
+   * for multi_tile_buf (vec / mat / acc), and each backend region has 2..16 slots.
    *
-   * The one-slot-per-iteration condition is a ptoas synchronization limit, not a
-   * typing one (hw-native-sys/PTOAS#1519 in the pinned ptoas) — see
-   * CoLiveSlotCollector.
+   * The opt-in fixed-address path additionally supports canonical co-live slots
+   * through addressed parent buffers and subviews, avoiding multi-tile startup
+   * and drain synchronization regressions in the assembler.
    *
-   * Anything else is a `ValueError` naming the shape, *not* a fallback: under this
-   * planner per-slot `alloc_tile`s would leave ptoas free to plan the slots on top
-   * of each other, which is the one thing the declaration exists to prevent. The
-   * ordinary `alloc_tile` path is reached only when no region is planned at all —
-   * under the PyPTO planner, or for an allocation that declares no slots.
+   * Unsupported declarations keep their addressed alloc_tile form under PyPTO.
+   * Under PTOAS they raise a ValueError: separate unaddressed alloc_tile ops
+   * would not preserve the declared separation between slots.
    *
    * @param func The function being generated (scanned for tile phis, which take a
    *             head-declared handle a per-use slot cannot provide)
@@ -992,12 +1162,14 @@ class PTOCodegen : public CodegenBase {
    * Emitted where the ordinary `alloc_tile` would be — at the tile's definition —
    * so a runtime slot index (`l0c[i % 2]`) is read inside the loop that names it.
    *
-   * @return false when no region was planned for `memref`'s allocation — it
-   *         declares no slots, or the PyPTO planner is in use. An allocation that
-   *         declares slots this planner cannot describe never reaches here:
-   *         PlanMultiBufferRegions has already raised.
+   * @return false when no region was planned, including addressed declarations
+   *         that keep ordinary alloc_tile lowering. Unsupported declarations
+   *         under the PTOAS planner have already raised in PlanMultiBufferRegions.
    */
-  bool TryEmitMultiTileGet(const ir::MemRefPtr& memref, const std::string& tile_buf, const ir::Span& span);
+  bool TryEmitMultiTileGet(const ir::TileTypePtr& type, const std::string& tile_buf, const ir::Span& span);
+
+  /// Existing operand whose region slot is also the in-place compute result.
+  [[nodiscard]] ir::VarPtr FindMultiTileInputAlias(const ir::AssignStmtPtr& stmt) const;
 
   /**
    * @brief Emit the `pto.alloc_multi_tile` declarations in the function head.
@@ -1017,6 +1189,8 @@ class PTOCodegen : public CodegenBase {
   /// Per-function mutable state that is reset at the start of each GenerateFunction call.
   struct FunctionState {
     bool buffer_ir = false;
+    /// Lowered slot producers require shared alias identity even through split APIs.
+    bool has_software_pipeline_slots = false;
     std::ostringstream constants_section;
     std::ostringstream body_section;
     std::string constants_indent;  ///< Fixed indent for constants_section (set once per function)
@@ -1033,6 +1207,10 @@ class PTOCodegen : public CodegenBase {
         view_ssa_to_base_ptr;  ///< tensor_view SSA → base ptr SSA (for rebinding IfStmt phi return_vars)
     std::map<const ir::Var*, std::string> memref_to_mlir;    ///< keyed by base_ Ptr
     std::map<const ir::Var*, const ir::Var*> var_to_memref;  ///< maps tile var → base_ Ptr
+    /// Plain Tile assignments recorded while emitting the surrounding function.
+    /// RegScope pre-scanning uses this provenance when an external alias is
+    /// defined before the scope and therefore is outside its statement tree.
+    std::map<const ir::Var*, ir::VarPtr> tile_aliases;
     std::map<const ir::Var*, std::shared_ptr<const ir::TileType>>
         memref_to_tile_type;  ///< keyed by base_ Ptr
 
@@ -1047,15 +1225,40 @@ class PTOCodegen : public CodegenBase {
     };
     std::vector<ExtraAllocTile> extra_alloc_tiles;
     std::map<std::string, std::string> ssa_to_tile_buf_type;
+    // Original descriptor of each emitted tile SSA. ExtractTileTypeInfo applies
+    // the same effective layout / packed-type rules as its declaration. Only
+    // physical configuration is compared here: valid extents and padding have
+    // operation-specific semantics and need not equal the logical result's.
+    std::map<std::string, std::shared_ptr<const ir::TileType>> ssa_to_tile_type;
     std::map<std::string, SubviewMaterializationInfo> subview_materializations;
-    /// SSA names emitted as tile views (`pto.subview` / `pto.treshape`).
-    std::set<std::string> tile_view_names;
+    /// Constant lower bound of each enclosing loop variable, while its body is
+    /// being emitted. `VisitStmt_(ForStmtPtr)` adds an entry when the loop's
+    /// start is a literal and removes it on the way out, so an entry means
+    /// "this variable is at least this value, here".
+    ///
+    /// Used only to prove a dividend non-negative, which is what lets a signed
+    /// FloorDiv/FloorMod lower to its cheap truncating form. Restricting it to
+    /// literal starts is deliberate: a symbolic start would need a real bound
+    /// analysis, and the shapes that matter -- a slot index derived from the
+    /// induction variable -- all have one.
+    std::map<const ir::Var*, int64_t> loop_var_lower_bound;
+
+    /// View SSA -> actual storage origin. Only full-span treshape inherits its
+    /// source's origin; subviews stay distinct because their window can differ.
+    /// This proves no-op copies without trusting IR MemRefs after phi rebinding.
+    std::map<std::string, std::string> tile_view_names;
+    /// Handles whose runtime valid extents can be updated by pto.set_validshape.
+    std::set<std::string> mutable_tile_names;
 
     /// Eligible multi-buffer regions, keyed by the allocation's base Ptr.
     std::map<const ir::Var*, MultiBufferRegion> multi_buffer_regions;
     /// The same regions in discovery order — the map is keyed by pointer, which
     /// is not a stable order to emit declarations in.
     std::vector<const ir::Var*> multi_buffer_region_order;
+    /// Slot remainders proven to have nonnegative operands in canonical loops.
+    std::set<const ir::Expr*> unsigned_slot_remainders;
+    /// Canonical (induction, offset, count) remainders in one statement region.
+    std::map<std::tuple<const ir::Expr*, int64_t, int64_t>, std::string> slot_index_ssa;
 
     int temp_counter = 0;
     std::set<std::string> used_ssa_names;
@@ -1076,12 +1279,22 @@ class PTOCodegen : public CodegenBase {
     /// a `[1, N]` row-major op result and its `[N, 1]` col-major reshape view,
     /// which occupy the same bytes. Their shared handle carries exactly one type
     /// (differently-typed reads become `pto.treshape` views of it), so it must
-    /// never be re-typed to suit another var. `TryGetSharedTileBufHandle` refuses
-    /// these identities.
+    /// never be re-typed to suit another var. `TryGetSharedTileBufHandle` only
+    /// accepts these identities for a dominating tile handle shared by both
+    /// branch yields in the result's known memory space, whose declared type
+    /// matches the requested type.
     std::set<std::string> memref_identity_mixed_types;
     /// alloc_tile SSA handles already emitted — dedups the alloc when several
     /// vars share one handle (PTOAS in-place aliasing).
     std::set<std::string> emitted_tile_alloc_names;
+    /// Declaration region for each emitted/staged alloc. Region 0 is the
+    /// function body/head; every SCF region gets a unique ID, including sibling
+    /// branches at the same nesting depth. Only active ancestor regions dominate
+    /// the current emission point. Keep this separate from function-wide dedup.
+    std::map<std::string, size_t> tile_alloc_scope;
+    std::vector<size_t> tile_alloc_scope_stack{0};
+    std::set<size_t> active_tile_alloc_scopes{0};
+    size_t next_tile_alloc_scope = 0;
 
     ir::FunctionPtr current_function;
     ir::VarPtr current_result_var;
@@ -1091,6 +1304,7 @@ class PTOCodegen : public CodegenBase {
     std::string gm_slot_buffer_ssa;
     DataType gm_slot_buffer_dtype = DataType::FP32;
     std::map<std::pair<int, int>, std::string> gm_slot_buffer_region_by_pipe;
+    std::map<int, DataType> c2v_payload_dtypes;
     std::set<const ir::Var*> ffts_workspace_vars;
 
     /// SSA name of the synthetic runtime-owned SDMA workspace pointer param.
@@ -1133,6 +1347,7 @@ class PTOCodegen : public CodegenBase {
 
     void Reset() {
       buffer_ir = false;
+      has_software_pipeline_slots = false;
       constants_section.str("");
       constants_section.clear();
       body_section.str("");
@@ -1146,14 +1361,17 @@ class PTOCodegen : public CodegenBase {
       view_ssa_to_base_ptr.clear();
       memref_to_mlir.clear();
       var_to_memref.clear();
+      tile_aliases.clear();
       memref_to_tile_type.clear();
 
       emitted_numeric_constants.clear();
 
       extra_alloc_tiles.clear();
       ssa_to_tile_buf_type.clear();
+      ssa_to_tile_type.clear();
       subview_materializations.clear();
       tile_view_names.clear();
+      mutable_tile_names.clear();
 
       temp_counter = 0;
       used_ssa_names.clear();
@@ -1165,8 +1383,14 @@ class PTOCodegen : public CodegenBase {
       memref_identity_type.clear();
       memref_identity_mixed_types.clear();
       emitted_tile_alloc_names.clear();
+      tile_alloc_scope.clear();
+      tile_alloc_scope_stack = {0};
+      active_tile_alloc_scopes = {0};
+      next_tile_alloc_scope = 0;
       multi_buffer_regions.clear();
       multi_buffer_region_order.clear();
+      unsigned_slot_remainders.clear();
+      slot_index_ssa.clear();
 
       tuple_element_index.clear();
       current_function.reset();
@@ -1177,6 +1401,7 @@ class PTOCodegen : public CodegenBase {
       gm_slot_buffer_ssa.clear();
       gm_slot_buffer_dtype = DataType::FP32;
       gm_slot_buffer_region_by_pipe.clear();
+      c2v_payload_dtypes.clear();
       ffts_workspace_vars.clear();
 
       sdma_workspace_arg_ssa.clear();
@@ -1202,6 +1427,9 @@ class PTOCodegen : public CodegenBase {
 
   /// True when the module needs the wrapper-defined counter-completion adapter.
   bool needs_deferred_completion_adapter_ = false;
+
+  /// URMA async transfer helper symbol -> MLIR element type.
+  std::map<std::string, std::string> urma_adapter_element_types_;
 
   /// Sites already reported by WarnIfHighPrecisionIgnored, cleared by Generate
   /// so a second compilation in the same process warns again.
@@ -1277,7 +1505,13 @@ class PTOCodegen : public CodegenBase {
   /// Helper for comparison expression visitors
   void VisitCmpExpr(const ir::BinaryExprPtr& op, const std::string& predicate);
 
-  /// Get MLIR type string for a scalar iter_arg/return_var (e.g., "index", "i1", "f32")
+  /// Spell scalar/vector/mask value types carried by SCF iter_args and results.
+  /// Tile handles follow the separate mutable-storage control-flow path.
+  std::string GetValueCarryTypeString(const ir::TypePtr& type) const;
+  /// MemRef bases owned by Tile parameters, including their derived views.
+  /// Rebuilt per function: preserve caller storage instead of allocating locally.
+  /// Unlike reg_addresses_, this tracks ownership, not emitted pointer SSA names.
+  std::set<const ir::Var*> parameter_backed_tile_bases_;
   std::string GetScalarIterArgTypeString(const std::shared_ptr<const ir::ScalarType>& scalar_type) const;
 };
 

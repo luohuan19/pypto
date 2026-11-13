@@ -199,6 +199,8 @@ class LowerPipelineMutator : public IRMutator {
     if (op->kind_ != ForKind::Pipeline || !op->HasAttr(kPipelineStagesAttr)) {
       return IRMutator::VisitStmt_(op);
     }
+    CHECK_SPAN(op->hardware_loop_policy_ == HardwareLoopPolicy::Auto, op->span_)
+        << "Pipeline expansion of HardwareLoopPolicy.Require is not supported yet";
     int64_t factor = static_cast<int64_t>(op->GetAttr<int>(kPipelineStagesAttr, 0));
     INTERNAL_CHECK_SPAN(factor >= 1, op->span_)
         << "LowerPipelineLoops: pipeline_stages must be >= 1, got " << factor;
@@ -566,6 +568,7 @@ class LowerPipelineMutator : public IRMutator {
 
 FunctionPtr TransformLowerPipelineLoops(const FunctionPtr& func) {
   INTERNAL_CHECK(func) << "LowerPipelineLoops cannot run on null function";
+  pipeline_loop::CheckExplicitFlagsOutsidePipeline(func->body_);
   LowerPipelineMutator mutator;
   auto new_body = mutator.VisitStmt(func->body_);
   if (new_body.get() == func->body_.get()) return func;

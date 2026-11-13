@@ -21,14 +21,17 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/verifier/reg_scope.h"
 
 namespace pypto {
 namespace ir {
@@ -106,6 +109,8 @@ FunctionPtr IRBuilder::EndFunction(const Span& end_span) {
       body, combined_span, func_ctx->GetFuncType(), func_ctx->GetLevel(), func_ctx->GetRole(),
       func_ctx->GetAttrs(), func_ctx->GetRequiresRuntimeBinding(), func_ctx->GetIRStage());
 
+  CheckRegScopes(func);
+
   // Pop context
   context_stack_.pop_back();
 
@@ -116,14 +121,16 @@ FunctionPtr IRBuilder::EndFunction(const Span& end_span) {
 
 void IRBuilder::BeginForLoop(const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop,
                              const ExprPtr& step, const Span& span, ForKind kind,
-                             std::vector<std::pair<std::string, std::any>> attrs) {
+                             std::vector<std::pair<std::string, std::any>> attrs, HardwareLoopPolicy policy) {
+  CHECK_SPAN(policy == HardwareLoopPolicy::Auto || kind == ForKind::Sequential, span)
+      << "HardwareLoopPolicy.Require requires Sequential ForKind";
   if (context_stack_.empty()) {
     throw pypto::RuntimeError("Cannot begin for loop: not inside a function or another valid context at " +
                               span.to_string());
   }
 
   context_stack_.push_back(
-      std::make_unique<ForLoopContext>(loop_var, start, stop, step, span, kind, std::move(attrs)));
+      std::make_unique<ForLoopContext>(loop_var, start, stop, step, span, kind, std::move(attrs), policy));
 }
 
 void IRBuilder::AddIterArg(const IterArgPtr& iter_arg) {
@@ -162,10 +169,10 @@ StmtPtr IRBuilder::EndForLoop(const Span& end_span) {
                      end_span.begin_line_, end_span.begin_column_);
 
   // Create for statement
-  auto for_stmt =
-      std::make_shared<ForStmt>(loop_ctx->GetLoopVar(), loop_ctx->GetStart(), loop_ctx->GetStop(),
-                                loop_ctx->GetStep(), loop_ctx->GetIterArgs(), body, loop_ctx->GetReturnVars(),
-                                combined_span, loop_ctx->GetKind(), loop_ctx->GetAttrs());
+  auto for_stmt = std::make_shared<ForStmt>(
+      loop_ctx->GetLoopVar(), loop_ctx->GetStart(), loop_ctx->GetStop(), loop_ctx->GetStep(),
+      loop_ctx->GetIterArgs(), body, loop_ctx->GetReturnVars(), combined_span, loop_ctx->GetKind(),
+      loop_ctx->GetAttrs(), std::vector<std::string>{}, loop_ctx->GetPolicy());
 
   // Pop context
   context_stack_.pop_back();
@@ -309,6 +316,77 @@ StmtPtr IRBuilder::EndIf(const Span& end_span) {
   return if_stmt;
 }
 
+void IRBuilder::BeginSimtScope(const std::vector<ExprPtr>& block_dims, const Span& span) {
+  CHECK(!context_stack_.empty()) << "SIMT scope requires an enclosing function";
+  context_stack_.push_back(std::make_unique<SimtScopeContext>(block_dims, span));
+}
+
+StmtPtr IRBuilder::EndSimtScope(const Span& end_span, const std::vector<VarPtr>& private_scalars) {
+  CHECK(!context_stack_.empty() && CurrentContext()->GetType() == BuildContext::Type::SIMT_SCOPE)
+      << "EndSimtScope requires an open SIMT scope";
+  const auto* context = static_cast<SimtScopeContext*>(CurrentContext());
+  const auto& stmts = context->GetStmts();
+  StmtPtr body = stmts.size() == 1 ? stmts[0] : std::make_shared<SeqStmts>(stmts, end_span);
+  const auto& begin = context->GetBeginSpan();
+  Span span(begin.filename_, begin.begin_line_, begin.begin_column_, end_span.begin_line_,
+            end_span.begin_column_);
+  auto scope = std::make_shared<SimtScopeStmt>(context->GetBlockDims(), body, span, private_scalars);
+  context_stack_.pop_back();
+  ApplyPendingLeadingComments(scope);
+  if (!context_stack_.empty()) CurrentContext()->AddStmt(scope);
+  return scope;
+}
+
+void IRBuilder::BeginRegScope(const Span& span) { BeginScope(ScopeKind::Reg, span); }
+
+StmtPtr IRBuilder::EndRegScope(const Span& span) {
+  CHECK(!context_stack_.empty() && CurrentContext()->GetType() == BuildContext::Type::SCOPE &&
+        static_cast<ScopeContext*>(CurrentContext())->GetScopeKind() == ScopeKind::Reg)
+      << "EndRegScope requires an open RegScope";
+  return EndScope(span);
+}
+
+VarPtr IRBuilder::EmitReg(const std::string& name, const std::string& op_name,
+                          const std::vector<ExprPtr>& args,
+                          const std::vector<std::pair<std::string, std::any>>& kwargs, const Span& span) {
+  CHECK(op_name.rfind("reg.", 0) == 0) << "EmitReg expects a reg operation";
+  bool inside = false;
+  for (const auto& context : context_stack_) {
+    if (context->GetType() == BuildContext::Type::SCOPE &&
+        static_cast<ScopeContext*>(context.get())->GetScopeKind() == ScopeKind::Reg) {
+      inside = true;
+    }
+  }
+  CHECK_SPAN(inside, span) << "EmitReg requires RegScope";
+  // The registry normalizes defaults for both Builder and raw IR calls.
+  const auto op = OpRegistry::GetInstance().GetOp(op_name);
+  auto has_kwarg = [&kwargs](const std::string& key) {
+    return std::any_of(kwargs.begin(), kwargs.end(), [&key](const auto& item) { return item.first == key; });
+  };
+  auto call = OpRegistry::GetInstance().Create(op_name, args, kwargs, span);
+  auto var = Var(name, call->GetType(), span);
+  // The DSL treats a same-dtype conversion without modifiers as a no-op and
+  // returns its operand. Preserve that canonical form for raw builder users.
+  bool no_op_convert = false;
+  if (IsOp(op, "reg.convert") && args.size() == 1 && !has_kwarg("rounding") && !has_kwarg("saturate")) {
+    auto source = std::dynamic_pointer_cast<const RegType>(args[0]->GetType());
+    const DataType* dtype = nullptr;
+    for (const auto& [key, value] : kwargs) {
+      if (key == "dtype") dtype = std::any_cast<DataType>(&value);
+    }
+    no_op_convert = source != nullptr && dtype != nullptr && source->dtype_ == *dtype;
+  }
+  Emit(std::make_shared<AssignStmt>(var, no_op_convert ? args[0] : ExprPtr(call), span));
+  return var;
+}
+
+VarPtr IRBuilder::EmitRegStore(const std::string& name, const ExprPtr& tile, const ExprPtr& offset,
+                               const ExprPtr& value, const ExprPtr& mask, const Span& span) {
+  std::vector<ExprPtr> args{tile, offset, value};
+  if (mask) args.push_back(mask);
+  return EmitReg(name, "reg.store", args, {}, span);
+}
+
 // ========== Scope Building ==========
 
 void IRBuilder::BeginScope(ScopeKind scope_kind, const Span& span, std::optional<Level> level,
@@ -332,7 +410,8 @@ void IRBuilder::BeginScope(ScopeKind scope_kind, const Span& span, std::optional
 
 StmtPtr IRBuilder::EndScope(const Span& end_span, std::vector<int64_t> devices,
                             std::vector<WindowBufferPtr> slots,
-                            std::vector<std::pair<std::string, std::any>> extra_attrs) {
+                            std::vector<std::pair<std::string, std::any>> extra_attrs,
+                            std::vector<std::string> engines) {
   CHECK(!context_stack_.empty() && CurrentContext()->GetType() == BuildContext::Type::SCOPE)
       << "Cannot end scope: not inside a scope context at " << end_span.to_string();
 
@@ -398,6 +477,10 @@ StmtPtr IRBuilder::EndScope(const Span& end_span, std::vector<int64_t> devices,
       scope_stmt = std::make_shared<const RuntimeScopeStmt>(
           *manual, std::move(name_hint), body, combined_span, std::vector<std::string>{}, std::move(attrs));
       break;
+    case ScopeKind::Reg:
+      scope_stmt = std::make_shared<const RegScopeStmt>(std::move(name_hint), body, combined_span,
+                                                        std::vector<std::string>{}, std::move(attrs));
+      break;
     case ScopeKind::Graph:
       // The region name becomes the outlined Graph function's name, which
       // codegen turns into the emitted symbol and hence the runtime's graph
@@ -408,9 +491,9 @@ StmtPtr IRBuilder::EndScope(const Span& end_span, std::vector<int64_t> devices,
                                                           std::vector<std::string>{}, std::move(attrs));
       break;
     case ScopeKind::CommDomain:
-      scope_stmt = std::make_shared<const CommDomainScopeStmt>(std::move(devices), std::move(slots),
-                                                               std::move(name_hint), body, combined_span,
-                                                               std::vector<std::string>{}, std::move(attrs));
+      scope_stmt = std::make_shared<const CommDomainScopeStmt>(
+          std::move(devices), std::move(slots), std::move(name_hint), body, combined_span,
+          std::vector<std::string>{}, std::move(attrs), std::move(engines));
       break;
   }
   // Safety net: every ScopeKind value above must populate scope_stmt. The switch has

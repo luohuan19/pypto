@@ -27,11 +27,13 @@
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/functor.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/type.h"
@@ -226,8 +228,22 @@ TypePtr IRMutator::RemapTypeViaVisitor(const TypePtr& type) {
         << "MemRef to a non-MemRef expression — not supported)";
     new_memref_opt = as_memref;
   }
-  return CloneTypeWithMemRefAndRemapExprs(
+  auto new_type = CloneTypeWithMemRefAndRemapExprs(
       type, new_memref_opt, [this](const ExprPtr& e) { return ExprFunctor<ExprPtr>::VisitExpr(e); });
+  // A distributed view carries a pointer-identity link to its domain's window
+  // slot. Follow the same visitor used for slots, including when only that
+  // link changes. The shared shape/MemRef helper preserves this field verbatim.
+  if (auto distributed = As<DistributedTensorType>(new_type);
+      distributed && distributed->window_buffer_.has_value()) {
+    auto window = As<WindowBuffer>(ExprFunctor<ExprPtr>::VisitExpr(*distributed->window_buffer_));
+    INTERNAL_CHECK_SPAN(window, (*distributed->window_buffer_)->span_)
+        << "DistributedTensorType window buffer mutated to non-WindowBuffer";
+    if (window != *distributed->window_buffer_) {
+      return std::make_shared<DistributedTensorType>(distributed->shape_, distributed->dtype_,
+                                                     distributed->memref_, distributed->tensor_view_, window);
+    }
+  }
+  return new_type;
 }
 
 ExprPtr IRMutator::ResolveVarRemapHit(const Expr* key, ExprPtr remapped) {
@@ -376,6 +392,11 @@ ExprPtr IRMutator::VisitExpr_(const CallPtr& op) {
   // from args, so the args walk alone won't propagate substitutions into a
   // returned TileType/TensorType's shape/view fields.
   auto new_type = RemapTypeViaVisitor(op->GetType());
+  if (args_changed && (IsOp(op, "reg.store") || IsOp(op, "reg.scatter"))) {
+    // Reg stores/scatters return exactly their destination type, including storage
+    // metadata rewritten by InitMemRef, MemoryReuse or AllocateMemoryAddr.
+    new_type = new_args[0]->GetType();
+  }
   bool type_changed = (new_type.get() != op->GetType().get());
 
   // Var-typed dependency attrs reference Vars defined elsewhere
@@ -961,6 +982,22 @@ StmtPtr IRMutator::VisitStmt_(const GraphScopeStmtPtr& op) {
   return op;
 }
 
+StmtPtr IRMutator::VisitStmt_(const RegScopeStmtPtr& op) {
+  INTERNAL_CHECK_SPAN(op->body_, op->span_) << "RegScopeStmt has null body";
+  auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
+  INTERNAL_CHECK_SPAN(new_body, op->span_) << "RegScopeStmt body mutated to null";
+  // ``kAttrDumpVars`` (``pl.dump_tag`` / ``dumps=``) names Vars, so a
+  // Var-substituting pass must rewrite it like the InCore / Spmd handlers do.
+  auto [new_attrs, attrs_changed] = MutateScopeAttrs(op->attrs_);
+  if (new_body.get() != op->body_.get() || attrs_changed) {
+    auto result = MutableCopy(op);
+    result->body_ = std::move(new_body);
+    if (attrs_changed) result->attrs_ = std::move(new_attrs);
+    return result;
+  }
+  return op;
+}
+
 StmtPtr IRMutator::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "HierarchyScopeStmt has null body";
   auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
@@ -1093,6 +1130,72 @@ StmtPtr IRMutator::VisitStmt_(const BreakStmtPtr& op) { return op; }
 StmtPtr IRMutator::VisitStmt_(const ContinueStmtPtr& op) { return op; }
 
 StmtPtr IRMutator::VisitStmt_(const InlineStmtPtr& op) { return op; }
+
+StmtPtr IRMutator::VisitStmt_(const SimtScopeStmtPtr& op) {
+  auto result = MutableCopy(op);
+  bool changed = false;
+  for (auto& dim : result->block_dims_) {
+    auto mapped = VisitExpr(dim);
+    changed |= mapped != dim;
+    dim = std::move(mapped);
+  }
+  std::vector<std::pair<const Expr*, ExprPtr>> saved;
+  for (size_t i = 0; i < op->private_scalars_.size(); ++i) {
+    const auto& var = op->private_scalars_[i];
+    auto mapped = AsVarLike(VisitExpr(var));
+    CHECK(mapped) << "SIMT private scalar binding must remain a variable";
+    changed |= mapped != var;
+    result->private_scalars_[i] = mapped;
+    auto it = var_remap_.find(var.get());
+    saved.emplace_back(var.get(), it == var_remap_.end() ? nullptr : it->second);
+  }
+  result->body_ = VisitStmt(op->body_);
+  for (const auto& [var, prior] : saved) {
+    if (prior) {
+      var_remap_[var] = prior;
+    } else {
+      var_remap_.erase(var);
+    }
+  }
+  changed |= result->body_ != op->body_;
+  return changed ? result : op;
+}
+
+StmtPtr IRMutator::VisitStmt_(const SimtLaunchStmtPtr& op) {
+  auto result = MutableCopy(op);
+  bool changed = false;
+  for (auto& dim : result->block_dims_) {
+    auto mapped = VisitExpr(dim);
+    changed |= mapped != dim;
+    dim = std::move(mapped);
+  }
+  for (auto& arg : result->args_) {
+    auto mapped = VisitExpr(arg);
+    changed |= mapped != arg;
+    arg = std::move(mapped);
+  }
+  for (size_t i = 0; i < result->results_.size(); ++i) {
+    auto& var = result->results_[i];
+    auto mapped = AsVarLike(VisitExpr(var));
+    INTERNAL_CHECK_SPAN(mapped, op->span_) << "SIMT result mutated to a non-variable";
+    const auto& arg_type = result->args_[result->result_param_indices_[i]]->GetType();
+    if (!structural_equal(mapped->GetType(), arg_type)) {
+      // A rewritten storage argument (e.g. an identity tensor.view fold) may
+      // acquire different metadata. The launch defines that same storage type;
+      // record its new identity so all later uses observe the corrected type.
+      if (auto iter_arg = As<IterArg>(mapped)) {
+        mapped =
+            std::make_shared<IterArg>(iter_arg->name_hint_, arg_type, iter_arg->initValue_, iter_arg->span_);
+      } else {
+        mapped = std::make_shared<Var>(mapped->name_hint_, arg_type, mapped->span_);
+      }
+      var_remap_[var.get()] = mapped;
+    }
+    changed |= mapped != var;
+    var = std::move(mapped);
+  }
+  return changed ? result : op;
+}
 
 StmtPtr IRMutator::VisitStmt_(const StmtPtr& op) { return op; }
 

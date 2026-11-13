@@ -135,20 +135,9 @@ inline void CheckNzLogicalRank(size_t rank, const char* what, const Span& span =
 
 /// Number of elements in one NZ C0 line (32 bytes) for ``dtype``.
 ///
-/// Derived from the *bit* width, not ``GetByte()``. ``GetByte()`` is
-/// ``ceil(bits/8)``, so every sub-byte dtype (INT4 / UINT4 / FP4 / HF4 / BOOL)
-/// reports 1 and would yield ``c0 = 32`` instead of the 64 elements that
-/// actually fit in a 32-byte C0 line — silently mis-blocking the tensor and
-/// accepting misaligned extents (e.g. FP4 ``C = 544`` passes ``% 32`` but is
-/// not a multiple of 64).
-///
-/// Sub-byte dtypes are rejected for now. This is a **PyPTO milestone-1 scope
-/// limit, not a hardware or pto-isa one**: pto-isa's NZ machinery does handle
-/// FP4 (``tload_common.hpp`` carries explicit ``caps::IsFP4`` branches through
-/// the NZ paths and asserts ``staticShape[4] == C0_SIZE_BYTE / sizeof(DType)``).
-/// Supporting it here means validating the packed-nibble addressing end to end,
-/// which milestone 1 does not attempt. The bit-based formula above is already
-/// the correct one to build on when it does.
+/// Derived from the bit width; sub-byte INT4, UINT4, HF4, and BOOL have no
+/// supported NZ addressing contract here. Both packed FP4 x2 formats use
+/// eight-bit byte carriers, so one C0 line contains 32 carrier elements.
 inline int64_t NzC0Elems(DataType dtype) {
   const auto bits = static_cast<int64_t>(dtype.GetBit());
   CHECK(bits >= 8) << "NZ layout does not support the sub-byte dtype '" << dtype.ToString() << "' (" << bits
@@ -458,11 +447,9 @@ inline bool IsProvableNonNegative(const ExprPtr& expr, const NzOffsetFacts& fact
   // non-negative. This is what a split-K block index reaches for --
   // ``(block % OK) * K_SLICE`` names the K half.
   //
-  // The dividend has to be proven too, rather than resting on the name:
-  // ``FloorMod`` lowers to ``arith.remsi`` (``pto_scalar_expr_codegen.cpp``),
-  // which truncates toward zero, so a negative dividend yields a negative
-  // remainder -- and a negative partition offset is clamped to 0 rather than
-  // caught, which is the silent wrong read this whole proof exists to prevent.
+  // Keep the proof conservative: signed integer and INDEX FloorMod codegen
+  // corrects arith.remsi to floor semantics, but this predicate still requires
+  // a non-negative dividend instead of relying on that stronger result bound.
   if (auto mod = As<FloorMod>(expr)) {
     auto divisor = As<ConstInt>(mod->right_);
     return divisor && divisor->value_ > 0 && IsProvableNonNegative(mod->left_, facts, budget);

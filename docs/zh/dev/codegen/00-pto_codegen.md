@@ -14,7 +14,7 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 
 **原因：** 嵌入分析逻辑的代码生成会变得脆弱——它重复了 Pass 已有的逻辑，且更难以独立测试。保持代码生成为直接的转换，确保其可预测性和可维护性。
 
-**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/28-normalize_return_order.md) pass。
+**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/30-normalize_return_order.md) pass。
 
 ## 概述
 
@@ -29,6 +29,13 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 
 ### 生成顺序
 
+有限浮点常量使用十进制科学计数法，NaN 和无穷使用目标类型位宽的十六进制位模式。
+例如，`pl.const(math.nan, pl.FP32)` 生成 `arith.constant 0x7FC00000 : f32`；
+`math.inf` 和 `-math.inf` 分别生成 `0x7F800000` 和 `0xFF800000`。
+非有限常量支持 FP32、FP16 和 BF16。窄化保留符号及 NaN 载荷的高位；
+若载荷被全部截断，则保留非零载荷，避免变成无穷。
+其他类型会收到诊断，不会生成非法浮点字面量。
+
 代码生成按以下固定顺序生成 MLIR:
 
 1. **常量**: 索引和浮点值的 `arith.constant`
@@ -38,6 +45,34 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 
 张量视图与分配前缀会**先**渲染到缓冲区、再定稿常量块, 因此只出现在某个 shape 或
 stride 表达式里的常量 (例如复合参数维度 `M * 2` 中的 `2`) 也会在使用前被声明到常量块。
+
+形状表达式可以保留 `tensor.dim(x, axis)`。代码生成将该轴的声明维度发射为 INDEX
+操作数，支持常量、符号和复合表达式，无需先生成 `x` 的张量视图或提前折叠 IR。
+只有该维度中的标量符号会成为动态维度 ABI 参数，张量操作数本身不会。
+打印的类型标注在重新解析时保留这些读取，不会把参数引用作为 Python 值求值。
+仅描述形状的赋值标注只有在直接维度读取临时量能够证明结构等价时才替换推导形状；否则保留
+推导出的运行时形状。常量维度直接发射为 INDEX，包括无符号常量。
+
+### 提取边界上的动态尺寸参数
+
+作用域提取会捕获 tensor 参数类型所需的标量符号，即使 kernel 正文没有直接读取它们。
+`[B, 16]` 这样的独立维度可以通过 tensor 描述符绑定 `B`。
+`[B * 2, 16]` 等支持反解的维度也保留描述符提取，因此 caller 无需单独绑定标量 `B`；
+`[(B + 15) // 16 * 16 + T * 4, 16]` 这样的复合维度无法绑定 `B` 或 `T`。
+提取器会保守地添加显式 `B`、`T` 参数，并传入 caller 中的值。
+这些符号必须在 caller 中具有运行时绑定：标量参数、正文中的值定义，或 tensor 参数的独立维度。
+仅出现在不可逆类型表达式中的符号会在提取阶段被拒绝，避免成为 orchestration 中未声明的参数。
+原尺寸表达式保持不变，不会替换为新的 `ROWS` 符号。
+
+IR 中标量参数位于引用它们的类型标注之前。运行时分发和原生 kernel 签名则按
+tensor 指针、显式标量 payload、剩余描述符尺寸参数的顺序排列。
+PTO codegen 和 wrapper 共享 `collect_tensor_shape_dyn_vars`，确定最后一组参数。
+显式标量优先于描述符提取，并按 Var 身份去重，因此同时用于 shape 和正文的符号只传一次。
+
+对于手写 kernel，描述符提取仍支持独立维度，以及单符号加减常量、乘非零常量。
+整除没有通用逆运算：`B // 5 == 2` 不能证明 `B == 10`。
+应显式传入该符号，或通过另一支持的维度暴露它，否则 wrapper 生成会报错。
+现有运行时描述符和标量打包格式保持不变。
 
 ## 架构
 
@@ -140,7 +175,7 @@ class MyKernel:
 output_dir = compile(
     MyKernel,
     strategy=OptimizationStrategy.Default,
-    backend_type=BackendType.Ascend910B,
+    backend_type=BackendType.Ascend910,
 )
 ```
 
@@ -167,7 +202,7 @@ print(pto_code)
 | `tile.load(tensor, [row, col], [h, w])` | `pto.partition_view` + `pto.tload` |
 | `tile.store(tile, [row, col], tensor)` | `pto.partition_view` + `pto.tstore` |
 | `tile.slice(tile, [h, w], [row, col][, valid_shape=...])` | `pto.subview`（零拷贝视图；仅在传入 `valid_shape` 时输出 `valid [...]` 子句） |
-| `tile.assemble(target, source, [row, col])` | （可选）`pto.tmov target -> dst` + `pto.subview dst[row, col] sizes [src.rows, src.cols]` + `pto.tmov src -> dst_view` |
+| `tile.assemble(target, source, [row, col])` | （可选）`pto.tmov target -> dst`；支持的 ND Vec 复制 / FIXPIPE 写回使用 `pto.tinsert`，其他情况使用 `pto.subview` + `pto.tmov` |
 | `tile.set_validshape(tile, vr, vc)` | 发 `pto.set_validshape`；操作数是视图时报错（见下） |
 | `tile.mul(lhs, rhs)` | `pto.tmul` |
 | `tile.addc(src0, src1, carry)` | `pto.taddc`（`src0 + src1 + carry`） |
@@ -180,7 +215,7 @@ print(pto_code)
 | `tile.xor(lhs, rhs, tmp)` / `tile.xors(lhs, scalar, tmp)` | `pto.txor` / `pto.txors`；scalar 使用同位宽 signless `iN` |
 | `tile.fillpad_expand(src, shape)` | `pto.tfillpad_expand ins(%src) outs(%dst)`（`shape` 元组仅用于类型推导；更大的 `dst` 及其 pad 来自结果类型） |
 
-**`tile.slice` / `tile.assemble` 下沉细节。** 两个 op 都通过 `pto.subview`
+**`tile.slice` / `tile.assemble` 下沉细节。** `tile.slice` 和 `tile.assemble` 的回退路径通过 `pto.subview`
 下沉，它是源 tile 的纯视图别名（不搬数据，也不会额外发 `pto.alloc_tile`）。
 `pto.subview` 要求结果 `tile_buf` 与源 `tile_buf` 在 `dtype`、`memory_space`、
 `blayout`、`slayout`、`fractal`、`pad` 和 `compact` 上完全一致，因此
@@ -194,9 +229,16 @@ print(pto_code)
   需要 zero/min/max 填充，请在切出来的子 tile 上再调用 `tile.fillpad`。
 
 对 `tile.assemble`，前置的 `pto.tmov target → dst` 仅在缓冲复用未把
-`target` 与目标缓冲合并时才会发出，用于保留写入窗口外的数据；末尾的
-`pto.tmov src → dst_view` 才是真正写入由 `pto.subview` 切出的子窗口的数据
-搬运。
+`target` 与目标缓冲合并时才会发出，用于保留写入窗口外的数据。ND（`row_major`、
+`none_box`）布局下的 FP32、FP16 和 BF16 Vec-to-Vec 复制使用
+`pto.tinsert`，直接传入原目标和显式偏移，保留目标行跨度，只复制源的有效区域，
+其余目标元素保持不变。A2/A3 上的列插入不能使用 `subview + tmov`：PTOAS 会把
+视图解析为父 tile 的物理维度，随后因源和目标形状不一致而拒绝编译（#2717）。
+其他复制继续使用 `pto.subview + pto.tmov`。A2/A3 PTOAS 不接受 INT16/INT32 TINSERT，
+固定版本的 ISA 也不接受有效列数为动态值的 INT8/UINT8 TINSERT；
+因此保留整数类型原有的整块 TMOV 复制。
+A2/A3 的插入列偏移必须满足 32 字节对齐（8 个 FP32 或 16 个 FP16/BF16 元素）。
+代码生成会拒绝违反该限制的常量偏移；动态偏移也必须由调用方保证满足此条件。
 
 **Acc 写回上的 FIXPIPE epilogue。** **发生类型转换的** `Acc → Mat` assemble，
 以及**任何** `Acc → GM` store，都是 cube 的 fix-pipe 在排空 L0C——它可以在写出的
@@ -211,7 +253,7 @@ print(pto_code)
 scale 还**决定**走哪条下沉路径，而不只是搭个便车——`INT32` 累加器之所以能
 抵达 `FP16` 的 Mat tile，正是因为它带了 scale（`DEQF16`）——因此由同一个判据
 `ir::CubeMatWritebackUsesFixpipe` 同时供 emitter 与 `FixpipeEpilogueValid` 使用；
-同 dtype 的 assemble 不发生转换，仍是普通的 `pto.tmov`，**带不了任何 epilogue**。
+同 dtype 的 Acc-to-Mat assemble 不发生转换，仍是普通的 `pto.tmov`，**带不了任何 epilogue**。
 `pto.tinsert` 与 `pto.tstore` 对打包后的 scale 操作数拼写不同，两种形式都无法从
 对方推出——二者连同其出处都逐字钉在各自的发射点上。寄存器编码见
 `codegen::EncodeFixpipePreQuant`，各后端的 dtype 表见 `99-verifier.md`。
@@ -243,12 +285,25 @@ tile 调用 `set_validshape`。
 | `tile.tpop_from_aiv(split=N[, id=I])` | `%buf = pto.tpop_from_aiv {[id = I, ]split = N} -> type` | 从 Vector 管道弹出 |
 | `system.tfree_to_aic(tile_from_tpop[, id=I])` | `pto.tfree_from_aic {[id = I, ]split = N}` | 将消费侧槽位释放回 Cube |
 | `system.tfree_to_aiv(tile_from_tpop[, id=I])` | `pto.tfree_from_aiv {[id = I, ]split = N}` | 将消费侧槽位释放回 Vector |
-| `system.aic_initialize_pipe(...)` | `pto.aic_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Cube 管道初始化（仅在显式设置时输出 `slot_num`/`local_slot_num`，否则由 PTOAS 取默认值） |
-| `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Vector 管道初始化（仅在显式设置时输出 `slot_num`/`local_slot_num`，否则由 PTOAS 取默认值） |
+| `system.aic_initialize_pipe(...)` | `pto.aic_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L][, nosplit = true, acc_push_epilogue = E]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Cube 管道初始化（仅在显式设置时输出 `slot_num`/`local_slot_num`，否则由 PTOAS 取默认值） |
+| `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L][, nosplit = true, acc_push_epilogue = E]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Vector 管道初始化（仅在显式设置时输出 `slot_num`/`local_slot_num`，否则由 PTOAS 取默认值） |
 | `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = false, base = B} -> i32` | 预留缓冲区（`memory_planner=PTOAS` 下发射 `auto = true` 且省略 `base`） |
 | `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | 导入对等缓冲区 |
 | `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | 跨核全员屏障（hard/FFTS 形态） |
 | `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_ptr[, %used] : !pto.ptr<i32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | 当前 PTO-ISA 的 soft/GM 轮询屏障（部分占用即可；GM workspace 至少 64 字节；显式 `N=0` 时从设备启动寄存器推导并省略 `%used`） |
+
+A5 C2V 单向管道显式提供 `c2v_dtype` 时，代码生成还会输出 `nosplit = true` 和
+`acc_push_epilogue`。例如，`c2v_dtype=pl.BF16, pre_relu=True` 对应：
+
+```text
+acc_push_epilogue = #pto.acc_push_epilogue<layout = nz2nd, quant = f32_bf16, relu = normal_relu>
+```
+
+PTOAS 将其下沉为 `TPUSH` 上的 `FixpipeParams<NZ2ND, F322BF16, NormalRelu>`；`TPOP` 接收
+BF16 Vec tile。FP16 对应 `f32_f16`，FP32 对应 `no_convert`，`pre_relu=False` 对应 `no_relu`。
+两端初始化函数携带相同约定。不支持的目标或方向、非 FP32 Acc 生产者及不匹配的弹出类型会被拒绝；
+PTOAS 继续检查两端配置和切分方式。预留缓冲区与 FIFO 槽位按传输类型计算大小，而不是按 FP32
+累加器计算；累加器本身保持 FP32，供其他消费者使用。
 
 **说明：**
 
@@ -270,8 +325,8 @@ tile 调用 `set_validshape`。
   `eL` 是 lane `L` 在切分轴上的**运行时** valid extent——ISA 直接从被弹出的 tile 上读取
   （`popVecTileFromGMFiFo`），因此偶数 code 要求 `e0 == e1`，奇数 code 要求
   `e0 == e1 + 1`。这些 extent 由
-  [LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md) 物化，
-  [ExpandMixedKernel](../passes/24-expand_mixed_kernel.md) 选择匹配的 code。
+  [LowerAutoVectorSplit](../passes/25-lower_auto_vector_split.md) 物化，
+  [ExpandMixedKernel](../passes/26-expand_mixed_kernel.md) 选择匹配的 code。
 - Cube-to-Vector FIFO 搬运的是紧凑矩形：producer 以 `valid_col` 为行间距写入
   `valid_row` x `valid_col` 数据块，每个消费 lane 再以相同间距读回自己的数据段
   （`gmStrideR = valid_col`，左右切分的 code 下加倍）。因此若传输两侧的 valid shape
@@ -281,7 +336,7 @@ tile 调用 `set_validshape`。
   shape——消费侧通过纯元数据的 `pto.treshape` 恢复（前端 tpop 结果不是 PTOAS 的本地
   绑定 tile，`pto.set_validshape` 无法就地修改它）。第一个例外是切分轴上的 extent：它必须保持
   逐 lane 的值并留在 TPOP 操作数上，因为 ISA 正是靠它定位 lane 1 的数据段起点——也正因如此，
-  编译期无法核验的逐 lane extent 绝不能到达那里。`pl.split` 或 `pl.split_aiv` 中切分轴 extent 为运行期
+  编译期无法核验的逐 lane extent 绝不能到达那里。显式 `pl.split_aiv` 中切分轴 extent 为运行期
   值的边界，会让被弹出的 tile 保留完整 box（`split_axis::WithFullSplitAxisValid`），使偶数
   code 的数据段落在 box 的一半处，而把 lane 自身的 extent 交给消费者携带。
 - 第二个例外是**非切分** Acc-to-Vec TPUSH 的**行**维度：它必须保持 producer 写入时
@@ -418,7 +473,7 @@ tile 调用 `set_validshape`。
 保留；`PTOAS` 模式由 ptoas `PlanMemory`（level2 强制要求、拒绝任何 `addr`
 操作数）完成生命周期复用与地址分配。
 
-> **注意：** `PTOAS` 模式跳过了 `MemoryReuse` 里的 Ascend910B `load + tpop_from_aic`
+> **注意：** `PTOAS` 模式跳过了 `MemoryReuse` 里的 Ascend910 `load + tpop_from_aic`
 > 原地写冒险守卫,以及 `AllocateMemoryAddr` 的 reserve-buffer 基址解析,这些交由
 > ptoas 处理。`compile()` 会输出告警 —— 相关 kernel 请上机验证。
 
@@ -432,22 +487,25 @@ tile 调用 `set_validshape`。
 %l0c_mb = pto.alloc_multi_tile valid_row = %c64_index valid_col = %c64_index
         : !pto.multi_tile_buf<!pto.tile_buf<loc=vec, dtype=f32, rows=64, cols=64, ...>, count=2>
 scf.for %i = %c0_index to %c4_index step %c1_index {
-  %0 = arith.remsi %i, %c2_index : index
-  %t = pto.multi_tile_get %l0c_mb[%0]
+  %slot = arith.remsi %i, %c2_index : index
+  %t = pto.multi_tile_get %l0c_mb[%slot]
      : !pto.multi_tile_buf<..., count=2> -> !pto.tile_buf<loc=vec, ...>
   ...
 }
 ```
 
+有符号整数和 `INDEX` 槽位采用[修正后的向下取模余数](../passes/32-lower_pipeline_to_slots.md#生成的-pto-ir)，保持 Python `%` 的语义。
+当被除数可证明非负且除数为正常量时（如上例），该修正会被跳过，因为此时 `arith.remsi` 的结果已与向下取模一致。
+
 有两点关键：
 
 - **不带 `addr`。** 区域由 ptoas `PlanMemory` 放置，且它被禁止合并这些槽位——这正是把作者
   声明的隔离带进 `level2` 的方式。
-- **操作数是槽位下标，而不是** `InitMemRef` 由它算出的字节偏移。ptoas 通过匹配下标的仿射形态
-  （`i % 2`）判断哪些访问可能落在同一槽位，这才是轮转能拿到按槽位的（动态）event id 的原因
+- **操作数是槽位下标，而不是** `InitMemRef` 由它算出的字节偏移。修正后的余数直接传入 `multi_tile_get`，
+  不会乘以槽位的字节数。ptoas 识别下标（`i % 2`）以判断哪些访问可能落在同一槽位，这才是轮转能拿到按槽位的（动态）event id 的原因
   ——第 *i* 轮的 load 由此与第 *i-1* 轮的计算重叠。
 
-`PlanMultiBufferRegions` 在遍历函数体之前判定适用性；ptoas 无法描述的形态（各槽位 tile 形状
+PTOAS planner 下，`PlanMultiBufferRegions` 在遍历函数体之前判定适用性；ptoas 无法描述的形态（各槽位 tile 形状
 不一致、各槽位声明的 valid shape 不一致、循环内有两个槽位同时活跃、内存空间不属于
 Vec / Mat / Acc、valid shape 是运行期值、某个槽位作为 phi 被带出 `if` 或循环、槽位数不在
 ptoas 的 `[2, 16]` 内）会报 `ValueError` 并指明具体形态，因为回退成逐槽位
@@ -461,17 +519,22 @@ ptoas 的 `[2, 16]` 内）会报 `ValueError` 并指明具体形态，因为回�
 | 同一轮迭代内填充并读取两个槽位 | ≤ 0.55 只保护**第一个** `multi_tile_get`，第二个 load 与下一轮迭代的写入竞争（0.54 真机实测算错）。0.56 起用整个区域的一个静态 event 保护循环体——正确，但没有区域形式赖以存在的逐槽位重叠 | [PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118)，0.56 修复 |
 | 预取：循环前填充槽位 0，之后每轮迭代填充槽位 `(i+1) % 2`、同时读取槽位 `i % 2` | ≤ 0.62 像一槽位轮转那样为两个槽位的 event 都做 prime 和 drain，在这里差一：迭代次数为偶数时算错，为奇数时设备挂死。0.63 只 prime 循环最先写入的那个槽位；0.64 和 0.65 又对两个槽位都做 prime | [PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519)，0.63 修复，0.64 回退 |
 
-`CoLiveSlotCollector` 只按循环体统计槽位选取次数，分不清这两种形态，而第二个缺陷在修复后又
-回来了。真机实测：预取形态在 0.63 下运行正确，但在 0.64 和 0.65 下迭代次数为偶数时读到后面
-块的数据、为奇数时挂死；同轮迭代形态在 0.65 下运行正确。因此代码生成对两者都拒绝，并指向
-PyPTO planner——它的固化地址 `alloc_tile` 路径在真机上能正确运行同轮迭代那种形态。直线代码
-不受影响：没有循环就没有跨迭代复用需要保护。放宽限制只需改 `PlanMultiBufferRegions` 里一个
-条件，但前提是固定的 ptoas 能在真机上正确运行预取形态。
+`CoLiveSlotCollector` 在原有 PTOAS planner 路径上保留保守拒绝。上表记录的预取回退仍是
+工具链约束；开启软件流水并不保证工具链同步正确。在 PyPTO planner 下，codegen 识别
+软件流水变换写入 IR 的槽位标记；对已经 lower 的程序生成代码无需再次传入开关。
+codegen 校验静态等大几何信息、region 固定基地址、
+槽位步长和对齐，允许规范的 Vec 共活槽位。槽位表达式可以是常量，或非负循环变量加
+非负常量后对槽位数取模，整个算术表达式必须使用 index 类型。这些槽位取模复用
+标量表达式生成器生成 `arith.remui`。
 
-`PYPTO` 模式下则完全不发射区域：`--pto-level=level3` 下的区域需要显式的基地址 `addr`，而
-codegen 目前还不发射它。限制不在 ptoas——给定常量 `addr`，ptoas 自 0.55 起在 level3 下推导出的
-逐槽位同步与 level2 相同（[PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106)，
-已关闭）。
+在 level3 下，每次循环迭代至多使用一个存活槽位的调度可以发射
+`pto.alloc_multi_tile addr = <base>`。共活预取槽位（包括静态循环），以及运行时或带条件的调度，
+使用固定地址父 buffer 与 `pto.subview`，避免上文记录的 multi-tile 同步回退。
+两者都保留由 PyPTO 规划的完整槽分配。原版 PTOAS 对动态 subview 的同步仍较保守，
+见 [#1587](https://github.com/hw-native-sys/PTOAS/issues/1587)。
+不支持的用户声明区域仍走普通固定地址 `alloc_tile`，继续保持槽位隔离。
+未变换的程序保持原有路径。preload/main/drain 变换及整循环回退规则见
+[LowerPipelineToSlots](../passes/32-lower_pipeline_to_slots.md)。
 
 ### 加载操作转换
 
@@ -610,7 +673,7 @@ allocate 112 on that axis and declare 100 as the tile's valid_shape ...
 `ComputeAllocTileFields` 是所有分配的唯一收口——逐变量声明、被提升出来的
 `extra_alloc_tiles`、以及控制流路径都经过它——因此校验看到的正是最终发射的内容，不会与之
 漂移。张量层的 `pl.matmul` / `pl.matmul_acc` 不会因 *M 轴*触发它：M 轴已由
-[`ConvertTensorToTileOps`](../passes/11-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing)
+[`ConvertTensorToTileOps`](../passes/13-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing)
 自动对齐；仍需用户自行保证的是 `K` 与 `N`。
 
 ## 完整示例
@@ -740,6 +803,24 @@ tile_c = pl.mul(tile_a, tile_b)
 | `DataType::INT8` | `i8` |
 | `DataType::UINT8` | `ui8` |
 
+### 标量布尔转换
+
+`pl.cast(flag, dtype)` 将标量 `False` 转为数值零，将 `True` 转为数值一，
+字面量与运行时值遵循相同语义。BOOL 使用 MLIR `i1`，但转换时不能将其解释为
+有符号的一位整数。
+
+| 目标类型 | 降低方式 |
+| -------- | -------- |
+| 有符号整数 | 用 `arith.extui` 将 `i1` 扩展到目标位宽 |
+| 无符号整数 | 用 `arith.extui` 扩展到无符号性（signless）的 `iN`，再桥接到 `uiN` |
+| INDEX | `arith.index_castui` |
+| 浮点 | 零扩展到 `i32`，再使用 `arith.sitofp` |
+| BOOL | 恒等转换 |
+
+浮点路径使用整数中间值，因为 A3 设备编译器拒绝 PTOAS 生成的直接 `(float)bool`
+转换。普通有符号整数扩宽仍使用符号扩展（sign extension）。上述规则针对标量转换；
+Tensor 和 Tile 转换算子有各自的降低规则。
+
 ### 内存空间映射
 
 | PyPTO 内存空间 | PTO 地址空间 |
@@ -822,162 +903,7 @@ PTO-ISA 侧配套修改。
 
 ## 内核包装器生成 (PTO 后端)
 
-通过 `ir.compile()` 使用 PTO 后端编译时, 会自动为每个 InCore 函数生成内核包装器, 以桥接 ptoas 输出到编排调用约定。
-
-### 流水线
-
-```text
-InCore Function -> PTOCodegen -> .pto -> ptoas -> .cpp -> kernel_wrapper -> kernels/aiv/<name>.cpp
-```
-
-每个 InCore 函数通过 ptoas 独立编译。最终的包装器文件包含:
-
-1. **预处理后的 ptoas 代码** (`__global__ AICORE` 替换为 `static`)
-2. **`kernel_entry(__gm__ int64_t* args)`** 包装器, 解包参数数组并转发到 ptoas 函数
-
-### 输出结构
-
-当程序包含编排函数时, PTO 后端生成以下输出结构:
-
-```text
-output_dir/
-├── passes_dump/                     # IR after each pass
-├── ptoas_passes/                    # 可选：每个 ptoas Pass 后的 IR
-│   └── <kernel-or-group>/            # 由 ptoas/MLIR 管理的转储树
-├── ptoas/                           # Intermediates
-│   ├── <func_name>.pto              # MLIR from PTOCodegen
-│   └── <func_name>.cpp              # C++ from ptoas
-├── kernels/aiv/
-│   └── <func_name>.cpp              # Final wrapper
-├── orchestration/
-│   └── <orch_func_name>.cpp         # simpler runtime orchestration code
-└── kernel_config.py                 # Runtime/orchestration/kernel config
-```
-
-仅当使用 `ir.compile(..., dump_ptoas_passes=True)` 或
-`RunConfig(dump_ptoas_passes=True)` 时才会生成 `ptoas_passes/`。
-
-编排代码生成使用 simpler 运行时 API (`rt_submit_task`, `make_tensor_external` 等) 生成编排 C++ 代码。
-
-### 运行时配置 (`kernel_config.py`)
-
-`kernel_config.py` 暴露一个 `RUNTIME_CONFIG` 字典，派发路径据此启动程序。固定键：
-
-| 键 | 何时写入 | 备注 |
-| -- | -------- | ---- |
-| `runtime` | 总是 | `"tensormap_and_ringbuffer"`（默认）或 `"host_build_graph"` —— 由 `ir.compile(runtime=...)`（或把调用包在 `PassContext([], runtime=...)` 中）选定的 `RuntimeKind` 所对应的线上名字。 |
-| `aicpu_thread_num` | 总是 (`0`) | `0` 选择 runtime 的架构默认值（a2a3：4；a5：5），调用方也可显式覆盖。 |
-
-runtime 由 `PassContext` 以 `ir::RuntimeKind` 携带，而不是仅作为 codegen 参数，
-这样需要针对特定 runtime 做合法化的 pass 可以 switch `PassContext::GetRuntime()`
-而不是比较字符串。之所以用枚举而非名字：这是一个封闭集合 —— `runtime/src/<arch>/
-runtime/` 下每个实现对应一个枚举值 —— 于是拼错是编译错误，而不是一个要到很晚才以
-晦涩 CCEC 报错（找不到 include 目录）浮现的取值。
-
-线上名字只在两处跨越 ABI 边界：写 `kernel_config.py` 时用 `ir::RuntimeKindToName`，
-读回时用 `ir::RuntimeKindFromName`。两者都以
-`passes.runtime_kind_to_name` / `passes.runtime_kind_from_name` 暴露给 Python。
-
-runtime 同时是 `@pl.jit` 缓存键的一个维度：`host_build_graph` 的调用不能复用为
-`tensormap_and_ringbuffer` 编译出的产物 —— 后者 `kernel_config.py` 里写的
-runtime 没有任何匹配的 worker 会绑定。
-
-### 参数解包
-
-包装器按照标准约定解包 `int64_t* args`:
-
-| 参数类型 | 解包模式 |
-| -------- | -------- |
-| `TensorType` | `ChipTensor*` -> `buffer.addr` -> 带类型指针 |
-| `ScalarType` | `uint64_t` -> 联合体解码 -> 带类型值 |
-
-### SPMD 身份参数
-
-`tile.get_block_idx()`、`tile.get_block_num()` 和 `tile.get_subblock_idx()`
-在 codegen 阶段被降阶为合成 `i32` 形参，PTOCodegen 把它们**追加到**
-`func.func` 签名末尾，并使用有意义的命名 SSA(`%__pypto_spmd_block_idx`、
-`%__pypto_spmd_block_num`、`%__pypto_spmd_subblock_idx`)。这些 op 的 IR
-契约不变 -- 合成形参只出现在生成的 MLIR / C++ 中，绝不进入
-`Function.params`。追加顺序固定为 `block_idx, block_num, subblock_idx`，
-并各自根据函数实际使用的 op 独立决定是否追加。
-
-```mlir
-func.func @spmd_kernel(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>,
-                       %__pypto_spmd_block_idx: i32,
-                       %__pypto_spmd_block_num: i32)
-                       attributes { ... } {
-  %0 = arith.index_cast %__pypto_spmd_block_idx : i32 to index
-  // ... 把 %0 当作 block 索引使用 ...
-}
-```
-
-kernel 包装器在 dispatch 时调用 `intrinsic.h::get_block_idx(args)` /
-`get_block_num(args)` 一次解析出运行时值，并把它们作为最后两个实参传给
-被包装的函数:
-
-```cpp
-extern "C" __aicore__ __attribute__((always_inline))
-void kernel_entry(__gm__ int64_t* args) {
-    // 从运行时 dispatch payload 读取逻辑 SPMD block 身份
-    int32_t __pypto_spmd_block_idx = get_block_idx(args);
-    int32_t __pypto_spmd_block_num = get_block_num(args);
-
-    // ... 张量 / 标量 / 动态维参数解包 ...
-
-    // 转发到 ptoas 生成的函数(block 参数追加在末尾)
-    spmd_kernel(a, out, __pypto_spmd_block_idx, __pypto_spmd_block_num);
-}
-```
-
-**subblock_idx(AIV lane)。** `tile.get_subblock_idx()` 走相同的合成形参通道:
-wrapper 从 `intrinsic.h::get_sub_block_id(args)`(调度器写入
-`GlobalContext.sub_block_id` 的运行时 per-core lane id)解析出值,并把
-`__pypto_spmd_subblock_idx` 追加在 block 身份实参之后。它刻意读取运行时
-lane id,而非 ccec `get_subblockid()` 寄存器 -- 后者在
-`tensormap_and_ringbuffer` 调度下返回过期值。
-
-即使张量程序没有调用 `tile.get_subblock_idx()`，split AIV FIFO 端点也会使用这个
-运行时值：PTOAS 下沉 split 端点后，wrapper 后端把 lane 作为 PTO-ISA 显式重载
-`TPUSH(pipe, tile, subblock_id)` / `TPOP(...)` 的第三个实参传入。如果函数还没有
-合成的 subblock 形参，后端会给生成函数增加一个私有尾随形参。显式重载根据每次调用
-的实际 tile 类型推导字节偏移，因此同一个自动 pipe 可以安全承载大小不同的连续传输。
-与 block 身份一样，wrapper 会无条件解析运行时 lane，因为
-`GlobalContext.sub_block_id` 在每个平台都由调度器填充。端点实参则受构建条件保护：
-device 构建会把 lane 传给显式重载，而 CPU simulation 和 in-core cost-model 构建保留
-PTO-ISA 的普通双实参端点，因为这些实现已经对 lane context 建模，且不提供仅用于
-device 的显式 lane 重载。
-
-**检测范围。** 两层各自基于函数体独立检测 SPMD usage:
-
-- `MemRefCollectorVisitor::UsesSpmdBlockOps` / `UsesSubblockOp`(C++，位于
-  `src/codegen/pto/pto_codegen.cpp`)决定 PTOCodegen 是否给该函数签名追加
-  block / subblock 形参。
-- `_uses_spmd_block_ops` / `_uses_dynamic_subblock_id`(Python，位于
-  `python/pypto/backend/pto_backend.py`)决定 wrapper 是否把相应局部变量追加到
-  对内函数调用末尾。split `TPUSH` / `TPOP` 端点还由
-  `_runtime_split_fifo_endpoint_counts` 检测；它们复用该 subblock 实参，或请求上述
-  私有形参。
-
-对于 SPMD 组内自身不调用 `tile.get_block_*` 的 sibling 函数
-(`group_uses_spmd=True` 但函数本身不用 SPMD ops)，wrapper 仍会声明这两个
-局部变量供 `_generate_arg_unpacking` 中 `__gm_pipe_buffer` 分片逻辑消费，
-但**不会**把它们追加到对内调用 -- 这与该函数 MLIR 签名保持一致。
-
-此设计替换了旧的宏 shadow + `[[block_local]] static` /
-`static thread_local` 桥接以及 `#pragma push_macro` / `#undef` /
-`pop_macro` 舞步。block 和 lane 身份现在与张量指针、标量参数、动态维一样
-通过调用图正常传递。
-
-### 实现
-
-**模块**: `python/pypto/backend/pto_backend.py`
-
-关键函数:
-
-- `generate()` -- 入口点: 生成所有 PTO 后端文件 (内核 + 编排 + 配置)
-- `_preprocess_ptoas_output()` -- 去除重复包含, 将函数设为静态
-- `_generate_arg_unpacking()` -- 根据 IR 参数类型生成 C++ 解包代码
-- `_generate_kernel_wrapper()` -- 组装完整的包装器文件
+PTO 后端为每个 ptoas 生成的 InCore 函数添加包装器，以供运行时派发。输出布局、运行时配置、参数解包和 SPMD 身份参数详见 [PTO 内核包装器生成](02-kernel_wrapper.md)。
 
 ## 另请参阅
 

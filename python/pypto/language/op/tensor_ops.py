@@ -133,6 +133,7 @@ from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import AtomicType, CachePolicy, Expr, MemorySpace, PadValue, TensorLayout
 
 from ..typing import BoolLike, IntLike, Ptr, Scalar, Tensor, Tile, predicate_to_expr
+from ._utils import _normalize_intlike
 
 # Bound TypeVar lets slice / assemble propagate the caller's concrete tensor
 # class (Tensor or its DistributedTensor subclass) through to the return type.
@@ -157,11 +158,6 @@ def _unwrap_rhs(rhs: "_RhsT | Tensor | Scalar") -> "_RhsT | Expr":
     if isinstance(rhs, (Tensor, Scalar)):
         return rhs.unwrap()
     return rhs
-
-
-def _normalize_intlike(seq: Sequence[IntLike]) -> list[int | Expr]:
-    """Unwrap Scalar elements to Expr so the sequence matches C++ binding types."""
-    return [elem.unwrap() if isinstance(elem, Scalar) else elem for elem in seq]
 
 
 def create(
@@ -382,11 +378,15 @@ def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
       and that **nothing writes those bytes while the kernel runs**. Mixing a
       cached write and a bypassing read of the same bytes is a coherency bug
       the compiler cannot detect, so coherency is the author's contract. This
-      is why the policy is never a default and never inferred. Declaring
-      BYPASS on a tensor the scope itself writes is rejected at outlining.
+      is why the policy is never a default and never inferred. All non-allocating
+      scope policies (BYPASS and every NOT_ALLOC_* mode) require a read-only
+      tensor; declaring one on a tensor the scope writes is rejected at outlining.
     * **Tracked by Var identity, never by name.** The declaration names the
-      binding live at the scope, so rebinding the name afterwards
-      (``b = self.foo(b)``) yields a new value the declaration does not cover.
+      binding live at the scope and follows compiler-recognized aliases.
+      Rebinding the name to different GM storage loses the declaration; handles
+      returned by ``pl.store`` or ``pl.assemble`` retain the scope read policy
+      when they preserve the declared destination's storage. The declaration
+      does not configure stores.
     * **Consumed at parse time.** It emits no IR statement of its own: the
       parser records it on the enclosing scope, the scope outliner resolves it
       to the outlined kernel's parameters, and ``ConvertTensorToTileOps`` turns
@@ -397,22 +397,27 @@ def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
       ``cache=pl.CachePolicy.DEFAULT`` opts a single read back into the cache
       inside a bypassing scope.
 
-    Requires PTOAS >= v0.64. **On A2/A3** a declared read compiles to a
+    Requires PTOAS >= v0.72. **On A2/A3** a declared read compiles to a
     ``cache_policy`` attribute on ``pto.tload`` plus the device's no-cache alias
     offset, which the assembler adds to that one load's source address; the
     offset comes from the driver through the dispatch payload, and a device that
-    reports no alias reports zero, leaving the read ordinary and correct. Other
-    architectures do not map GM twice — A5 expresses the policy on the load
-    instruction instead — and PTOAS lowers the bare attribute to an ordinary
-    load, so a declaration there is accepted and currently does nothing.
+    reports no alias reports zero, leaving the read ordinary and correct.
+    For new A5 code, use ``CachePolicy.NORMAL_*`` or
+    ``CachePolicy.NOT_ALLOC_*`` to select an ISA mode, for example
+    ``CachePolicy.NOT_ALLOC_KEEP`` for a non-allocating read. Existing
+    ``CachePolicy.BYPASS`` reads retain their A5 NotAllocKeep lowering for
+    compatibility.
+    BYPASS remains load-only. Explicit A5 policies are unsupported in binary
+    VPTO compilation units and are rejected before assembly.
     ``CachePolicy.DEFAULT`` emits nothing, so a read that declares no policy
     generates exactly the code it did before.
 
     Args:
         tensor: The tensor whose reads the policy applies to. Must be a
             ``Tensor`` value bound outside the scope and read inside it.
-        policy: ``CachePolicy.BYPASS`` to declare a streaming, non-cached read;
-            ``CachePolicy.DEFAULT`` for an ordinary cached read.
+        policy: ``CachePolicy.DEFAULT/BYPASS`` on A2/A3, or one of the six
+            A5-specific ``CachePolicy`` modes on A5. The same enum is used
+            on both targets. Scope policies configure reads only.
 
     Returns:
         Nothing. The marker is consumed at parse time and produces no value.
@@ -728,6 +733,8 @@ def matmul(
     a_trans: bool = False,
     b_trans: bool = False,
     c_matrix_nz: bool = False,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tensor:
     """Matrix multiplication with optional transpose.
 
@@ -747,13 +754,17 @@ def matmul(
         a_trans: Whether to transpose lhs (requires a 2D+ lhs)
         b_trans: Whether to transpose rhs (requires a 2D+ rhs)
         c_matrix_nz: C matrix non-zero flag
+        tf32_mode: Optional HF32 input rounding: "round_even" or "round_away".
+            Requires 2D FP32 operands, Ascend950, and PTOAS 0.72+. None preserves FP32.
 
     Returns:
         Tensor wrapping the matmul operation
     """
     lhs_expr = lhs.unwrap()
     rhs_expr = rhs.unwrap()
-    call_expr = _ir_ops.matmul(lhs_expr, rhs_expr, out_dtype, a_trans, b_trans, c_matrix_nz)
+    call_expr = _ir_ops.matmul(
+        lhs_expr, rhs_expr, out_dtype, a_trans, b_trans, c_matrix_nz, tf32_mode=tf32_mode
+    )
     return Tensor(expr=call_expr)
 
 
@@ -762,8 +773,9 @@ def quant_mx(
     *,
     group_axis: int,
     dtype: DataType = DataType.FP8E4M3FN,
+    quant_scale_alg: str = "ocp",
 ) -> tuple[Tensor, Tensor]:
-    """Quantize a 2D tensor to MXFP8 data and its packed FP8E8M0 scale.
+    """Quantize a 2D tensor to MXFP8/MXFP4 data and its packed FP8E8M0 scale.
 
     ``group_axis=1`` produces A-oriented ``[M, K]`` data and an
     ``MX_A_ZZ`` scale tensor ``[M, K/32]``. ``group_axis=0`` accepts B input
@@ -775,6 +787,8 @@ def quant_mx(
         group_axis: Quantization group axis. Use ``1`` for A/LHS data and ``0``
             for B/RHS data.
         dtype: Quantized MX data dtype. Defaults to ``FP8E4M3FN``.
+            ``FP4E2M1X2`` requires FP16/BF16 input and halves the output's last dimension.
+        quant_scale_alg: ``"ocp"`` (default) or ``"nv"``. FP16/BF16 NV requires axis 0.
 
     Returns:
         A pair ``(data, scale)``. ``data`` is the quantized MX tensor and
@@ -788,7 +802,9 @@ def quant_mx(
             ``group_axis`` is not supported, or ``dtype`` is not a supported MX
             data dtype.
     """
-    call_expr = _ir_ops.quant_mx(src.unwrap(), group_axis=group_axis, dtype=dtype)
+    call_expr = _ir_ops.quant_mx(
+        src.unwrap(), group_axis=group_axis, dtype=dtype, quant_scale_alg=quant_scale_alg
+    )
     span = call_expr.span
     return (
         Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),
@@ -830,6 +846,8 @@ def matmul_acc(
     a_trans: bool = False,
     b_trans: bool = False,
     init_cond: BoolLike | None = None,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tensor:
     """Matrix multiplication with accumulation: acc += lhs @ rhs.
 
@@ -853,6 +871,8 @@ def matmul_acc(
         a_trans: Whether to transpose lhs
         b_trans: Whether to transpose rhs
         init_cond: Optional predicate selecting overwrite over accumulate
+        tf32_mode: Optional HF32 input rounding: "round_even" or "round_away".
+            Requires 2D FP32 operands, Ascend950, and PTOAS 0.72+. None preserves FP32.
 
     Returns:
         Tensor wrapping the matmul_acc operation
@@ -864,6 +884,7 @@ def matmul_acc(
         a_trans,
         b_trans,
         init_cond=predicate_to_expr(init_cond),
+        tf32_mode=tf32_mode,
     )
     return Tensor(expr=call_expr)
 
@@ -2045,7 +2066,7 @@ def assemble(
             floating-point results are non-deterministic. The target must be
             zero-initialised before the kernel runs. Supported dtypes:
             fp32 / bf16 / fp16 / int32 / int16 / int8. bf16 atomic-add is
-            available on the Ascend910B (A2/A3) profile; it is not supported on
+            available on the Ascend910 (A2/A3) profile; it is not supported on
             A5, where an fp32 accumulator + cast is required instead.
 
     Returns:

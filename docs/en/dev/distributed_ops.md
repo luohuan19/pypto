@@ -15,7 +15,14 @@ accept a plain `Tensor` as `src`, and `get`/`tile.get` accept one as `dst` —
 TPUT/TGET only need a readable/writable *local* GM region on that side. The
 window-bound side (`put.dst`, `get.src`) still requires a `DistributedTensor`.
 
-There are **fifteen ops** and **four ABI enums**:
+HOST communication-domain allocations round each buffer's physical size to
+64 bytes while retaining its exact logical tensor size. This satisfies the
+32-byte transfer alignment and isolates distinct buffers on scalar cache
+lines: a DCCI writeback while staging counts must not overwrite signal credits
+concurrently delivered by a peer into a neighbouring buffer. Views within one
+buffer still require their own synchronization when sharing a cache line.
+
+There are **seventeen ops** and **five ABI enums**:
 
 | Op | Direction | Result | Hardware |
 | -- | --------- | ------ | -------- |
@@ -24,19 +31,47 @@ There are **fifteen ops** and **four ABI enums**:
 | `pld.tensor.remote_store` | push (write local tensor-level value → peer); lowered 1:1 to `pld.tile.remote_store` | `Unknown` (side effect) | TSTORE |
 | `pld.tensor.get` | pull (read peer → local GM) | `Unknown` (side effect) | TGET |
 | `pld.tensor.put` | push (write local → peer) | `Unknown` (side effect) | TPUT |
+| `pld.tensor.get_async` | asynchronous pull (peer → local GM) | aliases `dst` | URMA (A5); external helper + adapter |
+| `pld.tensor.put_async` | asynchronous push (local → peer GM) | aliases `dst` | URMA (A5); external helper + adapter |
 | `pld.tensor.allreduce` | collective reduce over window slices | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.barrier` | synchronise visibility of window data across ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.broadcast` | replicate root rank's data to all ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.reduce_scatter` | reduce and scatter chunks across ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.allgather` | gather data from all ranks via window | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.all_to_all` | push-based symmetric personalized exchange — every rank pushes its per-destination chunks to every peer's window via `pld.tensor.put` (TPUT), returns window as result | `DistributedTensorType` (same as src) | composite / HOST builtin |
-| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes `clamp(send_counts[dest], 0, MAX_RECV)` rows per destination into a flat 2D staging window (transfer size is the runtime row count, so padding never crosses the wire), and fills `recv_counts[src, 0]` so the receiver knows which rows are valid — the builtin kernel pulls ONE word per peer from that peer's own `send_counts` window (scalar read; no fixed-width requirement) and clamps reader-side, gated by a two-round credit barrier; the composite rail publishes via `pld.system.notify` (Set); returns window as result (same window-as-result pattern as symmetric `all_to_all`) | `DistributedTensorType` (same as target) | composite / HOST builtin / CHIP builtin |
+| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes `clamp(send_counts[dest], 0, MAX_RECV)` rows per destination into a flat 2D staging window (transfer size is the runtime row count, so padding never crosses the wire), and fills `recv_counts[src, 0]` so the receiver knows which rows are valid — the builtin kernel pulls ONE word per peer from that peer's own `send_counts` window (scalar read; no fixed-width requirement) and clamps reader-side, gated by a two-round credit barrier; the composite rail atomically resets local counts, announces readiness to all peers, then waits for each destination before publishing nonzero counts via `pld.system.notify` (AtomicAdd) and pushing payload; a final barrier completes the exchange; returns window as result (same window-as-result pattern as symmetric `all_to_all`) | `DistributedTensorType` (same as target) | composite / HOST builtin / CHIP builtin |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
 | `pld.system.defer_wait` | defer this task's logical completion on a local counter | `Unknown` (side effect) | Simpler completion runtime (no PTOAS wait op) |
 
 The seven side-effect-only ops produce [`UnknownType`](ir/02-types.md): they
 exist for their cross-rank effect, not for an SSA value a consumer reads.
+
+## Async transfer validation
+
+`pld.tensor.put_async` and `pld.tensor.get_async` lower on the A5 backend to a
+dtype-suffixed external helper call (`pypto_urma_{put,get}_async_<dtype>`). The
+helper validates the request against both endpoint tensor extents and the
+communication window, requests the URMA workspace from the IR `engines` field,
+and submits through the existing runtime entry point; it never polls. Task
+completion integration (the enclosing task releasing the consumer) is still
+pending. Both endpoints must be window-bound, dense row-major
+`DistributedTensor`s. The result aliases `dst`; returning from the op does not
+imply completion.
+
+Adapter symbols and C++ element types reuse the shared dtype conversions.
+
+- Python builders require `engine=pld.CommEngine.URMA` (also the default).
+  Integers, floats, booleans, strings, and unrelated enums are rejected before
+  integer conversion. Raw IR stores the engine as integer `1`.
+- `peer` must be an integer/index scalar. Negative constant ranks are rejected;
+  this check does not establish runtime rank bounds for a communication domain.
+- `dst_offsets`, `src_offsets`, and `shape` must be supplied together. A region
+  must be contiguous on both endpoints: skip leading transfer dimensions known
+  to equal one, then require every dimension after the first non-singleton to
+  span its full extent. Dynamic extents may exceed one and are not skipped.
+  Thus `[1, 32]` inside `[16, 64]` and `[1, 2, 64]` inside `[2, 4, 64]` are
+  contiguous, but `[2, 32]` and `[2, 1, 64]`, respectively, are not.
 
 ## Namespacing: why `tile.*` vs `tensor.*` vs `system.*`
 
@@ -98,10 +133,11 @@ pinning it to the vector lane would let the matmul race past the peer data it
 waits on.
 
 The flag is orthogonal to affinity (it constrains replication, not placement).
-Its only consumer is `LowerAutoVectorSplit`'s `pl.split_aiv` region placement
-stamp, which pins a region's no-duplicate calls to the AIV lane; see
+`ExpandMixedKernel` applies it when consuming `pl.split_aiv` regions, pinning
+a region's core-agnostic no-duplicate calls to the AIV lane. Software-pipeline
+analysis also treats these calls as non-replicable; see
 `docs/en/dev/ir/05-operators.md` and
-`docs/en/dev/passes/23-lower_auto_vector_split.md`.
+`docs/en/dev/passes/26-expand_mixed_kernel.md`.
 
 **Comm ops written outside every region are still duplicated onto both lanes,
 and nothing diagnoses it.** Putting the comm phase in a `pl.split_aiv` region is
@@ -109,9 +145,9 @@ the author's job; see `docs/en/user/language/04-scopes.md`.
 
 ## ABI enums (`include/pypto/ir/comm.h`)
 
-The four enums are an **append-only ABI**. Their underlying `int` values are
+The five enums are an **append-only ABI**. Their underlying `int` values are
 serialised as the op's kwarg payload (`op` for notify, `cmp` for wait/defer_wait, `atomic`
-for put) and cast back to the enum at codegen time. New variants may only be
+for put, `engine` for async transfers) and cast back to the enum at codegen time. New variants may only be
 added **at the end** so existing IR and cached programs keep their meaning.
 
 ```cpp
@@ -119,6 +155,7 @@ enum class NotifyOp : int { kAtomicAdd = 0, kSet = 1 };   // pld.system.notify
 enum class WaitCmp  : int { kEq = 0,        kGe = 1 };     // pld.system.wait / defer_wait
 enum class AtomicType : int { kNone = 0,    kAdd = 1 };    // pld.tensor.put, remote_store
 enum class ReduceOp : int { kSum = 0, kMax = 1, kMin = 2, kProd = 3 };  // pld.tensor.allreduce
+enum class CommEngine : int { kURMA = 1 };  // pld.tensor.put_async / get_async
 ```
 
 | Enum | Variant | Meaning |
@@ -133,18 +170,19 @@ enum class ReduceOp : int { kSum = 0, kMax = 1, kMin = 2, kProd = 3 };  // pld.t
 | `ReduceOp` | `kMax` | max-reduce every participating rank's window slice |
 | `ReduceOp` | `kMin` | min-reduce every participating rank's window slice |
 | `ReduceOp` | `kProd` | product-reduce every participating rank's window slice |
+| `CommEngine` | `kURMA` | URMA asynchronous transfer engine |
 
 Each enum is mirrored across three layers (C++ `enum class` → `nb::enum_` in the
 bindings → `.pyi` stub) and surfaced to the DSL as `pld.NotifyOp` /
-`pld.WaitCmp` / `pld.AtomicType` / `pld.ReduceOp`. The deducer validates the packed `int`
+`pld.WaitCmp` / `pld.AtomicType` / `pld.ReduceOp` / `pld.CommEngine`. The deducer validates the packed `int`
 against the enum range so codegen can cast back without a second guard.
 
 ## Barrier-signal protocol
 
 Every `pld.tensor.*` collective (`allreduce`, `barrier`, `broadcast`,
-`reduce_scatter`, `allgather`, `all_to_all`) synchronises through one shared,
+`reduce_scatter`, `allgather`, `all_to_all`, `all_to_all_v`) synchronises through one shared,
 **self-clearing credit barrier** built from `pld.system.notify` /
-`pld.system.wait` — except `all_to_all_v`'s builtin kernel, which uses the
+`pld.system.wait`. `all_to_all_v` uses the
 **two-round** variant described at the end of this section:
 
 ```text
@@ -159,14 +197,14 @@ Epilogue:  for src != my_rank:
 ```
 
 `AtomicAdd` turns each cell into a credit counter: every notify is a
-producer's `+1`, and the epilogue is the sole consumer's `-N`. Because adds
-and subtracts are atomic and commutative, the signal is provably all-zero
-again once every rank has finished its epilogue for a call — **the signal
-carries no state that outlives one call**, so every call's generation `g`
-restarts at 1 and no cross-call bookkeeping is required. A slow rank can
-inflate a fast rank's own next-call credit by at most 1 while it finishes the
-current call (bounded skew), so the counter never overflows and a fast rank
-can never observe a spurious pass.
+producer's `+1`, and the epilogue is the sole consumer's `-N`. Atomic
+subtraction retires this call's credits while preserving early next-call
+credits. The signal is all-zero after every rank retires this call only if
+no next-call credits have arrived; generation `g` restarts at 1 without a
+cross-call ledger. InCore `all_to_all_v` splits readiness announcements from
+on-demand destination waits, so a zero-row edge lets a fast peer post both
+next-call credits before a slow rank retires its current two. A cell may
+reach 4; `AtomicAdd(-2)` preserves both early credits.
 
 `Ge` (not `Eq`) is load-bearing: a fast peer can advance a cell past the value
 the waiting rank is looking for before that rank ever polls it, so an
@@ -178,14 +216,19 @@ advanced counter.
 `pld.system.notify`'s `value` only requires `ScalarType` — so a mesh
 allreduce's per-chunk credit count does not need to be known at compile time.
 
-`all_to_all_v`'s builtin kernel is the one **two-round** variant: its count
-pull requires the counts lifetime and the receive-window reuse to be protected
-across calls, so it runs Barrier A (`+1` / wait `Ge(1)`) before the pull and
-Barrier B (`+1` / wait `Ge(2)`) after the push, then subtracts 2 per local
-slot in a single `AtomicAdd(-2)` epilogue — never a reset, so an early credit
-from the next invocation is preserved. It is likewise reusable across
-sequential calls. Its InCore composite rail keeps the one-round self-clearing
-protocol above.
+`all_to_all_v` uses a **two-round** variant on both builtin and InCore
+composite rails. The builtin protects the counts lifetime and receive-window
+reuse across calls with Barrier A (`+1` / wait `Ge(1)`) before the count pull
+and Barrier B (`+1` / wait `Ge(2)`) after the payload push. The InCore rail
+atomically resets its own receive counts and announces readiness to every
+peer. It then waits for each non-self destination at `Ge(1)` before publishing
+a nonzero clamped count and pushing that destination's payload; it does not
+wait for all destinations before starting the first send. Zero-row counts
+remain zero from the receiver reset, without a publication. Barrier B
+(`Ge(2)`) completes the exchange. Both rails subtract 2 per local slot in a
+single `AtomicAdd(-2)` epilogue — never a signal reset, so an early credit
+from the next invocation is preserved. The signal is reusable across
+sequential calls.
 
 **Constraints:**
 
@@ -194,12 +237,13 @@ protocol above.
 | One signal must not be shared between mesh (`[NR, 1]`) and ring (`[2*(NR-1), NR]`) allreduce | Mesh addresses `[rank, 0]`; ring addresses `[row, rank]` — a shape mismatch, checked at lowering time |
 | A call aborted mid-flight (error / timeout) leaves the signal non-zero | Credits leak; recover via a host-side reset (`reset_persistent_windows`) before the next dispatch |
 
-Because the protocol is call-local and the signal always starts a call at
-all-zero, collectives are legal inside `for` / `while` / `if` — each call is a
-closed cycle, so the same compile-time `expected` values are reused every
-iteration. The only remaining requirement is rank-uniform execution (inherent
-to any barrier): rank-divergent control flow deadlocks, surfaced by `TWAIT`'s
-spin-count assert.
+Because the protocol is call-local, InCore collectives support rank-uniform
+`for` / `while` / `if` — each call is a closed cycle, so the same compile-time
+`expected` values are reused every iteration. Rank-divergent control flow
+deadlocks, surfaced by `TWAIT`'s spin-count assert.
+For `all_to_all_v`, loop support is InCore-only: HOST orchestrators still
+reject `for` / `while` calls because loop-carried comm-domain window lifetime
+management is not modeled.
 
 ## Op reference
 
@@ -280,7 +324,7 @@ to the `pto.tstore`, making the push a **combine** (`peer_region += src`) — th
 cross-rank twin of `tile.store`'s split-K accumulation, and what an all-to-all
 combine needs. Emitted only for `kAdd`, so plain pushes stay byte-identical.
 `kAdd` requires an fp32/bf16/fp16/int32/int16/int8 dtype -- the same hardware
-allow-list `tile.store` enforces -- and bf16 carries the same Ascend910B-only
+allow-list `tile.store` enforces -- and bf16 carries the same Ascend910-only
 restriction on top.
 
 `pld.tensor.put` (TPUT) has **no** tile-source form — its staging tile is a
@@ -359,7 +403,7 @@ transfer dim requires a matching static chunk (see above). `atomic` selects
 overwrite vs atomic-add (see `AtomicType`). `atomic=Add` additionally requires a
 `FP32/BF16/FP16/INT32/INT16/INT8` destination (the hardware atomic-add dtypes,
 since TPUT lands its chunks through the same store pipe as `tile.store`); a
-`BF16` destination is further restricted to the Ascend910B (A2/A3) profile by the
+`BF16` destination is further restricted to the Ascend910 (A2/A3) profile by the
 `AtomicAddDtypeValid` property verifier. The lowered `pld.tile.put` verifier
 requires the staging tile to **fit within** the flattened transfer in both
 **static** dims (it may be smaller — a chunk — but never larger; dynamic dims
@@ -443,6 +487,16 @@ those, by resolving each operand back to its `WindowBuffer` (see below); on the
 InCore and CHIP rails the operands arrive as function parameters with no such
 provenance, so distinctness is the caller's obligation.
 
+On the managed CHIP/L2 rail, an operand built in the orchestration must be
+provably row-major, or `LowerL2TensorCollectives` rejects it (see the
+[pass reference](passes/44-lower_l2_tensor_collectives.md#current-limitations)
+for what is proven and why). As a backstop, orchestration codegen emits one
+`is_contiguous` check per operand ahead of its `rt_submit_aiv_task`.
+The first non-contiguous operand latches `SIMPLER_ERROR_INVALID_ARGS` naming it
+(`__builtin_all_to_all_v__fp32: signal must be a contiguous row-major view`),
+and the runtime then drops the submit. A non-zero view offset is fine — the
+kernel adds `start_offset` — only a non-row-major stride vector is rejected.
+
 `MAX_RECV = target.shape[0] // NR`. Lowering reads `send_counts[dest]` at
 runtime, clamps it to `[0, MAX_RECV]`, and fills the receive-side count vector
 `recv_counts[src, 0]`. The builtin kernel (HOST and managed CHIP/L2 rails) does
@@ -455,9 +509,15 @@ clamp(send_counts_of[src][my_rank], 0, MAX_RECV)`). The exchange is gated by a
 **two-round credit barrier**: Barrier A (before the pull) certifies every rank
 staged its counts and finished consuming the previous invocation's receive
 window; Barrier B (after the push) certifies every peer read this rank's counts
-and pushed before it returns. The InCore composite rail instead publishes the
-already-clamped count into peer `dest`'s `recv_counts[my_rank, 0]` via
-`pld.system.notify` (Set). The push transfers exactly that many rows — the
+and pushed before it returns. The InCore composite rail atomically resets its
+own receive counts and announces readiness to all peers. For each non-self
+destination it waits for that destination's readiness before publishing a
+positive clamped count into `recv_counts[my_rank, 0]` via `pld.system.notify`
+(AtomicAdd) and pushing payload. A zero-row destination keeps the receiver's
+reset value without a count publication or payload transfer. A final `Ge(2)`
+barrier completes the exchange. Both reset and publication use
+atomics: scalar stores would flush an entire cache line and could overwrite a
+neighboring count or signal. The push transfers exactly that many rows — the
 transfer shape is the runtime `[rows, SIZE]`, not the compile-time capacity —
 so padding rows never cross the wire. After the call the receiver uses
 `recv_counts[src, 0]` to identify the valid rows; the remainder of its capacity
@@ -514,6 +574,13 @@ launched_core_num=B active_lanes=min(B, stride) lanes_per_peer=K` (`0` in the
 the launch width is observable from
 the device log alone instead of being inferred from the data path.
 
+The shared HOST/CHIP builtin uses two 32-KiB UB staging buffers per AIV
+(64 KiB total, independent of payload dtype). Large transfers use TPUT
+ping-pong buffering to overlap the next chunk's load with the previous
+chunk's store. Small transfers that fit in one buffer take the single-transfer
+path; valid columns limit both buffers to the actual payload or tail extent,
+so unused capacity is never transferred.
+
 The admitted blocks **partition the work** (RFC #2521 K3):
 
 - `B >= NR` — peer × length: `K = B / NR` lanes per peer, block `idx` owns
@@ -540,7 +607,7 @@ naming the CHIP rail in the diagnostic. The CHIP/L2 rail (below) accepts a
 compile-time `core_num`: it folds the same `B = CalAllToAllVBlocks(P, L)` at
 lowering and attaches it as the launch spec (`core_num=B`, `sync_start`) when
 `B > 1`. A runtime `core_num` is not supported on that rail yet — see
-[`40-lower_l2_tensor_collectives.md`](passes/40-lower_l2_tensor_collectives.md).
+[`44-lower_l2_tensor_collectives.md`](passes/44-lower_l2_tensor_collectives.md).
 
 **CHIP builtin** (`LowerL2TensorCollectives`): the same call written one level
 down, in a CHIP `Orchestration` body rather than in `host_orch`. It is rewritten
@@ -549,7 +616,7 @@ template the HOST rail uses, so the wire behaviour is identical and only the
 dispatch structure differs: the collective becomes one AIV task of the caller's
 own pipeline — no per-device fan-out, no nested L2 dispatch — ordered against
 the surrounding compute by ordinary TensorMap dependencies. See
-[`40-lower_l2_tensor_collectives.md`](passes/40-lower_l2_tensor_collectives.md).
+[`44-lower_l2_tensor_collectives.md`](passes/44-lower_l2_tensor_collectives.md).
 
 **HOST builtin** (`LowerHostTensorCollectives`): the same 5-arg call, made
 from a `host_orch` function, lowers per-device to `builtin.tensor.all_to_all_v`
@@ -566,10 +633,9 @@ control-vs-control is a notify racing a count publish). The kernel derives
 size), so the block layout is always consistent with the devices actually
 running — no exact `signal.shape[0]` == device-count requirement and no
 per-`MAX_RECV` variant mangling. Not supported inside a `for`/`while` loop in
-`host_orch` yet — a compiler limitation (`MaterializeCommDomainScopes` rejects
-it up front; the same restriction `LowerCompositeOps` enforces on the InCore
-path), not a property of the signal: the credit barrier is reusable across
-sequential calls.
+`host_orch` yet — `MaterializeCommDomainScopes` rejects it because loop-carried
+comm-domain window lifetime management is not modeled. The credit barrier is
+reusable across sequential calls, and InCore calls support rank-uniform loops.
 
 ### `pld.tensor.allreduce`
 
@@ -630,7 +696,7 @@ dynamic physical target dimension is bound from that tensor parameter.
   every row of the signal afterward.
 
 Host-orchestrator user code may omit `signal` outside `for` and `while` loops;
-the [`SynthesizeAllReduceSignals`](passes/45-synthesize_allreduce_signals.md)
+the [`SynthesizeAllReduceSignals`](passes/49-synthesize_allreduce_signals.md)
 pass inserts a private INT32 signal window with semantic shape
 `[world_size, core_num]`
 for that call (mesh mode only — `mode="ring"` requires an explicit signal). The
@@ -642,9 +708,13 @@ supported like any other collective. Explicit
 `signal` remains the internal form used by InCore lowering and by tests that
 intentionally construct the internal protocol. Comm-domain materialisation then
 keeps the signal buffer in the same domain as `src`, even when it is not passed
-to a user chip kernel. Mesh, ring, and host-builtin paths support FP16 and FP32
-with `ReduceOp.Sum`, `Max`, `Min`, and `Prod` for arbitrary positive element
-counts. InCore lowering uses UB-bounded chunks; the host builtin uses
+to a user chip kernel. InCore mesh, InCore ring, and host-builtin mesh all
+support FP16 and FP32 with `ReduceOp.Sum`, `Max`, `Min`, and `Prod` for
+arbitrary positive element counts. The one exception is **host-builtin
+ring** (`mode="ring"` lowered to `builtin.tensor.allreduce_ring`), which
+currently supports only `ReduceOp.Sum` with `dtype=FP32` — `Max`/`Min`/`Prod`
+and FP16 are not yet available on that specific path. InCore lowering uses
+UB-bounded chunks; the host builtin uses
 256-element chunks. InCore mesh and ring round only the physical FP16 remote
 tail span to 32 bytes. The host builtin rounds ragged FP16 and FP32 load spans
 to 32 bytes. Both preserve the logical valid shape. The host builtin accepts
@@ -700,6 +770,84 @@ One SPMD grid avoids both: `require_sync_start` admits all blocks together and
 `block_idx` gives deterministic, matching partitioning on every rank. That is a
 per-card admission guarantee, not a global simultaneous start across ranks — the
 ready barrier absorbs cross-rank launch skew.
+
+### `pld.tensor.allgather`
+
+```text
+pld.tensor.allgather(local_data, target, signal) -> DistributedTensorType(target)
+```
+
+Gathers one `[1, SIZE]` local chunk from every rank into the window-bound
+`target` and returns it — the **window-as-result** form. Unlike `allreduce`,
+`target` is not this rank's slice: it is the whole gathered matrix, so its
+leading extent is the rank count and its trailing extent is one chunk.
+
+```text
+local_data : Tensor[[1, SIZE]]                 -- this rank's chunk
+ target    : DistributedTensor[[NR, SIZE]]     -- the gathered result
+ signal    : DistributedTensor[[NR, 1]] INT32
+```
+
+**Shape contract.** The deducer compares `target.shape[1]` with
+`local_data.shape[1]` structurally rather than requiring a compile-time
+constant, so a symbol shared by both sides is admissible — including a runtime
+chunk width. The rail form `[TP, width * D]` is therefore valid; `[TP * width,
+D]` is not, and is rejected at IR construction with *"target SIZE must equal
+input SIZE"*.
+
+**Lowering.** Push-based: one `pld.tile.put` per peer writes this rank's chunk
+into that peer's `target` row `my_rank`, then a barrier, then a self-clearing
+epilogue. Nothing is pulled. The bounce stage is capped at one 16-KiB chunk and
+the transfer is chunked by `pld.tile.put` itself, so the composite emits no
+chunk loop of its own and a runtime extent is chunked at run time exactly as a
+static one is (see the chunking rules under
+[`pld.tensor.allreduce`](#pldtensorallreduce)). Any symbolic extent must be
+runtime-bound by a kernel scalar, loop variable or physical tensor-shape
+parameter; a type-metadata-only symbol is rejected during PTO codegen.
+
+**Type contract.** The deducer is shared by both execution paths, so it accepts
+what either needs: `local_data` may be a plain `Tensor` **or** a
+`DistributedTensor` (the HOST builtin stages through a `[1, SIZE]
+DistributedTensor` window, while InCore passes the plain chunk); `target` must be
+a window-bound `DistributedTensor` of `[NR, SIZE]`; `signal` may be **`[NR]` or
+`[NR, 1]`** INT32; and `local_data` and `target` must be different buffers —
+aliasing them is a cross-process data race.
+
+The InCore lowering is stricter than the deducer on one point: its barrier
+indexes one cell per rank, so it requires `signal` to be 2D `[NR, 1]`
+(`ValidateMeshSignalShape`). A `[NR, 1]` signal therefore satisfies both paths,
+while a rank-one `[NR]` signal is HOST-only. A signal shaped for ring
+`allreduce` (`[2*(NR-1), NR]`) cannot be shared with this collective on either
+path; give it its own window.
+
+### `pld.tensor.reduce_scatter`
+
+```text
+pld.tensor.reduce_scatter(target, signal, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensorType(target)
+```
+
+`target` is `[NR, SIZE]`. Each rank stages all `NR` chunks before the call; after
+it, rank `r`'s row `[r, 0:SIZE]` holds the element-wise reduction of chunk `r`
+across every rank (Sum/Max/Min/Prod by `ReduceOp`). Signal shape `[NR, 1]`.
+
+The row is walked in UB-sized chunks of at most 16 KiB. A static, 32-byte-aligned
+`SIZE` that fits one chunk keeps the single-tile path (ready barrier, peer loop,
+post-reduce barrier, store, epilogue); anything larger, not 32-byte aligned, or
+symbolic uses the chunked path: one ready barrier, then a read-complete barrier per chunk on
+generation `2 + chunk_index`, with a ragged final chunk carried as
+`valid_shape = min(chunk_cols, SIZE - offset)`. Either way a self-clearing
+epilogue restores the signal (see
+[Barrier-signal protocol](#barrier-signal-protocol)), so one signal serves
+back-to-back calls.
+
+Chunking is what makes a large, unaligned, or symbolic `SIZE` expressible at all:
+the single-tile form allocates the whole row as one VEC tile, which overflows the
+VEC budget for a real payload and is rejected by PTOAS whenever the row's byte
+width is not 32-byte aligned. A static `SIZE` below one chunk but not 32-byte
+aligned therefore also takes the chunked path, which rounds the physical chunk
+width up to the next aligned extent and keeps the logical width in `valid_shape`.
+A symbolic `SIZE` must be runtime-bound by a kernel scalar, loop variable, or
+physical tensor-shape parameter.
 
 ### `pld.system.notify` (TNOTIFY)
 
@@ -793,11 +941,17 @@ than a PTO tensor view.
 ## Pipeline integration
 
 Comm domains and their slot allocations are materialised by the
-[`MaterializeCommDomainScopes`](passes/46-materialize_comm_domain_scopes.md) pass, which wraps each
+[`MaterializeCommDomainScopes`](passes/50-materialize_comm_domain_scopes.md) pass, which wraps each
 host_orch body in nested `CommDomainScopeStmt` nodes (one per inferred comm domain) and produces the
 per-window `WindowBuffer` records that the runtime binds physical buffers to.
+Distributed codegen rounds each slot's physical allocation up to 64 bytes and
+sums these padded sizes for the domain window. `CommBufferSpec.count` and
+`DistributedTensor` shapes retain their logical extents. This keeps independent
+slots on separate A2/A3 D-cache lines: a scalar store followed by DCCI writes
+back a whole 64-byte line and must not overwrite an adjacent signal slot's
+credits. The padding also covers 32-byte remote-transfer alignment and tails.
 Host-level tensor collectives are then lowered by
-[`LowerHostTensorCollectives`](passes/47-lower_host_tensor_collectives.md) into internal builtin chip
+[`LowerHostTensorCollectives`](passes/51-lower_host_tensor_collectives.md) into internal builtin chip
 dispatches before the final `Simplify`.
 
 ## Testing
@@ -813,6 +967,11 @@ dispatches before the final `Simplify`.
   `test_l3_allgather.py`, `test_l3_reduce_scatter.py`, `test_l3_broadcast.py`
   (each likewise dynamic-NR, P=2/P=4),
   `test_l3_tensor_allreduce_intrinsic.py`, `test_l3_tensor_allreduce_ring_intrinsic.py`,
+  `test_l3_tensor_allgather_runtime_width.py` (composite allgather at a runtime
+  extent: one compile exercised at three different extents),
+  `test_l3_tensor_reduce_scatter_intrinsic.py`, `test_l3_tensor_reduce_scatter_chunked.py`,
+  `test_l3_tensor_reduce_scatter_runtime_size.py` (one compile at runtime sizes
+  1001 / 12288 / 12289),
   `test_l3_allreduce_ring.py` (hand-rolled ring RS+AG), `test_l3_host_tensor_allreduce.py`,
   `test_l3_host_tensor_allreduce_ring.py`,
   `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`,

@@ -11,6 +11,7 @@
 
 import logging
 import os
+import re
 import tempfile
 import uuid
 from collections.abc import Callable, Sequence
@@ -23,15 +24,17 @@ from time import perf_counter_ns
 from typing import Any, cast
 
 from pypto._cache_config import CacheConfig, record_bypass, record_stats, time_stage
+from pypto._environment import default_output_root
 from pypto._identity import digest_record, fingerprint_extra_sources
 from pypto.pypto_core import DataType
 
-from ._artifact_manifest import ArtifactKey, ArtifactSpec, ArtifactState, BuildKind
+from ._artifact_manifest import ArtifactKey, ArtifactSpec, ArtifactState, BuildKind, check_directory
 from ._toolchain import capture_toolchain
 from .artifact_cache import ArtifactLookup, ArtifactStore, BuildFailure, LookupStatus
 from .cache import CacheKey
 
 logger = logging.getLogger(__name__)
+_MAX_READY_CANDIDATES = 32
 _count_initial_lookup: ContextVar[bool] = ContextVar("jit_count_initial_lookup", default=False)
 
 
@@ -93,6 +96,70 @@ class JITArtifactStore(ArtifactStore):
             _count_initial_lookup.set(False)
             _event(result.status)
         return result
+
+    def lookup_ready(self, key: ArtifactKey, generated: ArtifactSpec) -> ArtifactLookup:
+        """Use a GENERATED hint first, then published READY metadata if needed.
+
+        Hints only select a slot. The selected READY payload is fully validated
+        before it can be used; no cached Python is executed.
+        """
+        from pypto.runtime._prebuilt import ready_spec  # noqa: PLC0415
+
+        first = ArtifactLookup(LookupStatus.MISS)
+        try:
+            spec = ready_spec(self._slot(key, generated), generated, metadata_only=True)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError, UnicodeError):
+            pass
+        else:
+            first = self.lookup(key, spec)
+            if first.handle is not None:
+                return first
+        fallback = self._lookup_ready_candidates(key, generated)
+        return first if fallback.status is LookupStatus.MISS else fallback
+
+    def _lookup_ready_candidates(self, key: ArtifactKey, generated: ArtifactSpec) -> ArtifactLookup:
+        """Find an orphan READY stage within one exact artifact key, without writes."""
+        from pypto.runtime._prebuilt import ready_spec  # noqa: PLC0415
+
+        parent = self._slot(key, generated).parent.parent
+        try:
+            check_directory(parent)
+            with os.scandir(parent) as entries:
+                candidates: list[str] = []
+                for entry in entries:
+                    if re.fullmatch(r"[0-9a-f]{64}", entry.name) and entry.is_dir(follow_symlinks=False):
+                        candidates.append(entry.name)
+                        if len(candidates) > _MAX_READY_CANDIDATES:
+                            return ArtifactLookup(
+                                LookupStatus.INVALID, reason=f"Too many READY candidates under {parent}"
+                            )
+        except FileNotFoundError:
+            return ArtifactLookup(LookupStatus.MISS)
+        except ValueError as exc:
+            return ArtifactLookup(LookupStatus.INVALID, reason=str(exc))
+        except OSError as exc:
+            return ArtifactLookup(LookupStatus.STORAGE_ERROR, reason=str(exc))
+        hit: ArtifactLookup | None = None
+        failure = ArtifactLookup(LookupStatus.MISS)
+        for digest in sorted(candidates):
+            directory = parent / digest / ArtifactState.BINARY_READY.value
+            try:
+                check_directory(directory)
+                spec = ready_spec(directory, generated, metadata_only=True)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError, UnicodeError):
+                continue
+            if spec.digest != digest:
+                continue
+            candidate = self.lookup(key, spec)
+            if candidate.handle is not None:
+                if hit is not None:
+                    return ArtifactLookup(
+                        LookupStatus.INVALID, reason=f"Ambiguous READY stages under {parent}"
+                    )
+                hit = candidate
+            elif candidate.status is not LookupStatus.MISS:
+                failure = candidate
+        return hit if hit is not None else failure
 
     def get_or_build(self, key: ArtifactKey, spec: ArtifactSpec, builder: Callable[[Path], Any]) -> Any:
         binary = spec.state is ArtifactState.BINARY_READY
@@ -213,10 +280,15 @@ def resolve_persistent(
         # Avoid tempfile's write probes under a readonly TMPDIR. The usual
         # build_output parent is created lazily; the exceptional temporary
         # parent is allocated securely before any runtime output can use it.
-        private_root = Path.cwd() / "build_output"
-        if private_root == config.root or config.root in private_root.parents:
-            private_root = _fallback_private_root(config.root, os.getpid())
-        store = JITArtifactStore(config.root, readonly=config.readonly, private_root=private_root)
+        # Placement is not a compilation input. Resolve it only for a new
+        # object, after the object hit above, without copying shared artifacts.
+        store = JITArtifactStore(config.root, readonly=config.readonly)
+        # Resolve here instead of in ArtifactStore so containment sees symlinks
+        # without adding a second filesystem traversal for the private root.
+        private_root = default_output_root().resolve()
+        if private_root == store.root or store.root in private_root.parents:
+            private_root = _fallback_private_root(store.root, os.getpid())
+        store.private_root = private_root
         spec = ArtifactSpec(
             ArtifactState.GENERATED,
             kind,
@@ -224,6 +296,18 @@ def resolve_persistent(
             if distributed
             else ("compiled_meta.json", "kernel_config.py"),
         )
+        ready = store.lookup_ready(key, spec)
+        _event(ready.status)
+        if ready.handle is not None:
+            record_stats(ready_hits=1)
+            compiled = restore_artifact(
+                store,
+                ready.handle,
+                private_root / f"run-{uuid.uuid4().hex}",
+                _validated_manifest=ready.manifest,
+            )
+            owner._artifact_objects[compatible] = compiled
+            return compiled
         initial = store.lookup(key, spec)
         _event(initial.status)
         handle = initial.handle
@@ -232,7 +316,12 @@ def resolve_persistent(
             _event(ready.status)
             record_stats(**{"ready_hits" if ready.handle is not None else "generated_hits": 1})
             handle = ready.handle or handle
-            compiled = restore_artifact(store, handle, private_root / f"run-{uuid.uuid4().hex}")
+            compiled = restore_artifact(
+                store,
+                handle,
+                private_root / f"run-{uuid.uuid4().hex}",
+                _validated_manifest=ready.manifest if ready.handle is not None else initial.manifest,
+            )
             owner._artifact_objects[compatible] = compiled
             return compiled
         record_stats(misses=1)

@@ -149,6 +149,15 @@ Pass CreateProgramPass(std::function<ProgramPtr(const ProgramPtr&)> transform, c
  */
 Pass InitMemRef();
 
+/// Initialize each writable SIMT Tile output while preserving GM reference semantics.
+Pass MaterializeSimtOutputs();
+
+/// Specialize SIMT helpers by dimensions and storage ABI, passing dynamic metadata explicitly.
+Pass SpecializeSimtHelpers();
+
+/// Outline transient per-thread regions before inlining and SSA conversion.
+Pass OutlineSimtScopes();
+
 /**
  * @brief Create the semantic must-alias materialization pass
  *
@@ -314,15 +323,13 @@ Pass SelectBufferIRFunctions();
  * argument slot, so a value computed inside the region has no slot and would be
  * frozen at its first-call value on every later replay, with no warning.
  *
- * Also rejects, at compile time, the boundary shapes the runtime would decline
- * to cache — an oversized or empty tensor boundary, runtime-allocated outputs,
- * a *computed* return value, nested graphs, and call sites carrying explicit
- * dependencies or a dispatch predicate. Returning a parameter is allowed:
- * `return c` for an `InOut` parameter is the DSL's spelling for writing in place
- * and lowers to an alias, so only a genuinely new value is refused —
- * `rt_submit_graph` yields a valid task id solely on a cache hit, so nothing may
- * depend on a graph call's result. Almost all of those degrade to a silent
- * non-graph fallback at runtime, which no numerical test can detect.
+ * Also rejects boundary shapes the runtime cannot record: oversized or empty
+ * tensor boundaries, runtime-allocated outputs, computed returns, nested graphs,
+ * and Graph dispatch predicates or SPMD launch specifications. Caller-supplied
+ * Out/InOut storage and parameter-alias returns are allowed. Invocation-local
+ * explicit predecessors order the outer Graph shell without entering its cached
+ * Definition; the outer completion TaskId is valid for recording and replay and
+ * covers the entire invocation. Recorded-local TaskIds cannot escape the Graph.
  *
  * @return Program-level pass
  */
@@ -361,39 +368,23 @@ Pass UnrollLoops();
 Pass SkewCrossCorePipeline();
 
 /**
- * @brief Rotate a ``pl.pipeline`` loop through the slots of one declared
- *        allocation; runs immediately before ``LowerPipelineLoops``.
+ * @brief Lower eligible pipeline loops to existing multi-slot MemRefs.
  *
- * Where ``LowerPipelineLoops`` buys ping-pong by replicating the body ``F`` times
- * so each copy owns a distinct buffer, this pass keeps ONE body and gives the
- * buffer ``F`` slots: every top-level ``tile.load`` / ``tile.read`` in the body
- * whose arguments read the induction variable is rebound onto
- * ``pl.MemRef(name, slots=F)[iv % F]``, and the loop is demoted to
- * ``ForKind::Sequential`` with ``pipeline_stages`` stripped. Bounds, step and
- * ``iter_args`` are untouched, so no remainder dispatch is needed and a dynamic
- * trip count needs no special case.
+ * With PassContext::GetEnableSoftwarePipeline(), the PyPTO planner generates
+ * preload / steady / drain sections for eligible single-level Vec loops. The prefetch
+ * distance is slots - 1; the steady loop uses a zero-based logical IV and
+ * selects (iv + distance) % slots for loads and iv % slots for compute/store.
+ * Existing tile.create operations name preloaded slots without reading or
+ * writing data. No new IR node or operator is required.
  *
- * The synthesized MemRef is shaped exactly like an author's declaration, so
- * ``InitMemRef`` resolves it and PTO codegen lowers it to one
- * ``pto.alloc_multi_tile`` plus a ``pto.multi_tile_get`` per use — no new IR op
- * and no new user-facing switch.
+ * With the option disabled, the existing PTOAS-planner path rotates eligible
+ * top-level loads through iteration-ordinal slots without changing bounds or iter_args.
+ * Under the default PyPTO planner, the disabled pass leaves functions untouched.
  *
- * **Self-gated on ``memory_planner=PTOAS``.** Only that planner emits a ptoas
- * region today — PTO codegen's ``PlanMultiBufferRegions`` bails under the PyPTO
- * planner — so this pass returns the function untouched there and the default
- * pipeline is byte-identical. The gate tracks that codegen limitation, not a
- * limitation of ptoas: an addressed region synchronizes identically at
- * ``--pto-level=level3``. Widening it is follow-up work in the address
- * allocator.
- *
- * Loops it declines — a slot count outside ptoas' ``[2, 16]``, a step other than 1,
- * a start not a multiple of ``F``, a body with no eligible load, a tile in a space
- * other than Vec / Mat / Acc, a runtime valid shape, a tile carried out as a phi or
- * consumed by a view / in-place op, or any loop nested under a pipeline loop this
- * pass already declined — are left intact for ``LowerPipelineLoops`` to replicate.
- * Every rejection is a fallback to the existing behaviour, never an error: codegen
- * refuses a region it cannot describe, so synthesizing a doubtful one would turn a
- * kernel that compiles today into a compile failure.
+ * Both paths demote successfully lowered loops to Sequential. A declined loop
+ * stays Pipeline for LowerPipelineLoops and CanonicalizeIOOrder. The pass runs
+ * before InitMemRef so declared-slot geometry follows the existing allocation
+ * path; addressed software-pipeline regions stay under PyPTO memory planning.
  */
 Pass LowerPipelineToSlots();
 
@@ -492,6 +483,9 @@ Pass OutlineHierarchyScopes();
  * - Only processes Opaque/Orchestration functions containing Cluster scopes
  */
 Pass OutlineClusterScopes();
+
+/// Reuse closed outlined InCore kernels and exclusive Group bundles, preserving every dispatch.
+Pass DeduplicateOutlinedKernels();
 
 /**
  * @brief Outline Graph scopes into separate `FunctionType::Graph` functions
@@ -633,7 +627,7 @@ Pass LegalizeTileCast();
  *
  * L0C legality uses the backend's physical accumulator-row alignment, which
  * may be stricter than the logical cube shape (for example, an INT32 M=16
- * result occupies 32 rows on Ascend910B).  When that physical ``[M, N]``
+ * result occupies 32 rows on Ascend910).  When that physical ``[M, N]``
  * footprint exceeds L0c, fresh ``tile.matmul`` and ``tile.matmul_bias`` calls
  * are M/N-tiled.  A result consumed by one output store uses direct-to-GM
  * placement; a result consumed entirely as a later matmul operand is assembled
@@ -649,31 +643,18 @@ Pass LegalizeTileCast();
  * ``tile.matmul_acc`` calls with caller-owned accumulators remain deferred with
  * ``PH-AT-006``.
  *
- * Full-K M/N grids may use output-, A-, or B-stationary loop orders.  L0C
- * double-buffering is enabled automatically under DSA_RP and PTOAS and is an
- * opt-in under the legacy PYPTO planner.  Under PYPTO, chained Mat-scratch
- * producers remain output-stationary to avoid the allocator offset-packing
- * limitation tracked by issue #1908; some dbC-enabled layouts can still exceed
- * operand capacity there.
- * DSA_RP and PTOAS retain operand-stationary choices because their lifetime-aware
- * placement can subdivide the released operand range.
+ * Full-K M/N grids may use output-, A-, or B-stationary loop orders.  Automatic
+ * L0C double-buffering is excluded before candidate enumeration under PYPTO and
+ * DSA_RP. PTOAS retains its existing dbC selection for native allocator
+ * compatibility, independently of the stored legacy flag. Under PYPTO, chained
+ * Mat-scratch producers remain output-stationary to avoid the allocator offset-packing
+ * limitation tracked by issue #1908.
+ * DSA_RP and PTOAS retain operand-stationary choices; this does not guarantee
+ * that the native PTOAS allocator can repack every sequential buffer sequence.
  *
- * The pass also recognizes a user-authored, static pipeline (stage >= 2, trip
- * count divisible by the stage count) containing exactly one already-L0
- * ``tile.matmul``.  Its selected moving operand must be produced by a direct
- * per-iteration Mat-to-L0 transfer, while the other operand is loop-invariant.
- * Its Acc result must have one canonical loop-carried drain: direct-to-GM
- * ``tile.store`` needs at least four iterations; Acc-to-Mat ``tile.assemble``
- * needs at least eight iterations and an aligned Acc tile occupying at least
- * one quarter of L0C.  When the
- * conservative whole-function Acc footprint (including the physical stage
- * multiplicity of other pipelined Acc producers) plus one slot per profitable
- * loop fits in L0C, it enables the existing two-accumulator drain-overlap
- * schedule automatically under the PyPTO memory planner.  Deeper operand
- * pipelines are scheduled in depth-two compute/drain chunks and still rotate
- * only two L0C slots.  Explicit loop policies, nested control flow, multiple
- * cube matmuls or Acc values, non-canonical drain/yield chains, additional
- * stores, and insufficient L0C capacity stay unchanged.
+ * Existing already-L0 pipelines are not automatically marked for accumulator
+ * double buffering.  Explicit ``pipeline_double_buffer_c`` attributes remain
+ * caller-owned scheduling decisions and are preserved for downstream lowering.
  *
  * Eligible calls require static 2D operands with B in Mat and A in Mat or Vec.
  * ``tile.matmul_bias`` is supported when both matrix operands are Mat and its
@@ -825,28 +806,18 @@ Pass ResolveBackendOpLayouts();
 Pass ExpandMixedKernel();
 
 /**
- * @brief Lower AUTO pl.split mixed InCore functions into the explicit split_aiv
- *        form before ExpandMixedKernel (RFC #1300 staged convergence).
+ * @brief Lower explicit AIV regions without implicitly halving their bodies.
  *
- * For each mixed InCore function carrying a function-level split mode (UP_DOWN /
- * LEFT_RIGHT), inserts tile.aiv_shard at C->V boundaries and tile.aic_gather at
- * V->C boundaries, halves only the VECTOR sub-region (affinity-gated reuse of the
- * split_axis machinery), injects get_subblock_idx, and stamps split + split_aiv.
- * ExpandMixedKernel then folds aiv_shard/aic_gather into split-stamped tpush/tpop
- * via its op-driven boundary arm, and SplitVectorKernel takes its "already
- * explicit" arm (attribute stamping only).
- *
- * This is the LIVE auto-split lowering path: it always runs, immediately before
- * ExpandMixedKernel. SplitVectorKernel's former per-op halving driver was deleted
- * once this pass became unconditional — the halving machinery now lives only in
- * split_axis_utils, shared by this pass.
+ * Retains regions for ExpandMixedKernel, localizes explicit boundary valid
+ * extents, and stamps split_aiv. Mixed function-level AUTO splitting is rejected
+ * with a migration diagnostic. The public name is retained for compatibility.
  */
 Pass LowerAutoVectorSplit();
 
 /**
  * @brief Inject __gm_pipe_buffer workspace parameter for cross-core pipes
  *
- * Backend-gated (BackendHandler::RequiresGMPipeBuffer()). On Ascend910B the
+ * Backend-gated (BackendHandler::RequiresGMPipeBuffer()). On Ascend910 the
  * cross-core tpush/tpop path rides through a shared GM buffer; this pass adds
  * the workspace parameter and propagates it upward through callers, stopping
  * at Orchestration functions which materialize the buffer locally.
@@ -888,13 +859,15 @@ Pass Simplify();
 /**
  * @brief Decompose composite tile/distributed ops into primitive ops.
  *
- * Lowering rules live in a file-local dispatch table inside
- * ``src/ir/transforms/lower_composite_ops_pass.cpp``. Today the pass handles
+ * Lowering rules are selected by the function-local dispatch table in
+ * ``src/ir/transforms/lower_composite/lower_composite_rules.cpp``.
+ * Today the pass handles
  * ``tile.sin`` / ``tile.cos``, packed ``tile.tquant_mx``, and explicit-signal
  * InCore ``pld.tensor.allreduce``; host-level allreduce is skipped and lowered
  * later by ``LowerHostTensorCollectives``. Future single-result composite ops
- * (softmax, gelu, layernorm, ...) are added by appending a rule function + one
- * dispatch-table row. Multi-result rules may also need projection remapping in
+ * (softmax, gelu, layernorm, ...) add a rule function in the appropriate
+ * ``lower_composite/`` module, a declaration in ``lower_composite_rules.h``,
+ * and a dispatch-table row. Multi-result rules may also need projection remapping in
  * the mutator, as ``tile.tquant_mx`` does.
  *
  * FP32-only for the trig rules — non-FP32 inputs are rejected at

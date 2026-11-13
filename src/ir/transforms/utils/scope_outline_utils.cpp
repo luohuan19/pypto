@@ -27,6 +27,7 @@
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -134,7 +135,9 @@ class StoreTargetCollector : public IRVisitor {
   void VisitExpr_(const CallPtr& op) override {
     auto opnode = std::dynamic_pointer_cast<const Op>(op->op_);
     if (opnode && IsOp(opnode, "tile.store") && op->args_.size() >= 3) {
-      if (auto var = As<Var>(op->args_[2])) {
+      // A loop-carried destination is an IterArg, with its own ObjectKind.
+      // It needs the same post-store return binding as an ordinary Var.
+      if (auto var = AsVarLike(op->args_[2])) {
         store_targets.insert(var.get());
       }
     }
@@ -469,7 +472,7 @@ class PostStoreAliasCollector : public IRVisitor {
     auto call = std::dynamic_pointer_cast<const Call>(op->value_);
     auto opnode = call ? std::dynamic_pointer_cast<const Op>(call->op_) : nullptr;
     if (opnode && IsOp(opnode, "tile.store") && call->args_.size() >= 3) {
-      if (auto target = As<Var>(call->args_[2])) {
+      if (auto target = AsVarLike(call->args_[2])) {
         alias_to_target.emplace(op->var_.get(), target.get());
       }
     }
@@ -590,7 +593,7 @@ class StoreEvalToAssignMutator : public IRMutator {
   [[nodiscard]] std::optional<TrackedStore> MatchTrackedStore(const ExprPtr& value) const {
     auto call = std::dynamic_pointer_cast<const Call>(value);
     if (!IsOp(call, "tile.store") || call->args_.size() < 3) return std::nullopt;
-    auto target = As<Var>(call->args_[2]);
+    auto target = AsVarLike(call->args_[2]);
     if (!target) return std::nullopt;
     auto it = target_vars_.find(target.get());
     if (it == target_vars_.end()) return std::nullopt;
@@ -615,6 +618,38 @@ class StoreEvalToAssignMutator : public IRMutator {
   std::unordered_set<const Var*> claimed_;
 };
 
+/// Collect tensor operands in shape expressions without traversing their types.
+class TensorTypeDependencyCollector : public IRVisitor {
+ public:
+  std::vector<const Var*> tensors;
+
+ protected:
+  void VisitExpr_(const VarPtr& op) override {
+    if (AsTensorTypeLike(op->GetType())) tensors.push_back(op.get());
+  }
+  void VisitExpr_(const IterArgPtr& op) override {
+    if (AsTensorTypeLike(op->GetType())) tensors.push_back(op.get());
+  }
+};
+
+/// Symbols recoverable from a tensor descriptor without a caller-side value.
+/// Keep this restricted to the wrapper's supported inverses: a bare symbol,
+/// +/- an integer constant, or multiplication by a nonzero integer constant.
+/// Floor division and multi-symbol expressions do not uniquely determine a Var.
+VarPtr DescriptorBoundSymbol(const ExprPtr& dim) {
+  if (auto symbol = AsVarLike(dim)) return symbol;
+  if (!As<Add>(dim) && !As<Sub>(dim) && !As<Mul>(dim)) return nullptr;
+  auto binary = As<BinaryExpr>(dim);
+  auto symbol = AsVarLike(binary->left_);
+  auto constant = As<ConstInt>(binary->right_);
+  if (!symbol || !constant) {
+    symbol = AsVarLike(binary->right_);
+    constant = As<ConstInt>(binary->left_);
+  }
+  if (!symbol || !constant || (As<Mul>(dim) && constant->value_ == 0)) return nullptr;
+  return symbol;
+}
+
 /**
  * @brief Collect the *upward-exposed* uses of a subtree — variables read
  *        before the subtree (re)defines them.
@@ -633,8 +668,9 @@ class StoreEvalToAssignMutator : public IRMutator {
  * On SSA input the two agree exactly: no Var is defined twice, so a variable
  * defined inside the body can never also be read ahead of that definition.
  * The traversal order deliberately mirrors ``VarDefUseCollector`` so the
- * derived parameter order is unchanged; only *when* a definition is recorded
- * differs (after the assigned value is visited, matching ``SSAVerifier``).
+ * derived parameter order is unchanged except that tensors referenced by a
+ * captured variable's shape precede that variable. Definitions are recorded
+ * after the assigned value is visited, matching ``SSAVerifier``.
  */
 class UpwardExposedUseCollector : public IRVisitor {
  public:
@@ -646,6 +682,45 @@ class UpwardExposedUseCollector : public IRVisitor {
   /// True when `var`'s value on entry to the visited subtree comes from
   /// outside it — i.e. the subtree captures rather than defines it.
   [[nodiscard]] bool IsExternal(const Var* var) const { return live_in_.count(var) > 0; }
+
+  /// Close the capture set over tensor shape dependencies. Preserve descriptor
+  /// extraction for supported invertible dimensions: a shape-only symbol may
+  /// have no caller-side scalar to pass. Other expressions (e.g. rows =
+  /// ceildiv(B, 16) * 16 + T * 4) need the original symbols passed explicitly.
+  void CaptureShapeDependencies(const std::unordered_set<const Var*>& runtime_bindings) {
+    std::unordered_set<const Var*> descriptor_bound;
+    var_collectors::VarDefUseCollector dependencies;
+    for (const Var* var : ordered) {
+      if (auto type = AsTensorTypeLike(var->GetType())) {
+        for (const auto& dim : type->shape_) {
+          if (auto symbol = DescriptorBoundSymbol(dim)) descriptor_bound.insert(symbol.get());
+          dependencies.VisitExpr(dim);
+        }
+      }
+    }
+    std::vector<const Var*> shape_params;
+    std::unordered_set<const Var*> shape_param_set;
+    for (const Var* var : dependencies.var_uses_ordered) {
+      if (!As<ScalarType>(var->GetType())) continue;
+      if (descriptor_bound.count(var) && !IsExternal(var)) continue;
+      RecordUse(var);
+      if (IsExternal(var)) {
+        CHECK_SPAN(runtime_bindings.count(var) > 0, var->span_)
+            << "Cannot capture dynamic shape symbol '" << var->name_hint_
+            << "': no caller-side runtime binding is available for this non-invertible shape. "
+               "Pass the symbol as an explicit scalar parameter or expose it as a bare tensor "
+               "parameter dimension";
+        shape_params.push_back(var);
+        shape_param_set.insert(var);
+      }
+    }
+    // Explicit scalar parameters must precede annotations that reference them
+    // in printable IR. Runtime dispatch still partitions tensors before scalars.
+    for (const Var* var : ordered) {
+      if (!shape_param_set.count(var)) shape_params.push_back(var);
+    }
+    ordered = std::move(shape_params);
+  }
 
  protected:
   // Var and IterArg are handled by separate overrides rather than a shared
@@ -708,6 +783,14 @@ class UpwardExposedUseCollector : public IRVisitor {
  private:
   void RecordUse(const Var* var) {
     if (var && defined_.count(var) == 0 && live_in_.insert(var).second) {
+      // A retained tensor.dim in a captured type names another tensor. Capture
+      // that tensor before its dependent parameter so the outlined signature
+      // is self-contained. Bare dimension symbols remain signature-bound.
+      if (auto type = AsTensorTypeLike(var->GetType())) {
+        TensorTypeDependencyCollector dependencies;
+        for (const auto& dim : type->shape_) dependencies.VisitExpr(dim);
+        for (const Var* dependency : dependencies.tensors) RecordUse(dependency);
+      }
       ordered.push_back(var);
     }
   }
@@ -741,12 +824,15 @@ class UpwardExposedUseCollector : public IRVisitor {
 
 ScopeOutliner::ScopeOutliner(std::string func_name, const std::unordered_map<const Var*, TypePtr>& var_types,
                              const std::unordered_map<const Var*, VarPtr>& var_objects,
-                             const std::unordered_set<std::string>& known_names, ScopeKind target_scope_kind,
-                             FunctionType outlined_func_type, std::string name_suffix, ProgramPtr program,
+                             const std::unordered_set<std::string>& known_names,
+                             const std::unordered_set<const Var*>& runtime_bindings,
+                             ScopeKind target_scope_kind, FunctionType outlined_func_type,
+                             std::string name_suffix, ProgramPtr program,
                              std::shared_ptr<std::unordered_set<std::string>> reserved_func_names)
     : func_name_(std::move(func_name)),
       var_types_(var_types),
       var_objects_(var_objects),
+      runtime_bindings_(runtime_bindings),
       known_names_(known_names),
       target_scope_kind_(target_scope_kind),
       outlined_func_type_(outlined_func_type),
@@ -776,6 +862,13 @@ ExprPtr ScopeOutliner::VisitExpr_(const VarPtr& op) {
   return IRMutator::VisitExpr_(op);
 }
 
+ExprPtr ScopeOutliner::VisitExpr_(const IterArgPtr& op) {
+  // A post-store result replaces a use of the carry, not its header binding or
+  // initializer. Return the replacement before the base visitor rebuilds it.
+  auto it = store_target_renames_.find(op.get());
+  return it != store_target_renames_.end() ? it->second : IRMutator::VisitExpr_(op);
+}
+
 /**
  * @brief Compute used_after when no explicit context is available.
  *
@@ -803,12 +896,14 @@ std::unordered_set<const Var*> ScopeOutliner::ComputeFallbackUsedAfter(const Sco
   if (!inside_nested_scope_body_) {
     var_collectors::VarDefUseCollector def_collector;
     def_collector.VisitStmt(scope->body_);
-    // Scalars are excluded from the defensive "export every definition"
-    // fallback. The runtime cannot return one, so exporting a scalar nobody
-    // asked for can only turn a harmless local into a hard error further down
-    // (the scalar-output hoist would have to lift it, or reject the scope).
+    // Scalars, tuple unpacking temporaries, and Reg values are not runtime
+    // outputs. Tuple projections already expose their tensor definitions;
+    // exporting the tuple too would create a nested terminal SPMD output.
+    // Actual live-out uses are handled by the explicit tail-use analysis.
     for (const Var* var : def_collector.var_defs) {
-      if (As<ScalarType>(var->GetType())) continue;
+      if (As<ScalarType>(var->GetType()) || As<TupleType>(var->GetType()) || As<RegType>(var->GetType())) {
+        continue;
+      }
       used_after.insert(var);
     }
   }
@@ -1000,25 +1095,18 @@ namespace {
 /// Append @p extra to @p body's trailing YieldStmt, adding one when the body has
 /// none (a loop that carried nothing yields nothing today).
 ///
-/// Walks the same spine as ``GetLastYieldStmt``: the trailing yield is the last
-/// element of the outermost SeqStmts chain. A statement kind that hides a yield
-/// from this walk gets a *new* trailing yield instead, which is why the caller
-/// checks the resulting arity.
+/// Existing result slots belong to the enclosing control flow even when a
+/// transparent runtime/split scope wraps their yield. Extend that yield in
+/// place, retaining its metadata and scheduling scope; a separate yield would
+/// leave two terminators and lose the original slots at the trailing spine.
 StmtPtr AppendTrailingYieldValues(const StmtPtr& body, const std::vector<ExprPtr>& extra, const Span& span) {
   if (extra.empty()) return body;
-  if (auto yield = As<YieldStmt>(body)) {
-    auto values = yield->value_;
-    values.insert(values.end(), extra.begin(), extra.end());
-    return std::make_shared<YieldStmt>(values, yield->span_);
-  }
-  if (auto seq = As<SeqStmts>(body)) {
-    auto stmts = seq->stmts_;
-    if (!stmts.empty() && transform_utils::GetLastYieldStmt(stmts.back())) {
-      stmts.back() = AppendTrailingYieldValues(stmts.back(), extra, span);
-    } else {
-      stmts.push_back(std::make_shared<YieldStmt>(extra, span));
-    }
-    return SeqStmts::Flatten(std::move(stmts), seq->span_);
+  if (transform_utils::GetLastYieldStmt(body)) {
+    return transform_utils::RewriteLastYieldStmt(body, [&](const YieldStmtPtr& yield) -> StmtPtr {
+      auto result = MutableCopy(yield);
+      result->value_.insert(result->value_.end(), extra.begin(), extra.end());
+      return result;
+    });
   }
   return SeqStmts::Flatten({body, std::make_shared<YieldStmt>(extra, span)}, span);
 }
@@ -1550,6 +1638,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   // substitution and the call-site lookup below.
   UpwardExposedUseCollector live_in;
   live_in.VisitStmt(scope_body);
+  live_in.CaptureShapeDependencies(runtime_bindings_);
 
   std::vector<VarPtr> input_vars;
   for (const Var* var_ptr : live_in.ordered) {
@@ -1597,6 +1686,11 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   std::vector<std::pair<const Var*, const Var*>> deferred_post_store_aliases;
   for (const Var* var_ptr : body_collector.var_defs_ordered) {
     if (!used_after.count(var_ptr)) continue;
+    // Fallback output discovery includes store destinations. A destination
+    // bound by a loop *inside* this scope still leaves that loop through its
+    // return_vars, never through the IterArg binder itself. Exporting the
+    // binder would later substitute a plain Var into a loop header.
+    if (var_ptr->GetKind() == ObjectKind::IterArg) continue;
 
     // Skip if this var_def is a post-store alias of an external store
     // target: that same tensor will be exported by the store-target pass
@@ -1787,6 +1881,8 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
     TypePtr RemapType(const TypePtr& type) { return RemapTypeViaVisitor(type); }
   };
   TrackingSubstituteMutator subst_mutator(var_substitution_map);
+  // Remap annotations even for parameters that are only used through types.
+  for (const auto& input_var : input_vars) subst_mutator.VisitExpr(input_var);
   auto transformed_body = subst_mutator.VisitStmt(pre_sub_body);
 
   // Reconcile param/output Vars with any freshened versions created during
@@ -1924,12 +2020,14 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       outlined_attrs.emplace_back("split", static_cast<int>(split));
     }
   };
-  // Propagate the optional cross-core ring depth (pl.split(mode, slot_num=N))
-  // from the scope's attrs onto the outlined function, where ExpandMixedKernel
-  // reads it to size the automatic cube->vector pipe.
+  // Propagate transport and optional local depths from pl.cross_core_slot to
+  // the outlined function, where ExpandMixedKernel builds the automatic pipe.
   auto append_slot_num_attr = [&]() {
     if (op->HasAttr("slot_num")) {
       outlined_attrs.emplace_back("slot_num", op->GetAttr<int>("slot_num", 0));
+    }
+    if (op->HasAttr("local_slot_num")) {
+      outlined_attrs.emplace_back("local_slot_num", op->GetAttr<int>("local_slot_num", 0));
     }
   };
   auto append_windowize_attr = [&]() {
@@ -1963,11 +2061,13 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       // write: the policy is a promise about the bytes, and the direction
       // inference above already knows whether the scope writes them.
       const ParamDirection dir = input_param_directions[static_cast<size_t>(it->second)];
-      CHECK_SPAN(static_cast<CachePolicy>(policy) != CachePolicy::kBypass || dir == ParamDirection::In,
+      CHECK_SPAN(!IsNonAllocatingCachePolicy(static_cast<CachePolicy>(policy)) || dir == ParamDirection::In,
                  op->span_)
-          << "pl.set_cache_policy(" << v->name_hint_
-          << ", CachePolicy.BYPASS) is not allowed on a tensor this scope writes ("
-          << ParamDirectionToString(dir)
+          << "pl.set_cache_policy(" << v->name_hint_ << ", "
+          << (static_cast<CachePolicy>(policy) == CachePolicy::kBypass
+                  ? "CachePolicy.BYPASS"
+                  : CachePolicyToString(static_cast<CachePolicy>(policy)))
+          << ") is not allowed on a tensor this scope writes (" << ParamDirectionToString(dir)
           << "). A bypassing read of bytes the same kernel writes is a coherency bug.";
       cache_policy_indices.emplace_back(it->second, policy);
     }
@@ -1986,17 +2086,17 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   // (ExpandMixedKernel copies it to both lanes; SplitVectorKernel reads it to
   // bypass its automatic per-op halving). Also stamp a coarse representative
   // ``split`` mode from the region node — but only when the scope itself
-  // carries no AUTO cross-core transfer split (``incore->split_``), which has
-  // a separate meaning. The authoritative per-region mode is ``node->split_``
-  // (consumed at pass 23).
+  // carries no legacy function-level split (``incore->split_``), which would
+  // conflict with the derived metadata. The authoritative per-region mode is
+  // ``node->split_`` and is consumed by ExpandMixedKernel.
   auto append_split_aiv_attr = [&](SplitMode incore_split) {
     SplitAivModeSummaryFinder finder;
     finder.VisitStmt(scope_body);
     if (!finder.found) return;
-    // A function-level AUTO split (optimizations=[pl.split(mode)], carried as the
-    // scope's own split_) and explicit pl.split_aiv region(s) are mutually
-    // exclusive AIV-split mechanisms. Downstream lowering takes the per-region
-    // path and would silently drop the function-level split, so reject the
+    // A legacy function-level split (optimizations=[pl.split(mode)], carried as
+    // the scope's own split_) cannot coexist with explicit pl.split_aiv regions.
+    // Region lowering derives the function metadata and would silently drop the
+    // user's function-level split, so reject the
     // combination HERE — the scope's user split (incore_split) and the regions
     // are both visible only at outline time; post-outline they merge
     // indistinguishably into the function's split / split_aiv attrs (a single
@@ -2219,26 +2319,13 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   }
   TrackingSubstituteMutator caller_type_mutator(caller_var_map);
   std::vector<TypePtr> effective_return_types;
-  effective_return_types.reserve(return_types.size() + (scope_task_id_var ? 1 : 0));
+  effective_return_types.reserve(return_types.size());
   for (const auto& return_type : return_types) {
     effective_return_types.push_back(caller_type_mutator.RemapType(return_type));
   }
-  if (scope_task_id_var) {
-    effective_return_types.push_back(std::make_shared<ScalarType>(DataType::TASK_ID));
-  }
-  // Determine call return type. Single non-task-id return is unwrapped; the
-  // task_id_var path always uses TupleType (even for the lone TASK_ID
-  // element) so codegen's ``IsSubmitCall`` detection — which keys on a
-  // trailing ``Scalar[TASK_ID]`` element of a ``TupleType`` — fires
-  // uniformly.
-  TypePtr call_return_type;
-  if (effective_return_types.empty()) {
-    call_return_type = nullptr;
-  } else if (!scope_task_id_var && effective_return_types.size() == 1) {
-    call_return_type = effective_return_types[0];
-  } else {
-    call_return_type = std::make_shared<TupleType>(effective_return_types);
-  }
+  // Pack after remapping so result shapes retain caller-local identities.
+  // Submit appends TaskId without changing the outlined callee's signature.
+  auto call_return_type = MakeCallResultType(effective_return_types, scope_task_id_var != nullptr);
 
   // Build the synthesised call expression. When ``scope_task_id_var`` is
   // set (user-written ``as tid`` OR synthesized above for a deps-only
@@ -2268,8 +2355,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
     // verification take one path.
     synthesised_call_expr = std::make_shared<Submit>(
         global_var, call_args, std::move(submit_deps), std::vector<std::pair<std::string, std::any>>{},
-        std::move(submit_attrs), call_return_type ? call_return_type : std::make_shared<UnknownType>(),
-        op->span_,
+        std::move(submit_attrs), call_return_type, op->span_,
         /*core_num=*/spmd_scope ? std::optional<ExprPtr>(spmd_scope->core_num_) : std::nullopt,
         /*sync_start=*/spmd_scope && spmd_scope->sync_start_,
         /*allow_early_resolve=*/scope_allow_early_resolve,
@@ -2294,13 +2380,11 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       }
     }
     if (!call_attrs.empty()) {
-      synthesised_call_expr = std::make_shared<Call>(
-          global_var, call_args, std::vector<std::pair<std::string, std::any>>{}, std::move(call_attrs),
-          call_return_type ? call_return_type : std::make_shared<UnknownType>(), op->span_);
-    } else if (call_return_type) {
-      synthesised_call_expr = std::make_shared<Call>(global_var, call_args, call_return_type, op->span_);
+      synthesised_call_expr =
+          std::make_shared<Call>(global_var, call_args, std::vector<std::pair<std::string, std::any>>{},
+                                 std::move(call_attrs), call_return_type, op->span_);
     } else {
-      synthesised_call_expr = std::make_shared<Call>(global_var, call_args, op->span_);
+      synthesised_call_expr = std::make_shared<Call>(global_var, call_args, call_return_type, op->span_);
     }
   }
   // Keep the original name (``call_expr``) for the rest of the function —

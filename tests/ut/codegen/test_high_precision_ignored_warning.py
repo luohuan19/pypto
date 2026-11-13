@@ -11,7 +11,7 @@
 
 The request survives every layer below the DSL: PyPTO writes ``precisionType``
 into the PTO IR and PTOAS keeps it as a ``HIGH_PRECISION`` template argument.
-Only PTO-ISA decides whether to read it, and Ascend910B's ``TDIV_IMPL`` /
+Only PTO-ISA decides whether to read it, and Ascend910's ``TDIV_IMPL`` /
 ``TLOG_IMPL`` / ``TREM_IMPL`` / ``TFMOD_IMPL`` accept the template parameter
 without ever branching on it — the op computes the default result and nothing
 downstream says so. Ascend950 selects a separate compensated algorithm.
@@ -21,11 +21,10 @@ the two halves of that separately: the attribute is still emitted on both
 backends (PTOAS's input must not change), and the warning appears on exactly
 the backend that ignores it.
 
-``tile.rsqrt`` is deliberately absent. It opts into high precision by taking a
-scratch tile rather than by carrying ``precisionType``, and that form is
-implemented on Ascend910B too, so it is honoured and must stay silent. The DSL
-rejects ``pl.rsqrt(tile, high_precision=True)`` outright, which is what keeps it
-away from this path.
+``tile.rsqrt`` is deliberately absent from this warning hook. Its explicit
+``high_precision=True`` flag requires scratch and emits the selector for A5;
+Ascend910 honours the request through its scratch overload, so it must stay
+silent even though that backend ignores the selector itself.
 """
 
 # DSL function bodies are parsed as AST, not executed — suppress pyright errors.
@@ -263,7 +262,7 @@ def _source_location(warning_line: str) -> str:
     ],
 )
 def test_ascend910b_warns_naming_the_op_and_the_arch(program_cls, op_name, capfd):
-    _incore_mlir(program_cls, BackendType.Ascend910B)
+    _incore_mlir(program_cls, BackendType.Ascend910)
     warnings = _warnings(capfd)
 
     assert len(warnings) == 1, f"expected exactly one warning, got {warnings}"
@@ -279,7 +278,7 @@ def test_ascend950_stays_silent_because_it_honours_the_request(program_cls, capf
 
 def test_no_warning_without_the_flag(capfd):
     """The warning tracks the request, not the operator."""
-    _incore_mlir(DefaultPrecisionDiv, BackendType.Ascend910B)
+    _incore_mlir(DefaultPrecisionDiv, BackendType.Ascend910)
     assert _warnings(capfd) == []
 
 
@@ -289,7 +288,7 @@ def test_no_warning_without_the_flag(capfd):
 
 
 def test_unrolled_loop_warns_once_for_its_single_written_site(capfd):
-    mlir = _incore_mlir(HighPrecisionUnrolledDiv, BackendType.Ascend910B)
+    mlir = _incore_mlir(HighPrecisionUnrolledDiv, BackendType.Ascend910)
     emitted = [line for line in mlir.splitlines() if "pto.tdiv" in line]
 
     assert len(emitted) == CHUNKS, f"expected the loop body to be replicated:\n{mlir}"
@@ -308,7 +307,7 @@ def test_two_written_sites_keep_their_own_locations(program_cls, capfd):
     sites here would collapse onto one key and report the `def` line, so this
     pins the two apart on both the tile and the rebuilt-tensor path.
     """
-    _incore_mlir(program_cls, BackendType.Ascend910B)
+    _incore_mlir(program_cls, BackendType.Ascend910)
     warnings = _warnings(capfd)
 
     assert len(warnings) == 2, f"expected one warning per written site, got {warnings}"
@@ -348,10 +347,13 @@ def test_both_emitters_report_the_same_dropped_request(enable_buffer_ir, capfd):
     The op names are asserted as the *logical* ones the user wrote: lowering
     through Buffer IR must not surface `buffer.div` in a diagnostic.
     """
-    mlir = _incore_mlir(BufferIrPrecisionOps, BackendType.Ascend910B, enable_buffer_ir=enable_buffer_ir)
+    mlir = _incore_mlir(BufferIrPrecisionOps, BackendType.Ascend910, enable_buffer_ir=enable_buffer_ir)
     warnings = _warnings(capfd)
 
-    assert mlir.count("high_precision>") == 3, f"expected three attributes:\n{mlir}"
+    # PTOAS v0.70 names high-precision division diff_compensation; log/recip
+    # retain high_precision. Both emitters must use the operation's selector.
+    for kind, mode in (("div", "diff_compensation"), ("log", "high_precision"), ("recip", "high_precision")):
+        assert mlir.count(f"#pto<{kind}_precision {mode}>") == 1, mlir
     assert _warned_ops(warnings) == {"tile.div", "tile.log", "tile.recip"}, warnings
     assert len(warnings) == 3, f"expected one warning per op, got {warnings}"
 
@@ -368,7 +370,7 @@ def test_buffer_ir_stays_silent_on_ascend950(capfd):
 
 
 @pytest.mark.parametrize(
-    ("backend_type", "arch"), [(BackendType.Ascend910B, "a2a3"), (BackendType.Ascend950, "a5")]
+    ("backend_type", "arch"), [(BackendType.Ascend910, "a2a3"), (BackendType.Ascend950, "a5")]
 )
 def test_attribute_is_emitted_on_both_backends(backend_type, arch):
     """Warning about the drop must not suppress the attribute.
@@ -380,7 +382,8 @@ def test_attribute_is_emitted_on_both_backends(backend_type, arch):
     mlir = _incore_mlir(HighPrecisionDiv, backend_type)
 
     assert f'pto.target_arch = "{arch}"' in mlir, mlir
-    assert "precisionType = #pto<div_precision high_precision>" in mlir, mlir
+    # The PTOAS v0.70 division selector is diff_compensation on both targets.
+    assert "precisionType = #pto<div_precision diff_compensation>" in mlir, mlir
 
 
 if __name__ == "__main__":

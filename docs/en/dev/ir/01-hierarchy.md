@@ -213,6 +213,8 @@ field from the `Stmt` base class. See [Leading comments on statements](#leading-
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator runtime region (`SIMPLER_SCOPE`); `manual_=true` selects manual dependency mode |
 | **YieldStmt** | `values_` | Yield values in loop iteration |
 | **EvalStmt** | `expr_` | Evaluate expression for side effects |
+| **SimtScopeStmt** | `block_dims_`, `body_` | Transient per-thread execution region; outlined before SSA |
+| **SimtLaunchStmt** | `callee_`, `block_dims_`, `args_`, `results_` (DefField), `result_param_indices_` | Launch a void SIMT helper and define updated storage versions; see [Scalar SIMT IR](11-simt.md) |
 | **SeqStmts** | `stmts_` | General statement sequence |
 | **BreakStmt** | *(none)* | Exit loop |
 | **ContinueStmt** | *(none)* | Skip to next loop iteration |
@@ -389,7 +391,7 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
     mode**: the regions are authoritative for vector placement, and the
     `AivSplitValid` verifier rejects vector compute outside every region (write
     a `mode=None` region per full-width phase — see
-    [LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md)). A
+    [LowerAutoVectorSplit](../passes/25-lower_auto_vector_split.md)). A
     top-level `for aiv_id in pl.split_aiv(...)` is wrapped by the parser in an
     enclosing `InCoreScopeStmt` (so `OutlineIncoreScopes` can outline it), i.e.
     `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`.
@@ -530,6 +532,22 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `role_` | optional[Role] | Hierarchy role (auto-derived from `func_type_` for InCore/AIC/AIV/Group/Orchestration/Graph; see below) |
 | `attrs_` | list[(str, Any)] | Ordered free-form metadata, exposed as `UsualField` (participates in structural traversal) |
 
+### Call result types
+
+`ir.make_call_result_type(return_types, is_submit=False)` (C++:
+`MakeCallResultType`) packs declared return positions without inferring types
+or flattening tuple-valued results. Parser and lowering passes share it.
+
+| Declared results | Call type | Submit type |
+| ---------------- | --------- | ----------- |
+| `[]` | `UnknownType` | `Tuple[TaskId]` |
+| `[T]` | `T` | `Tuple[T, TaskId]` |
+| `[T1, T2]` | `Tuple[T1, T2]` | `Tuple[T1, T2, TaskId]` |
+| `[Tuple[T1, T2]]` | `Tuple[T1, T2]` | `Tuple[Tuple[T1, T2], TaskId]` |
+
+TaskId belongs to the launch; packing never modifies the callee signature.
+Return-type inference and symbolic shape substitution happen before packing.
+
 ### Function body representation
 
 `FunctionIRStage` is a typed, reflected field independent of `FunctionType`,
@@ -652,6 +670,7 @@ Consequences:
 | `Spmd` | SPMD data-parallel dispatch wrapper |
 | `Inline` | Whole-body substitution at every call site; eliminated by `InlineFunctions` before any other pass |
 | `Graph` | Callable orchestration fragment, recorded once and replayed by the `host_build_graph` runtime |
+| `SIMT` | Void device helper invoked only by `SimtLaunchStmt`; no runtime task metadata |
 
 `IsInCoreType(type)` / `ir.is_incore_type(type)` returns `True` for `InCore`, `AIC`, and `AIV`.
 
@@ -692,7 +711,7 @@ Functions stored in sorted map for deterministic ordering. GlobalVar names must 
 | **Unary Ops** | 5 | Abs, Neg, Not, BitNot, Cast |
 | **Call/Access** | 2 | Call, TupleGetItemExpr |
 | **Operations** | 2 | Op, GlobalVar |
-| **Statements** | 17 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, SplitAivScopeStmt, GraphScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
+| **Statements** | 19 | SimtScopeStmt, SimtLaunchStmt, AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, SplitAivScopeStmt, GraphScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
 | **Types** | 6 | ScalarType, TensorType, TileType, TupleType, PipeType, UnknownType |
 | **Functions** | 2 | Function, Program |
 
