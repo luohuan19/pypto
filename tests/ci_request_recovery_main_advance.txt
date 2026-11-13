@@ -1,0 +1,1 @@
+Fork fixture main advanced while full rerun is active.
