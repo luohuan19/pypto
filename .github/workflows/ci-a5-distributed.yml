@@ -12,7 +12,7 @@ cache-mode: read
 jobs:
   changes:
     if: >-
-      github.event.issue.pull_request &&
+      github.event.issue.number == 17 && github.event.issue.pull_request &&
       contains(github.event.comment.body, '/ci a5-distributed')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -105,80 +105,12 @@ jobs:
     if: needs.changes.outputs.checkout_sha != ''
     permissions:
       contents: read
-    runs-on: [self-hosted, linux, npu-a5]
-    defaults:
-      run:
-        working-directory: a5-dist-checkout
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/a5-dist-checkout/ptoas-bin
-      PTOAS_VERSION: ${{ needs.toolchain.outputs.ptoas_version }}
-      PTOAS_SHA256_AARCH64: ${{ needs.toolchain.outputs.ptoas_sha256_aarch64 }}
-      PTOAS_SHA256_X86_64: ${{ needs.toolchain.outputs.ptoas_sha256_x86_64 }}
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      CCACHE_UMASK: '000'
-      TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+    runs-on: ubuntu-latest
     steps:
-      - name: Fetch composite action definitions
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: a5-dist-checkout
-          checkout-ref: ${{ needs.changes.outputs.checkout_sha }}
-          needs-device: 'true'
-          pip-cache-name: pip-a5
-          pto-isa-commit: ${{ needs.toolchain.outputs.pto_isa_commit }}
-          runtime-targets: build_package_a5
-          # Keep runner-specific ring settings out of this job's environment.
-          unset-ring: 'true'
-          toolchain: bundle
-
-      - name: Run distributed tests
-        id: distributed
-        timeout-minutes: 70
+      - name: Fork-only rerun reporting test (intentional failure, no NPU)
         run: |
-          source activate.sh
-          # Select tests from the pinned PR checkout, including suites added by the PR.
-          if [ -f tests/st/distributed/test_l3_urma_async.py ]; then
-            LOGDIR="$GITHUB_WORKSPACE/a5-dist-checkout/outputs/urma_async/ascend"
-            mkdir -p "$LOGDIR"
-            export ASCEND_PROCESS_LOG_PATH="$LOGDIR"
-            # Four cards select the P=4 cases. No --forked: JIT compilation can
-            # leave a child that pytest-forked waits on beyond its timeout.
-            task-submit --device auto --device-num 4 --timeout 3900 --max-time 1800 \
-              --run "cd $GITHUB_WORKSPACE/a5-dist-checkout && source activate.sh && python -m pytest \
-                tests/st/distributed/test_l3_urma_async.py \
-                -v --platform=a5 --device=\$TASK_DEVICE --durations=0 \
-                --junitxml=$GITHUB_WORKSPACE/a5-dist-checkout/ci-distributed-junit.xml"
-          else
-            python -m pytest tests/lint/test_ci_placeholder.py -v \
-              --junitxml=ci-distributed-junit.xml
-          fi
-
-      - name: Upload distributed test results
-        if: always() && (steps.distributed.outcome == 'success' || steps.distributed.outcome == 'failure')
-        uses: actions/upload-artifact@v4
-        with:
-          name: a5-distributed-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: warn
-          path: |
-            a5-dist-checkout/ci-distributed-junit.xml
-            a5-dist-checkout/outputs/urma_async/ascend/**
-
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: a5-dist-checkout
+          sleep 45
+          exit 1
 
   result:
     concurrency:
