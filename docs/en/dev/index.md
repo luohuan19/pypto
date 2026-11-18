@@ -257,3 +257,5 @@ first clean review on a controlled PR and verify the review's commit ID and
 
 - [PTO ISA reference](../reference/index.md) — the hardware model the backend targets.
 - [Runtime documentation](https://www.pypto.ai/simpler/) — the scheduler that executes compiled programs.
+
+A5 distributed CI requires passing lint for the current PR head.
