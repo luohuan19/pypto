@@ -113,12 +113,13 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - name: Fork PR 17 device stand-in
-        run: sleep 90
+      - name: Fork-only device stand-in
+        run: echo "Device stand-in completed"
 
   result:
     concurrency:
-      group: ci-a5-check-${{ github.run_id }}
+      group: ci-a5-admission-${{ github.event.issue.number }}
+      queue: max
       cancel-in-progress: false
     if: always() && needs.changes.outputs.check_id != ''
     needs: [changes, toolchain, onboard-tests-a5-distributed]
@@ -134,7 +135,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           sparse-checkout: .github/scripts
           persist-credentials: false
-      - name: Simulate publisher outage on the first attempt
+      - name: Simulate first-attempt publisher failure
         if: github.run_attempt == '1'
         run: exit 1
       - name: Publish the independent PR check
