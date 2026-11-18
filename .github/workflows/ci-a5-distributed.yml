@@ -42,6 +42,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python .github/scripts/ci_a5_distributed.py prepare
 
+      - name: Hold full-rerun admission open for the fork observation
+        if: github.run_attempt != '1'
+        run: sleep 80
+
   toolchain:
     needs: changes
     if: needs.changes.outputs.checkout_sha != ''
@@ -124,7 +128,7 @@ jobs:
     if: always() && needs.changes.outputs.check_id != ''
     needs: [changes, toolchain, onboard-tests-a5-distributed]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 1
     permissions:
       contents: read
       checks: write
@@ -135,9 +139,15 @@ jobs:
           ref: ${{ github.workflow_sha }}
           sparse-checkout: .github/scripts
           persist-credentials: false
-      - name: Simulate first-attempt publisher failure
+      - name: Force a job timeout only for the first request on the test head
         if: github.run_attempt == '1'
-        run: exit 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECK_ID: ${{ needs.changes.outputs.check_id }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$CHECK_ID" --jq .head_sha)
+          count=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/check-runs?filter=all&check_name=ci%2Fa5-distributed" --jq .total_count)
+          if [ "$count" = 1 ]; then sleep 120; fi
       - name: Publish the independent PR check
         env:
           GH_TOKEN: ${{ github.token }}
