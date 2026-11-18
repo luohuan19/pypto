@@ -1,0 +1,193 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Pin a main PR merge and report its independent A5 distributed check."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+from ci_control import (
+    MERGE_POLL_SECONDS,
+    MERGE_WAIT_SECONDS,
+    api,
+    current_base,
+    output,
+    pages,
+    pull,
+    report,
+    sha,
+)
+
+COMMAND = "/ci a5-distributed"
+JOB = "onboard-tests-a5-distributed"
+
+
+def attempt_url(repo: str, run_id: str, attempt: str) -> str:
+    return f"https://github.com/{repo}/actions/runs/{run_id}/attempts/{attempt}"
+
+
+def update_check(repo: str, check_id: str, payload: dict[str, Any]) -> None:
+    """Retry an idempotent PATCH on transient service/transport errors only."""
+    for retry in range(3):
+        try:
+            api(f"repos/{repo}/check-runs/{check_id}", payload, method="PATCH")
+            return
+        except subprocess.CalledProcessError as error:
+            transient = re.search(
+                r"HTTP (?:429|5[0-9]{2})\b|connection reset|timeout|unexpected EOF", error.stderr or "", re.I
+            )
+            if not transient or retry == 2:
+                raise
+            time.sleep(2**retry)
+
+
+def reopen(repo: str, run: dict[str, Any]) -> None:
+    """Refresh a carried-over PR check when GitHub reruns the device job alone."""
+    if (
+        run["path"] != ".github/workflows/ci-a5-distributed.yml"
+        or run["event"] != "issue_comment"
+        or run["head_branch"] != "main"
+        or run["run_attempt"] < 2
+    ):
+        return
+    run_id, attempt = str(run["id"]), str(run["run_attempt"])
+    url = attempt_url(repo, run_id, attempt)
+    # The source workflow puts the trusted prepare output in the device job
+    # name. Never derive a check ID from a PR comment or a test artifact.
+    for _ in range(12):
+        live = api(f"repos/{repo}/actions/runs/{run_id}")
+        if live["status"] == "completed" or live["run_attempt"] != run["run_attempt"]:
+            return
+        jobs = pages(f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+        for job in jobs:
+            match = re.fullmatch(r"onboard-tests-a5-distributed / check ([1-9][0-9]*)", job["name"])
+            if not match or job["run_attempt"] != run["run_attempt"]:
+                continue
+            check_id = match[1]
+            check = api(f"repos/{repo}/check-runs/{check_id}")
+            if check["name"] != "ci/a5-distributed" or check["external_id"] != run_id:
+                raise ValueError("Unexpected A5 check ownership")
+            if check["details_url"] != url:
+                update_check(repo, check_id, {"status": "in_progress", "details_url": url})
+            return
+        # A fresh prepare publishes its own in-progress check.
+        if any(job["name"] == "changes" and job["run_attempt"] == run["run_attempt"] for job in jobs):
+            return
+        time.sleep(5)
+    raise ValueError("Could not identify the A5 rerun job")
+
+
+def prepare(repo: str, event: dict[str, Any]) -> None:
+    """Accept an exact new PR command and freeze its current head/base/merge."""
+    if (
+        event.get("action") != "created"
+        or "pull_request" not in event.get("issue", {})
+        or event.get("comment", {}).get("body", "").strip() != COMMAND
+    ):
+        return
+    number = int(event["issue"]["number"])
+    deadline = time.monotonic() + MERGE_WAIT_SECONDS
+    pinned = None
+    while True:
+        pr = pull(repo, number)
+        head, base = sha(pr["head"]["sha"]), current_base(repo)
+        if pinned is None:
+            pinned = (head, base)
+        elif pinned != (head, base):
+            raise ValueError(f"PR head or base changed while waiting; post {COMMAND} again")
+        if pr.get("mergeable") is False:
+            raise ValueError("PR has merge conflicts; update the PR branch before retrying")
+        if pr.get("mergeable") is True and pr.get("merge_commit_sha"):
+            merge = sha(pr["merge_commit_sha"])
+            commit = api(f"repos/{repo}/git/commits/{merge}")
+            if [parent["sha"] for parent in commit["parents"]] == [base, head]:
+                break
+        # GitHub can briefly return an old synthetic merge after a base update.
+        # Retry only that eventual consistency; never switch to a newer head.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError(f"GitHub test merge is not ready; retry {COMMAND} later")
+        time.sleep(min(MERGE_POLL_SECONDS, remaining))
+    latest = pull(repo, number)
+    if latest["head"]["sha"] != head or latest.get("merge_commit_sha") != merge or current_base(repo) != base:
+        raise ValueError(f"PR head or base changed during validation; post {COMMAND} again")
+    run_id = os.environ["GITHUB_RUN_ID"]
+    url = attempt_url(repo, run_id, os.environ["GITHUB_RUN_ATTEMPT"])
+    # Each request owns its own check ID, so a late result cannot overwrite a
+    # newer request. No ci/full status is written by this partial test run.
+    check = api(
+        f"repos/{repo}/check-runs",
+        {
+            "name": "ci/a5-distributed",
+            "head_sha": head,
+            "external_id": run_id,
+            "status": "in_progress",
+            "details_url": url,
+        },
+    )
+    if type(check.get("id")) is not int or check["id"] <= 0:
+        raise ValueError("GitHub did not return a valid check ID")
+    check_id = str(check["id"])
+    try:
+        output({"checkout_sha": merge, "check_id": check_id})
+    except (OSError, ValueError):
+        # Without these outputs the normal finalizer cannot find the check.
+        try:
+            update_check(repo, check_id, {"status": "completed", "conclusion": "failure", "details_url": url})
+        except subprocess.CalledProcessError as cleanup_error:
+            report(f"Could not complete check {check_id}: {cleanup_error}")
+        raise
+    report(f"A5 distributed tests for PR #{number}: head {head}, base {base}, merge {merge}. [Run]({url})")
+
+
+def finish(repo: str, needs: dict[str, Any]) -> None:
+    """Only a completed device job can produce a successful partial-test check."""
+    check_id = needs["changes"]["outputs"]["check_id"]
+    if not check_id.isdecimal() or int(check_id) <= 0:
+        raise ValueError("Expected a positive check ID")
+    expected = {"changes", "toolchain", JOB}
+    if set(needs) != expected:
+        raise ValueError("Unexpected A5 distributed dependency set")
+    failed = [name for name in sorted(expected) if needs[name]["result"] != "success"]
+    summary = ", ".join(f"{name}: {needs[name]['result']}" for name in sorted(expected))
+    update_check(
+        repo,
+        check_id,
+        {
+            "status": "completed",
+            "details_url": attempt_url(repo, os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]),
+            "conclusion": "failure" if failed else "success",
+            "output": {"title": "A5 distributed test results", "summary": summary},
+        },
+    )
+    if failed:
+        raise ValueError(f"A5 distributed tests did not pass: {summary}")
+
+
+def main() -> None:
+    repo = os.environ["GITHUB_REPOSITORY"]
+    if sys.argv[1] == "prepare":
+        prepare(repo, json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()))
+    elif sys.argv[1] == "reopen":
+        reopen(repo, json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())["workflow_run"])
+    elif sys.argv[1] == "finish":
+        finish(repo, json.loads(os.environ["CI_NEEDS"]))
+    else:
+        raise ValueError("Expected prepare or finish")
+
+
+if __name__ == "__main__":
+    main()
