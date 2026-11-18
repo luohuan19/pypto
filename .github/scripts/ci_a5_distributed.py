@@ -111,28 +111,29 @@ def attempt_check(repo: str, original_id: str, run_id: str, attempt: str) -> str
     if original["name"] != "ci/a5-distributed" or original["external_id"] != run_id:
         raise ValueError("Unexpected A5 check ownership")
     url = attempt_url(repo, run_id, attempt)
-    if same_attempt(original, url):
-        # A full rerun executed prepare and already supplied a new check ID.
-        return original_id
-    # GitHub retains the conclusion of a completed Actions check even after
-    # accepting an in_progress PATCH. Publish a fresh check for this attempt.
-    key = f"{run_id}:{attempt}:{original_id}"
     head = sha(original["head_sha"])
-    pending = original_id if original["status"] != "completed" else None
-    for check in head_checks(repo, head):
-        if check["app"]["id"] != original["app"]["id"] or not re.fullmatch(
-            rf"{run_id}:[1-9][0-9]*:{original_id}", check["external_id"] or ""
-        ):
-            continue
-        if check["external_id"] == key or same_attempt(check, url):
-            return str(check["id"])
-        if pending is None and check["status"] != "completed":
-            pending = str(check["id"])
-    if pending:
-        # A previous publisher failed before completing this check. The observer
-        # and finalizer keep using its ID, including on subsequent retries.
-        update_check(repo, pending, attempt_fields(url, "Retrying the distributed check."))
-        return pending
+    key = f"{run_id}:{attempt}:{original_id}"
+    family = [
+        check
+        for check in head_checks(repo, head)
+        if check["app"]["id"] == original["app"]["id"]
+        and re.fullmatch(rf"{run_id}:[1-9][0-9]*:{original_id}", check["external_id"] or "")
+    ]
+    family.append(original)
+    current = next((c for c in family if c["external_id"] == key or same_attempt(c, url)), None)
+    pending = [c for c in family if c["status"] != "completed"]
+    if current or pending:
+        selected = current or pending[0]
+        for check in pending:
+            if check["id"] != selected["id"]:
+                # Earlier versions could strand multiple checks after repeated
+                # publisher outages. Retire only siblings of this exact request.
+                update_check(repo, str(check["id"]), {"status": "completed", "conclusion": "cancelled"})
+        if current is None:
+            update_check(repo, str(selected["id"]), attempt_fields(url, "Retrying the distributed check."))
+        return str(selected["id"])
+    # GitHub retains the conclusion of a completed check after an in_progress
+    # PATCH. Only a rerun with no unfinished check needs a fresh one.
     created = api(
         f"repos/{repo}/check-runs",
         {
