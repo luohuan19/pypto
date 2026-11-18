@@ -36,15 +36,19 @@ jobs:
           ref: ${{ github.workflow_sha }}
           sparse-checkout: .github/scripts
           persist-credentials: false
+      - name: Seed an unfinished check for a missing test owner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/actions/runs/1" --silent 2>missing-owner.log; then exit 1; fi
+          grep 'HTTP 404' missing-owner.log
+          head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/17" --jq .head.sha)
+          gh api "repos/$GITHUB_REPOSITORY/check-runs" -f name=ci/a5-distributed -f head_sha="$head" -f external_id=a5-pr-17:1 -f status=in_progress --jq .id
       - name: Validate main PR and pin its test merge
         id: target
         env:
           GH_TOKEN: ${{ github.token }}
         run: python .github/scripts/ci_a5_distributed.py prepare
-
-      - name: Hold full-rerun admission open for the fork observation
-        if: github.run_attempt != '1'
-        run: sleep 80
 
   toolchain:
     needs: changes
@@ -128,7 +132,7 @@ jobs:
     if: always() && needs.changes.outputs.check_id != ''
     needs: [changes, toolchain, onboard-tests-a5-distributed]
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 5
     permissions:
       contents: read
       checks: write
@@ -139,15 +143,12 @@ jobs:
           ref: ${{ github.workflow_sha }}
           sparse-checkout: .github/scripts
           persist-credentials: false
-      - name: Force a job timeout only for the first request on the test head
+      - name: Interrupt the first result publication
         if: github.run_attempt == '1'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CHECK_ID: ${{ needs.changes.outputs.check_id }}
-        run: |
-          head=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$CHECK_ID" --jq .head_sha)
-          count=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/check-runs?filter=all&check_name=ci%2Fa5-distributed" --jq .total_count)
-          if [ "$count" = 1 ]; then sleep 120; fi
+        run: exit 1
+      - name: Keep the result-only retry observable on the fork
+        if: github.run_attempt != '1'
+        run: sleep 65
       - name: Publish the independent PR check
         env:
           GH_TOKEN: ${{ github.token }}
