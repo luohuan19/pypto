@@ -13,7 +13,8 @@ from enum import Enum
 from types import TracebackType
 from typing import Any, overload
 
-from pypto.pypto_core.ir import Function, Program, Span, Stmt
+from pypto.pypto_core.backend import Backend
+from pypto.pypto_core.ir import Function, HardwareLoopProfile, HardwareLoopQualification, Program, Span, Stmt
 
 class IRProperty(Enum):
     """Verifiable IR properties."""
@@ -69,6 +70,11 @@ class IRProperty(Enum):
     BufferIR = ...
     TileStorageLegalized = ...
     TileStorageAllocated = ...
+    RegScopeValid = ...
+    HardwareLoopContractValid = ...
+    SimtValid = ...
+    SimtOutputsMaterialized = ...
+    SimtSpecialized = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -123,11 +129,15 @@ class RuntimeKind(Enum):
     HOST_BUILD_GRAPH = ...
     """Host CPU builds the whole task graph up front; required for Graph Execution."""
 
+    HOST_BUILD_GRAPH_EXPERIMENTAL = ...
+    """Original A5 host graph implementation."""
+
+def is_host_build_graph(kind: RuntimeKind) -> bool: ...
 def runtime_kind_to_name(kind: RuntimeKind) -> str:
-    """Wire name written to ``RUNTIME_CONFIG["runtime"]``, e.g. ``"host_build_graph"``."""
+    """Application-facing runtime selection, e.g. ``"host_build_graph"``."""
 
 def runtime_kind_from_name(name: str) -> RuntimeKind:
-    """Parse a ``RUNTIME_CONFIG["runtime"]`` wire name back into a :class:`RuntimeKind`."""
+    """Parse an application-facing runtime selection into a :class:`RuntimeKind`."""
 
 class DiagnosticPhase(Enum):
     """Controls when DiagnosticInstrument runs registered checks (warnings + perf hints)."""
@@ -298,13 +308,15 @@ class PassContext:
         enable_pypto_l0c_double_buffer: bool = False,
         runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
         enable_buffer_ir: bool = True,
+        enable_software_pipeline: bool = False,
+        report_hardware_loops: bool = False,
     ) -> None:
         """Create a PassContext with instruments and pass configuration (incl. memory planner).
 
-        ``enable_pypto_l0c_double_buffer`` opts the legacy ``PYPTO`` planner in
-        to chooser-emitted L0C double-buffering (dbC=2; experimental, default
-        off). It has no effect under ``DSA_RP`` or ``PTOAS``, which enable
-        chooser dbC=2 automatically.
+        ``enable_pypto_l0c_double_buffer`` remains a stored compatibility
+        flag. Automatic dbC is disabled for PYPTO and DSA_RP; PTOAS retains
+        its existing selection independently of this flag. Explicit buffering
+        declarations are preserved.
 
         ``runtime`` selects the target Simpler runtime ABI; its wire name is
         what lands in ``RUNTIME_CONFIG["runtime"]`` in the generated
@@ -313,6 +325,10 @@ class PassContext:
 
         ``enable_buffer_ir`` defaults to true and selects supported whole kernels
         for Buffer IR. Unsupported kernels retain Tile; false selects Tile for all.
+
+        ``enable_software_pipeline`` uses explicit prefetch and rotating slots for
+        eligible pipeline loops. It requires ``PYPTO`` memory planning and cannot
+        be combined with ``enable_buffer_ir``. The default keeps unroll lowering.
         """
         ...
 
@@ -335,6 +351,10 @@ class PassContext:
         """Get the diagnostic checks suppressed by this context."""
         ...
 
+    def get_backend(self) -> Backend:
+        """Return the configured backend; raise ValueError when none is configured."""
+        ...
+
     def get_memory_planner(self) -> MemoryPlanner:
         """Get the memory planner selection for this context."""
         ...
@@ -343,12 +363,19 @@ class PassContext:
         """Get the target Simpler runtime ABI for this context."""
         ...
 
+    def get_report_hardware_loops(self) -> bool: ...
+    def get_hardware_loop_profile(self) -> HardwareLoopProfile: ...
+    def get_hardware_loop_reports(self) -> list[HardwareLoopQualification]: ...
     def get_enable_buffer_ir(self) -> bool:
         """Whether supported whole kernels use Buffer IR."""
         ...
 
+    def get_enable_software_pipeline(self) -> bool:
+        """Get whether eligible pipeline loops use explicit software pipelining."""
+        ...
+
     def get_enable_pypto_l0c_double_buffer(self) -> bool:
-        """Whether chooser-emitted dbC=2 is enabled under legacy PYPTO."""
+        """Return the legacy flag; it does not override the planner's dbC policy."""
         ...
 
     def get_instruments(self) -> list[PassInstrument]:
@@ -379,6 +406,19 @@ class PassPipeline:
         """Get copies of all passes in execution order."""
 
 # Factory functions
+
+def outline_reg_scopes() -> Pass:
+    """Outline register scopes into synchronous device helpers before SSA conversion."""
+    ...
+
+def outline_simt_scopes() -> Pass:
+    """Outline per-thread regions before SSA conversion."""
+
+def specialize_simt_helpers() -> Pass:
+    """Specialize SIMT helpers by dimensions and storage ABI; pass dynamic metadata explicitly."""
+
+def materialize_simt_outputs() -> Pass:
+    """Copy writable SIMT Tile inputs into dedicated output storage; preserve GM references."""
 
 def init_mem_ref() -> Pass:
     """Create an init memref pass."""
@@ -459,23 +499,17 @@ def skew_cross_core_pipeline() -> Pass:
 def lower_pipeline_to_slots() -> Pass:
     """Create a pass that multi-buffers ``pl.pipeline`` loops via MemRef slots.
 
-    Runs immediately before ``lower_pipeline_loops``. Instead of replicating the
-    body ``F`` times, keeps one body and rebinds every top-level ``tile.load`` /
-    ``tile.read`` whose arguments read the induction variable onto
-    ``pl.MemRef(name, slots=F)[iv % F]``, then demotes the loop to
-    ``ForKind.Sequential`` with ``pipeline_stages`` stripped. Bounds, step and
-    ``iter_args`` are untouched, so no remainder dispatch is needed.
+    Runs immediately before ``lower_pipeline_loops``. With ``PYPTO`` memory
+    planning and ``enable_software_pipeline=True``, emits explicit preload,
+    steady-state and drain phases using existing loops, MemRef slots and tile
+    ops. The prefetch distance is ``stage - 1``; no new IR nodes are introduced.
 
-    Self-gated on ``memory_planner=PTOAS``: only that planner's codegen path emits
-    a ptoas multi-buffer region today, so under the default PyPTO planner the pass
-    returns every function untouched. The gate tracks that codegen limitation, not
-    a ptoas one — an addressed region synchronizes identically at level3, and
-    widening the gate is follow-up work in the address allocator. Loops it
-    declines — an unsupported
-    slot count, a step other than 1, a start not a multiple of ``F``, no eligible
-    load, an unsupported memory space or runtime valid shape, a tile carried out as
-    a phi or consumed by a view op, or nesting under a declined pipeline loop — are
-    left intact for ``lower_pipeline_loops`` to replicate.
+    With ``PTOAS`` memory planning, preserves the existing same-iteration slot
+    rotation: eligible top-level loads are rebound onto
+    ``pl.MemRef(name, slots=F)[iv % F]`` without explicit prefetch. Accepted loops
+    become ``ForKind.Sequential`` with ``pipeline_stages`` stripped. Declined
+    loops remain intact for ``lower_pipeline_loops`` to replicate. The default
+    ``PYPTO`` path remains unchanged when the software pipeline flag is off.
 
     Returns:
         Function-level pass
@@ -518,6 +552,9 @@ def convert_to_ssa() -> Pass:
 def outline_incore_scopes() -> Pass:
     """Create a pass that outlines InCore scopes."""
 
+def deduplicate_outlined_kernels() -> Pass:
+    """Reuse closed outlined kernels and exclusive Group bundles; preserve every dispatch."""
+
 def outline_cluster_scopes() -> Pass:
     """Create a pass that outlines Cluster scopes to Group and standalone Spmd scopes to Spmd."""
 
@@ -551,6 +588,13 @@ def block_nz_tensor_views() -> Pass:
     argument ranks cannot both be printed.
     """
 
+def legalize_mx_scale_tensor_views() -> Pass:
+    """Validate MX alignment and load windows, preserving logical rank-2 views for PTOAS.
+
+    ZZ/NN retain their aligned complete-box windows. ``MX_A_ND`` keeps compact
+    dynamic row bases and valid-row tails, with complete aligned scale pairs.
+    """
+
 def block_mx_scale_tensor_views() -> Pass:
     """Create a pass that physicalizes logical MX scale tensor views.
 
@@ -559,6 +603,9 @@ def block_mx_scale_tensor_views() -> Pass:
     ``tile.load`` windows and ND/MX backing aliases while preserving logical
     tile result types. Symbolic offsets must be provably aligned and
     non-negative.
+
+    ``MX_A_ND [M, G]`` instead remains row-major rank 2. Compact row bases and
+    valid-row tails are preserved; the group axis must contain aligned pairs.
 
     Must run after ``flatten_tile_nd_to_2d`` and before
     ``materialize_tensor_strides``.
@@ -586,8 +633,9 @@ def auto_tile_matmul_l0() -> Pass:
     on-chip Mat scratch for chained matmul consumers; compatible
     f32-to-bf16/f16 ``rint`` casts fold into the FIXPIPE writeback.
 
-    Full-K grids support output-, A-, and B-stationary schedules. dbC=2 is
-    enabled automatically under DSA_RP and PTOAS and available as a legacy-PYPTO opt-in. Eligible calls
+    Full-K grids support output-, A-, and B-stationary schedules. Automatic
+    dbC is excluded before selection for PYPTO and DSA_RP; PTOAS retains its
+    existing selection independently of the legacy flag. Eligible calls
     require static 2D operands with B in Mat and A in Mat or Vec. When the
     chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is needed,
     although a chained result may still be remapped to Mat by the compatible
@@ -601,10 +649,8 @@ def auto_tile_matmul_l0() -> Pass:
     for those Mat-backed windows. An already-Bias-resident source remains one
     external full-N slot and is never N-tiled.
 
-    Under the PyPTO planner, a canonical static already-L0 pipeline containing
-    one stationary-panel ``tile.matmul`` and one direct store or assemble drain
-    may automatically use two L0C slots when its conservative post-lowering
-    Acc footprint fits.
+    Already-L0 pipelines are not automatically marked for accumulator double
+    buffering. Explicit buffering attributes are preserved.
     """
 
 def canonicalize_tile_slice() -> Pass:
@@ -665,22 +711,16 @@ def expand_mixed_kernel() -> Pass:
     """Create a pass that expands mixed InCore functions into AIC + AIV + Group."""
 
 def lower_auto_vector_split() -> Pass:
-    """Lower AUTO ``pl.split`` mixed InCore functions into the explicit ``split_aiv`` form.
+    """Preserve explicit AIV regions and localize boundary valid extents.
 
-    Inserts ``tile.aiv_shard`` at C->V boundaries and ``tile.aic_gather`` at V->C
-    boundaries, halves only the vector sub-region (affinity-gated), injects
-    ``get_subblock_idx``, and stamps ``split`` + ``split_aiv`` — all BEFORE
-    ExpandMixedKernel folds the reshape ops into split-stamped tpush/tpop.
-
-    This is the live auto-split lowering path: it always runs immediately before
-    ExpandMixedKernel, so SplitVectorKernel only stamps attrs for the resulting
-    ``split_aiv`` functions.
+    Mixed function-level AUTO splitting is rejected. User computation shapes
+    and addresses remain unchanged. The public name is retained for compatibility.
     """
 
 def inject_gm_pipe_buffer() -> Pass:
     """Create a backend-gated pass that injects ``__gm_pipe_buffer`` for cross-core pipes.
 
-    On backends whose cross-core pipe rides through GM (currently Ascend910B), adds a
+    On backends whose cross-core pipe rides through GM (currently Ascend910), adds a
     ``__gm_pipe_buffer`` Out-tensor parameter to functions that issue ``initialize_pipe``
     ops and propagates it through callers. Orchestration functions materialize the
     buffer locally via ``tensor.create`` instead of receiving it as a parameter. No-op
@@ -801,6 +841,10 @@ def lower_l2_tensor_collectives() -> Pass:
 
     Runs before :func:`derive_call_directions` so the emitted call
     gets its argument directions and task edges derived like any kernel call.
+    ``pld.tensor.indexed_all_to_all_v`` also lowers on this rail (A5 URMA only),
+    with six tensor operands and a positive compile-time core_num. All AIVs
+    share local copies between remote submission and CQ waits without sharing
+    remote queues.
     ``pld.tensor.all_to_all_v`` accepts a compile-time ``core_num``: the admitted
     block count ``B = CalAllToAllVBlocks(P, L)`` is folded and ``B`` blocks are
     launched; a runtime ``core_num`` is rejected.
@@ -817,11 +861,12 @@ def legalize_graph_boundary() -> Pass:
     A value computed inside the region loses that origin and would be frozen at
     its first-call value on every later replay.
 
-    Also rejects, at compile time, the boundary shapes the runtime would decline
-    to cache — an oversized or empty tensor boundary, runtime-allocated outputs,
-    return values, nested graphs, and call sites carrying explicit dependencies
-    or a dispatch predicate. Almost all of those degrade to a silent non-graph
-    fallback at runtime, which no numerical test can detect.
+    Rejects oversized or empty tensor boundaries, runtime-allocated outputs,
+    computed returns, nested graphs, and Graph dispatch predicates or SPMD launch
+    specifications. Caller-supplied Out/InOut storage and parameter-alias returns
+    are allowed. Explicit predecessors order the outer Graph invocation without
+    entering its cached Definition. Its completion TaskId is valid for recording
+    and replay and covers the whole invocation; recorded-local TaskIds cannot escape.
     """
 
 def materialize_valid_shape_symbols() -> Pass:
@@ -1003,11 +1048,21 @@ class l0_tile_chooser:
         used under one level of a full-K output-grid pipeline, while
         ``max_n_nested_pipelined`` covers two nested pipeline levels. A value
         of zero leaves the corresponding bound disabled.
+
+        ``reduction_iterations`` counts source K blocks before one drain (zero
+        means unknown, costed as a one-block lower bound without dbC).
+        ``reduction_pipeline_stages`` describes enclosing operand storage
+        replication, independently of that arithmetic count.
+        ``independent_output_tiles`` reloads both operands per output reduction
+        and excludes held-panel and dbC schedules not implemented by that route.
         """
 
         M: int
         N: int
         K: int
+        reduction_iterations: int
+        reduction_pipeline_stages: int
+        independent_output_tiles: bool
         l0a_bytes: int
         l0b_bytes: int
         l0c_bytes: int
@@ -1088,6 +1143,10 @@ __all__ = [
     "PassContext",
     "PassPipeline",
     "init_mem_ref",
+    "materialize_simt_outputs",
+    "outline_simt_scopes",
+    "outline_reg_scopes",
+    "specialize_simt_helpers",
     "memory_reuse",
     "allocate_memory_addr",
     "fuse_create_assemble_to_slice",
@@ -1101,12 +1160,14 @@ __all__ = [
     "convert_to_ssa",
     "outline_incore_scopes",
     "outline_cluster_scopes",
+    "deduplicate_outlined_kernels",
     "outline_hierarchy_scopes",
     "outline_graph_scopes",
     "convert_tensor_to_tile_ops",
     "optimize_orch_tensors",
     "block_nz_tensor_views",
     "block_mx_scale_tensor_views",
+    "legalize_mx_scale_tensor_views",
     "flatten_tile_nd_to_2d",
     "legalize_tile_cast",
     "legalize_spmd_launches",

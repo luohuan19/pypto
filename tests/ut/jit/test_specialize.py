@@ -22,12 +22,15 @@ this method, whichever surface authored the kernel.
 from typing import Any
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 import torch
+from pypto.ir import DistributedConfig
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
-from pypto.jit.decorator import jit
+from pypto.jit import _tensor_meta
+from pypto.jit.decorator import _discover_dep_bindings, jit
 from pypto.language.parser.diagnostics import ParserTypeError
-from pypto.pypto_core import DataType, ir
+from pypto.pypto_core import DataType, ir, passes
 from pypto.pypto_core.ir import MemorySpace
 from pypto.runtime.runner import RunConfig
 
@@ -219,6 +222,155 @@ class TestFreeNameResolution:
         assert cast_call.kwargs["target_type"] == expected_dtype
 
 
+_GLOBAL_REDUCE_OP = pld.ReduceOp.Sum
+
+
+@pl.jit
+def _initialize_allreduce(data: pl.InOut[pld.DistributedTensor[[1, 256], pl.FP32]]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        data = pl.store(pl.tile.full([1, 256], pl.FP32, 1.0), [0, 0], data)
+    return data
+
+
+def _global_allreduce():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=_GLOBAL_REDUCE_OP)
+
+
+def _make_allreduce(reduce_op):
+    @pl.jit.host
+    def host():
+        data_buf = pld.alloc_window_buffer(256 * 4)
+        signal_buf = pld.alloc_window_buffer(2 * 4)
+        for rank in pl.range(pld.world_size()):
+            data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+            _initialize_allreduce(data, device=rank)
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+        data = pld.tensor.allreduce(data, signal, op=reduce_op)
+
+    def set_op(value):
+        nonlocal reduce_op
+        reduce_op = value
+
+    return host, set_op
+
+
+@pl.jit.host
+def _literal_allreduce_sum():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+
+
+@pl.jit.host
+def _literal_allreduce_max():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Max)
+
+
+@pl.jit.host
+def _literal_allreduce_min():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Min)
+
+
+@pl.jit.host
+def _literal_allreduce_prod():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Prod)
+
+
+class TestDistributedEnumConstants:
+    @pytest.fixture
+    def pass_verification_instruments(self):
+        # Distributed tensor dumps with absent memref/tensor_view cannot reparse,
+        # including the literal controls. Keep full compilation and before/after
+        # IR property checks; enum folding is checked independently above.
+        return [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]
+
+    @pytest.fixture(params=["closure", "global"])
+    def allreduce(self, request, monkeypatch):
+        if request.param == "closure":
+            return _make_allreduce(pld.ReduceOp.Sum)
+
+        def set_op(value):
+            monkeypatch.setitem(_global_allreduce.__globals__, "_GLOBAL_REDUCE_OP", value)
+
+        return pl.jit.host(_global_allreduce), set_op
+
+    @pytest.fixture
+    def config(self):
+        return RunConfig(platform="a2a3", distributed_config=DistributedConfig(device_ids=[0, 1]))
+
+    @pytest.mark.parametrize(
+        "reduce_op, literal",
+        [
+            (pld.ReduceOp.Sum, _literal_allreduce_sum),
+            (pld.ReduceOp.Max, _literal_allreduce_max),
+            (pld.ReduceOp.Min, _literal_allreduce_min),
+            (pld.ReduceOp.Prod, _literal_allreduce_prod),
+        ],
+    )
+    def test_alias_matches_literal_through_compile(self, allreduce, config, reduce_op, literal):
+        kernel, set_op = allreduce
+        set_op(reduce_op)
+        specialized = kernel.specialize()
+        assert _find_call(specialized, "pld.tensor.allreduce").kwargs["op"] == int(reduce_op)
+        control = literal.compile(config=config)
+        compiled = kernel.compile(config=config)
+        assert compiled.program is not None and control.program is not None
+        actual_op = _find_call(compiled.program, "builtin.tensor.allreduce").kwargs["op"]
+        literal_op = _find_call(control.program, "builtin.tensor.allreduce").kwargs["op"]
+        assert actual_op == literal_op == int(reduce_op)
+
+    def test_rebinding_enum_invalidates_cache(self, allreduce, config):
+        kernel, set_op = allreduce
+        hashes = set()
+        compiled_by_op = {}
+        for reduce_op in pld.ReduceOp:
+            set_op(reduce_op)
+            hashes.add(kernel._get_source_hash())
+            compiled = kernel.compile(config=config)
+            assert compiled.program is not None
+            assert _find_call(compiled.program, "builtin.tensor.allreduce").kwargs["op"] == int(reduce_op)
+            assert kernel.compile(config=config) is compiled
+            compiled_by_op[reduce_op] = compiled
+        assert len(hashes) == len(compiled_by_op) == 4
+        assert len({id(compiled) for compiled in compiled_by_op.values()}) == 4
+        set_op(pld.ReduceOp.Sum)
+        assert kernel.compile(config=config) is compiled_by_op[pld.ReduceOp.Sum]
+
+
 class TestSpecialize:
     """``specialize()`` returns a usable pre-pass program."""
 
@@ -310,6 +462,420 @@ class TestParamAccessors:
     def test_output_param_names_excludes_pure_inputs(self):
         assert _abs_entry.output_param_names == ("out",)
         assert _abs_kernel.output_param_names == ("out",)
+
+
+def test_implicit_first_out_is_saved_before_rebinding_and_ignores_inout():
+    from pypto.debug import torch_codegen  # noqa: PLC0415
+
+    @jit
+    def entry(
+        state: pl.InOut[pl.Tensor[[M, N], pl.FP32]],
+        out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+        other: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+    ):
+        pypto_implicit_out = state  # noqa: F841
+        pypto_implicit_out1 = other  # noqa: F841
+        out = other  # noqa: F841
+
+    values = [torch.full((M, N), value) for value in (1.0, 2.0, 3.0)]
+    before = entry.specialize(*values)
+    after = passes.normalize_return_order()(passes.convert_to_ssa()(before))
+    function = after.get_function("entry")
+    assert function is not None
+    assert ir.returned_param_indices(function, after) == [1]
+    namespace = {}
+    exec(torch_codegen(after), namespace)  # noqa: S102
+    torch.testing.assert_close(namespace["entry"](*values), values[1])
+
+
+@pytest.mark.parametrize("with_docstring", [False, True])
+def test_implicit_first_out_preserves_func_attr_prologue(with_docstring):
+    @jit
+    def entry(out: pl.Out[pl.Tensor[[M, N], pl.FP32]]):
+        """The implicit result capture must follow the complete attribute prologue."""
+        pl.func_attr({"split_aic": True})
+        pl.func_attr({"split_aiv": True})
+        saved = out  # noqa: F841
+
+    # Exercise both legal prologues through the public specialization surface.
+    if not with_docstring:
+        # A second source function avoids mutating a JIT object's source snapshot.
+        @jit
+        def entry_without_docstring(out: pl.Out[pl.Tensor[[M, N], pl.FP32]]):
+            pl.func_attr({"split_aic": True})
+            pl.func_attr({"split_aiv": True})
+            saved = out  # noqa: F841
+
+        entry = entry_without_docstring
+    program = entry.specialize(torch.zeros((M, N)))
+    function = program.get_function(entry.__name__)
+    assert function is not None
+    assert ir.returned_param_indices(function, program) == [0]
+
+
+def test_no_return_entry_without_out_does_not_invent_an_inout_result():
+    @jit
+    def entry(state: pl.InOut[pl.Tensor[[M, N], pl.FP32]]):
+        saved = state  # noqa: F841
+
+    program = entry.specialize(torch.ones((M, N)))
+    function = program.get_function("entry")
+    assert function is not None
+    assert not function.return_types
+    assert ir.returned_param_indices(function, program) == []
+
+
+@pytest.mark.parametrize(
+    "first_result",
+    [
+        "name",
+        "jit_call",
+        "builtin_call",
+        "tuple_projection",
+        "scoped_tuple_projection",
+        "assigned_tuple_projection",
+        "rebound_tuple_element",
+        "tuple_alias",
+        "tuple_unpack",
+        "branch_tuple_projection",
+        "branch_tuple_join",
+        "tuple_element_expression",
+        "tuple_dep_call",
+        "named_tuple_dep_call",
+        "inline_tuple_dep_projection",
+        "literal_tuple_projection",
+        "forwarded_tuple_dep_call",
+        "loop_tuple_projection",
+    ],
+)
+def test_host_specializes_downstream_chip_in_explicit_return_order(first_result):
+    @pl.jit.incore
+    def kernel(out: pl.Out[pl.Tensor]):
+        return out
+
+    @pl.jit
+    def chip_produce(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        return second, first
+
+    @pl.jit
+    def chip_forward(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        return kernel(second), first
+
+    @pl.jit
+    def chip_builtin(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        return pl.tensor.assemble(second, second, [0]), first
+
+    @pl.jit
+    def chip_projection(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = (second, first)
+        return pair[0], first
+
+    @pl.jit(auto_scope=False)
+    def chip_scoped_projection(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        with pl.manual_scope():
+            pair = (second, first)
+            return pair[0], first
+
+    @pl.jit
+    def chip_assigned_projection(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = (second, first)
+        value = pair[0]
+        return value, first
+
+    @pl.jit
+    def chip_rebound_tuple_element(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = (second, first)
+        second = first  # noqa: F841
+        return pair[0], first
+
+    @pl.jit
+    def chip_tuple_alias(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = (second, first)
+        alias = pair
+        pair = (first, second)  # noqa: F841
+        return alias[0], first
+
+    @pl.jit
+    def chip_tuple_unpack(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = (second, first)
+        value, other = pair
+        return value, other
+
+    @pl.jit
+    def chip_branch_projection(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = (second, first)
+        if pl.tensor.dim(first, 0) > 1:
+            value = pair[0]
+        else:
+            value = second
+        return value, first
+
+    @pl.jit
+    def chip_branch_tuple_join(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        if pl.tensor.dim(first, 0) > 1:
+            pair = (second, first)
+        else:
+            alias = second
+            pair = (alias, first)
+        return pair[0], first
+
+    @pl.jit
+    def chip_tuple_element_expression(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = (second, first)
+        forwarded = (pair[0], first)
+        return forwarded[0], first
+
+    @pl.jit.graph
+    def make_pair(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        return second, first
+
+    @pl.jit
+    def chip_tuple_dep_call(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = make_pair(first, second)
+        return pair[0], first
+
+    @pl.jit.graph
+    def make_named_pair(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        result = (second, first)
+        return result
+
+    @pl.jit
+    def chip_named_tuple_dep_call(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = make_named_pair(first, second)
+        return pair[0], first
+
+    @pl.jit
+    def chip_inline_tuple_dep_projection(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        return make_named_pair(first, second)[0], first
+
+    @pl.jit
+    def chip_literal_tuple_projection(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        return (second, first)[0], first
+
+    @pl.jit.graph
+    def forward_pair(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        return make_named_pair(first, second)
+
+    @pl.jit
+    def chip_forwarded_tuple_dep_call(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = forward_pair(first, second)
+        return pair[0], first
+
+    @pl.jit
+    def chip_loop_tuple_projection(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = (second, first)
+        for i in pl.range(3):
+            pair = (second, first)
+        value = pair[0]
+        return value, first
+
+    produce = {
+        "name": chip_produce,
+        "jit_call": chip_forward,
+        "builtin_call": chip_builtin,
+        "tuple_projection": chip_projection,
+        "scoped_tuple_projection": chip_scoped_projection,
+        "assigned_tuple_projection": chip_assigned_projection,
+        "rebound_tuple_element": chip_rebound_tuple_element,
+        "tuple_alias": chip_tuple_alias,
+        "tuple_unpack": chip_tuple_unpack,
+        "branch_tuple_projection": chip_branch_projection,
+        "branch_tuple_join": chip_branch_tuple_join,
+        "tuple_element_expression": chip_tuple_element_expression,
+        "tuple_dep_call": chip_tuple_dep_call,
+        "named_tuple_dep_call": chip_named_tuple_dep_call,
+        "inline_tuple_dep_projection": chip_inline_tuple_dep_projection,
+        "literal_tuple_projection": chip_literal_tuple_projection,
+        "forwarded_tuple_dep_call": chip_forwarded_tuple_dep_call,
+        "loop_tuple_projection": chip_loop_tuple_projection,
+    }[first_result]
+
+    @pl.jit
+    def chip_consume(x: pl.Tensor):
+        return x
+
+    @pl.jit.host
+    def entry(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        left, right = produce(first, second)
+        return chip_consume(left)
+
+    program = entry.specialize(torch.empty(64), torch.empty(32))
+    consume = program.get_function("chip_consume")
+    assert consume is not None
+    assert isinstance(consume.params[0].type, ir.TensorType)
+    extent = consume.params[0].type.shape[0]
+    assert isinstance(extent, ir.ConstInt)
+    assert extent.value == 32
+
+
+def test_host_specializes_consumer_from_saved_chip_tuple():
+    @pl.jit
+    def produce(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        return second, first
+
+    @pl.jit
+    def consume(x: pl.Tensor):
+        return x
+
+    @pl.jit.host
+    def entry(first: pl.Out[pl.Tensor], second: pl.Out[pl.Tensor]):
+        pair = produce(first, second)
+        left = pair[0]
+        return consume(left)
+
+    program = entry.specialize(torch.empty(64), torch.empty(32))
+    consumer = program.get_function("consume")
+    assert consumer is not None
+    assert isinstance(consumer.params[0].type, ir.TensorType)
+    extent = consumer.params[0].type.shape[0]
+    assert isinstance(extent, ir.ConstInt)
+    assert extent.value == 32
+
+
+def test_host_reuses_dependency_return_summary_for_equal_inputs(monkeypatch):
+    @pl.jit
+    def chip(out: pl.Out[pl.Tensor], width: pl.constexpr):
+        return out
+
+    @pl.jit.host
+    def entry(a: pl.Out[pl.Tensor], b: pl.Out[pl.Tensor]):
+        first = chip(a, 2)
+        repeat = chip(a, 2)
+        different_shape = chip(b, 2)
+        different_constexpr = chip(a, 3)
+        return first, repeat, different_shape, different_constexpr
+
+    original = _tensor_meta.extract_local_tensor_metas
+    descents = 0
+
+    def count(func, *args, **kwargs):
+        nonlocal descents
+        if func is chip._func:
+            descents += 1
+        return original(func, *args, **kwargs)
+
+    monkeypatch.setattr(_tensor_meta, "extract_local_tensor_metas", count)
+    metas = original(
+        entry._func,
+        seed_meta={
+            "a": _tensor_meta.TensorMeta((64,), DataType.FP32),
+            "b": _tensor_meta.TensorMeta((32,), DataType.FP32),
+        },
+        caller_func_type="host",
+        discover_deps=_discover_dep_bindings,
+    )
+    assert [metas[name].shape for name in ("first", "repeat", "different_shape", "different_constexpr")] == [
+        (64,),
+        (64,),
+        (32,),
+        (64,),
+    ]
+    assert descents == 3
+
+
+def test_host_shares_return_summary_across_independent_chip_callers(monkeypatch):
+    @pl.jit.graph
+    def shared(x: pl.Tensor):
+        value = x
+        return value
+
+    @pl.jit
+    def chip_left(out: pl.Out[pl.Tensor]):
+        return shared(out)
+
+    @pl.jit
+    def chip_right(out: pl.Out[pl.Tensor]):
+        return shared(out)
+
+    @pl.jit.host
+    def entry(out: pl.Out[pl.Tensor]):
+        left = chip_left(out)
+        right = chip_right(out)
+        return left, right
+
+    original = _tensor_meta.extract_local_tensor_metas
+    descents = 0
+
+    def count(func, *args, **kwargs):
+        nonlocal descents
+        if func is shared._func:
+            descents += 1
+        return original(func, *args, **kwargs)
+
+    monkeypatch.setattr(_tensor_meta, "extract_local_tensor_metas", count)
+    metas = original(
+        entry._func,
+        seed_meta={"out": _tensor_meta.TensorMeta((64,), DataType.FP32)},
+        caller_func_type="host",
+        discover_deps=_discover_dep_bindings,
+    )
+    assert metas["left"].shape == metas["right"].shape == (64,)
+    assert descents == 1
+
+
+def test_host_infers_out_metadata_for_chip_returning_kernel_call():
+    @pl.jit.incore
+    def kernel(out: pl.Out[pl.Tensor]):
+        return out
+
+    @pl.jit
+    def chip_produce(out: pl.Out[pl.Tensor]):
+        return kernel(out)
+
+    @pl.jit
+    def chip_consume(x: pl.Tensor):
+        return x
+
+    @pl.jit.host
+    def entry(out: pl.Out[pl.Tensor]):
+        result = chip_produce(out)
+        return chip_consume(result)
+
+    program = entry.specialize(torch.empty(32))
+    consume = program.get_function("chip_consume")
+    assert consume is not None
+    assert isinstance(consume.params[0].type, ir.TensorType)
+    extent = consume.params[0].type.shape[0]
+    assert isinstance(extent, ir.ConstInt)
+    assert extent.value == 32
+
+
+@pytest.mark.parametrize("op", ["assemble", "store", "write"])
+def test_host_preserves_metadata_for_qualified_chip_writeback(op):
+    @pl.jit
+    def chip_store(src: pl.Tensor, out: pl.Out[pl.Tensor]):
+        tile = pl.tile.load(src, [0, 0], [1, 32], [1, 32])
+        out = pl.tile.store(tile, [0, 0], out)
+        return out
+
+    @pl.jit
+    def chip_assemble(src: pl.Tensor, out: pl.Out[pl.Tensor]):
+        out = pl.tensor.assemble(out, src, [0, 0])
+        return out
+
+    @pl.jit
+    def chip_write(src: pl.Tensor, out: pl.Out[pl.Tensor]):
+        out = pl.tensor.write(out, [0, 0], pl.tensor.read(src, [0, 0]))
+        return out
+
+    produce = {"assemble": chip_assemble, "store": chip_store, "write": chip_write}[op]
+
+    @pl.jit
+    def chip_consume(x: pl.Tensor):
+        return x
+
+    @pl.jit.host
+    def entry(src: pl.Tensor, out: pl.Out[pl.Tensor]):
+        result = produce(src, out)
+        return chip_consume(result)
+
+    program = entry.specialize(torch.empty((1, 32)), torch.empty((1, 64)))
+    consume = program.get_function("chip_consume")
+    assert consume is not None
+    assert isinstance(consume.params[0].type, ir.TensorType)
+    extent = consume.params[0].type.shape[-1]
+    assert isinstance(extent, ir.ConstInt)
+    assert extent.value == 64
 
 
 if __name__ == "__main__":

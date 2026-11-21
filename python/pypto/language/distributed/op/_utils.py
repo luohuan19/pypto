@@ -9,10 +9,9 @@
 
 """Shared helpers for ``pld.*`` DSL wrappers."""
 
-from collections.abc import Sequence
 from typing import Any, overload
 
-from pypto.language.typing import IntLike, Scalar
+from pypto.language.op._utils import _normalize_intlike
 from pypto.pypto_core import ir as _ir
 from pypto.pypto_core.ir import Expr
 
@@ -29,11 +28,6 @@ def _unwrap(value: Any) -> Any:
     return value
 
 
-def _normalize_intlike(seq: Sequence[IntLike]) -> list[int | Expr]:
-    """Unwrap Scalar elements to Expr so the sequence matches C++ binding types."""
-    return [elem.unwrap() if isinstance(elem, Scalar) else elem for elem in seq]
-
-
 @overload
 def _unwrap_distributed_tensors(op_name: str, *, target: Any) -> tuple[Expr]: ...
 
@@ -47,8 +41,26 @@ def _unwrap_distributed_tensors(op_name: str, *, target: Any, signal: Any) -> tu
 
 
 @overload
+def _unwrap_distributed_tensors(op_name: str, *, dst: Any) -> tuple[Expr]: ...
+
+
+@overload
+def _unwrap_distributed_tensors(op_name: str, *, src: Any) -> tuple[Expr]: ...
+
+
+@overload
+def _unwrap_distributed_tensors(op_name: str, *, dst: Any, src: Any) -> tuple[Expr, Expr]: ...
+
+
+@overload
 def _unwrap_distributed_tensors(
     op_name: str, *, target: Any, signal: Any, recv_counts: Any
+) -> tuple[Expr, Expr, Expr]: ...
+
+
+@overload
+def _unwrap_distributed_tensors(
+    op_name: str, *, target: Any, signal: Any, send_counts: Any
 ) -> tuple[Expr, Expr, Expr]: ...
 
 
@@ -60,11 +72,8 @@ def _unwrap_distributed_tensors(op_name: str, **named: Any) -> tuple[Expr, ...]:
     order. Raises :class:`TypeError` with an op-named, role-tagged diagnostic
     when an argument is not a window-bound :class:`DistributedTensor`.
 
-    This is the shared validation path for ops whose operands are *all*
-    window-bound :class:`DistributedTensor`s — ``pld.tensor.get`` /
-    ``pld.tensor.allreduce`` (and future tensor-level collectives). Ops with
-    an asymmetric signature (e.g. ``pld.tensor.put``, whose ``src`` may be a
-    plain :class:`pl.Tensor`) validate inline instead.
+    Pass only operands that must be window-bound. For asymmetric transfers,
+    validate the remote endpoint here and unwrap the local Tensor separately.
     """
     exprs: list[Expr] = []
     for role, value in named.items():

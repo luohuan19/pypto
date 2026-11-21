@@ -16,16 +16,19 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "pypto/core/error.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/transforms/ir_property.h"
+#include "pypto/ir/transforms/utils/hardware_loop_analysis.h"
 #include "pypto/ir/verifier/diagnostic_check_registry.h"
 
 namespace pypto {
 
 namespace backend {
+class Backend;
 class BackendHandler;
 }  // namespace backend
 
@@ -238,11 +241,10 @@ enum class MemoryPlanner {
 /**
  * @brief Which Simpler runtime ABI a compilation targets.
  *
- * The two runtimes differ in where the task graph is built, which is what
+ * The runtime families differ in where the task graph is built, which is what
  * decides whether an orchestration fragment can be recorded and replayed at
- * all. Closed set: each enumerator corresponds to one implementation under
- * `runtime/src/<arch>/runtime/`, and a pass that must legalize IR for a
- * particular runtime switches on this rather than comparing strings.
+ * all. Codegen resolves the selected family to a Simpler implementation for
+ * the target architecture. Passes use the family to legalize IR.
  */
 enum class RuntimeKind : uint8_t {
   /// Task graph built on the AICPU, dependencies auto-derived through the
@@ -251,17 +253,21 @@ enum class RuntimeKind : uint8_t {
   /// Host CPU builds the whole task graph up front, which is what makes Graph
   /// Execution (record once, replay) possible.
   HostBuildGraph = 1,
+  /// Explicit selection of the original A5 host graph scheduler.
+  HostBuildGraphExperimental = 2,
 };
+
+inline constexpr bool IsHostBuildGraph(RuntimeKind kind) {
+  return kind == RuntimeKind::HostBuildGraph || kind == RuntimeKind::HostBuildGraphExperimental;
+}
 
 inline constexpr RuntimeKind kDefaultRuntimeKind = RuntimeKind::TensorMapAndRingBuffer;
 
 /**
  * @brief Wire name for a runtime kind.
  *
- * This is the value written to `RUNTIME_CONFIG["runtime"]` in the generated
- * `kernel_config.py`, the value `CompiledProgram.runtime_name` reports, and the
- * name used verbatim as a filesystem path component when compiling kernels — so
- * it is spelled out here rather than derived from the enumerator name.
+ * This spelling identifies the application-facing compile selection. Codegen
+ * writes its target-specific Simpler implementation name into kernel_config.py.
  *
  * @param kind The runtime kind
  * @return Wire name, e.g. "host_build_graph"
@@ -271,7 +277,7 @@ inline constexpr RuntimeKind kDefaultRuntimeKind = RuntimeKind::TensorMapAndRing
 /**
  * @brief Parse a wire name back into a runtime kind.
  *
- * @param name Wire name as it appears in `RUNTIME_CONFIG["runtime"]`
+ * @param name Application-facing runtime selection
  * @return The matching kind
  * @throws pypto::ValueError if the name is not one PyPTO can compile for
  */
@@ -293,17 +299,18 @@ class PassContext {
    * @param memory_planner Who plans on-chip buffer memory (default: PyPTO).
    *        DsaRP replaces MemoryReuse with in-tree capacity-constrained DSA-RP.
    *        PtoAS skips PyPTO address allocation so ptoas PlanMemory owns it.
-   * @param enable_pypto_l0c_double_buffer Opt the legacy PyPTO planner in to
-   *        chooser-emitted L0C double-buffering (dbC=2; default: false,
-   *        experimental). No effect under DsaRP or PtoAS, which enable chooser
-   *        dbC=2 automatically. When true, AutoTileMatmulL0 may emit two co-live
-   *        L0C accumulators and the legacy PyPTO allocator preserves the
-   *        ping-pong where capacity permits.
+   * @param enable_pypto_l0c_double_buffer Legacy compatibility flag (default:
+   *        false). This flag does not enable automatic dbC for PyPTO or DsaRP;
+   *        PtoAS retains its existing automatic selection independently of it.
+   *        Explicit buffering declarations are preserved.
    * @param runtime Which Simpler runtime ABI to target (default:
    *        TensorMapAndRingBuffer). Passes that must legalize IR for a specific
    *        runtime switch on this rather than inspecting codegen options.
    * @param enable_buffer_ir Enable Buffer IR for supported whole kernels (default: true).
    *        Unsupported kernels retain Tile IR; selected-kernel failures propagate.
+   * @param enable_software_pipeline Lower eligible pipeline loops to rotating
+   *        slots with explicit prefetch (default: false). Requires PyPTO memory
+   *        planning and the tile IR pipeline.
    */
   explicit PassContext(std::vector<PassInstrumentPtr> instruments,
                        VerificationLevel verification_level = VerificationLevel::Basic,
@@ -311,7 +318,8 @@ class PassContext {
                        DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
                        MemoryPlanner memory_planner = MemoryPlanner::PyPTO,
                        bool enable_pypto_l0c_double_buffer = false, RuntimeKind runtime = kDefaultRuntimeKind,
-                       bool enable_buffer_ir = true);
+                       bool enable_buffer_ir = true, bool enable_software_pipeline = false,
+                       bool report_hardware_loops = false);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -370,9 +378,7 @@ class PassContext {
   [[nodiscard]] MemoryPlanner GetMemoryPlanner() const;
 
   /**
-   * @brief Whether chooser-emitted L0C double-buffering (dbC=2) is enabled under
-   *        the legacy PyPTO planner. Off by default (experimental). No effect
-   *        under DsaRP or PtoAS.
+   * @brief Return the legacy flag; it does not override the planner's dbC policy.
    */
   [[nodiscard]] bool GetEnablePyptoL0cDoubleBuffer() const;
 
@@ -386,11 +392,18 @@ class PassContext {
   /// Whether supported whole kernels use Buffer IR.
   [[nodiscard]] bool GetEnableBufferIR() const;
 
+  /** @brief Whether eligible pipeline loops use explicit software pipelining. */
+  [[nodiscard]] bool GetEnableSoftwarePipeline() const;
+
   /**
    * @brief Get the currently active context (top of thread-local stack)
    * @return Pointer to current context, or nullptr if none
    */
   static PassContext* Current();
+
+  /// Access registered operator rules through the same target resolution as
+  /// GetBackendHandler; this does not introduce per-context target ownership.
+  [[nodiscard]] const backend::Backend* GetBackend() const;
 
   /**
    * @brief Convenience accessor for the currently configured BackendHandler.
@@ -405,7 +418,21 @@ class PassContext {
    */
   [[nodiscard]] const backend::BackendHandler* GetBackendHandler() const;
 
+  /// Host-only codegen may run without a device backend; its profile is unsupported.
+  [[nodiscard]] HardwareLoopProfile GetHardwareLoopProfile() const;
+
+  [[nodiscard]] bool GetReportHardwareLoops() const { return report_hardware_loops_; }
+  [[nodiscard]] const std::vector<HardwareLoopQualification>& GetHardwareLoopReports() const {
+    return hardware_loop_reports_;
+  }
+  /// Replace, never accumulate, reports at each codegen boundary. No cached proof.
+  void SetHardwareLoopReports(std::vector<HardwareLoopQualification> reports) {
+    hardware_loop_reports_ = std::move(reports);
+  }
+
  private:
+  bool report_hardware_loops_ = false;
+  std::vector<HardwareLoopQualification> hardware_loop_reports_;
   std::vector<PassInstrumentPtr> instruments_;
   VerificationLevel verification_level_;
   DiagnosticPhase diagnostic_phase_;
@@ -414,6 +441,7 @@ class PassContext {
   bool enable_pypto_l0c_double_buffer_;
   RuntimeKind runtime_;
   bool enable_buffer_ir_;
+  bool enable_software_pipeline_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

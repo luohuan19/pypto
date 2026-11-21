@@ -42,6 +42,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
 
@@ -605,9 +606,12 @@ std::optional<int64_t> StaticPositiveTripCount(const ForStmtPtr& op) {
   return (*stop - *start + *step - 1) / *step;
 }
 
+using ReturnedParamIndexCache = std::unordered_map<const Function*, std::vector<std::optional<size_t>>>;
+
 class StorageRootAnalysis : public IRVisitor {
  public:
-  explicit StorageRootAnalysis(ProgramPtr program) : program_(std::move(program)) {}
+  StorageRootAnalysis(ProgramPtr program, ReturnedParamIndexCache& returned_param_indices)
+      : program_(std::move(program)), returned_param_indices_(returned_param_indices) {}
 
   void Initialize(const std::vector<VarPtr>& params) {
     for (const auto& param : params) {
@@ -882,15 +886,23 @@ class StorageRootAnalysis : public IRVisitor {
   std::unordered_map<const Var*, MemRefPtr> root_memrefs_;
   std::unordered_map<const Var*, std::vector<StorageLocation>> tuple_locations_;
   std::unordered_set<const Var*> unsupported_locations_;
+  ReturnedParamIndexCache& returned_param_indices_;
 
   std::vector<StorageLocation> CollectReturnedLocations(const CallPtr& call,
                                                         const FunctionPtr& callee) const {
-    auto ret = GetTrailingReturn(callee ? callee->body_ : StmtPtr{});
-    if (!ret) return {};
+    auto it = returned_param_indices_.find(callee.get());
+    if (it == returned_param_indices_.end()) {
+      it = returned_param_indices_.emplace(callee.get(), return_lineage::ExplicitReturnedParamIndices(callee))
+               .first;
+    }
+    const auto& indices = it->second;
     std::vector<StorageLocation> locations;
-    locations.reserve(ret->value_.size());
-    for (const auto& value : ret->value_) {
-      locations.push_back(ResolveCalleeReturnExpr(value, call, callee));
+    locations.reserve(indices.size());
+    for (const auto& index : indices) {
+      // Unknown slots keep their position; dropping one would shift every
+      // later TupleGetItem onto a different storage dependency.
+      locations.push_back(index && *index < call->args_.size() ? ResolveExpr(call->args_[*index])
+                                                               : StorageLocation{});
     }
     bool has_location = false;
     for (const auto& location : locations) {
@@ -901,25 +913,6 @@ class StorageRootAnalysis : public IRVisitor {
     }
     if (!has_location) return {};
     return locations;
-  }
-
-  StorageLocation ResolveCalleeReturnExpr(const ExprPtr& expr, const CallPtr& call,
-                                          const FunctionPtr& callee) const {
-    auto var = AsVarLike(expr);
-    if (!var || !call || !callee) return {};
-    for (size_t i = 0; i < callee->params_.size() && i < call->args_.size(); ++i) {
-      if (callee->params_[i] && callee->params_[i]->UniqueId() == var->UniqueId()) {
-        return ResolveExpr(call->args_[i]);
-      }
-    }
-    return {};
-  }
-
-  static ReturnStmtPtr GetTrailingReturn(const StmtPtr& stmt) {
-    if (auto ret = As<ReturnStmt>(stmt)) return ret;
-    auto seq = As<SeqStmts>(stmt);
-    if (!seq || seq->stmts_.empty()) return nullptr;
-    return As<ReturnStmt>(seq->stmts_.back());
   }
 };
 
@@ -1682,6 +1675,23 @@ class AutoDepMutator : public IRMutator {
                                           submit->allow_early_resolve_, submit->predicate_);
   }
 
+  /// Derive compiler dependency edges and NoDep / OutputExisting candidates
+  /// for one call (a Submit is analysed through its Call view).
+  ///
+  /// Two candidate kinds are tracked per argument, both keyed by the same
+  /// hazard scan:
+  /// * `auto_no_dep` — a precise read of an `Input` argument.
+  /// * `auto_output_existing` — the same rule for a `ReadWrite` / `InOut`
+  ///   argument whose output buffer already exists.
+  ///
+  /// A candidate is emitted only when the scan found a hazard that a
+  /// user-supplied edge already orders (`has_covered_hazard`). A prior write
+  /// from a dynamic producer that cannot be tied to an active/inactive loop or
+  /// to complete user-edge coverage marks the candidate `blocked` and
+  /// withdraws it. Arguments with no hazard get no candidate.
+  ///
+  /// Returns @p call unchanged when no edge or candidate was derived. The
+  /// Submit caller maps a rewritten Call's attrs back onto the original Submit.
   ExprPtr AnalyzeCallLike(const CallPtr& call, const Expr* identity_key,
                           const std::vector<std::pair<std::string, std::any>>& output_attrs) {
     if (prior_stack_.empty() || active_scope_stack_.empty()) return call;
@@ -1709,6 +1719,9 @@ class AutoDepMutator : public IRMutator {
     if (accesses.empty()) return call;
 
     auto arg_directions = call->GetArgDirections();
+    // Candidate predicates and state transitions. A candidate needs a precise
+    // region and the matching direction; it becomes "covered" once a hazard is
+    // ordered, and "blocked" when a dynamic producer cannot be resolved.
     std::unordered_map<size_t, AutoNoDepCandidateState> auto_no_dep_candidates;
     std::unordered_map<size_t, AutoNoDepCandidateState> auto_output_existing_candidates;
     auto can_consider_auto_no_dep = [&](const StorageAccess& access) {
@@ -1754,6 +1767,8 @@ class AutoDepMutator : public IRMutator {
                          auto_no_dep_detail(access, prior_edge));
       }
     };
+    // State transitions: "covered" records a hazard the user edge already
+    // orders; "blocked" withdraws the candidate.
     auto mark_auto_no_dep_blocked = [&](const StorageAccess& access) {
       if (!can_consider_auto_no_dep(access)) return;
       auto& state = auto_no_dep_candidates[access.arg_index];
@@ -1773,6 +1788,9 @@ class AutoDepMutator : public IRMutator {
       auto_output_existing_candidates[access.arg_index].has_covered_hazard = true;
     };
 
+    // Hazard scan over every prior access in the enclosing scopes: alias,
+    // region overlap and direction decide whether an edge is required, and a
+    // user edge that already orders the pair satisfies it.
     std::vector<VarPtr> compiler_edges;
     for (const auto& access : accesses) {
       for (auto frame_it = prior_stack_.rbegin(); frame_it != prior_stack_.rend(); ++frame_it) {
@@ -1783,6 +1801,10 @@ class AutoDepMutator : public IRMutator {
           VarPtr prior_edge =
               prior.task_id_var_is_direct ? prior.task_id_var : CanonicalTaskId(prior.task_id_var);
           if (!prior_edge) prior_edge = prior.task_id_var;
+          // Classify the prior producer before deciding: an active/inactive
+          // dynamic loop bounds which user edges are trustworthy, complete
+          // coverage means every use is already ordered, and
+          // `covered_by_user_edge` answers that for this specific pair.
           const bool active_dynamic_prior = prior.dynamic_producer && prior.innermost_dynamic_loop_id != 0 &&
                                             IsActiveDynamicLoopId(prior.innermost_dynamic_loop_id);
           const bool inactive_dynamic_prior =
@@ -1835,6 +1857,8 @@ class AutoDepMutator : public IRMutator {
       }
     }
 
+    // Resolve candidates: a covered, unblocked argument is emitted; everything
+    // else stays conservative (no candidate).
     std::vector<int32_t> auto_no_dep_indices;
     for (const auto& [arg_index, state] : auto_no_dep_candidates) {
       if (!state.has_covered_hazard) {
@@ -1865,6 +1889,7 @@ class AutoDepMutator : public IRMutator {
     }
     std::sort(auto_output_existing_indices.begin(), auto_output_existing_indices.end());
 
+    // Record this call's own accesses so later calls can depend on them.
     for (auto& access : accesses) {
       access.task_id_var = task_id ? task_id : ProducerTaskIdForAccess(call, access);
       access.task_id_var_is_direct = access.task_id_var && IsTaskIdVar(access.task_id_var);
@@ -1875,6 +1900,7 @@ class AutoDepMutator : public IRMutator {
       prior_stack_.back().push_back(std::move(access));
     }
 
+    // Derive attrs only when something was found; otherwise keep the node.
     if (compiler_edges.empty() && auto_no_dep_indices.empty() && auto_output_existing_indices.empty()) {
       return call;
     }
@@ -2320,12 +2346,15 @@ Pass AutoDeriveTaskDependencies(bool analyze_auto_scopes) {
 
     auto new_functions = program->functions_;
     bool changed = false;
+    // All analyses read the original immutable Program. Share the cache across
+    // callers so nested returns in a callee's body are scanned only once per pass.
+    ReturnedParamIndexCache returned_param_indices;
 
     for (auto& [gvar, func] : new_functions) {
       (void)gvar;
       if (!func || !func->body_) continue;
 
-      StorageRootAnalysis storage(program);
+      StorageRootAnalysis storage(program, returned_param_indices);
       storage.Initialize(func->params_);
       storage.VisitStmt(func->body_);
 

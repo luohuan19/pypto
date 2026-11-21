@@ -33,6 +33,7 @@ import pytest
 from pypto import backend, codegen, ir, passes
 from pypto.backend import BackendType
 from pypto.backend.pto_backend import _build_group_mapping
+from pypto.runtime import RunConfig
 
 
 def _extract_func_section(mlir_code: str, func_name: str) -> str:
@@ -355,7 +356,7 @@ class TestCrossCoreTpushTpopCodegen:
         setup with explicit AIC/AIV tpush/tpop ops.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         # backend.set_backend_type(BackendType.Ascend950)
 
         pipeline = passes.PassPipeline()
@@ -489,7 +490,7 @@ class TestCrossCoreTpushTpopCodegen:
         )
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "dynamic_tpop_program", span))
         tpop_line = next(line.strip() for line in mlir_code.splitlines() if "pto.tpop_from_aic" in line)
 
@@ -519,7 +520,7 @@ class TestCrossCoreTpushTpopCodegen:
         )
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "dynamic_tpop_static_row_program", span))
         lines = [line.strip() for line in mlir_code.splitlines()]
         tpop_line = next(line for line in lines if "pto.tpop_from_aic" in line)
@@ -544,7 +545,7 @@ class TestCrossCoreTpushTpopCodegen:
         func = ir.Function("empty_tpop", [], [], body, span, ir.FunctionType.AIV)
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "empty_tpop_program", span))
         tpop_line = next(line.strip() for line in mlir_code.splitlines() if "pto.tpop_from_aic" in line)
 
@@ -573,7 +574,7 @@ class TestCrossCoreTpushTpopCodegen:
         )
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         with pytest.raises(
             ValueError, match="tpop valid_shape operand must be integer or index type, got i1"
         ):
@@ -657,7 +658,7 @@ class TestCrossCoreTpushTpopCodegen:
         )
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "narrow_then_push_program", span))
 
         narrowed_alloc_lines = [
@@ -757,7 +758,7 @@ class TestCrossCoreTpushTpopCodegen:
         )
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         mlir_code = codegen.PTOCodegen().generate(
             ir.Program([producer, consumer], "partial_acc_to_vec_program", span)
         )
@@ -789,7 +790,7 @@ class TestCrossCoreTpushTpopCodegen:
         )
 
     def _row_narrowed_acc_push_program(
-        self, valid_rows, valid_cols, compact, split=0, rows=64, backend_type=BackendType.Ascend910B
+        self, valid_rows, valid_cols, compact, split=0, rows=64, backend_type=BackendType.Ascend910
     ):
         """One AIC function that pushes a row-narrowed Acc tile into the C2V FIFO.
 
@@ -963,76 +964,24 @@ class TestCrossCoreTpushTpopCodegen:
         producer_code = self._row_narrowed_acc_push_program(8, 128, ir.CompactMode.normal, split=1, rows=16)
         assert "pto.tpush_to_aiv" in producer_code
 
-    def test_split_acc_to_vec_pop_uses_full_box_for_tpop(self):
-        """A split C2V pop transports the full per-lane box, not the logical valid box.
-
-        pto-isa builds the GM slot view of a Cube->Vector pop from the popped
-        tile's compile-time rows/cols and the producer's box row pitch, but
-        strides it with the tile's runtime validCol
-        (``gmGap = gStride3 - gShape4``, ``lenBurst = validCol``). A narrowed
-        validCol therefore collapses the GM gap to zero and the lane reads one
-        contiguous run instead of one box row per burst — silent data loss in
-        the *valid* region, since the matching PTO_ASSERT is compiled out in
-        release. This is the consumer-side counterpart of the producer-side
-        widening already asserted by
-        ``test_split_tpush_uses_full_box_transport_dims``.
-        """
+    @staticmethod
+    def _static_acc_to_vec_pop_code(
+        shape, valid_shape, *, split=1, lane_stride=None, backend_type=BackendType.Ascend910
+    ):
+        """Generate a static C2V consumer without running the split-lowering passes."""
         span = ir.Span.unknown()
-        zero = ir.ConstInt(0, pl.INDEX, span)
-        rows = ir.ConstInt(16, pl.INDEX, span)
-        cols = ir.ConstInt(32, pl.INDEX, span)
-        half_rows = ir.ConstInt(8, pl.INDEX, span)
-        valid_cols = ir.ConstInt(24, pl.INDEX, span)
-        offsets = ir.MakeTuple([zero, zero], span)
-        shape = ir.MakeTuple([rows, cols], span)
-        valid_shape = ir.MakeTuple([rows, valid_cols], span)
-
-        src = ir.Var("src", ir.TensorType([16, 32], pl.FP32), span)
-        acc_memref = ir.MemRef(ir.MemorySpace.Acc, ir.ConstInt(0, pl.INT64, span), 16 * 32 * 4, 0)
-        acc_type = ir.TileType(
-            [rows, cols],
-            pl.FP32,
-            acc_memref,
-            ir.TileView(valid_shape=[rows, valid_cols]),
-            ir.MemorySpace.Acc,
-        )
-        acc_tile = ir.Var("acc_tile", acc_type, span)
-        load_call = ir.Call(
-            ir.Op("tile.load"),
-            [src, offsets, shape, valid_shape],
-            {"target_memory": ir.MemorySpace.Acc},
-            acc_type,
-            span,
-        )
-        push_call = ir.Call(
-            ir.Op("tile.tpush_to_aiv"),
-            [acc_tile],
-            {"split": 1},
-            ir.UnknownType(),
-            span,
-        )
-        producer = ir.Function(
-            "split_acc_producer",
-            [(src, ir.ParamDirection.In)],
-            [],
-            ir.SeqStmts(
-                [ir.AssignStmt(acc_tile, load_call, span), ir.EvalStmt(push_call, span)],
-                span,
-            ),
-            span,
-            ir.FunctionType.AIC,
-        )
-
-        # Per-lane consumer half of an UP_DOWN split: [8, 32] box, logical [8, 24].
-        vec_type = ir.TileType(
-            [half_rows, cols],
+        tile_type = ir.TileType(
+            [ir.ConstInt(dim, pl.INDEX, span) for dim in shape],
             pl.FP32,
             None,
-            ir.TileView(valid_shape=[half_rows, valid_cols]),
+            ir.TileView(valid_shape=[ir.ConstInt(dim, pl.INDEX, span) for dim in valid_shape]),
             ir.MemorySpace.Vec,
         )
-        popped = ir.Var("popped", vec_type, span)
-        pop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 1}, vec_type, span)
+        kwargs = {"split": split}
+        if lane_stride is not None:
+            kwargs["lane_stride"] = lane_stride
+        popped = ir.Var("popped", tile_type, span)
+        pop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], kwargs, tile_type, span)
         consumer = ir.Function(
             "split_vec_consumer",
             [],
@@ -1041,13 +990,24 @@ class TestCrossCoreTpushTpopCodegen:
             span,
             ir.FunctionType.AIV,
         )
-
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-        mlir_code = codegen.PTOCodegen().generate(
-            ir.Program([producer, consumer], "split_acc_to_vec_program", span)
-        )
-        consumer_code = _extract_func_section(mlir_code, "split_vec_consumer")
+        backend.set_backend_type(backend_type)
+        mlir_code = codegen.PTOCodegen().generate(ir.Program([consumer], "split_acc_to_vec_program", span))
+        return _extract_func_section(mlir_code, "split_vec_consumer")
+
+    def test_split_acc_to_vec_pop_uses_full_box_for_tpop(self):
+        """A split C2V pop transports the full per-lane box, not the logical valid box.
+
+        The pinned pto-isa derives its GM slot rows/cols from GetValidRow and
+        GetValidCol. Its GM row stride is validCol for UP_DOWN and twice
+        validCol for LEFT_RIGHT. Narrowing validCol therefore changes the
+        producer's physical row pitch and silently reads the wrong data.
+        TPOP must preserve that pitch before treshape restores logical validity.
+        This is the consumer-side counterpart of the producer-side widening in
+        ``test_split_tpush_uses_full_box_transport_dims``.
+        """
+        # Per-lane consumer half of an UP_DOWN split: [8, 32] box, logical [8, 24].
+        consumer_code = self._static_acc_to_vec_pop_code([8, 32], [8, 24])
         consumer_lines = [line.strip() for line in consumer_code.splitlines()]
 
         pop_index = next(i for i, line in enumerate(consumer_lines) if "pto.tpop_from_aic" in line)
@@ -1066,6 +1026,58 @@ class TestCrossCoreTpushTpopCodegen:
         assert "rows=8, cols=32, v_row=8, v_col=24" in consumer_lines[reshape_index], (
             f"the logical per-lane valid shape must be restored by treshape:\n{consumer_code}"
         )
+
+    @pytest.mark.parametrize(
+        ("split", "shape", "valid_shape", "stride_kind"),
+        [
+            (1, [32, 128], [20, 128], "default"),
+            (1, [32, 128], [20, 128], "capacity"),
+            (1, [32, 128], [20, 128], "logical"),
+            (1, [32, 128], [20, 96], "default"),
+            (1, [32, 128], [20, 96], "capacity"),
+            (1, [32, 128], [20, 96], "logical"),
+            (2, [32, 64], [32, 20], "default"),
+            (2, [32, 64], [32, 20], "capacity"),
+        ],
+    )
+    def test_split_acc_to_vec_pop_preserves_partition_stride(self, split, shape, valid_shape, stride_kind):
+        """Narrow valid extents do not change the default physical partition stride.
+
+        A balanced logical partition may instead carry an explicit smaller stride.
+        Widening that split-axis extent to capacity would move lane 1's FIFO read.
+        """
+        axis = split - 1
+        stride = {"default": None, "capacity": shape[axis], "logical": valid_shape[axis]}[stride_kind]
+        consumer_code = self._static_acc_to_vec_pop_code(shape, valid_shape, split=split, lane_stride=stride)
+        pop_line = next(line.strip() for line in consumer_code.splitlines() if "pto.tpop_from_aic" in line)
+        transport_shape = list(shape)
+        if stride_kind == "logical":
+            transport_shape[axis] = stride
+        rows, cols = transport_shape
+        assert f"pto.tpop_from_aic(%c{rows}_index, %c{cols}_index) {{split = {split}}}" in pop_line, (
+            f"the split-axis transport extent must preserve the partition stride:\n{consumer_code}"
+        )
+        reshape_lines = [line for line in consumer_code.splitlines() if "pto.treshape" in line]
+        assert len(reshape_lines) == 1, consumer_code
+        transport = re.search(r"^(%\w+) = pto\.tpop_from_aic", pop_line)
+        assert transport is not None
+        assert f"pto.treshape {transport.group(1)}" in reshape_lines[0], consumer_code
+        assert (
+            f"rows={shape[0]}, cols={shape[1]}, v_row={valid_shape[0]}, v_col={valid_shape[1]}"
+            in reshape_lines[0]
+        ), consumer_code
+
+    def test_left_right_acc_to_vec_pop_rejects_stride_smaller_than_physical_columns(self):
+        """LEFT_RIGHT cannot change its lane offset without also changing the GM row pitch."""
+        with pytest.raises(ValueError, match="LEFT_RIGHT.*lane_stride.*physical"):
+            self._static_acc_to_vec_pop_code([32, 64], [32, 20], split=2, lane_stride=20)
+
+    def test_hardware_split_acc_to_vec_pop_rejects_stride_smaller_than_physical_rows(self):
+        """A hardware split already places each lane at its physical row band."""
+        with pytest.raises(ValueError, match="lane_stride.*physical.*hardware"):
+            self._static_acc_to_vec_pop_code(
+                [32, 128], [20, 128], lane_stride=20, backend_type=BackendType.Ascend950
+            )
 
     @pytest.mark.parametrize(
         (
@@ -1175,7 +1187,7 @@ class TestCrossCoreTpushTpopCodegen:
         )
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "split_narrow_then_push_program", span))
 
         set_validshape_lines = [
@@ -1304,7 +1316,7 @@ class TestCrossCoreTpushTpopCodegen:
         )
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         mlir_code = codegen.PTOCodegen().generate(
             ir.Program([func], "dual_aiv_narrow_then_push_program", span)
         )
@@ -1426,7 +1438,7 @@ class TestCrossCoreTpushTpopCodegen:
         )
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         mlir_code = codegen.PTOCodegen().generate(
             ir.Program([func], "dual_aiv_zero_row_replay_program", span)
         )
@@ -1704,6 +1716,96 @@ class TestCrossCoreTpushTpopCodegen:
 
 class TestExpandMixedKernelCodegen:
     """Tests that PTO codegen works on AIC/AIV functions produced by expand_mixed_kernel."""
+
+    @pytest.mark.parametrize("tile_polling", [False, True], ids=["scalar", "tile"])
+    @pytest.mark.parametrize("keep_result", [False, True], ids=["unused-result", "used-result"])
+    def test_while_condition_only_iter_arg_codegen(self, tmp_path, tile_polling, keep_result):
+        """Mixed SPMD polling must retain condition-only state even with an unused result (#3009)."""
+
+        @pl.jit
+        def mixed_while_poll(
+            a: pl.Tensor[[32, 16], pl.FP16],
+            b: pl.Tensor[[16, 16], pl.FP16],
+            scratch: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            flags: pl.InOut[pl.Tensor[[16], pl.INT32]],
+            cube_out: pl.Out[pl.Tensor[[32, 16], pl.FP32]],
+            vector_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            TILE_POLLING: pl.constexpr,
+            KEEP_RESULT: pl.constexpr,
+        ):
+            # Matmul makes this a mixed kernel; the nested AIV branches retain
+            # the producer/consumer shape without requiring device execution.
+            for worker in pl.spmd(2, sync_start=True, name_hint="mixed_while_poll"):
+                ac = pl.load(a, [worker * 16, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                bc = pl.load(b, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                pl.store(pl.matmul(ac, bc, out_dtype=pl.FP32), [worker * 16, 0], cube_out)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    if lane == 0:
+                        if worker == 0:
+                            av = pl.load(a, [0, 0], [16, 16], target_memory=pl.MemorySpace.Vec)
+                            pl.store(pl.add(pl.cast(av, pl.FP32), 1.0), [0, 0], scratch)
+                            pl.system.cacheinvalid()
+                            pl.system.fence()
+                            pl.write(flags, [0], pl.const(1, pl.INT32))
+                        elif worker == 1:
+                            if TILE_POLLING:
+                                initial_tile = pl.load(flags, [0], [16], target_memory=pl.MemorySpace.Vec)
+                                initial_ready = pl.tile.read(initial_tile, [0])
+                            else:
+                                initial_ready = pl.read(flags, [0])
+                            for (ready,) in pl.while_(init_values=(initial_ready,)):
+                                pl.cond(ready != 1)
+                                pl.system.cacheinvalid()
+                                if TILE_POLLING:
+                                    flag_tile = pl.load(flags, [0], [16], target_memory=pl.MemorySpace.Vec)
+                                    next_ready = pl.tile.read(flag_tile, [0])
+                                else:
+                                    next_ready = pl.read(flags, [0])
+                                final_ready = pl.yield_(next_ready)
+                            if KEEP_RESULT:
+                                # This control used to hide the bug by making
+                                # the loop result live independently of its condition.
+                                pl.write(flags, [1], final_ready)
+                            pl.system.cacheinvalid()
+                            received = pl.load(scratch, [0, 0], [16, 16], target_memory=pl.MemorySpace.Vec)
+                            pl.store(pl.mul(received, 2.0), [0, 0], vector_out)
+            return cube_out, vector_out
+
+        mixed_while_poll.compile(
+            TILE_POLLING=tile_polling,
+            KEEP_RESULT=keep_result,
+            config=RunConfig(
+                backend_type=BackendType.Ascend910,
+                codegen_only=True,
+                save_kernels=True,
+                save_kernels_dir=str(tmp_path),
+                dump_passes=True,
+            ),
+        )
+        dumps = list((tmp_path / "passes_dump").glob("*after_ExpandMixedKernel.py"))
+        assert dumps, "Expected an ExpandMixedKernel pass dump"
+        expanded = "\n".join(path.read_text() for path in dumps)
+        assert "__FREE_VAR" not in expanded, expanded
+        assert "pl.while_(init_values=" in expanded, expanded
+
+        pto_files = list(tmp_path.rglob("*.pto"))
+        assert pto_files, "Expected generated PTO MLIR"
+        pto = "\n".join(path.read_text() for path in pto_files)
+        loop = re.search(
+            r"scf\.while \([^\n]+\) : \(i32\) -> \(i32\) \{.*?scf\.condition\(.*?"
+            r"\} do \{(?P<body>.*?)scf\.yield (?P<yielded>%\w+) : i32",
+            pto,
+            re.DOTALL,
+        )
+        assert loop is not None, pto
+        # The backedge must yield the freshly read flag, so retaining a reload
+        # while yielding stale state cannot satisfy this polling regression.
+        body = loop.group("body")
+        yielded = loop.group("yielded")
+        reload_op = "pto.tgetval" if tile_polling else "pto.load"
+        assert re.search(rf"^\s*{re.escape(yielded)} = {re.escape(reload_op)} ", body, re.MULTILINE), body
+        if tile_polling:
+            assert "pto.tload " in body, body
 
     @staticmethod
     def _expand_and_generate(program) -> dict[str, str]:
@@ -1996,7 +2098,7 @@ class TestExpandMixedKernelCodegen:
                 self.group_func()
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
             transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(
                 MultiplePipeSetup

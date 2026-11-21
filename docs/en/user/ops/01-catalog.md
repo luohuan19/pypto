@@ -41,7 +41,7 @@ See [Memory and Data Movement](../language/03-memory.md) for which moves are leg
 | -------- | ----- | ------------ |
 | [`add`][pypto.language.add] [`sub`][pypto.language.sub] [`mul`][pypto.language.mul] [`div`][pypto.language.div] | `pl.` | Binary arithmetic; a Python number on the right selects the scalar-operand form. For Tensor/Tensor and Tile/Tile `div`, `high_precision=True` selects the slower, higher-precision PTO path on A5; on A2/A3 PTO-ISA ignores it and returns the default result, which compilation warns about |
 | [`neg`][pypto.language.neg] [`abs`][pypto.language.abs] [`recip`][pypto.language.recip] | `pl.` | Unary negate, absolute value, reciprocal. For FP16/FP32 reciprocal, `high_precision=True` selects the slower, higher-precision PTO path on A5; on A2/A3 PTO-ISA ignores it and returns the default result, which compilation warns about |
-| [`rem`][pypto.language.tile.rem] [`rems`][pypto.language.tile.rems] [`fmod`][pypto.language.fmod] [`fmods`][pypto.language.fmods] | `pl.` | Floor (`rem*`) and truncating (`fmod*`) remainder. Tensor operands must match shape and dtype; tile-tile operands must match physical and valid shapes. A2/A3 supports FP32/INT32 for `rem*` and FP32 for `fmod*`; every A2/A3 INT32 `rem*` source/scalar value must be in the inclusive PTO-ISA domain `[-2^24, 2^24]`. A2/A3 scalar forms require provably positive valid extents. Tile `rem` / `rems` scratch must have provably sufficient physical and valid capacity (two / one rows and all source columns) and must not overlap a live source on A2/A3. A5 accepts the wider frontend dtype union. `high_precision=True` is FP32 tile-tile only (defined on A5; accepted but ignored on A2/A3, where compilation warns) |
+| [`rem`][pypto.language.tile.rem] [`rems`][pypto.language.tile.rems] [`fmod`][pypto.language.fmod] [`fmods`][pypto.language.fmods] | `pl.` | Floor (`rem*`) and truncating (`fmod*`) remainder. Tensor operands must match shape and dtype; tile-tile operands must match physical and valid shapes. A2/A3 supports FP32/INT32 for `rem*` and FP32 for `fmod*`; every A2/A3 INT32 `rem*` source/scalar value must be in the inclusive PTO-ISA domain `[-2^24, 2^24]`. A2/A3 scalar forms require provably positive valid extents. Tile `rem` / `rems` scratch must have provably sufficient physical and valid capacity (two / one rows and all source columns) and must not overlap a live source on A2/A3. A5 accepts the wider frontend dtype union. `high_precision=True` is FP32 tile-tile only: `rem` honors it on A2/A3 and A5; `fmod` honors it on A5 but ignores it on A2/A3 with a compilation warning |
 | [`addc`][pypto.language.tile.addc] [`subc`][pypto.language.tile.subc] [`addsc`][pypto.language.tile.addsc] [`subsc`][pypto.language.tile.subsc] | `pl.` (t) | Three-input add / subtract with carry operand |
 | [`part_add`][pypto.language.part_add] [`part_mul`][pypto.language.part_mul] [`part_max`][pypto.language.part_max] [`part_min`][pypto.language.part_min] | `pl.` | Partial (segmented) arithmetic |
 
@@ -50,7 +50,7 @@ See [Memory and Data Movement](../language/03-memory.md) for which moves are leg
 | Operator | Reach | What it does |
 | -------- | ----- | ------------ |
 | [`exp`][pypto.language.exp] [`log`][pypto.language.log] | `pl.` | Exponential, natural logarithm. For `log`, `high_precision=True` selects the slower, higher-precision PTO path on A5; on A2/A3 PTO-ISA ignores it and returns the default result, which compilation warns about |
-| [`sqrt`][pypto.language.sqrt] [`rsqrt`][pypto.language.rsqrt] | `pl.` | Square root; reciprocal square root. `high_precision=` is tensor-only and **raises** on a Tile — at tile level precision is selected by passing the scratch tile to `pl.tile.rsqrt(src, tmp)` |
+| [`sqrt`][pypto.language.sqrt] [`rsqrt`][pypto.language.rsqrt] | `pl.` | Square root; reciprocal square root. `rsqrt` defaults to `high_precision=False` at both levels. Tensor high precision allocates scratch automatically; Tile high precision requires `pl.tile.rsqrt(src, tmp=tmp, high_precision=True)` (or `pl.rsqrt(src, high_precision=True, tmp=tmp)`). Scratch without the flag is rejected. A5 codegen emits `RsqrtAlgorithm::HIGH_PRECISION`. |
 | [`sin`][pypto.language.tensor.sin] [`cos`][pypto.language.tensor.cos] | `pl.` | Trigonometric |
 
 ## Comparison and selection
@@ -123,7 +123,7 @@ Tensor `pl.col_sum(x, is_binary=True)` selects binary-tree reduction with compil
 | [`assemble`][pypto.language.tensor.assemble] | `pl.` | Write a sub-region back; also written `dst[i:i+16] = src` |
 | [`reinterpret_view`][pypto.language.reinterpret_view] | `pl.` | Reinterpret without moving data |
 | [`set_validshape`][pypto.language.set_validshape] | `pl.` | Declare the meaningful region of a tile |
-| [`cast`][pypto.language.cast] | `pl.` | Convert dtype — may expand to a multi-hop chain, see [LegalizeTileCast](../../dev/passes/17-legalize_tile_cast.md) |
+| [`cast`][pypto.language.cast] | `pl.` | Convert dtype — may expand to a multi-hop chain, see [LegalizeTileCast](../../dev/passes/19-legalize_tile_cast.md) |
 | [`dim`][pypto.language.tensor.dim] | `pl.` | A tensor's runtime dimension |
 | [`read`][pypto.language.read] [`write`][pypto.language.write] | `pl.` | Element access |
 
@@ -131,31 +131,42 @@ Tensor `pl.col_sum(x, is_binary=True)` selects binary-tree reduction with compil
 
 | Operator | Reach | What it does |
 | -------- | ----- | ------------ |
-| `quant_mx` | `pl.` (T/t) | Ascend950 MXFP8 block-32 dynamic quantization to FP8E4M3FN data plus FP8E8M0 scales (`group_axis` = PTOAS `grpAxis`). Tensor calls materialize GM data and MX-layout scales; tile calls stay on-chip. MXFP4 quant is out of scope. A direct tensor quant→matmul chain may use data+scale V2C transport (see [types](../language/00-types.md)) |
+| `quant_mx` | `pl.` (T/t) | Ascend950 block-32 dynamic quantization to FP8E4M3FN or packed `fp4e2m1x2` data plus FP8E8M0 scales. FP4 requires FP16/BF16 input; axis1 returns `[M,K/2]`, axis0 transposes `[N,K]` to `[K,N/2]`. `quant_scale_alg="ocp"` is the default; `"nv"` covers axis0 for every source dtype and axis1 for FP32, while axis1 FP16/BF16 NV is unsupported by PTOAS. Tensor calls materialize GM data and MX-layout scales; tile calls stay on-chip. FP8 results can feed `matmul_mx`; FP4 tile results require supported Mat→Left/Right placement before tile matmul (see [types](../language/00-types.md)). |
+| `quant_mx_raw` | `pl.tile.` (t) | Direct Ascend950 TQUANT with explicit max/scaling workspaces. Returns native FP4E2M1X2 or INT8 data and raw UINT8 exponent codes, without blocked MX scale packing. Axis1 accepts any positive row count and K divisible by 32 (64 for native FP4); source valid rows may be smaller than physical rows. Axis0 consumes source orientation directly and groups 32 valid rows; `interleave=True` interleaves exponent pairs for FP16/BF16 with rows divisible by 64. |
 | `tmov_x2zz` | `pl.` (t) | Ascend950 exponent X-to-ZZ layout conversion (UINT8). Workspace `tmp` is write-only; axis1 needs `dst_rows`/`dst_cols` for ZZ `[M,G]` over flat TQUANT exp. Typically used via `quant_mx` lowering rather than directly |
 
 ## Linear algebra
 
 | Operator | Reach | What it does |
 | -------- | ----- | ------------ |
-| [`matmul`][pypto.language.matmul] | `pl.` | Matrix multiply; `a_trans=` / `b_trans=` transpose an operand in place of a DN annotation |
-| [`matmul_acc`][pypto.language.matmul_acc] | `pl.` | Multiply-accumulate into an existing `Acc` tile |
-| [`matmul_bias`][pypto.language.tile.matmul_bias] | `pl.` (t) | Multiply with a bias operand |
+| [`matmul`][pypto.language.matmul] | `pl.` | Matrix multiply; `a_trans=` / `b_trans=` transpose an operand in place of a DN annotation. Operand dtypes must pair: INT8, FP16, BF16 or FP32 with itself, plus any FP8 (E4M3FN / E5M2, **either order**) or HF8 pair on Ascend950, which always produces FP32 |
+| [`matmul_acc`][pypto.language.matmul_acc] | `pl.` | Multiply-accumulate into an existing `Acc` tile. Same operand pairs as `matmul`; the accumulator carries the FP32 / INT32 result dtype |
+| [`matmul_bias`][pypto.language.tile.matmul_bias] | `pl.` (t) | Multiply with a bias operand. Same operand pairs as `matmul`; the bias matches the accumulator dtype |
 | [`batch_matmul`][pypto.language.batch_matmul] | `pl.` (t) | Batched multiply, **tile operands only**. For tensors call `pl.matmul` — rank > 2 dispatches to `tile.batch_matmul` during lowering |
 | [`gemv`][pypto.language.tile.gemv] [`gemv_acc`][pypto.language.tile.gemv_acc] [`gemv_bias`][pypto.language.tile.gemv_bias] | `pl.` (t) | Matrix-vector forms |
-| [`matmul_mx`][pypto.language.matmul_mx] [`matmul_mx_acc`][pypto.language.tile.matmul_mx_acc] [`matmul_mx_bias`][pypto.language.tile.matmul_mx_bias] | `pl.` (T/t) | A5 MX block-scale multiply. Tensor `matmul_mx` consumes oriented 2D data/scale tensors and returns FP32; `_acc` / `_bias` remain tile-only. Data reaching the op must be FP8E4M3FN; native FP4×FP4 is unsupported |
+| [`matmul_mx`][pypto.language.matmul_mx] [`matmul_mx_acc`][pypto.language.tile.matmul_mx_acc] [`matmul_mx_bias`][pypto.language.tile.matmul_mx_bias] | `pl.` (T/t) | A5 MX block-scale multiply. Tensor `matmul_mx` uses oriented 2D data/scale tensors with FP8E4M3FN on both sides and returns FP32. The Tile API supports all four FP8E4M3FN/FP8E5M2 pairs and packed FP4 pairs, including the Tile-only `_acc` and `_bias` forms |
 
-For phased GEMV accumulation, select producer phases with `pl.AccPhase`. A producer
-ending with `pl.AccPhase.Final` must be paired with a store using `pl.STPhase.Final`:
+`pl.tile.matmul`, `pl.tile.matmul_acc`, and the GEMV family accept producer
+phases through `acc_phase=pl.AccPhase`. `Unspecified` is the default and keeps
+the existing behavior. Use `Partial` for intermediate K chunks and pair the
+last producer's `Final` with a store using `pl.STPhase.Final`:
 
 Here `lhs0`, `rhs0`, `lhs1`, and `rhs1` are preloaded tiles, and `output` is the
 destination tensor.
 
 ```python
-partial = pl.tile.gemv(lhs0, rhs0, acc_phase=pl.AccPhase.Partial)
-final = pl.tile.gemv_acc(partial, lhs1, rhs1, acc_phase=pl.AccPhase.Final)
+partial = pl.tile.matmul(lhs0, rhs0, acc_phase=pl.AccPhase.Partial)
+final = pl.tile.matmul_acc(partial, lhs1, rhs1, acc_phase=pl.AccPhase.Final)
 pl.store(final, [0, 0], output, st_phase=pl.STPhase.Final)
 ```
+
+For Matmul, `acc_phase` is keyword-only; `matmul_acc` retains its existing
+`init_cond` position and both options can be used together. A final result
+must be drained exactly once in the same straight-line region. Before that
+store, only a plain SSA alias may forward it; other operations may not consume it. Put the entire pair inside a branch or loop body when
+execution is conditional or repeated. Automatic K tiling assigns `Final` only
+to the last physical K block. Selecting phases does not remove the compiler's
+other synchronization or imply a performance improvement.
 
 ## Gather, scatter, sort
 
@@ -193,7 +204,7 @@ The mixed-kernel surface — AIC and AIV cooperating inside one InCore function.
 Push and pop must be **paired**, and each pop must be matched by a `tfree`. The tutorial covering this is
 [Mixed kernels](../tutorials/03-mixed-kernel.md); the machine-level mechanics are in
 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md) and
-[ExpandMixedKernel](../../dev/passes/24-expand_mixed_kernel.md).
+[ExpandMixedKernel](../../dev/passes/26-expand_mixed_kernel.md).
 
 ## Tasks and dependencies
 

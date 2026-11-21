@@ -13,12 +13,68 @@
 #define PYPTO_IR_TRANSFORMS_STRUCTURAL_COMPARISON_H_
 
 #include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "pypto/core/error.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
 namespace ir {
+
+/// A structural comparison cannot safely represent this input. This is not inequality.
+class StructuralComparisonUnsupported : public pypto::TypeError {
+ public:
+  StructuralComparisonUnsupported(const std::string& reason, const std::string& field_path)
+      : pypto::TypeError(reason + " at " + field_path), reason_(reason), field_path_(field_path) {}
+
+  [[nodiscard]] const std::string& reason() const { return reason_; }
+  [[nodiscard]] const std::string& field_path() const { return field_path_; }
+
+  [[noreturn]] void RethrowWithMessage(const std::string& message) const override {
+    throw StructuralComparisonUnsupported(message, GetStackTrace(), reason_, field_path_);
+  }
+
+ private:
+  StructuralComparisonUnsupported(const std::string& message, std::vector<StackFrame> trace,
+                                  std::string reason, std::string field_path)
+      : pypto::TypeError(message, std::move(trace)),
+        reason_(std::move(reason)),
+        field_path_(std::move(field_path)) {}
+
+  std::string reason_;
+  std::string field_path_;
+};
+
+namespace structural_comparison_detail {
+
+/// Compare standalone types with free-variable identity in one analysis scope.
+/// Each distinct immutable type is projected once into a shared exact arena.
+class TypeComparisonCache {
+ public:
+  TypeComparisonCache();
+  ~TypeComparisonCache();
+
+  [[nodiscard]] bool Equal(const TypePtr& lhs, const TypePtr& rhs);
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace structural_comparison_detail
+
+/// Verify local binding visibility and unique definitions independently of comparison.
+/// Open captures are allowed; closure/effect checks belong to the caller.
+void verify_structural_bindings(const IRNodePtr& node);
+
+/// All comparisons use exact scalar dtypes, floating-point bits, and reflected
+/// semantic fields, including storage. Names and spans marked IgnoreField are
+/// omitted. Definitions are alpha-renamed; free references follow the flag below.
+/// Hashes are process-local fingerprints and must be confirmed with equality.
 
 /**
  * @brief Compute structural hash of an IR node
@@ -26,18 +82,12 @@ namespace ir {
  * Computes hash based on IR node tree structure, ignoring Span (source location).
  * Two IR nodes with identical structure will hash to the same value.
  *
- * This can be used with structural_equal as custom hasher/comparator for unordered containers:
- * @code
- * std::unordered_map<IRNodePtr, int,
- *                    decltype(&structural_hash),
- *                    decltype(&structural_equal)> my_map(
- *   16, structural_hash, structural_equal
- * );
- * @endcode
+ * Use wrappers selecting identical options when hashing/comparing container keys.
+ * Definitions are alpha-renamed. Free variables preserve identity by default.
  *
  * @param node IR node to hash
- * @param enable_auto_mapping If true, ignore variable names (e.g., x+1 and y+1 hash the same).
- *                            If false, variable names matter (default).
+ * @param enable_auto_mapping If true, alpha-map free variables (e.g., x+1 and y+1 hash the same).
+ *                            If false, preserve free-variable identity (default).
  * @return Structural hash value
  */
 uint64_t structural_hash(const IRNodePtr& node, bool enable_auto_mapping = false);
@@ -46,8 +96,8 @@ uint64_t structural_hash(const IRNodePtr& node, bool enable_auto_mapping = false
  * @brief Compute structural hash of a type
  *
  * @param type Type to hash
- * @param enable_auto_mapping If true, ignore variable names (e.g., x+1 and y+1 hash the same).
- *                            If false, variable names matter (default).
+ * @param enable_auto_mapping If true, alpha-map free variables (e.g., x+1 and y+1 hash the same).
+ *                            If false, preserve free-variable identity (default).
  * @return Structural hash value
  */
 uint64_t structural_hash(const TypePtr& type, bool enable_auto_mapping = false);
@@ -61,7 +111,8 @@ uint64_t structural_hash(const TypePtr& type, bool enable_auto_mapping = false);
  * @param lhs First IR node
  * @param rhs Second IR node
  * @param enable_auto_mapping If true, automatically map variables (e.g., x+1 equals y+1).
- *                            If false, variable names must match exactly (default).
+ *                            If false, preserve free-variable identity; definitions still alpha-map
+ * (default).
  * @return true if structurally equal, false otherwise
  */
 bool structural_equal(const IRNodePtr& lhs, const IRNodePtr& rhs, bool enable_auto_mapping = false);
@@ -72,7 +123,8 @@ bool structural_equal(const IRNodePtr& lhs, const IRNodePtr& rhs, bool enable_au
  * @param lhs First type
  * @param rhs Second type
  * @param enable_auto_mapping If true, automatically map variables (e.g., x+1 equals y+1).
- *                            If false, variable names must match exactly (default).
+ *                            If false, preserve free-variable identity; definitions still alpha-map
+ * (default).
  * @return true if structurally equal, false otherwise
  */
 bool structural_equal(const TypePtr& lhs, const TypePtr& rhs, bool enable_auto_mapping = false);
@@ -81,13 +133,14 @@ bool structural_equal(const TypePtr& lhs, const TypePtr& rhs, bool enable_auto_m
  * @brief Assert two IR nodes are structurally equal
  *
  * Like structural_equal but throws ValueError with detailed error message
- * showing the first mismatch location and Python-printed IR context.
+ * showing the first differing field path and exact scalar values.
  * Useful for debugging and testing.
  *
  * @param lhs First IR node
  * @param rhs Second IR node
  * @param enable_auto_mapping If true, automatically map variables (e.g., x+1 equals y+1).
- *                            If false, variable names must match exactly (default).
+ *                            If false, preserve free-variable identity; definitions still alpha-map
+ * (default).
  * @throws ValueError if nodes are not structurally equal, with detailed diagnostic message
  */
 void assert_structural_equal(const IRNodePtr& lhs, const IRNodePtr& rhs, bool enable_auto_mapping = false);
@@ -100,7 +153,8 @@ void assert_structural_equal(const IRNodePtr& lhs, const IRNodePtr& rhs, bool en
  * @param lhs First type
  * @param rhs Second type
  * @param enable_auto_mapping If true, automatically map variables (e.g., x+1 equals y+1).
- *                            If false, variable names must match exactly (default).
+ *                            If false, preserve free-variable identity; definitions still alpha-map
+ * (default).
  * @throws ValueError if types are not structurally equal, with detailed diagnostic message
  */
 void assert_structural_equal(const TypePtr& lhs, const TypePtr& rhs, bool enable_auto_mapping = false);

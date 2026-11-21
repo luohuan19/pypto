@@ -1,5 +1,9 @@
 # Tuning the InCore Function
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Making the bar itself shorter: overlapping transfer with compute, changing the algorithm,
 respecting the hardware's granularity, and — when nothing else wins — not writing the
 kernel in PyPTO at all.
@@ -24,7 +28,8 @@ A = (indices % 3 - 1).to(torch.float32).reshape(ROWS, TC)
 
 def check(kernel):
     out = torch.zeros(ROWS, TC, dtype=torch.float32)
-    kernel(A, out, config=CFG)
+    compiled = kernel.compile(A, out, config=CFG)
+    compiled(A, out, config=CFG)
     torch.testing.assert_close(out, torch.exp(A), rtol=1e-3, atol=1e-4)
 ```
 

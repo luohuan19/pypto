@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import (
     CompactMode,
+    DistributedTensorType,
     Expr,
     MemorySpace,
     MemRef,
@@ -22,6 +23,8 @@ from pypto.pypto_core.ir import (
     TensorType,
     TileLayout,
     TileType,
+    TupleType,
+    Type,
 )
 from pypto.pypto_core.ir import (
     TensorView as _TensorViewBase,
@@ -30,7 +33,49 @@ from pypto.pypto_core.ir import (
     TileView as _TileViewBase,
 )
 
-from .utils import _normalize_expr, _normalize_shape
+from .utils import _normalize_expr
+
+
+def _merge_annotation_metadata(annotation: Type, inferred: Type) -> Type:
+    """Fill omitted metadata from inference without changing annotated value types.
+
+    Callers validate type kinds, shapes, and dtypes separately. Omitted views and
+    memory spaces inherit inference. Allocation annotations, including their
+    absence, remain exact. Tuple DAGs are merged once per type pair.
+    """
+    cache: dict[tuple[int, int], tuple[Type, Type, Type]] = {}
+
+    def merge(ann: Type, inf: Type) -> Type:
+        key = (id(ann), id(inf))
+        if key in cache:
+            return cache[key][2]
+        result = ann
+        if type(ann) is not type(inf):
+            return ann
+        if isinstance(ann, TupleType) and isinstance(inf, TupleType):
+            if len(ann.types) == len(inf.types):
+                result = TupleType([merge(a, i) for a, i in zip(ann.types, inf.types)])
+        elif isinstance(ann, TileType) and isinstance(inf, TileType):
+            result = TileType(
+                ann.shape,
+                ann.dtype,
+                ann.memref,
+                ann.tile_view if ann.tile_view is not None else inf.tile_view,
+                ann.memory_space if ann.memory_space is not None else inf.memory_space,
+            )
+        elif isinstance(ann, TensorType) and isinstance(inf, TensorType):
+            memref = ann.memref
+            view = ann.tensor_view if ann.tensor_view is not None else inf.tensor_view
+            if isinstance(ann, DistributedTensorType) and isinstance(inf, DistributedTensorType):
+                window = ann.window_buffer
+                result = DistributedTensorType(ann.shape, ann.dtype, memref, view, window)
+            else:
+                result = TensorType(ann.shape, ann.dtype, memref, view)
+        cache[key] = (ann, inf, result)
+        return result
+
+    return merge(annotation, inferred)
+
 
 # Store the original native __init__
 _native_tensor_type_init = TensorType.__init__
@@ -67,17 +112,17 @@ def _tensor_type_init_wrapper(
     memref: MemRef | None = None,
     tensor_view: _TensorViewBase | None = None,
 ):
-    """Wrapped __init__ for TensorType that supports integer shapes, optional MemRef and TensorView.
+    """Forward raw shape extents to TensorType's native validator.
 
     Args:
         shape: Shape dimensions as a sequence of integers or Expr nodes.
-               Integers are automatically converted to ConstInt(dim, DataType.INT64, Span.unknown()).
+               The native constructor validates elements and converts integers to INDEX constants.
         dtype: Element data type
         memref: Optional memory reference
         tensor_view: Optional tensor view information
     """
-    shape_exprs = _normalize_shape(shape)
-    _native_tensor_type_init(self, shape_exprs, dtype, memref, tensor_view)
+    # Pre-normalization would turn bool/float into Exprs before native validation.
+    _native_tensor_type_init(self, shape, dtype, memref, tensor_view)
 
 
 def _tile_type_init_wrapper(
@@ -88,26 +133,25 @@ def _tile_type_init_wrapper(
     tile_view: _TileViewBase | None = None,
     memory_space: MemorySpace | None = None,
 ):
-    """Wrapped __init__ for TileType that supports integer shapes, optional MemRef and TileView.
+    """Forward raw shape extents while preserving Tile memory-space inference.
 
     Args:
         shape: Shape dimensions as a sequence of integers or Expr nodes.
-               Integers are automatically converted to ConstInt(dim, DataType.INT64, Span.unknown()).
+               The native constructor validates elements and converts integers to INDEX constants.
         dtype: Element data type
         memref: Optional memory reference
         tile_view: Optional tile view information
         memory_space: Optional memory space
     """
-    shape_exprs = _normalize_shape(shape)
     if memref is not None and memory_space is None:
         memory_space = _infer_tile_memory_space_from_memref(memref)
-    _native_tile_type_init(self, shape_exprs, dtype, memref, tile_view, memory_space)
+    _native_tile_type_init(self, shape, dtype, memref, tile_view, memory_space)
 
 
-# Monkey-patch the native TensorType.__init__ to support integer shapes
+# Python versions differ in whether nanobind construction uses these patched
+# initializers. Both paths leave shape validation to the native constructor.
 TensorType.__init__ = _tensor_type_init_wrapper
 
-# Monkey-patch the native TileType.__init__ to support integer shapes
 TileType.__init__ = _tile_type_init_wrapper
 
 
@@ -197,4 +241,4 @@ class TileView(metaclass=_TileViewMeta):
     """TileView factory: accepts Expr or int in valid_shape/stride."""
 
 
-__all__ = ["TensorType", "TileType", "TensorView", "TileView"]
+__all__ = ["TensorType", "TileType", "TensorView", "TileView", "_merge_annotation_metadata"]

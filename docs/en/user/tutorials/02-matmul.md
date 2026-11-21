@@ -1,5 +1,9 @@
 # Tiled Matmul
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 The first operator that runs on the cube unit, and the first whose K axis does not fit.
 
 > **Prerequisites:** [Your first operator](00-elementwise.md).
@@ -32,7 +36,8 @@ torch.manual_seed(0)
 a = torch.randn(128, 128, dtype=torch.float16)
 b = torch.randn(128, 128, dtype=torch.float16)
 c = torch.zeros(128, 128, dtype=torch.float32)
-matmul_small(a, b, c, config=RunConfig(platform="a2a3sim"))
+compiled = matmul_small.compile(a, b, c, config=RunConfig(platform="a2a3sim"))
+compiled(a, b, c, config=RunConfig(platform="a2a3sim"))
 assert torch.allclose(c, a.float() @ b.float(), rtol=1e-2, atol=1e-2)
 ```
 

@@ -71,8 +71,8 @@ from .type import (  # also shadows C++ TensorView/TileView with Python subclass
 )
 
 # Export common DataType values for convenience
-FP4 = DataType.FP4
 FP4E2M1X2 = DataType.FP4E2M1X2  # packed carrier (PTOAS / Torch)
+FP4E1M2X2 = DataType.FP4E1M2X2  # packed carrier (PTOAS)
 FP8E4M3FN = DataType.FP8E4M3FN
 FP8E5M2 = DataType.FP8E5M2
 FP8E8M0 = DataType.FP8E8M0  # MX block-scale exponent
@@ -148,11 +148,11 @@ del _directions
 # Register ruff as the format callback for IR printing (best-effort: no-op if ruff is unavailable)
 try:
     if _shutil.which("ruff"):
-        from pypto.ir.formatter import ruff_format as _ruff_format
+        from pypto.ir.formatter import formatting_callback as _formatting_callback
         from pypto.pypto_core import ir as _ir_core
 
-        _ir_core.register_format_callback(_ruff_format)
-        del _ruff_format, _ir_core
+        _ir_core.register_format_callback(_formatting_callback)
+        del _formatting_callback, _ir_core
 except Exception:  # noqa: BLE001
     pass  # Best-effort: formatting is optional
 

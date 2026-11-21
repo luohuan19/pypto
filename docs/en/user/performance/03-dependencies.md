@@ -1,5 +1,9 @@
 # Managing Dependencies
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Why the runtime sometimes runs in sequence what could have run at once, and what to do
 about it.
 
@@ -46,7 +50,8 @@ A = torch.randn(ROWS, COLS, dtype=torch.float32)
 
 def check(kernel):
     out = torch.zeros(ROWS, COLS, dtype=torch.float32)
-    kernel(A, out, config=CFG)
+    compiled = kernel.compile(A, out, config=CFG)
+    compiled(A, out, config=CFG)
     torch.testing.assert_close(out, A * 2.0, rtol=1e-4, atol=1e-4)
 ```
 

@@ -2200,7 +2200,7 @@ class TestScopeTransparentToSSA:
         from pypto.backend import BackendType  # noqa: PLC0415
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
 
             @pl.program
@@ -2257,6 +2257,90 @@ class TestScopeOutlineBoundary:
 
         walk(stmt)
         return out
+
+    def test_scope_dependency_keeps_loop_result_live(self):
+        """A dependency on a scope attr alone must keep the loop's TaskId live."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]) -> pl.Tensor[[128, 128], pl.FP32]:
+                with pl.manual_scope():
+                    with pl.at(level=pl.Level.CORE_GROUP) as seed:
+                        pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+                    for i in pl.range(1):
+                        ready = seed
+                    with pl.at(level=pl.Level.CORE_GROUP, deps=[ready]):
+                        pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+                return c
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration, strict_ssa=True)
+            def main(self, c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]]) -> pl.Tensor[[128, 128], pl.FP32]:
+                with pl.manual_scope():
+                    with pl.at(level=pl.Level.CORE_GROUP) as seed:
+                        pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+                    for i, (incoming,) in pl.range(1, init_values=(seed,)):
+                        ready: pl.Scalar[pl.TASK_ID] = seed
+                        result: pl.Scalar[pl.TASK_ID] = pl.yield_(ready)
+                    with pl.at(level=pl.Level.CORE_GROUP, deps=[result]):
+                        pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+                return c
+
+        After = passes.convert_to_ssa()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    @pytest.mark.parametrize("overwrite_iters", [0, 4])
+    def test_scope_dependency_keeps_incoming_value_across_second_loop(self, overwrite_iters):
+        """The second loop must start with the first loop's result."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                source: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+                c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                with pl.manual_scope():
+                    with pl.at(level=pl.Level.CORE_GROUP) as latest:
+                        pl.store(pl.load(source, [0, 0], [128, 128]), [0, 0], source)
+                    for i in pl.range(1):
+                        ready = latest
+                    with pl.at(level=pl.Level.CORE_GROUP, deps=[latest]) as seed:
+                        pl.store(pl.load(source, [0, 0], [128, 128]), [0, 0], source)
+                    for j in pl.range(overwrite_iters):
+                        ready = seed
+                    with pl.at(level=pl.Level.CORE_GROUP, deps=[ready]):
+                        pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+                return c
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration, strict_ssa=True)
+            def main(
+                self,
+                source: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+                c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                with pl.manual_scope():
+                    with pl.at(level=pl.Level.CORE_GROUP) as latest:
+                        pl.store(pl.load(source, [0, 0], [128, 128]), [0, 0], source)
+                    for i, (initial,) in pl.range(1, init_values=(latest,)):
+                        first: pl.Scalar[pl.TASK_ID] = latest
+                        before_overwrite: pl.Scalar[pl.TASK_ID] = pl.yield_(first)
+                    with pl.at(level=pl.Level.CORE_GROUP, deps=[latest]) as seed:
+                        pl.store(pl.load(source, [0, 0], [128, 128]), [0, 0], source)
+                    for j, (incoming,) in pl.range(overwrite_iters, init_values=(before_overwrite,)):
+                        second: pl.Scalar[pl.TASK_ID] = seed
+                        result: pl.Scalar[pl.TASK_ID] = pl.yield_(second)
+                    with pl.at(level=pl.Level.CORE_GROUP, deps=[result]):
+                        pl.store(pl.load(c, [0, 0], [128, 128]), [0, 0], c)
+                return c
+
+        After = passes.convert_to_ssa()(Before)
+        ir.assert_structural_equal(After, Expected)
 
     def test_scope_blocks_escaping_var_promotion_in_inner_loop(self):
         """Issue #1351. A var first-defined inside ``pl.at`` body must NOT
@@ -2533,6 +2617,67 @@ class TestArbitraryAttrKeyRemap:
         collector.visit_function(main)
         for var in collector.attr_vars:
             assert id(var) in bound, f"Call attr references unbound Var {var.name_hint}"
+
+
+class TestRegisterScopes:
+    """A VF boundary preserves Tile versions and ordinary loop SSA carries."""
+
+    @staticmethod
+    def program(loop_stop=None, chain=False):
+        span = ir.Span.unknown()
+        tile_type = ir.TileType([128], DataType.FP32, memory_space=ir.MemorySpace.Vec)
+        src, dst = ir.Var("src", tile_type, span), ir.Var("dst", tile_type, span)
+        x = ir.Var("x", ir.RegType(64, DataType.FP32, ir.RegKind.VecReg), span)
+        load = ir.AssignStmt(
+            x,
+            ir.create_op_call("reg.load", [src, ir.ConstInt(0, DataType.INDEX, span)], {"lanes": 64}, span),
+            span,
+        )
+        store = ir.AssignStmt(
+            dst,
+            ir.create_op_call("reg.store", [dst, ir.ConstInt(0, DataType.INDEX, span), x], span=span),
+            span,
+        )
+        if chain:
+            # The verifier intentionally accepts only store-return Tile inputs
+            # from outside the region in this fixture; exercise chained stores
+            # through the same destination to test SSA ordering independently.
+            first = ir.Var("first", tile_type, span)
+            store = ir.AssignStmt(
+                first,
+                ir.create_op_call("reg.store", [dst, ir.ConstInt(0, DataType.INDEX, span), x], span=span),
+                span,
+            )
+        if loop_stop is not None:
+            store = ir.ForStmt(
+                ir.Var("i", ir.ScalarType(DataType.INDEX), span),
+                ir.ConstInt(0, DataType.INDEX, span),
+                ir.ConstInt(loop_stop, DataType.INDEX, span),
+                ir.ConstInt(1, DataType.INDEX, span),
+                [],
+                store,
+                [],
+                span,
+            )
+        scope = ir.RegScopeStmt("", ir.SeqStmts([load, store], span), span)
+        body = ir.SeqStmts([scope, ir.ReturnStmt([dst], span)], span)
+        function = ir.Function("kernel", [src, dst], [tile_type], body, span, type=ir.FunctionType.AIV)
+        return ir.Program([function], "RegisterSSA", span)
+
+    def test_same_name_store_version_is_visible_after_scope(self):
+        after = passes.convert_to_ssa()(self.program())
+        function = next(iter(after.functions.values()))
+        assert isinstance(function.body, ir.SeqStmts)
+        scope, returned = function.body.stmts
+        assert isinstance(scope, ir.RegScopeStmt)
+        assert isinstance(scope.body, ir.SeqStmts)
+        assert isinstance(returned, ir.ReturnStmt)
+        store = scope.body.stmts[1]
+        assert isinstance(store, ir.AssignStmt)
+        assert isinstance(store.value, ir.Call)
+        assert returned.value[0] is store.var
+        assert store.var is not function.params[1]
+        assert store.value.args[0] is function.params[1]
 
 
 if __name__ == "__main__":

@@ -22,6 +22,12 @@ namespace pypto {
 namespace ir {
 namespace op_predicates {
 
+/// Whether tile.cast must keep its result disjoint from its source. Widening
+/// casts are unsafe in place on every target. A2/A3 narrowing casts process all
+/// row heads before the tails, so later output rows can overwrite unread input.
+/// Callers without a resolved target must conservatively pass is_a2a3=true.
+bool CastRequiresDisjointSource(const CallPtr& call, bool is_a2a3);
+
 /// Index of the argument a builtin *output-side* op binds its result to.
 ///
 /// These ops do not allocate: they bind a fresh SSA var to a buffer an existing
@@ -41,6 +47,13 @@ namespace op_predicates {
 /// @return the aliased argument index, or nullopt when @p op declares no reuse
 ///         or @p arg_count is too small for the declared index
 [[nodiscard]] std::optional<size_t> BuiltinWritebackArgIndex(const OpPtr& op, size_t arg_count);
+
+/// Immediate source of a physical buffer alias: a Var/IterArg, an in-place
+/// view's first operand, or the registry-declared writeback operand. Returns
+/// nullptr for fresh storage or unknown provenance. This is a storage relation,
+/// not host return lineage; inheriting only a memory space does not suffice.
+/// Shared by borrowed-storage classification and FIFO lifetime analysis.
+[[nodiscard]] ExprPtr GetBufferAliasSource(const ExprPtr& value);
 
 /// True if the Call targets a tpop op (tile.tpop_from_aic / tile.tpop_from_aiv).
 /// Decided by the registry's CrossCoreRole, not by op-name string matching.
@@ -83,7 +96,7 @@ bool IsBufferAliasingViewOp(const std::string& op_name);
 bool OutputInheritsSourceBuffer(const std::string& op_name);
 
 /// True for builtin ops whose name is namespaced `tile.` / `tensor.` /
-/// `system.` / `array.`, or for the distributed context query
+/// `system.` / `array.` / `reg.`, or for the distributed context query
 /// `pld.system.get_comm_ctx`. Builtin ops are never user Functions, so they
 /// carry no callee body and no Out/InOut params to trace.
 ///

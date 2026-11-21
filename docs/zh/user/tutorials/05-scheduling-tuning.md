@@ -1,5 +1,9 @@
 # 调度调优
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 搞清运行时拿你的图做了什么，然后凭证据去改。
 
 > **前置**：[塑形任务图](04-task-graph.md)。
@@ -26,7 +30,8 @@
 ```python
 from pypto.runtime import RunConfig
 
-kernel(a, b, out, config=RunConfig(platform="a2a3sim", enable_dep_gen=True))
+compiled = kernel.compile(a, b, out, config=RunConfig(platform="a2a3sim", enable_dep_gen=True))
+compiled(a, b, out, config=RunConfig(platform="a2a3sim", enable_dep_gen=True))
 ```
 
 然后渲染它：
@@ -47,7 +52,8 @@ viewer 默认输出文本，要图视图得传 `--format html`。
 一张并行的图并不保证并行的执行。swimlane 给出逐任务时序：
 
 ```python
-kernel(a, b, out, config=RunConfig(platform="a2a3sim", enable_chip_swimlane=True))
+compiled = kernel.compile(a, b, out, config=RunConfig(platform="a2a3sim", enable_chip_swimlane=True))
+compiled(a, b, out, config=RunConfig(platform="a2a3sim", enable_chip_swimlane=True))
 ```
 
 > **模拟器注意事项：** 在 `*sim` 平台上这是单趟的，只产出 `chip_swimlane_records.json`。合并后的 `merged_swimlane_*.json` 视图会被**有意跳过**，因为模拟器尚未提供转换器所需的任务元数据。在真机平台上同一个开关会把负载**跑两遍** —— 先一趟 dep_gen 采集图，再一趟干净的计时 —— 因为采集会扰动时序。
@@ -59,7 +65,8 @@ kernel(a, b, out, config=RunConfig(platform="a2a3sim", enable_chip_swimlane=True
 运行时用环来存放在飞的任务。如果某个环饱和了，往图里加并行度不会有任何收益：
 
 ```python
-kernel(a, b, out, config=RunConfig(platform="a2a3sim", enable_scope_stats=True))
+compiled = kernel.compile(a, b, out, config=RunConfig(platform="a2a3sim", enable_scope_stats=True))
+compiled(a, b, out, config=RunConfig(platform="a2a3sim", enable_scope_stats=True))
 ```
 
 ```bash

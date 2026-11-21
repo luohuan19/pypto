@@ -1,5 +1,9 @@
 # 任务粒度
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 派发不是免费的。把 InCore 函数的尺寸定在「核把时间花在算，而不是花在等着被告知算什么」的那个点上。
 
 > **前置**：[读泳道图](00-swimlane.md)。
@@ -63,7 +67,8 @@ def many_small_tasks(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
     return c
 
 c = fresh()
-many_small_tasks(A, B, c, config=CFG)
+compiled = many_small_tasks.compile(A, B, c, config=CFG)
+compiled(A, B, c, config=CFG)
 torch.testing.assert_close(c, A + B, rtol=1e-4, atol=1e-4)
 ```
 
@@ -81,7 +86,8 @@ def larger_tiles(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
     return c
 
 c = fresh()
-larger_tiles(A, B, c, config=CFG)
+compiled = larger_tiles.compile(A, B, c, config=CFG)
+compiled(A, B, c, config=CFG)
 torch.testing.assert_close(c, A + B, rtol=1e-4, atol=1e-4)
 ```
 
@@ -111,7 +117,8 @@ def loop_inside(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
     return c
 
 c = fresh()
-loop_inside(A, B, c, config=CFG)
+compiled = loop_inside.compile(A, B, c, config=CFG)
+compiled(A, B, c, config=CFG)
 torch.testing.assert_close(c, A + B, rtol=1e-4, atol=1e-4)
 ```
 
@@ -149,11 +156,13 @@ def merged_chain(a: pl.Tensor, b: pl.Tensor, out: pl.Out[pl.Tensor]):
 
 expected = torch.exp(A[:LARGE] + B[:LARGE])
 scratch, out = torch.zeros(LARGE, COLS), torch.zeros(LARGE, COLS)
-two_tasks_via_gm(A[:LARGE], B[:LARGE], scratch, out, config=CFG)
+compiled = two_tasks_via_gm.compile(A[:LARGE], B[:LARGE], scratch, out, config=CFG)
+compiled(A[:LARGE], B[:LARGE], scratch, out, config=CFG)
 torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-4)
 
 out = torch.zeros(LARGE, COLS)
-merged_chain(A[:LARGE], B[:LARGE], out, config=CFG)
+compiled = merged_chain.compile(A[:LARGE], B[:LARGE], out, config=CFG)
+compiled(A[:LARGE], B[:LARGE], out, config=CFG)
 torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-4)
 ```
 
@@ -163,13 +172,13 @@ torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-4)
 
 **代价：** 合并后的任务要同时持有每一个中间结果。
 
-> **跨引擎合并不是这一招。** 把一个 cube 操作和一个 vector 操作放进同一个作用域，还需要一个 split 模式 —— 没有 `pl.split(...)` 的话缓冲放不下，编译器会拒绝这个作用域。那个情形是 [mix kernel](02-runtime-overhead.md#build-a-mixed-kernel)；把 `matmul` 和消费它的 vector 操作合并之前先读它。
+> **跨引擎合并不是这一招。** 把 cube 和 vector 操作放进同一个作用域会形成带跨核传输的混合 kernel。如果全宽 vector 工作超出缓冲预算，需要用 `pl.split_aiv` 区域、显式 shard/gather 边界及每 lane 的形状和偏移来分片。把 `matmul` 和消费它的 vector 操作合并之前，先阅读 [mix kernel](02-runtime-overhead.md#build-a-mixed-kernel)。
 
 **怎么确认：** 被合并的任务不再作为独立节点出现在 `deps.json` 里，中间结果的 GM 流量从 kernel 里消失。
 
 ## 另一个方向：太粗
 
-粒度不是单调的。单卡的核数是固定的 —— Ascend910B 上是 **48 个 vector 与 24 个 cube** —— 而一个任务占一个核。
+粒度不是单调的。单卡的核数是固定的 —— Ascend910 上是 **48 个 vector 与 24 个 cube** —— 而一个任务占一个核。
 
 ```text
 太多小任务                  合适                      太少大任务

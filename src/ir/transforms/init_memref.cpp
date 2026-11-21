@@ -9,6 +9,15 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+// Complexity exception for VF initialization validation: allocation and alias
+// lookup remain indexed, but VerifyRegMemoryInitialization visits each helper
+// with its call site's actual views, scalar values and initialized intervals.
+// Its bound is O((N + E) log(N + E)), where E is the sum of helper-body sizes
+// over VF call sites. E can be quadratic in the compact Program size when a
+// large helper is reused many times. In/InOut and alias-return declarations
+// alone cannot prove partially masked initialization. This exception requires
+// approval under .claude/rules/pass-complexity.md before merging.
+
 #include <algorithm>
 #include <any>
 #include <array>
@@ -24,8 +33,11 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/op_rules.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
@@ -55,6 +67,11 @@
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/normalize_stmt_structure.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/reg_memory_analysis.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
+#include "pypto/ir/transforms/utils/simplify.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/transforms/utils/vf_helpers.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 #include "pypto/ir/verifier/verifier.h"
@@ -64,28 +81,116 @@ namespace ir {
 
 namespace {
 
-// A tile owns no general-pool buffer ("buffer-less by design") when its defining
-// value is a cross-core tpop result, or a non-permuting zero-copy view / plain
-// alias chained off a buffer-less source. `source_buffer_less` reports whether a
-// source Var is itself buffer-less (the MemRef-creating mutator queries the type;
-// the HasMemRefs verifier consults its tracked set). tile.transpose is excluded —
-// pto.ttrans is not in-place safe and always needs a fresh buffer.
-template <typename SourceBufferLess>
-bool ProducesBufferLessTile(const ExprPtr& value, const SourceBufferLess& source_buffer_less) {
-  if (auto call = std::dynamic_pointer_cast<const Call>(value)) {
-    if (!call->op_) return false;
-    if (IsOp(call, "tile.tpop_from_aic") || IsOp(call, "tile.tpop_from_aiv")) {
-      return true;
-    }
-    if (op_predicates::IsBufferAliasingViewOp(call->op_->name_) && !call->args_.empty()) {
-      auto in = AsVarLike(call->args_[0]);
-      return in && source_buffer_less(in.get());
-    }
-    return false;
+// A receive owns its FIFO slot. Views, physical writebacks and VF results can
+// borrow that slot under fresh SSA names. Both allocation and HasMemRefs need
+// the identity of the receive to distinguish two MemRef-less branch inputs.
+class BorrowedTileRoots {
+ public:
+  [[nodiscard]] const Var* Find(const ExprPtr& value) const {
+    auto var = AsVarLike(value);
+    auto it = roots_.find(var.get());
+    return it == roots_.end() ? nullptr : it->second;
   }
-  auto v = AsVarLike(value);
-  return v && source_buffer_less(v.get());
-}
+
+  [[nodiscard]] const Var* Definition(const VarPtr& result, const ExprPtr& value) const {
+    if (op_predicates::IsTPop(As<Call>(value))) return result.get();
+    return Find(op_predicates::GetBufferAliasSource(value));
+  }
+
+  void Bind(const VarPtr& result, const Var* root) {
+    if (root) roots_[result.get()] = root;
+  }
+
+  void BindAlias(const VarPtr& result, const ExprPtr& source) { Bind(result, Find(source)); }
+
+ private:
+  std::map<const Var*, const Var*> roots_;
+};
+
+// Call results are flat tuples of captured Tiles. Preserve their actual views
+// across copies and control flow until a projection selects one. A null field
+// has no common caller operand and uses the ordinary projection lowering.
+class VFReturnTuples {
+ public:
+  struct Storage {
+    TypePtr type;
+    const Var* root = nullptr;  // Canonical FIFO receive for a borrowed Tile.
+  };
+
+  void Record(const VarPtr& result, const std::vector<ExprPtr>& args, const BorrowedTileRoots& borrowed) {
+    auto& fields = fields_[result.get()];
+    fields.clear();
+    fields.reserve(args.size());
+    for (const auto& arg : args) fields.push_back({arg->GetType(), borrowed.Find(arg)});
+  }
+
+  [[nodiscard]] const std::vector<Storage>* Find(const ExprPtr& value) const {
+    auto var = AsVarLike(value);
+    auto it = fields_.find(var.get());
+    return it == fields_.end() ? nullptr : &it->second;
+  }
+
+  void Copy(const VarPtr& result, const ExprPtr& source) {
+    if (const auto* fields = Find(source)) fields_[result.get()] = *fields;
+  }
+
+  [[nodiscard]] const Storage* Project(const ExprPtr& value) const {
+    auto item = As<TupleGetItemExpr>(value);
+    if (!item) return nullptr;
+    const auto* fields = Find(item->tuple_);
+    if (!fields) return nullptr;
+    INTERNAL_CHECK_SPAN(item->index_ >= 0 && static_cast<size_t>(item->index_) < fields->size(), item->span_)
+        << "Internal error: VF return projection out of bounds";
+    const auto& field = (*fields)[item->index_];
+    return field.type ? &field : nullptr;
+  }
+
+  void Join(const VarPtr& result, const ExprPtr& lhs, const ExprPtr& rhs) {
+    const auto* left = Find(lhs);
+    const auto* right = Find(rhs);
+    if (!left || !right || left->size() != right->size()) return;
+    auto fields = *left;
+    auto tuple = As<TupleType>(result->GetType());
+    INTERNAL_CHECK_SPAN(tuple && tuple->types_.size() == fields.size(), result->span_)
+        << "Internal error: VF tuple arity changed at control-flow join";
+    for (size_t i = 0; i < fields.size(); ++i) {
+      auto& field = fields[i];
+      const auto& other = (*right)[i];
+      if (field.type == other.type && field.root == other.root) continue;
+      if (field.root && field.root == other.root) {
+        // Different views can borrow one slot. Preserve the join's logical
+        // view rather than imposing one branch's metadata on both paths.
+        field.type =
+            CloneTypeWithMemRef(tuple->types_[i], std::nullopt, As<TileType>(field.type)->memory_space_);
+      } else {
+        field = {};
+      }
+    }
+    fields_[result.get()] = std::move(fields);
+  }
+
+  void JoinBranches(const IfStmtPtr& branch, const YieldStmtPtr& lhs, const YieldStmtPtr& rhs) {
+    if (!lhs || !rhs) return;
+    for (size_t i = 0; i < branch->return_vars_.size() && i < lhs->value_.size() && i < rhs->value_.size();
+         ++i) {
+      if (As<TupleType>(branch->return_vars_[i]->GetType())) {
+        Join(branch->return_vars_[i], lhs->value_[i], rhs->value_[i]);
+      }
+    }
+  }
+
+  void JoinLoop(const std::vector<VarPtr>& results, const std::vector<IterArgPtr>& carries,
+                const StmtPtr& body) {
+    auto yield = transform_utils::GetLastYieldStmt(body);
+    if (!yield) return;
+    for (size_t i = 0; i < results.size() && i < carries.size() && i < yield->value_.size(); ++i) {
+      if (As<TupleType>(results[i]->GetType())) Join(results[i], carries[i], yield->value_[i]);
+    }
+  }
+
+ private:
+  std::map<const Var*, std::vector<Storage>> fields_;
+};
 
 /// Byte envelope of a static slice of an NZ-boxed accumulator (L0C) parent.
 ///
@@ -186,68 +291,6 @@ std::optional<uint64_t> StaticSliceViewSpanBytes(const CallPtr& call, const Shap
 // Compiler-owned PTO level3 scratch (A2/A3 under PyPTO/DSA-RP planners only).
 constexpr int64_t kA2A3CiScratchColsInt32 = 192;
 constexpr int64_t kA2A3CiScratchColsInt16 = 448;
-// PTOAS v0.60 makeTCvtTmpType head block: 4 bytes * 64 cols * min(cols/64, 255).
-constexpr int64_t kTcvtHeadBlockCols = 64;
-constexpr int64_t kTcvtHeadBlockBytes = 4;
-constexpr int64_t kTcvtHeadMaxBlocks = 255;
-constexpr int64_t kTcvtTailRowBytes = 32;
-constexpr int64_t kTcvtFp16HalfToI8Base = 128;
-constexpr int64_t kTcvtMinScratchBytes = 32;
-constexpr int64_t kTcvtScratchAlignBytes = 32;
-
-int64_t CeilDivI64(int64_t num, int64_t den) { return (num + den - 1) / den; }
-
-/// Non-saturating A2/A3 pto.tcvt forms whose ISA implementation needs a tmp.
-/// Mirrors PTOAS v0.60 `makeTCvtTmpType` for FP32->INT16 and FP16->{INT16,INT8,UINT8}.
-///
-/// Excludes INT4: pto-isa routes FP16<->INT4 through saturating `vconv_f162s4*`
-/// without a TmpTileData operand (`kIsNarrowingCvt` does not cover int4). PTOAS
-/// level3 therefore does not require an explicit tcvt tmp for those casts.
-bool TcvtNeedsLevel3Scratch(DataType src, DataType dst) {
-  if (src == DataType::FP32 && dst == DataType::INT16) return true;
-  return src == DataType::FP16 && (dst == DataType::INT16 || dst == DataType::INT8 || dst == DataType::UINT8);
-}
-
-/// Match PTOAS v0.60's makeTCvtTmpType capacity calculation. The returned byte
-/// count is represented as an i8 scratch tile so the shape is also its capacity.
-int64_t TcvtScratchCapacityBytes(const TileTypePtr& src_tile, DataType dst, const Span& span) {
-  const auto src_shape = src_tile->shape_;
-  const auto valid_shape = GetValidShape(src_tile);
-  CHECK_SPAN(src_shape.size() == 2 && valid_shape.size() == 2, span)
-      << "InitMemRef: A2/A3 narrowing tile.cast scratch requires a 2D source tile";
-  auto rows_ci = As<ConstInt>(valid_shape[0]);
-  auto cols_ci = As<ConstInt>(valid_shape[1]);
-  auto src_cols_ci = As<ConstInt>(src_shape[1]);
-  CHECK_SPAN(rows_ci && cols_ci && src_cols_ci, span)
-      << "InitMemRef: A2/A3 non-saturating narrowing tile.cast requires static source shape "
-         "and valid_shape to size its level3 scratch tile";
-
-  const int64_t rows = rows_ci->value_;
-  const int64_t cols = cols_ci->value_;
-  const int64_t src_cols = src_cols_ci->value_;
-  int64_t bytes = 0;
-  if (src_tile->dtype_ == DataType::FP32) {
-    if (rows > 0 && cols > 0) {
-      const int64_t head = kTcvtHeadBlockBytes * kTcvtHeadBlockCols *
-                           std::min<int64_t>(cols / kTcvtHeadBlockCols, kTcvtHeadMaxBlocks);
-      const int64_t remainder = cols % kTcvtHeadBlockCols;
-      const int64_t tail =
-          remainder == 0
-              ? 0
-              : kTcvtTailRowBytes * ((std::min<int64_t>(rows, kTcvtHeadMaxBlocks) - 1) * (src_cols / 8) +
-                                     CeilDivI64(remainder, 8));
-      bytes = std::max(head, tail);
-    }
-  } else if (src_tile->dtype_ == DataType::FP16 && cols > 0) {
-    const int64_t width = std::min<int64_t>(cols, kTcvtHeadBlockCols);
-    const int64_t half_to_i16 = kTcvtTailRowBytes * CeilDivI64(width, 8);
-    const int64_t half_to_i8 =
-        std::max(half_to_i16, kTcvtFp16HalfToI8Base + kTcvtTailRowBytes * CeilDivI64(width, 16));
-    bytes = (dst == DataType::INT8 || dst == DataType::UINT8) ? half_to_i8 : half_to_i16;
-  }
-  return std::max<int64_t>(kTcvtMinScratchBytes,
-                           CeilDivI64(bytes, kTcvtScratchAlignBytes) * kTcvtScratchAlignBytes);
-}
 
 ExprPtr MakeStaticShape(const std::vector<int64_t>& dims, const Span& span) {
   std::vector<ExprPtr> elements;
@@ -258,23 +301,72 @@ ExprPtr MakeStaticShape(const std::vector<int64_t>& dims, const Span& span) {
   return std::make_shared<MakeTuple>(std::move(elements), span);
 }
 
+// A private tile.create used only as scratch can keep its allocation. Other
+// uses (including view construction and loop initializers) may require a
+// differently typed native window parent over the same storage.
+class PrivateScratchAnalysis : public IRVisitor {
+ public:
+  explicit PrivateScratchAnalysis(const StmtPtr& body) { VisitStmt(body); }
+
+  [[nodiscard]] bool IsPrivate(const ExprPtr& expression) const {
+    const auto var = AsVarLike(expression);
+    const auto tile = var ? As<TileType>(var->GetType()) : nullptr;
+    return var && created_.count(var.get()) && !other_uses_.count(var.get()) && tile &&
+           (!tile->memref_ || !(*tile->memref_)->is_pinned_);
+  }
+
+ protected:
+  void VisitStmt_(const AssignStmtPtr& statement) override {
+    if (IsOp(As<Call>(statement->value_), "tile.create")) created_.insert(statement->var_.get());
+    VisitExpr(statement->value_);
+  }
+  void VisitExpr_(const CallPtr& call) override {
+    for (size_t i = 0; i < call->args_.size(); ++i) {
+      if (i != 2 || !IsOp(call, "tile.gather_compare")) VisitExpr(call->args_[i]);
+    }
+  }
+  void VisitVarLike_(const VarPtr& var) override { other_uses_.insert(var.get()); }
+  void VisitExpr_(const IterArgPtr& argument) override { other_uses_.insert(argument.get()); }
+  void VisitStmt_(const ForStmtPtr& loop) override {
+    for (const auto& argument : loop->iter_args_) VisitExpr(argument->initValue_);
+    IRVisitor::VisitStmt_(loop);
+  }
+  void VisitStmt_(const WhileStmtPtr& loop) override {
+    for (const auto& argument : loop->iter_args_) VisitExpr(argument->initValue_);
+    IRVisitor::VisitStmt_(loop);
+  }
+
+ private:
+  std::set<const Var*> created_;
+  std::set<const Var*> other_uses_;
+};
+
 struct PtoScratchSpec {
   ExprPtr shape;
   DataType dtype;
   std::string name_component;
+  std::optional<size_t> replace_arg = std::nullopt;
 };
 
-/// Materialize level3 scratch before MemRef collection.
+/// Materialize scratch before MemRef collection.
+///
+/// In addressless A2/A3 code, aliased gather scratch gets a private allocation.
+/// Workspace operands carry no caller-readable result (the registry contract),
+/// so no copy is needed. This keeps native window parents valid in both Tile
+/// and Buffer IR without moving allocations into either emitter.
 ///
 /// Optional compiler-owned scratch (`tile.ci`, narrowing `tile.cast`, required
 /// `tile.sort32`) is inserted only when absent. Caller-owned tmp operands on
 /// `tile.sel` / `tile.sels` / `tile.prelu` are preserved when present; those
 /// ops require an explicit tmp in the IR, so this pass never synthesizes one
 /// for them. `tile.col_sum` / `tile.row_expand_add` likewise keep caller tmp.
-class MaterializePtoLevel3ScratchMutator : public IRMutator {
+class MaterializePtoScratchMutator : public IRMutator {
  public:
-  explicit MaterializePtoLevel3ScratchMutator(bool materialize_a2a3_scratch)
-      : materialize_a2a3_scratch_(materialize_a2a3_scratch) {}
+  explicit MaterializePtoScratchMutator(const backend::Backend* target,
+                                        const StmtPtr& addressless_body = nullptr)
+      : backend_(target), materialize_a2a3_scratch_(target->GetHandler()->RequiresLevel3TmpScratch()) {
+    if (addressless_body) private_scratch_.emplace(addressless_body);
+  }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto call = As<Call>(op->value_);
@@ -295,7 +387,11 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
     auto scratch_assign = std::make_shared<AssignStmt>(scratch_var, scratch_create, op->span_);
 
     std::vector<ExprPtr> args = call->args_;
-    args.push_back(scratch_var);
+    if (spec->replace_arg) {
+      args[*spec->replace_arg] = scratch_var;
+    } else {
+      args.push_back(scratch_var);
+    }
     auto new_call = std::make_shared<Call>(call->op_, std::move(args), call->kwargs_, call->attrs_,
                                            call->GetType(), call->span_);
     auto new_assign = MutableCopy(op);
@@ -305,6 +401,20 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
 
  private:
   std::optional<PtoScratchSpec> GetScratchSpec(const CallPtr& call, const Span& span) const {
+    if (private_scratch_) {
+      if (!IsOp(call, "tile.gather_compare") || call->args_.size() != 3 ||
+          private_scratch_->IsPrivate(call->args_[2])) {
+        return std::nullopt;
+      }
+      const auto workspace = backend::StaticLogicalBufferDescriptor(call->args_[2]->GetType());
+      // Preserve caller validation: do not silently repair invalid shapes,
+      // layouts, validity, or capacity while isolating an otherwise dense alias.
+      if (!backend::IsAlignedDenseVecBuffer(workspace) || workspace->dtype_ != DataType::UINT8 ||
+          workspace->shape_[0] != 1 || workspace->valid_shape_ != workspace->shape_) {
+        return std::nullopt;
+      }
+      return PtoScratchSpec{MakeStaticShape(workspace->shape_, span), DataType::UINT8, "gather", 2};
+    }
     if (IsOp(call, "tile.ci") && call->args_.size() == 2) {
       if (!materialize_a2a3_scratch_) return std::nullopt;
       auto result_type = As<TileType>(call->GetType());
@@ -316,24 +426,20 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
     }
 
     if (IsOp(call, "tile.cast") && call->args_.size() == 1) {
-      if (!materialize_a2a3_scratch_) return std::nullopt;
       auto src_type = As<TileType>(call->args_[0]->GetType());
       INTERNAL_CHECK_SPAN(src_type, span) << "tile.cast source must be TileType before InitMemRef";
       const DataType dst = call->GetKwarg<DataType>("target_type");
-      if (!TcvtNeedsLevel3Scratch(src_type->dtype_, dst)) return std::nullopt;
-      // The scratch exists only for PTOAS's *non-saturating* narrowing helper,
-      // which emulates the target's overflow behavior with a chunked vector
-      // sequence. A saturating cast is a native conversion that takes no tmp, so
-      // synthesizing one would allocate Vec memory the emitted `pto.tcvt` never
-      // reads. Every pair reaching here narrows to an integer, whose default is
-      // saturating, so only a cast that explicitly opted out needs the buffer. A
-      // caller-supplied tmp is untouched either way: this arm only runs for the
-      // 1-argument form.
-      if (GetSaturationMode(call) != static_cast<int>(SaturationMode::kOff)) {
-        return std::nullopt;
-      }
-      const int64_t bytes = TcvtScratchCapacityBytes(src_type, dst, span);
-      return PtoScratchSpec{MakeStaticShape({1, bytes}, span), DataType::INT8, "tcvt"};
+      // Ask the backend whether this conversion needs scratch. Caller-provided
+      // scratch is preserved because this arm only handles one-argument casts.
+      const bool saturating = GetEmittedSaturationMode(call) == static_cast<int>(SaturationMode::kOn);
+      const auto plan =
+          backend_->PlanOpScratch("tile.cast", {src_type->dtype_, std::nullopt, dst, saturating, src_type});
+      INTERNAL_CHECK_SPAN(plan, span) << "Internal error: tile.cast scratch rule is not registered";
+      if (plan->status == backend::OpScratchStatus::NotRequired) return std::nullopt;
+      CHECK_SPAN(plan->status == backend::OpScratchStatus::Required, span) << "InitMemRef: " << plan->reason;
+      INTERNAL_CHECK_SPAN(plan->spec, span) << "Internal error: required cast scratch has no spec";
+      const auto& spec = *plan->spec;
+      return PtoScratchSpec{MakeStaticShape({spec.rows, spec.cols}, span), spec.dtype, "tcvt"};
     }
 
     if (IsOp(call, "tile.sort32") && call->args_.size() == 2) {
@@ -350,6 +456,8 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
     return std::nullopt;
   }
 
+  const backend::Backend* backend_;
+  std::optional<PrivateScratchAnalysis> private_scratch_;
   bool materialize_a2a3_scratch_ = false;
   std::size_t scratch_counter_ = 0;
 };
@@ -469,15 +577,11 @@ class DeclaredAllocCollector : public IRVisitor {
 class InitMemRefMutator : public IRMutator {
  public:
   InitMemRefMutator(const DeclaredAllocMap& declared_allocs, const backend::BackendHandler* handler,
-                    FunctionType func_type)
-      : declared_allocs_(declared_allocs), handler_(handler), func_type_(func_type) {}
-
-  /// Whether `type` is bound to one of this function's declared allocations.
-  [[nodiscard]] bool HasUserBinding(const TypePtr& type) const {
-    if (declared_allocs_.empty()) return false;
-    auto binding = GetDeclaredAlloc(type);
-    return binding && declared_allocs_.count(binding->base_.get()) > 0;
-  }
+                    FunctionType func_type, ProgramPtr program)
+      : declared_allocs_(declared_allocs),
+        handler_(handler),
+        func_type_(func_type),
+        program_(std::move(program)) {}
 
   /// The MemRef a user binding asks for, sized to the slot it selects.
   /// Returns nullopt when `type` carries no binding.
@@ -607,7 +711,10 @@ class InitMemRefMutator : public IRMutator {
         old_var_expr->GetType(), memref, [this](const ExprPtr& expr) { return VisitExpr(expr); },
         source_memory_space);
 
-    return std::make_shared<IterArg>(iter_arg->name_hint_, new_type, new_init, iter_arg->span_);
+    auto result = std::make_shared<IterArg>(iter_arg->name_hint_, new_type, new_init, iter_arg->span_);
+    borrowed_.BindAlias(result, new_init);
+    vf_returns_.Copy(result, new_init);
+    return result;
   }
 
   // Process normal Var variable (creates new MemRef based on usage)
@@ -701,6 +808,22 @@ class InitMemRefMutator : public IRMutator {
     return std::static_pointer_cast<const Expr>(GetNewVar(var_ptr));
   }
 
+  /// Validate a declaration against the storage an alias actually inherits.
+  /// Type deduction and SSA can carry the source's pinned declaration onto an
+  /// unannotated result (notably gather_row). Its presence alone is therefore
+  /// not a request for another buffer. Resolve it to a byte address before
+  /// comparing: base identity alone would also accept a different slot, while
+  /// MemRef pointer equality would reject independently rebuilt equal indices.
+  void CheckAliasBinding(const AssignStmtPtr& op, const MemRefPtr& inherited) const {
+    auto requested = UserBoundMemRef(op->var_->GetType());
+    if (!requested) return;
+    CHECK_SPAN(inherited && CompareBaseAddress(*requested, inherited) == AddressRelation::kSame,
+               op->var_->span_)
+        << "Tile '" << op->var_->name_hint_
+        << "' lands in its source tile's allocation, but its binding selects a different or "
+           "unproven address. Bind the source tile instead.";
+  }
+
   /**
    * @brief Create a view MemRef from a source expression for the LHS variable of an assignment.
    *
@@ -710,17 +833,39 @@ class InitMemRefMutator : public IRMutator {
    */
   StmtPtr ShareMemRefFrom(const ExprPtr& source, const AssignStmtPtr& op, const ExprPtr& new_value) {
     auto parent_memref_opt = GetTypeMemRef(source->GetType());
-    if (!parent_memref_opt.has_value()) return nullptr;
+    if (!parent_memref_opt.has_value()) {
+      CheckAliasBinding(op, nullptr);
+      return nullptr;
+    }
     const auto& parent_memref = *parent_memref_opt;
+
+    // A nested slice can narrow a strided window's byte envelope back to its
+    // dense size without removing the parent's row gaps. Preserve that fact
+    // through every storage-sharing view instead of inferring it at codegen
+    // from only the final MemRef size.
+    bool non_dense_source = non_dense_view_memrefs_.count(parent_memref) != 0;
+    if (auto parent_tile = As<TileType>(source->GetType())) {
+      const auto dense_bytes = utils::StaticPhysicalAllocationBytes(parent_tile, MemorySpace::Vec, handler_);
+      non_dense_source = non_dense_source || !dense_bytes || *dense_bytes != parent_memref->size_;
+    }
+    if (auto call = As<Call>(new_value); call && IsOp(call, "tile.reinterpret_view")) {
+      auto source_tile = As<TileType>(source->GetType());
+      auto result_tile = As<TileType>(op->var_->GetType());
+      const bool fp4_alias = (source_tile && source_tile->dtype_.IsPackedFp4()) ||
+                             (result_tile && result_tile->dtype_.IsPackedFp4());
+      // A reverse packed-to-byte alias drops the same pitch/offset metadata as
+      // byte-to-packed, so neither direction can hide a strided ancestor.
+      CHECK_SPAN(!fp4_alias || (!non_dense_source && As<ConstInt>(parent_memref->byte_offset_)), call->span_)
+          << "FP4E2M1X2 UB alias requires a contiguous byte-carrier tile with a static UB offset; "
+             "unsupported slice provenance survives nested slices, aliases and reshapes. Slice the "
+             "GM tensor and load the window instead";
+    }
 
     // Compute additional byte offset from the view op (if applicable)
     ExprPtr additional_offset = MakeZeroByteOffset();
     if (auto call = As<Call>(new_value)) {
       additional_offset = ComputeViewByteOffset(call, source->GetType());
     }
-
-    // Accumulate: total_offset = parent.byte_offset + additional_offset
-    ExprPtr total_offset = AddByteOffsets(parent_memref->byte_offset_, additional_offset);
 
     auto source_ms = ExtractMemorySpaceFromType(source->GetType());
 
@@ -742,20 +887,11 @@ class InitMemRefMutator : public IRMutator {
       }
     }
 
-    // For pure aliases (no offset change, same size), share the SAME MemRef shared_ptr
-    // to preserve base_ Ptr identity. MemoryReuse builds sharing groups by base_ Ptr —
-    // variables sharing the same base_ are merged into one lifetime group.
-    bool is_pure_alias = (view_size == parent_memref->size_);
-    if (is_pure_alias) {
-      if (auto const_offset = As<ConstInt>(additional_offset)) {
-        is_pure_alias = (const_offset->value_ == 0);
-      } else {
-        is_pure_alias = false;
-      }
-    }
-    MemRefPtr view_memref = is_pure_alias
-                                ? parent_memref
-                                : std::make_shared<MemRef>(parent_memref->base_, total_offset, view_size);
+    // Full aliases share the exact MemRef; subviews retain the source's slots
+    // while narrowing the window. Later reanchoring uses the same construction.
+    MemRefPtr view_memref = MakeAliasingMemRef(parent_memref, additional_offset, view_size, op->span_);
+    CheckAliasBinding(op, view_memref);
+    if (non_dense_source) non_dense_view_memrefs_.insert(view_memref);
 
     std::optional<MemRefPtr> view_opt = view_memref;
     TypePtr new_type = CloneTypeWithMemRefAndRemapExprs(
@@ -767,9 +903,11 @@ class InitMemRefMutator : public IRMutator {
 
   // Rebuild an AssignStmt whose LHS tile var keeps its TileType + memory_space but
   // carries no MemRef. Used for tiles that own no general-pool buffer: cross-core
-  // tpop results and zero-copy views over them (codegen lowers those to
+  // tpop results and their physical writebacks / zero-copy views (codegen lowers views to
   // pto.treshape over the source rather than a fresh alloc_tile).
-  StmtPtr MakeMemRefLessAssign(const AssignStmtPtr& op, const ExprPtr& new_value) {
+  StmtPtr MakeMemRefLessAssign(const AssignStmtPtr& op, const ExprPtr& new_value, const Var* root) {
+    // A FIFO slot has no statically provable allocation address.
+    CheckAliasBinding(op, nullptr);
     auto var_expr = std::static_pointer_cast<const Expr>(op->var_);
     if (auto tile_type = std::dynamic_pointer_cast<const TileType>(var_expr->GetType())) {
       for (size_t i = 0; i < tile_type->shape_.size(); ++i) {
@@ -785,38 +923,62 @@ class InitMemRefMutator : public IRMutator {
         ResolveTileMemorySpace(var_expr->GetType()));
     auto new_var = std::make_shared<Var>(op->var_->name_hint_, new_type, op->var_->span_);
     var_map_[op->var_] = new_var;
+    borrowed_.Bind(new_var, root);
     return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
+  }
+
+  // A VF result denotes exactly the argument's view, including MemRef-less
+  // cross-core pipe views. It never owns a new allocation.
+  StmtPtr BindVFResult(const VFReturnTuples::Storage& storage, const AssignStmtPtr& op,
+                       const ExprPtr& value) {
+    CheckAliasBinding(op, GetTypeMemRef(storage.type).value_or(nullptr));
+    auto var = std::make_shared<Var>(op->var_->name_hint_, storage.type, op->var_->span_);
+    borrowed_.Bind(var, storage.root);
+    var_map_[op->var_] = var;
+    return std::make_shared<AssignStmt>(var, value, op->span_, op->leading_comments_);
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     // First visit the value (RHS)
     auto new_value = VisitExpr(op->value_);
 
-    // A tile that owns no general-pool buffer — a cross-core tpop result (its
-    // data lives in the reserved C2V/V2C slot, addressed via the pipe), or a
-    // zero-copy view / plain alias chained off one — stays MemRef-less, so
-    // AllocateMemoryAddr reserves no phantom buffer and no fresh, disconnected
-    // buffer is created.
-    if (As<TileType>(op->var_->GetType()) && ProducesBufferLessTile(new_value, [](const Var* v) {
-          return !GetTypeMemRef(v->GetType()).has_value();
-        })) {
-      return MakeMemRefLessAssign(op, new_value);
+    if (auto call = As<Call>(new_value)) {
+      if (auto helper = ResolveVFCall(call, program_)) {
+        auto aliases = VFReturnedArguments(helper, call);
+        // Call result caches must use the actual borrowed views too. A formal
+        // may retain an explicit layout that caller canonicalization removed.
+        std::vector<TypePtr> types;
+        types.reserve(aliases.size());
+        for (const auto& alias : aliases) types.push_back(alias->GetType());
+        TypePtr type = types.size() == 1 ? types[0] : std::make_shared<TupleType>(types);
+        auto value =
+            std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_, type, call->span_);
+        if (aliases.size() == 1) return BindVFResult({type, borrowed_.Find(aliases[0])}, op, value);
+        auto var = std::make_shared<Var>(op->var_->name_hint_, type, op->var_->span_);
+        var_map_[op->var_] = var;
+        vf_returns_.Record(var, aliases, borrowed_);
+        return std::make_shared<AssignStmt>(var, value, op->span_, op->leading_comments_);
+      }
+    }
+    if (vf_returns_.Find(new_value)) {
+      auto var = std::make_shared<Var>(op->var_->name_hint_, new_value->GetType(), op->var_->span_);
+      var_map_[op->var_] = var;
+      vf_returns_.Copy(var, new_value);
+      return std::make_shared<AssignStmt>(var, new_value, op->span_, op->leading_comments_);
+    }
+    if (auto storage = vf_returns_.Project(new_value)) return BindVFResult(*storage, op, new_value);
+
+    // FIFO storage is provided by the pipe. Follow physical aliases before
+    // allocating a Tile, including writebacks with a fresh SSA result.
+    if (As<TileType>(op->var_->GetType())) {
+      if (auto root = borrowed_.Definition(op->var_, new_value)) {
+        return MakeMemRefLessAssign(op, new_value, root);
+      }
     }
 
-    // Check if the RHS is a Call expression
-    if (auto call = std::dynamic_pointer_cast<const Call>(op->value_)) {
+    if (auto call = As<Call>(op->value_)) {
       LOG_DEBUG << "Processing AssignStmt for " << op->var_->name_hint_ << " with call to "
                 << call->op_->name_;
-
-      // A view / in-place result physically IS its source's buffer, so binding
-      // it to a different one cannot be honored. Say so instead of silently
-      // dropping the binding — the user asked for something impossible.
-      CHECK_SPAN(!op_predicates::OutputInheritsSourceBuffer(call->op_->name_) ||
-                     !HasUserBinding(op->var_->GetType()),
-                 op->var_->span_)
-          << "Tile '" << op->var_->name_hint_ << "' is produced by '" << call->op_->name_
-          << "', which lands in its source tile's allocation, so it cannot be given one of its own. "
-             "Bind the source tile instead.";
 
       // Handle view operations: output should share MemRef with input tile.
       // A pure metadata view (slice/reshape/...) inherits its input's buffer.  A
@@ -883,6 +1045,24 @@ class InitMemRefMutator : public IRMutator {
     return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
   }
 
+  StmtPtr VisitStmt_(const SimtLaunchStmtPtr& op) override {
+    auto launch = MutableCopy(op);
+    for (auto& dim : launch->block_dims_) dim = VisitExpr(dim);
+    for (auto& arg : launch->args_) arg = VisitExpr(arg);
+    for (size_t i = 0; i < launch->results_.size(); ++i) {
+      // MaterializeSimtOutputs has already selected (and initialized) the
+      // writable Tile storage. GM results are reference updates. Neither kind
+      // allocates another buffer at the result definition.
+      const auto& argument = launch->args_[launch->result_param_indices_[i]];
+      auto result =
+          std::make_shared<Var>(op->results_[i]->name_hint_, argument->GetType(), op->results_[i]->span_);
+      borrowed_.BindAlias(result, argument);
+      var_map_[op->results_[i]] = result;
+      launch->results_[i] = std::move(result);
+    }
+    return launch;
+  }
+
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     // Manual traversal of ForStmt fields to ensure correct MemRef assignment:
     // - iter_args inherit MemRef from initValue (via ProcessIterArg)
@@ -943,6 +1123,7 @@ class InitMemRefMutator : public IRMutator {
     new_for->iter_args_ = new_iter_args;
     new_for->body_ = new_body;
     new_for->return_vars_ = new_return_vars;
+    vf_returns_.JoinLoop(new_return_vars, new_iter_args, new_body);
 
     // Patch return_vars so each shares its iter_arg's MemRef (inherited from initValue).
     // This establishes the invariant that initValue/iter_arg/return_var all share the
@@ -965,6 +1146,25 @@ class InitMemRefMutator : public IRMutator {
     return new_for;
   }
 
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    auto result = IRMutator::VisitStmt_(op);
+    auto loop = As<WhileStmt>(result);
+    if (!loop || loop->return_vars_.empty()) return result;
+    vf_returns_.JoinLoop(loop->return_vars_, loop->iter_args_, loop->body_);
+    // Match the ForStmt invariant: the result is the carried storage even if
+    // the loop executes zero times. A fresh return MemRef would lose both
+    // alias identity and initialization established before the loop.
+    auto get_iter_arg_var = [&](size_t i) -> VarPtr {
+      return i < loop->iter_args_.size() ? loop->iter_args_[i] : nullptr;
+    };
+    auto [patched, changed] =
+        PatchReturnVarsFromYield(loop->return_vars_, op->return_vars_, get_iter_arg_var);
+    if (!changed) return result;
+    auto patched_loop = MutableCopy(loop);
+    patched_loop->return_vars_ = std::move(patched);
+    return patched_loop;
+  }
+
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
     auto result = IRMutator::VisitStmt_(op);
     auto new_if = As<IfStmt>(result);
@@ -972,12 +1172,22 @@ class InitMemRefMutator : public IRMutator {
 
     auto then_yield = FindYieldStmt(new_if->then_body_);
     auto else_yield = new_if->else_body_.has_value() ? FindYieldStmt(new_if->else_body_.value()) : nullptr;
+    vf_returns_.JoinBranches(new_if, then_yield, else_yield);
     if (!then_yield && !else_yield) return result;
 
     auto get_yield_var = [&](size_t i) -> VarPtr {
-      VarPtr var = nullptr;
-      if (then_yield && i < then_yield->value_.size()) var = As<Var>(then_yield->value_[i]);
-      if (!var && else_yield && i < else_yield->value_.size()) var = As<Var>(else_yield->value_[i]);
+      auto then_var =
+          then_yield && i < then_yield->value_.size() ? AsVarLike(then_yield->value_[i]) : nullptr;
+      auto else_var =
+          else_yield && i < else_yield->value_.size() ? AsVarLike(else_yield->value_[i]) : nullptr;
+      auto var = then_var ? then_var : else_var;
+      if (auto tile = var ? As<TileType>(var->GetType()) : nullptr; tile && !tile->memref_) {
+        // Only a single borrowed slot can remain an alias after the join.
+        // Distinct slots need the ordinary allocated phi and branch copies:
+        // lifetime analysis cannot tie the selected handle to either slot.
+        auto root = borrowed_.Find(then_var);
+        if (!root || root != borrowed_.Find(else_var)) return nullptr;
+      }
       return var;
     };
     auto [patched, changed] = PatchReturnVarsFromYield(new_if->return_vars_, op->return_vars_, get_yield_var);
@@ -990,7 +1200,7 @@ class InitMemRefMutator : public IRMutator {
   }
 
  private:
-  // Shared logic for ForStmt/IfStmt: patch each return_var to share its yield value's MemRef.
+  // Share return storage with loop carries (For/While) or branch yield values (If).
   // get_yield_var(i) resolves the yield variable for the i-th return_var.
   using YieldVarResolver = std::function<VarPtr(size_t)>;
   std::pair<std::vector<VarPtr>, bool> PatchReturnVarsFromYield(const std::vector<VarPtr>& new_return_vars,
@@ -1002,12 +1212,15 @@ class InitMemRefMutator : public IRMutator {
 
     for (size_t i = 0; i < new_return_vars.size(); ++i) {
       auto yield_var = get_yield_var(i);
-      auto yield_tile = yield_var ? GetTileTypeWithMemRef(yield_var->GetType()) : nullptr;
+      // A borrowed FIFO value deliberately has no MemRef. Control-flow results
+      // must inherit that absence too, rather than keep a fresh allocation.
+      auto yield_tile = yield_var ? As<TileType>(yield_var->GetType()) : nullptr;
       if (As<TileType>(new_return_vars[i]->GetType()) && yield_tile) {
         auto new_type = CloneTypeWithMemRef(new_return_vars[i]->GetType(), yield_tile->memref_,
                                             yield_tile->GetMemorySpace());
         auto new_rv =
             std::make_shared<Var>(new_return_vars[i]->name_hint_, new_type, new_return_vars[i]->span_);
+        borrowed_.BindAlias(new_rv, yield_var);
         var_map_[old_return_vars[i]] = new_rv;
         patched.push_back(new_rv);
         changed = true;
@@ -1019,9 +1232,13 @@ class InitMemRefMutator : public IRMutator {
   }
 
   std::map<VarPtr, VarPtr> var_map_;
+  BorrowedTileRoots borrowed_;
+  std::set<MemRefPtr> non_dense_view_memrefs_;
   const DeclaredAllocMap& declared_allocs_;
   const backend::BackendHandler* handler_ = nullptr;
   FunctionType func_type_ = FunctionType::InCore;
+  ProgramPtr program_;
+  VFReturnTuples vf_returns_;
   uint64_t next_id_ = 0;
 };
 
@@ -1030,7 +1247,7 @@ class InitMemRefMutator : public IRMutator {
  * @brief Initialize MemRef for all variables in a function
  *
  * This transformation:
- * 1. Normalizes statement structure (ensures SeqStmts)
+ * 1. Simplifies scalar constants and normalizes statement structure
  * 2. Materializes compiler-owned PTO scratch required by level3
  * 3. Initializes the MemRef field for all Var nodes
  * 4. Creates tile.alloc operations for non-DDR MemRefs (addr=-1, unallocated)
@@ -1038,22 +1255,32 @@ class InitMemRefMutator : public IRMutator {
  * Memory space is read from TileType::memory_space_ (set by InferTileMemorySpace).
  * Variables without memory_space default to DDR.
  */
-FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
-  // Step 1: Normalize statement structure to ensure SeqStmts
-  auto normalized_func = NormalizeStmtStructure(func);
+FunctionPtr TransformInitMemRef(const FunctionPtr& func, const ProgramPtr& program) {
+  // Helper storage is borrowed from each launch caller; allocating here would
+  // give the helper an unrelated UB/GM buffer instead of its supplied operand.
+  if (func->func_type_ == FunctionType::SIMT || func->func_type_ == FunctionType::VF) return func;
+  // Lowering may introduce constant SSA aliases after the early Simplify pass.
+  // Normalize them with the shared transformation before building addresses,
+  // including when InitMemRef is invoked outside the default pipeline.
+  auto normalized_func =
+      NormalizeStmtStructure(transform_utils::SimplifyFunction(func, /*constants_only=*/true));
 
   const auto* ctx = PassContext::Current();
-  const backend::BackendHandler* handler = nullptr;
+  const backend::Backend* target = nullptr;
   if (backend::BackendConfig::IsConfigured()) {
-    handler = ctx ? ctx->GetBackendHandler() : backend::GetBackend()->GetHandler();
+    target = ctx ? ctx->GetBackend() : backend::GetBackend();
   }
+  const auto* handler = target ? target->GetHandler() : nullptr;
 
   // PTOAS level2 owns implicit-tmp materialization as part of PlanMemory. PyPTO
   // and DSA-RP instead emit fixed addresses and invoke level3. CI/TCVT scratch
-  // remains restricted to A2/A3, while TSORT32 scratch is level-driven.
+  // requirements come from the backend, while TSORT32 scratch is level-driven.
   const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
   if (handler != nullptr && (planner == MemoryPlanner::PyPTO || planner == MemoryPlanner::DsaRP)) {
-    MaterializePtoLevel3ScratchMutator materializer(handler->RequiresLevel3TmpScratch());
+    MaterializePtoScratchMutator materializer(target);
+    normalized_func = materializer.VisitFunction(normalized_func);
+  } else if (handler != nullptr && planner == MemoryPlanner::PtoAS && handler->RequiresLevel3TmpScratch()) {
+    MaterializePtoScratchMutator materializer(target, normalized_func->body_);
     normalized_func = materializer.VisitFunction(normalized_func);
   }
 
@@ -1088,7 +1315,7 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
     }
   }
 
-  InitMemRefMutator mutator(declared_allocs, handler, normalized_func->func_type_);
+  InitMemRefMutator mutator(declared_allocs, handler, normalized_func->func_type_, program);
 
   std::vector<VarPtr> new_params;
   new_params.reserve(normalized_func->params_.size());
@@ -1103,6 +1330,16 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
   auto result_func = MutableCopy(normalized_func);
   result_func->params_ = new_params;
   result_func->body_ = new_body;
+  // The custom function rebuild bypasses IRMutator::VisitFunction. Keep
+  // parameter-valued attrs (including external return contracts) attached to
+  // the fresh Vars whose tensor types now carry memory references.
+  for (auto& [key, value] : result_func->attrs_) {
+    if (auto remapped =
+            MapAttrExprs(value, [&mutator](const ExprPtr& expr) { return mutator.VisitExpr(expr); })) {
+      value = std::move(*remapped);
+    }
+  }
+  VerifyRegMemoryInitialization(result_func, program);
 
   // Step 4: Collect ALL MemRefs (DDR gets tensor.alloc, on-chip gets tile.alloc)
   memref_collectors::MemRefWithSpaceCollector collector(/*skip_ddr=*/false);
@@ -1140,7 +1377,16 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
 
 // Factory function
 namespace pass {
-Pass InitMemRef() { return CreateFunctionPass(TransformInitMemRef, "InitMemRef", kInitMemRefProperties); }
+Pass InitMemRef() {
+  return CreateProgramPass(
+      [](const ProgramPtr& program) {
+        return_lineage::ScopedTraceCache lineage_cache;
+        auto result = MutableCopy(program);
+        for (auto& [_, function] : result->functions_) function = TransformInitMemRef(function, program);
+        return ProgramPtr(result);
+      },
+      "InitMemRef", kInitMemRefProperties);
+}
 }  // namespace pass
 
 // ============================================================================
@@ -1154,15 +1400,69 @@ namespace {
  */
 class HasMemRefsVerifier : public IRVisitor {
  public:
-  explicit HasMemRefsVerifier(std::vector<Diagnostic>& diagnostics) : diagnostics_(diagnostics) {}
+  HasMemRefsVerifier(std::vector<Diagnostic>& diagnostics, ProgramPtr program)
+      : diagnostics_(diagnostics), program_(std::move(program)) {}
+
+  void VisitExpr_(const IterArgPtr& op) override {
+    IRVisitor::VisitExpr_(op);
+    TrackBufferLessAlias(op, op->initValue_);
+    vf_returns_.Copy(op, op->initValue_);
+  }
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    IRVisitor::VisitStmt_(op);
+    TrackLoopResults(op->return_vars_, op->iter_args_);
+    vf_returns_.JoinLoop(op->return_vars_, op->iter_args_, op->body_);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    IRVisitor::VisitStmt_(op);
+    TrackLoopResults(op->return_vars_, op->iter_args_);
+    vf_returns_.JoinLoop(op->return_vars_, op->iter_args_, op->body_);
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    IRVisitor::VisitStmt_(op);
+    auto then_yield = FindYieldStmt(op->then_body_);
+    auto else_yield = op->else_body_ ? FindYieldStmt(*op->else_body_) : nullptr;
+    if (!then_yield || !else_yield) return;
+    vf_returns_.JoinBranches(op, then_yield, else_yield);
+    for (size_t i = 0;
+         i < op->return_vars_.size() && i < then_yield->value_.size() && i < else_yield->value_.size(); ++i) {
+      if (borrowed_.Find(then_yield->value_[i]) == borrowed_.Find(else_yield->value_[i])) {
+        TrackBufferLessAlias(op->return_vars_[i], then_yield->value_[i]);
+      }
+    }
+  }
+
+  void VisitStmt_(const SimtLaunchStmtPtr& op) override {
+    for (const auto& result : op->results_) {
+      if (As<TileType>(result->GetType()) && !GetTypeMemRef(result->GetType())) {
+        diagnostics_.emplace_back(DiagnosticSeverity::Error, "HasMemRefs", 0,
+                                  "SIMT Tile result has no initialized output storage", result->span_);
+      }
+    }
+    IRVisitor::VisitStmt_(op);
+  }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (!op || !op->var_ || !op->var_->GetType()) return;
+    if (auto call = As<Call>(op->value_)) {
+      if (auto helper = ResolveVFCall(call, program_)) {
+        auto aliases = VFReturnedArguments(helper, call);
+        if (aliases.size() == 1) {
+          TrackBufferLessAlias(op->var_, aliases[0]);
+        } else {
+          vf_returns_.Record(op->var_, aliases, borrowed_);
+        }
+      }
+    }
+    vf_returns_.Copy(op->var_, op->value_);
+    if (auto storage = vf_returns_.Project(op->value_)) borrowed_.Bind(op->var_, storage->root);
     auto tile_type = std::dynamic_pointer_cast<const TileType>(op->var_->GetType());
     if (tile_type && !tile_type->memref_.has_value()) {
-      if (IsBufferLessByDesign(op)) {
-        buffer_less_.insert(op->var_.get());
-      } else {
+      borrowed_.Bind(op->var_, borrowed_.Definition(op->var_, op->value_));
+      if (!borrowed_.Find(op->var_)) {
         diagnostics_.emplace_back(
             DiagnosticSeverity::Error, "HasMemRefs", 0,
             "TileType variable '" + op->var_->name_hint_ + "' has no MemRef initialized", op->var_->span_);
@@ -1172,16 +1472,21 @@ class HasMemRefsVerifier : public IRVisitor {
   }
 
  private:
-  // A cross-core tpop result (its data lives in the reserved C2V/V2C slot, not a
-  // tile MemRef) and any zero-copy view / plain alias chained off such a result
-  // legitimately carry no MemRef. Shares the rule with the MemRef-creating mutator
-  // via ProducesBufferLessTile; here a source is buffer-less iff it is tracked.
-  [[nodiscard]] bool IsBufferLessByDesign(const AssignStmtPtr& op) const {
-    return ProducesBufferLessTile(op->value_, [this](const Var* v) { return buffer_less_.count(v) > 0; });
+  void TrackBufferLessAlias(const VarPtr& var, const ExprPtr& source) {
+    auto tile = As<TileType>(var->GetType());
+    if (tile && !tile->memref_) borrowed_.BindAlias(var, source);
   }
 
-  std::set<const Var*> buffer_less_;
+  void TrackLoopResults(const std::vector<VarPtr>& results, const std::vector<IterArgPtr>& iter_args) {
+    for (size_t i = 0; i < results.size() && i < iter_args.size(); ++i) {
+      TrackBufferLessAlias(results[i], iter_args[i]);
+    }
+  }
+
+  BorrowedTileRoots borrowed_;
   std::vector<Diagnostic>& diagnostics_;
+  ProgramPtr program_;
+  VFReturnTuples vf_returns_;
 };
 
 }  // namespace
@@ -1192,9 +1497,10 @@ class HasMemRefsPropertyVerifierImpl : public PropertyVerifier {
 
   void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
     if (!program) return;
+    return_lineage::ScopedTraceCache lineage_cache;
     for (const auto& [gv, func] : program->functions_) {
-      if (!func || !func->body_) continue;
-      HasMemRefsVerifier verifier(diagnostics);
+      if (!func || !func->body_ || func->func_type_ == FunctionType::VF) continue;
+      HasMemRefsVerifier verifier(diagnostics, program);
       verifier.VisitStmt(func->body_);
     }
   }

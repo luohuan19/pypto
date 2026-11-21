@@ -1,5 +1,9 @@
 # 分块 matmul
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 第一个跑在 cube 单元上的算子，也是第一个 K 轴装不下的算子。
 
 > **前置**：[第一个算子](00-elementwise.md)。
@@ -30,7 +34,8 @@ torch.manual_seed(0)
 a = torch.randn(128, 128, dtype=torch.float16)
 b = torch.randn(128, 128, dtype=torch.float16)
 c = torch.zeros(128, 128, dtype=torch.float32)
-matmul_small(a, b, c, config=RunConfig(platform="a2a3sim"))
+compiled = matmul_small.compile(a, b, c, config=RunConfig(platform="a2a3sim"))
+compiled(a, b, c, config=RunConfig(platform="a2a3sim"))
 assert torch.allclose(c, a.float() @ b.float(), rtol=1e-2, atol=1e-2)
 ```
 

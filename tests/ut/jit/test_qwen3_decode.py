@@ -19,7 +19,7 @@ import pytest
 # Module-level skip — tests need torch to construct tensor metadata samples.
 torch = pytest.importorskip("torch")
 
-from pypto.pypto_core import ir  # noqa: E402
+from pypto.pypto_core import ir, passes  # noqa: E402
 
 from examples.models.qwen3_jit.config import (  # noqa: E402
     BATCH,
@@ -100,17 +100,16 @@ class TestQwen3JITLowering:
         assert "qwen3_decode" in names
 
         # OutlineIncoreScopes extracts each ``pl.at`` block into a separate
-        # InCore-class function. Expect one per name_hint in the kernel files.
+        # InCore-class function. Equivalent v/k and up/gate kernels share a
+        # definition after DeduplicateOutlinedKernels; their dispatches remain.
         expected_outlined_hints = {
             "rmsnorm",  # input_rmsnorm scope
             "post_rmsnorm",  # post_rmsnorm scope
             "q_proj",  # q_projection scope
             "k_proj",  # k_projection scope
-            "v_proj",  # v_projection scope
             "out_proj_residual",  # out_projection_residual scope (with split)
             "down_proj_residual",  # down_projection_residual scope (with split)
             "gate_proj",  # mlp_block first scope
-            "up_proj",  # mlp_block second scope
             "silu",  # mlp_block third scope
             "rope_kv_cache",  # rope_kv_cache_update scope
         }
@@ -118,6 +117,65 @@ class TestQwen3JITLowering:
             assert any(n.startswith(hint) or n == hint for n in names), (
                 f"Expected an outlined function for ``pl.at(name_hint='{hint}')``; got functions: {names}"
             )
+
+        class Calls(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.names = []
+
+            def visit_call(self, op):
+                if isinstance(op.op, ir.GlobalVar):
+                    self.names.append(op.op.name)
+                super().visit_call(op)
+
+            def visit_submit(self, op):
+                if isinstance(op.op, ir.GlobalVar):
+                    self.names.append(op.op.name)
+                super().visit_submit(op)
+
+        calls = Calls()
+        entry = post_pass.get_function("qwen3_decode")
+        assert entry is not None
+        calls.visit_function(entry)
+        assert calls.names.count("k_proj") == 2
+        assert calls.names.count("gate_proj") == 2
+
+    def test_input_rmsnorm_keeps_four_stages_and_shared_scratch(self):
+        """The legacy Tile path must fit without reducing the model's pipeline depth.
+
+        Marking every reduction scratch as an exclusive loop workspace changed
+        four sequential reductions from one 32 KiB allocation to four. Keeping
+        only the compile-success check would miss a workaround that silently
+        reduced stage=4 to stage=2, so also pin the four reduction sites.
+        """
+        # Scratch sharing is a Tile IR contract; the default Buffer IR path has
+        # its own storage model and remains covered by the shared fixture.
+        with passes.PassContext([], enable_buffer_ir=False):
+            post_pass = qwen3_decode.lower(*_make_args())
+        function = post_pass.get_function("rmsnorm")
+        assert function is not None
+        scratch_bases: list[ir.Var] = []
+        allocation_bytes: list[int] = []
+
+        class Storage(ir.IRVisitor):
+            def visit_call(self, op):
+                if op.op.name == ir.get_op("tile.row_sum").name:
+                    scratch = op.args[1]
+                    assert isinstance(scratch.type, ir.TileType)
+                    assert scratch.type.memref is not None
+                    scratch_bases.append(scratch.type.memref.base_)
+                elif op.op.name == ir.get_op("tile.alloc").name:
+                    size = op.args[1]
+                    assert isinstance(size, ir.ConstInt)
+                    allocation_bytes.append(size.value)
+                super().visit_call(op)
+
+        Storage().visit_stmt(function.body)
+        assert len(scratch_bases) == 4, "Preserve the original four-stage reduction schedule"
+        assert all(base.same_as(scratch_bases[0]) for base in scratch_bases), (
+            "Sequential reductions must retain scratch reuse"
+        )
+        assert sum(allocation_bytes) <= 188416, "The original schedule must fit the 910B UB budget"
 
     def test_qwen3_decode_post_pass_has_orchestration_entry(self, post_pass):
         """The entry function lands as Orchestration after outlining."""

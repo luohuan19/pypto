@@ -1,5 +1,9 @@
 # Distributed Programming Model
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+>
 > **Prerequisites:** [Getting Started](../00-getting_started.md) — basic PyPTO
 > tensor/tile model. This guide uses the `pld` namespace
 > (`import pypto.language.distributed as pld`).
@@ -108,7 +112,8 @@ cfg = RunConfig(platform="a2a3", distributed_config=dc)
 
 inputs = torch.randn(2, 1, SIZE)
 outputs = torch.zeros_like(inputs)
-orchestrator(inputs, outputs, config=cfg)   # blocks until both ranks finish
+compiled = orchestrator.compile(inputs, outputs, config=cfg)
+compiled(inputs, outputs, config=cfg)   # blocks until both ranks finish
 ```
 
 This is the "one-shot" dispatch pattern. See [03-execution](03-execution.md)

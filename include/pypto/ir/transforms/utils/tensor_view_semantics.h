@@ -135,20 +135,9 @@ inline void CheckNzLogicalRank(size_t rank, const char* what, const Span& span =
 
 /// Number of elements in one NZ C0 line (32 bytes) for ``dtype``.
 ///
-/// Derived from the *bit* width, not ``GetByte()``. ``GetByte()`` is
-/// ``ceil(bits/8)``, so every sub-byte dtype (INT4 / UINT4 / FP4 / HF4 / BOOL)
-/// reports 1 and would yield ``c0 = 32`` instead of the 64 elements that
-/// actually fit in a 32-byte C0 line — silently mis-blocking the tensor and
-/// accepting misaligned extents (e.g. FP4 ``C = 544`` passes ``% 32`` but is
-/// not a multiple of 64).
-///
-/// Sub-byte dtypes are rejected for now. This is a **PyPTO milestone-1 scope
-/// limit, not a hardware or pto-isa one**: pto-isa's NZ machinery does handle
-/// FP4 (``tload_common.hpp`` carries explicit ``caps::IsFP4`` branches through
-/// the NZ paths and asserts ``staticShape[4] == C0_SIZE_BYTE / sizeof(DType)``).
-/// Supporting it here means validating the packed-nibble addressing end to end,
-/// which milestone 1 does not attempt. The bit-based formula above is already
-/// the correct one to build on when it does.
+/// Derived from the bit width; sub-byte INT4, UINT4, HF4, and BOOL have no
+/// supported NZ addressing contract here. Both packed FP4 x2 formats use
+/// eight-bit byte carriers, so one C0 line contains 32 carrier elements.
 inline int64_t NzC0Elems(DataType dtype) {
   const auto bits = static_cast<int64_t>(dtype.GetBit());
   CHECK(bits >= 8) << "NZ layout does not support the sub-byte dtype '" << dtype.ToString() << "' (" << bits
@@ -458,11 +447,9 @@ inline bool IsProvableNonNegative(const ExprPtr& expr, const NzOffsetFacts& fact
   // non-negative. This is what a split-K block index reaches for --
   // ``(block % OK) * K_SLICE`` names the K half.
   //
-  // The dividend has to be proven too, rather than resting on the name:
-  // ``FloorMod`` lowers to ``arith.remsi`` (``pto_scalar_expr_codegen.cpp``),
-  // which truncates toward zero, so a negative dividend yields a negative
-  // remainder -- and a negative partition offset is clamped to 0 rather than
-  // caught, which is the silent wrong read this whole proof exists to prevent.
+  // Keep the proof conservative: signed integer and INDEX FloorMod codegen
+  // corrects arith.remsi to floor semantics, but this predicate still requires
+  // a non-negative dividend instead of relying on that stronger result bound.
   if (auto mod = As<FloorMod>(expr)) {
     auto divisor = As<ConstInt>(mod->right_);
     return divisor && divisor->value_ > 0 && IsProvableNonNegative(mod->left_, facts, budget);
@@ -645,6 +632,32 @@ inline bool IsBlockedMxShape(const std::vector<ExprPtr>& shape) {
          fractal_cols->value_ == tile_view_semantics::kMXSFractalCols;
 }
 
+/// PTOAS v0.74 accepts logical MX views; their layout tag owns physical packing.
+/// ZZ/NN retain static fractal alignment. ND activation scales are already
+/// row-major GM data: rows may be dynamic and need no 16-row alignment, while
+/// the contiguous group axis still consists of complete scale pairs.
+inline bool IsLogicalMxShape(const std::vector<ExprPtr>& shape, TensorLayout layout) {
+  if (shape.size() != 2 || !IsMxTensorLayout(layout)) return false;
+  if (layout == TensorLayout::MX_A_ND) {
+    auto rows = As<ConstInt>(shape[0]);
+    auto groups = As<ConstInt>(shape[1]);
+    return (!rows || rows->value_ > 0) && groups && groups->value_ > 0 &&
+           groups->value_ % tile_view_semantics::kMXSFractalCols == 0;
+  }
+  const bool is_a = layout == TensorLayout::MX_A_ZZ;
+  auto block = As<ConstInt>(shape[is_a ? 0 : 1]);
+  auto group = As<ConstInt>(shape[is_a ? 1 : 0]);
+  return block && group && block->value_ > 0 && group->value_ > 0 &&
+         block->value_ % tile_view_semantics::kMXSFractalRows == 0 &&
+         group->value_ % tile_view_semantics::kMXSFractalCols == 0;
+}
+
+/// Accept the default logical form or legacy blocked ZZ/NN views. MX_A_ND
+/// always retains its rank-2 row-major ABI, including in the legacy pass.
+inline bool IsCanonicalMxShape(const std::vector<ExprPtr>& shape, TensorLayout layout) {
+  return IsLogicalMxShape(shape, layout) || (layout != TensorLayout::MX_A_ND && IsBlockedMxShape(shape));
+}
+
 /// Build packed canonical strides for the given (shape, layout).
 ///
 /// Definitions (per RFC #1300 §2.3, amended for NZ / MX):
@@ -658,9 +671,9 @@ inline bool IsBlockedMxShape(const std::vector<ExprPtr>& shape) {
 ///        ordinary row-major and match pto-isa's ``BaseShape2D<..., NZ>``
 ///        exactly. Callers must block the shape first — ``CheckNzViewIsBlocked``
 ///        enforces that invariant downstream.
-///   MX : row-major over the blocked rank-5 shape. Logical rank-2 MX strides
-///        are not physical GM addressing; callers must block first, and
-///        ``IsBlockedMxShape`` enforces that invariant downstream.
+///   MX : logical rank-2 row-major strides for PTOAS-owned packing, or physical
+///        row-major strides for the explicit legacy rank-5 blocking pass.
+///        MX_A_ND already matches row-major GM data and always remains rank 2.
 ///
 /// Throws ``pypto::ValueError`` for DN layout with rank < 2.
 inline std::vector<ExprPtr> BuildLogicalStridesFromLayout(const std::vector<ExprPtr>& shape,

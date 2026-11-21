@@ -308,6 +308,13 @@ void IRVisitor::VisitStmt_(const GraphScopeStmtPtr& op) {
   VisitStmt(op->body_);
 }
 
+void IRVisitor::VisitStmt_(const RegScopeStmtPtr& op) {
+  INTERNAL_CHECK_SPAN(op->body_, op->span_) << "RegScopeStmt has null body";
+  // A ``pl.dump_tag`` / ``dumps=`` puts ``kAttrDumpVars`` on this scope too.
+  VisitScopeAttrs(op);
+  VisitStmt(op->body_);
+}
+
 void IRVisitor::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "HierarchyScopeStmt has null body";
   VisitScopeAttrs(op);
@@ -364,6 +371,18 @@ void IRVisitor::VisitStmt_(const BreakStmtPtr& op) {}
 void IRVisitor::VisitStmt_(const ContinueStmtPtr& op) {}
 
 void IRVisitor::VisitStmt_(const InlineStmtPtr& op) {}
+
+void IRVisitor::VisitStmt_(const SimtScopeStmtPtr& op) {
+  for (const auto& var : op->private_scalars_) VisitExpr(var);
+  for (const auto& dim : op->block_dims_) VisitExpr(dim);
+  VisitStmt(op->body_);
+}
+
+void IRVisitor::VisitStmt_(const SimtLaunchStmtPtr& op) {
+  for (const auto& dim : op->block_dims_) VisitExpr(dim);
+  for (const auto& arg : op->args_) VisitExpr(arg);
+  for (const auto& result : op->results_) VisitExpr(result);
+}
 
 void IRVisitor::VisitStmt_(const StmtPtr& op) {}
 

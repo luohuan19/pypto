@@ -41,8 +41,11 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/packed_fp4_cast.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/transforms/utils/vf_helpers.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
 #include "src/ir/transforms/loop_invariant_mat_residency.h"
@@ -207,8 +210,8 @@ class DemandCollector : public IRVisitor {
 class TileMemorySpaceAnalyzer : public IRVisitor {
  public:
   TileMemorySpaceAnalyzer(const std::vector<VarPtr>& params, const std::map<VarPtr, MemorySpace>& demands,
-                          FunctionType func_type)
-      : demands_(demands) {
+                          FunctionType func_type, ProgramPtr program)
+      : demands_(demands), program_(std::move(program)) {
     for (const auto& var : params) {
       auto tile_type = As<TileType>(var->GetType());
       if (!tile_type) continue;
@@ -238,6 +241,31 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
   [[nodiscard]] const std::map<VarPtr, MemorySpace>& GetVarMemory() const { return var_memory_; }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
+    std::vector<ExprPtr> aliases;
+    if (auto call = As<Call>(op->value_); auto helper = ResolveVFCall(call, program_)) {
+      aliases = VFReturnedArguments(helper, call);
+      if (As<TupleType>(op->var_->GetType())) vf_returns_[op->var_.get()] = aliases;
+    } else if (auto source = AsVarLike(op->value_)) {
+      if (auto it = vf_returns_.find(source.get()); it != vf_returns_.end()) {
+        vf_returns_[op->var_.get()] = it->second;
+      }
+    } else if (auto item = As<TupleGetItemExpr>(op->value_)) {
+      auto tuple = AsVarLike(item->tuple_);
+      if (tuple && vf_returns_.count(tuple.get())) {
+        const auto& values = vf_returns_.at(tuple.get());
+        INTERNAL_CHECK_SPAN(item->index_ >= 0 && static_cast<size_t>(item->index_) < values.size(), op->span_)
+            << "Internal error: VF tuple projection out of bounds";
+        aliases = {values[item->index_]};
+      }
+    }
+    if (As<TileType>(op->var_->GetType()) && aliases.size() == 1) {
+      auto source = AsVarLike(aliases[0]);
+      INTERNAL_CHECK_SPAN(source && var_memory_.count(source), op->span_)
+          << "Internal error: VF result source has no inferred memory space";
+      var_memory_[op->var_] = var_memory_.at(source);
+      IRVisitor::VisitStmt_(op);
+      return;
+    }
     if (!op->var_ || !As<TileType>(op->var_->GetType())) {
       IRVisitor::VisitStmt_(op);
       return;
@@ -263,6 +291,22 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
       }
     }
 
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const SimtLaunchStmtPtr& op) override {
+    for (size_t i = 0; i < op->results_.size(); ++i) {
+      if (!As<TileType>(op->results_[i]->GetType())) continue;
+      auto source = AsVarLike(op->args_[op->result_param_indices_[i]]);
+      if (!source) continue;
+      if (auto found = var_memory_.find(source); found != var_memory_.end()) {
+        var_memory_[op->results_[i]] = found->second;
+      } else if (auto tile = As<TileType>(source->GetType()); tile && tile->memory_space_) {
+        var_memory_[op->results_[i]] = *tile->memory_space_;
+      }
+    }
+    // Register definitions during analysis, before loop/branch yields feed
+    // their result placements back to the corresponding control-flow results.
     IRVisitor::VisitStmt_(op);
   }
 
@@ -418,6 +462,8 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
 
  private:
   const std::map<VarPtr, MemorySpace>& demands_;
+  ProgramPtr program_;
+  std::map<const Var*, std::vector<ExprPtr>> vf_returns_;
   std::map<VarPtr, MemorySpace> var_memory_;
 
   /// Memory space of `yield`'s value at position `i`: the analyzed space when the
@@ -601,7 +647,7 @@ class MoveCollector : public IRVisitor {
         // target implements is PTOAS's `TMovOp::verify`, and PyPTO has no
         // faithful copy of it: `SoC::GetMemoryGraph()` models the memory
         // hierarchy for `FindMemPath`, not tmov legality, and omits edges this
-        // pipeline emits and PTOAS accepts (`Acc -> Vec` on Ascend910B). A
+        // pipeline emits and PTOAS accepts (`Acc -> Vec` on Ascend910). A
         // per-pair check here would reject working kernels.
         INTERNAL_CHECK_SPAN(IsTileMoveEverPossibleInto(allowed_spaces[0]), call->span_)
             << "Internal error: InferTileMemorySpace wants a tile.move into "
@@ -640,7 +686,11 @@ class TileMemorySpaceMutator : public IRMutator {
     if (tile_type->memory_space_ != mem_it->second) {
       TileView source = tile_view_semantics::GetEffectiveTileView(*tile_type);
       TileView target_layout = tile_view_semantics::GetImplicitTileView(tile_type->shape_, mem_it->second);
-      source.blayout = target_layout.blayout;
+      // Vec FP4 layouts identify the carrier packing axis. Preserve an
+      // explicit ND/DN producer view when resolving the memory space.
+      if (!tile_type->dtype_.IsPackedFp4() || mem_it->second != MemorySpace::Vec) {
+        source.blayout = target_layout.blayout;
+      }
       source.slayout = target_layout.slayout;
       source.fractal = target_layout.fractal;
       new_view = std::move(source);
@@ -703,6 +753,17 @@ class TileMemorySpaceMutator : public IRMutator {
     return new_iter_arg;
   }
 
+  StmtPtr VisitStmt_(const SimtLaunchStmtPtr& op) override {
+    auto result = As<SimtLaunchStmt>(IRMutator::VisitStmt_(op));
+    // Launch definitions inherit their rewritten operand's placement. The
+    // base mutator records that in var_remap_, while this pass consults its
+    // own cache; both must name the same definition for later consumers.
+    for (size_t i = 0; i < op->results_.size(); ++i) {
+      var_cache_[op->results_[i]] = result->results_[i];
+    }
+    return result;
+  }
+
   using CallArgReplacements = std::unordered_map<const Expr*, std::vector<VarPtr>>;
 
   std::pair<std::vector<std::pair<std::string, std::any>>, bool> RemapCallAttrs(
@@ -718,14 +779,13 @@ class TileMemorySpaceMutator : public IRMutator {
     };
 
     for (const auto& [key, value] : op->attrs_) {
-      if (key == kAttrManualDepEdges || key == kAttrCompilerManualDepEdges ||
-          key == kAttrArgDirOverrideVars || key == kAttrDumpVars) {
+      if (key == kAttrDumpVars) {
         if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&value)) {
           std::vector<VarPtr> remapped_vars;
           bool attr_changed = false;
           remapped_vars.reserve(vars->size());
           for (const auto& var : *vars) {
-            if (key == kAttrDumpVars && var) {
+            if (var) {
               auto replacements = arg_replacements.find(var.get());
               if (replacements != arg_replacements.end() &&
                   (replacements->second.size() != 1 || replacements->second.front().get() != var.get())) {
@@ -745,16 +805,15 @@ class TileMemorySpaceMutator : public IRMutator {
             continue;
           }
         }
-      } else if (key == kAttrDevice) {
-        if (const auto* device = std::any_cast<ExprPtr>(&value); device && *device) {
-          auto remapped = IRMutator::VisitExpr(*device);
-          INTERNAL_CHECK_SPAN(remapped, op->span_) << "Call device attribute mutated to null";
-          if (remapped.get() != device->get()) {
-            changed = true;
-            new_attrs.emplace_back(key, std::any(std::move(remapped)));
-            continue;
-          }
-        }
+      }
+      // Attributes contain live IR references regardless of their name. Keep
+      // dump_vars' operand-move expansion above, then remap every supported
+      // expression-valued attribute using the same rules as IRMutator.
+      auto remapped = MapAttrExprs(value, [&](const ExprPtr& expr) { return IRMutator::VisitExpr(expr); });
+      if (remapped) {
+        changed = true;
+        new_attrs.emplace_back(key, std::move(*remapped));
+        continue;
       }
       new_attrs.emplace_back(key, value);
     }
@@ -881,7 +940,24 @@ class TileMemorySpaceMutator : public IRMutator {
             const bool probe_describes_this_call =
                 probe_type &&
                 tile_view_semantics::ShapeExprListsEquivalent(probe_type->shape_, old_call_type->shape_);
-            if (probe_describes_this_call) {
+            // Packed FP4 changes carrier geometry when Mat promotion changes
+            // its packing axis. That shape difference is intentional, not an
+            // ND-to-2D flattening mismatch. Re-deduce the original load first
+            // to establish that its region arguments still describe this tile.
+            bool packed_load_geometry_changed = false;
+            if (!probe_describes_this_call && probe_type && IsOp(call, "tile.load") &&
+                old_call_type->dtype_.IsPackedFp4()) {
+              auto original_probe = registry.Create(call_op_name, call->args_, call->kwargs_, call->span_);
+              auto original_type = As<TileType>(original_probe->GetType());
+              packed_load_geometry_changed =
+                  original_type &&
+                  tile_view_semantics::ShapeExprListsEquivalent(original_type->shape_, old_call_type->shape_);
+            }
+            auto promoted_shape = old_call_type->shape_;
+            if (packed_load_geometry_changed) {
+              promoted_shape = probe_type->shape_;
+              promoted_view = tile_view_semantics::GetEffectiveTileView(*probe_type);
+            } else if (probe_describes_this_call) {
               TileView probe_view = tile_view_semantics::GetEffectiveTileView(*probe_type);
               promoted_view.blayout = probe_view.blayout;
               promoted_view.slayout = probe_view.slayout;
@@ -891,7 +967,7 @@ class TileMemorySpaceMutator : public IRMutator {
                   promoted_view, tile_view_semantics::GetImplicitTileLayout(old_call_type->shape_, promoted));
             }
 
-            auto promoted_type = std::make_shared<TileType>(old_call_type->shape_, old_call_type->dtype_,
+            auto promoted_type = std::make_shared<TileType>(promoted_shape, old_call_type->dtype_,
                                                             old_call_type->memref_, promoted_view, promoted);
             new_value = std::make_shared<Call>(call->op_, call->args_, std::move(new_kwargs), call->attrs_,
                                                std::move(promoted_type), call->span_);
@@ -910,11 +986,12 @@ class TileMemorySpaceMutator : public IRMutator {
     if ((new_call || AsVarLike(new_value)) && old_tile_type) {
       auto new_tile_type = As<TileType>(new_value->GetType());
       if (new_tile_type && new_tile_type.get() != old_tile_type.get()) {
-        // Preserve the Var's memory_space (set by VisitExpr_(VarPtr) based on var_memory_)
-        // and, for the same reason, its MemRef: a re-deduced Call type carries neither,
-        // and the MemRef is what a declared allocation rides on to InitMemRef.
-        auto synced_memref =
-            new_tile_type->memref_.has_value() ? new_tile_type->memref_ : old_tile_type->memref_;
+        // Preserve the resolved space and this definition's declared storage.
+        // Re-deduction can inherit the input's MemRef (gather_row); letting it
+        // override an explicit result constraint would hide a conflicting
+        // binding before InitMemRef can compare the actual addresses.
+        auto synced_memref = GetTypeMemRef(
+            WithCarriedMemRef(new_tile_type, old_tile_type, /*preserve_declared_binding=*/true));
         auto synced_type =
             std::make_shared<TileType>(new_tile_type->shape_, new_tile_type->dtype_, synced_memref,
                                        new_tile_type->tile_view_, old_tile_type->memory_space_);
@@ -927,7 +1004,10 @@ class TileMemorySpaceMutator : public IRMutator {
         // the Call does not, so a print->parse roundtrip — which re-derives the
         // Call type from the LHS annotation — sees a memory_space presence
         // mismatch on body[*].value.type.
-        if (new_call && new_tile_type->memory_space_ != old_tile_type->memory_space_) {
+        // Keep the constraint on the Call as well, so later re-inference does
+        // not mistake the operand's binding for the result's declaration.
+        if (new_call && (new_tile_type->memory_space_ != old_tile_type->memory_space_ ||
+                         new_tile_type->memref_ != synced_memref)) {
           new_value = std::make_shared<Call>(new_call->op_, new_call->args_, new_call->kwargs_,
                                              new_call->attrs_, synced_type, new_call->span_);
         }
@@ -1044,7 +1124,7 @@ class TileMemorySpaceMutator : public IRMutator {
     // Look up backend layout spec so tile.move carries the correct layout for the consumer.
     // This avoids a later ResolveBackendOpLayouts repair pass needing to insert tile.reshape.
     const backend::BackendTileLayoutSpec* layout_spec = nullptr;
-    if (backend::BackendConfig::IsConfigured()) {
+    if (backend::BackendConfig::IsConfigured() && !IsDensePackedFp4DnCast(call)) {
       layout_spec = backend::GetBackend()->GetTileLayoutSpec(call->op_->name_);
     }
 
@@ -1181,7 +1261,7 @@ class TileMemorySpaceMutator : public IRMutator {
 // Transform: combine analysis, move collection, and mutation
 // ============================================================================
 
-FunctionPtr TransformInferTileMemorySpace(const FunctionPtr& func) {
+FunctionPtr TransformInferTileMemorySpace(const FunctionPtr& func, const ProgramPtr& program) {
   // Phase 0: Collect backward demand from op input_constraints; propagate
   // through OutputMemoryInheritsInput() ops so demand reaches retargetable
   // producers (tile.load/tile.create) even through view chains (slice/fillpad).
@@ -1191,7 +1271,7 @@ FunctionPtr TransformInferTileMemorySpace(const FunctionPtr& func) {
 
   // Phase 1: Analyze — infer memory space for each tile variable, using Phase-0
   // demand as fallback for retargetable producers whose target_memory is absent.
-  TileMemorySpaceAnalyzer analyzer(func->params_, demand_collector.GetDemands(), func->func_type_);
+  TileMemorySpaceAnalyzer analyzer(func->params_, demand_collector.GetDemands(), func->func_type_, program);
   analyzer.VisitStmt(func->body_);
 
   const auto& var_memory = analyzer.GetVarMemory();
@@ -1235,8 +1315,8 @@ Pass InferTileMemorySpace() {
       // must have its tiles placed here too. Gating on InCore alone left those
       // tiles unset, and InitMemRef then defaulted them to DDR -- yielding a
       // vector op reading a DDR operand, which no hardware does.
-      if (IsInCoreType(func->func_type_)) {
-        new_functions[gvar] = TransformInferTileMemorySpace(func);
+      if (IsInCoreType(func->func_type_) || func->func_type_ == FunctionType::VF) {
+        new_functions[gvar] = TransformInferTileMemorySpace(func, program);
       } else {
         new_functions[gvar] = func;
       }
@@ -1337,7 +1417,7 @@ class TileMemoryInferredPropertyVerifierImpl : public PropertyVerifier {
       if (!func || !func->body_) continue;
       // Must mirror the pass's own gate above: verifying a narrower set than
       // the pass transforms is how the AIC/AIV miss stayed invisible.
-      if (!IsInCoreType(func->func_type_)) continue;
+      if (!IsInCoreType(func->func_type_) && func->func_type_ != FunctionType::VF) continue;
       TileMemoryInferredVerifier verifier(diagnostics, func->name_);
       verifier.VisitStmt(func->body_);
     }

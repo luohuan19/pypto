@@ -25,7 +25,7 @@ namespace pypto {
 namespace backend {
 
 /**
- * @brief BackendHandler implementation for Ascend910B (a2a3).
+ * @brief BackendHandler implementation for Ascend910 (a2a3).
  *
  * Cross-core data is routed via GM, so the AIV side does not need a fractal
  * adapter; the GM-backed slot buffer must be injected by ExpandMixedKernel;
@@ -36,12 +36,15 @@ class Ascend910BHandler : public BackendHandler {
   static const Ascend910BHandler& Instance();
 
   [[nodiscard]] std::string GetPtoTargetArch() const override { return "a2a3"; }
+  [[nodiscard]] const sync::ResourceCatalog& GetSyncResourceCatalog() const override;
   [[nodiscard]] std::string GetLaunchSpecCoreCountMethod() const override { return "set_block_num"; }
   [[nodiscard]] std::string GetDefaultSimPlatform() const override { return "a2a3sim"; }
   [[nodiscard]] std::vector<std::string> GetExtraPtoasFlags() const override { return {"--pto-arch", "a3"}; }
   [[nodiscard]] bool HonorsHighPrecisionAlgorithm() const override { return false; }
 
   [[nodiscard]] bool RequiresGMPipeBuffer() const override { return true; }
+  [[nodiscard]] bool SupportsRuntimeBoundLocalSoftwarePipeline() const override { return true; }
+  [[nodiscard]] bool SupportsLocalPipeDepth() const override { return true; }
   [[nodiscard]] bool RequiresSplitLoadTpopWorkaround() const override { return true; }
 
   // A2/A3 has no int32 ordering compare; pto-isa substitutes an equality
@@ -51,32 +54,6 @@ class Ascend910BHandler : public BackendHandler {
   }
   [[nodiscard]] bool RequiresLevel3TmpScratch() const override { return true; }
 
-  // A2/A3 TSEL takes a level-3 explicit scratch of UINT32 [1, 16].
-  [[nodiscard]] backend::TileScratchSpec GetTselScratchSpec() const override {
-    return {DataType::UINT32, 1, 16};
-  }
-
-  // PTOAS verifies the A2/A3 TSELS scratch against one complete physical source
-  // row, in the source dtype (see tests/st/runtime/ops/test_sels.py).
-  [[nodiscard]] backend::TileScratchSpec GetTselsScratchSpec(DataType src_dtype,
-                                                             int64_t src_cols) const override {
-    return {src_dtype, 1, src_cols};
-  }
-
-  // A2/A3 TSELS covers 16/32-bit integers, FP16, and FP32 -- no 8-bit form.
-  [[nodiscard]] bool SupportsTselsDataType(const DataType& src_dtype) const override {
-    return src_dtype == DataType::INT16 || src_dtype == DataType::UINT16 || src_dtype == DataType::INT32 ||
-           src_dtype == DataType::UINT32 || src_dtype == DataType::FP16 || src_dtype == DataType::FP32;
-  }
-
-  // A2/A3 TSEL adds bf16 but still stops at 16 bits, as does the texpands behind
-  // tile.full -- so an 8-bit select has no lowering at all on this arch.
-  [[nodiscard]] bool SupportsTselDataType(const DataType& dtype) const override {
-    return dtype == DataType::INT16 || dtype == DataType::UINT16 || dtype == DataType::INT32 ||
-           dtype == DataType::UINT32 || dtype == DataType::FP16 || dtype == DataType::BF16 ||
-           dtype == DataType::FP32;
-  }
-
   [[nodiscard]] bool RequiresVtoCFractalAdapt() const override { return false; }
   [[nodiscard]] bool RequiresRuntimeSubblockBridge() const override { return true; }
   [[nodiscard]] bool RequiresNoSplitDualAivDispatch() const override { return true; }
@@ -85,11 +62,14 @@ class Ascend910BHandler : public BackendHandler {
   [[nodiscard]] bool RequiresLowPrecisionMatScratch() const override { return true; }
   // A2/A3 has no packed fp4 load/store ABI; reject the whole FP4 family.
   [[nodiscard]] bool SupportsIncoreDataType(const DataType& dtype) const override {
-    return dtype.GetBit() != 4 && !dtype.IsFp4Family();
+    return dtype.GetBit() != 4 && !dtype.IsPackedFp4();
   }
 
   // A2/A3 store pipe supports bf16 atomic-add (pto-isa set_atomic_bf16).
   [[nodiscard]] bool SupportsBf16AtomicAdd() const override { return true; }
+
+  // TStoreAccNz2nz uses a 12-bit nSize field and channel split for FP32 C0=8.
+  [[nodiscard]] int GetAccToNzGmStoreMaxCols() const override { return (1 << 12) - 1; }
 
   // A2/A3 fix-pipe Acc->GM destination whitelist (pto-isa a2a3 CheckAcc2gm,
   // non-quant branch; ptoas rejects anything else at pto.tstore verification).
@@ -131,24 +111,18 @@ class Ascend910BHandler : public BackendHandler {
   [[nodiscard]] uint32_t GetL2CacheLineBytes() const override { return 512; }
   [[nodiscard]] uint32_t GetRecommendedInnermostDimBytes() const override { return 512; }
 
-  // L0 capacity (matches Create910BSoC AIC core memory layout).
-  [[nodiscard]] uint32_t GetL0aCapacityBytes() const override { return 64ULL * 1024; }
-  [[nodiscard]] uint32_t GetL0bCapacityBytes() const override { return 64ULL * 1024; }
-  [[nodiscard]] uint32_t GetL0cCapacityBytes() const override { return 128ULL * 1024; }
-  [[nodiscard]] uint32_t GetBiasCapacityBytes() const override { return 1ULL * 1024; }
   [[nodiscard]] bool SupportsMatToBiasMove(const DataType& source_dtype,
                                            const DataType& bias_dtype) const override {
     return (source_dtype == DataType::INT32 && bias_dtype == DataType::INT32) ||
            (bias_dtype == DataType::FP32 &&
             (source_dtype == DataType::FP32 || source_dtype == DataType::FP16));
   }
-  [[nodiscard]] uint64_t GetMatCapacityBytes() const override { return 512ULL * 1024; }
   [[nodiscard]] int GetL0cMAlignment(const DataType& accumulator_dtype) const override {
     return accumulator_dtype == DataType::INT32 ? 32 : GetL0FractalAlignment();
   }
 
  private:
-  Ascend910BHandler() = default;
+  Ascend910BHandler();
 };
 
 }  // namespace backend

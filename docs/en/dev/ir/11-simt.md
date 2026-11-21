@@ -1,0 +1,411 @@
+# Scalar SIMT IR
+
+Use `pl.simt_scope` inside an explicit `@pl.jit.aiv` function to run scalar
+code on a SIMT thread block. The compiler lowers that region to the canonical
+void helper and explicit launch model described below.
+
+## Public authoring
+
+```python
+import pypto.language as pl
+
+@pl.jit.aiv
+def copy_aiv(src: pl.Tensor[[1, 128], pl.FP32],
+             dst: pl.InOut[pl.Tensor[[1, 128], pl.FP32]],
+             valid: pl.Scalar[pl.INT32]):
+    with pl.simt_scope(dims=(128, 1, 1)):
+        tid = pl.simt.thread_idx(pl.simt.Axis.X)
+        if tid < valid:
+            value = pl.simt.load(src, (0, tid))
+            pl.simt.store(dst, (0, tid), value)
+    return dst
+
+@pl.jit
+def copy(src: pl.Tensor[[1, 128], pl.FP32],
+         dst: pl.InOut[pl.Tensor[[1, 128], pl.FP32]],
+         valid: pl.Scalar[pl.INT32]):
+    return copy_aiv(src, dst, valid)
+```
+
+`pl.simt.Axis` is the shared `ir.SimtAxis` enum. Coordinate queries require one
+typed axis, positional or `axis=`; `lane_id()` takes none. Dimensions are three
+positive compile-time integers. They describe threads, not an element allocation
+or grid; bounds checks remain explicit. GM Tensor and Vec/UB Tile operands use
+their existing storage. Supported scalar types vary by operation; see the
+[coverage matrix](../codegen/06-simt-interface-coverage.md).
+
+Scalar assignments are thread-private, including shadowing an outer scalar.
+A private scalar cannot be read after the scope. Stores automatically rebind the
+outer storage handle, with one result per written capture. An alias made before
+a Tile update retains the old value; Tensor aliases retain GM reference semantics.
+`In` storage stays read-only through views, and partial updates require initialized
+contents. Build views outside the region. No `as` clause, nested region, storage
+allocation/rebinding, cross-boundary jump, VMI capture or manual resource limit is
+accepted. Scopes may be placed inside outer loops and branches.
+
+The transient `SimtScopeStmt` derives directly from `Stmt`, with `block_dims` and
+`body` fields, plus `private_scalars` identifying reassigned outer scalar bindings.
+It preserves the execution boundary through binding, printing,
+serialization and cloning. [OutlineSimtScopes](../passes/01-outline_simt_scopes.md)
+runs before SSA and emits canonical helpers/launches. Explicit named helper and
+`pl.simt.launch` syntax remains available for canonical IR.
+
+## Function and launch
+
+`FunctionType.SIMT` is appended to the serialized function-kind enum (value 9).
+A SIMT helper has no runtime task level, role, binding requirement, or return
+values. `is_incore_type(SIMT)` is false: helpers are not dispatchable runtime tasks.
+`is_device_function_type(SIMT)` is true.
+
+```python
+launch = ir.SimtLaunchStmt(
+    ir.GlobalVar("helper"),
+    [ir.ConstInt(n, DataType.INT32, span) for n in (64, 1, 1)],
+    [src, dst],
+    [updated_dst],
+    [1],
+    span,
+)
+```
+
+`block_dims` contains three positive constant integers. Boolean and dynamic
+values, and products exceeding INT32_MAX, are rejected at construction.
+`args` are uses; `results` are definitions. `result_param_indices` is increasing
+and maps each result to exactly one InOut helper parameter. Results retain the
+corresponding argument's full type and storage metadata.
+
+The statement participates in visitor/mutator dispatch, structural equality and
+hashing, MessagePack serialization, deep cloning, use-before-definition checks,
+and SSA conversion. Python printing uses a canonical statement spelling:
+
+```python
+updated_dst = pl.simt.launch(
+    self.helper, src, dst, block_dims=(64, 1, 1), result_param_indices=(1,)
+)
+```
+
+The text parser reads this spelling. It is an IR round-trip format; the higher
+level programming interface derives output mappings during outlining.
+
+## Scalar operations
+
+| Operation | Result | Contract |
+| --------- | ------ | -------- |
+| `simt.thread_idx`, `block_idx`, `block_dim`, `grid_dim` | INT32 | Required typed `SimtAxis.X/Y/Z` kwarg |
+| `simt.lane_id`, `simt.veccore_id` | INT32 | No axis; physical lane or vector core ID |
+| `simt.load(storage, indices)` | Element scalar | Tile in Vec/UB or Tensor in GM |
+| `simt.store(storage, indices, value)` | VoidType | Scalar dtype must match storage |
+
+Python IR wrappers live in `pypto.ir.op.simt`. Indices normalize to `MakeTuple`
+with one integer/index scalar per logical dimension. Store belongs in `EvalStmt`,
+not a value-bearing assignment. Packed vectors and sub-byte storage are excluded.
+
+Tensor accesses express direct GM access with no implicit Tile staging. ND/DN
+views carry their existing strides and offsets; fractal layouts are rejected.
+Explicitly non-Vec Tile storage is rejected. GM accepts PTOAS `l1cache` policies
+`cache`/`uncache` and separate load/store `l2cache` policy sets. Cache attributes
+on UB accesses are invalid.
+
+## Math, bit operations and explicit conversion
+
+All operations below are available in both `pl.simt` and `pypto.ir.op.simt`.
+They operate independently in each thread and add no synchronization.
+
+| API | Operand / result | Contract |
+| --- | ---------------- | -------- |
+| `abs(x)` | FP32 → FP32 | Clear the sign bit |
+| `min(x, y)`, `max(x, y)` | FP32 → FP32 | minNum/maxNum; one NaN yields the numeric operand |
+| `exp`, `log`, `sqrt`, `sin`, `cos` | FP32 → FP32 | Natural exponential/logarithm; trigonometric input in radians |
+| `ceil`, `floor`, `rint`, `round` | FP32 → FP32 | Toward +∞ / −∞ / nearest-even / nearest-away; retain FP32 |
+| `pow(x, y)`, `fma(x, y, z)` | FP32 → FP32 | Power; fused multiply-add with one final rounding |
+| `prmt(x, y, selector)` | INT32 → INT32 | Byte permutation using four low selector nibbles |
+| `mulhi(x, y, *, unsigned=False)` | INT32 → INT32 | High 32 bits of a signed/unsigned 64-bit product |
+| `ftoi(x, *, dtype=None, rounding="z", unsigned=False)` | FP16/BF16/FP32 → 32-bit integer; FP32 → 64-bit integer | Mandatory saturation; default INT32 |
+| `itof(x, *, dtype=None, rounding="r", unsigned=False)` | 32-bit integer → FP16/BF16/FP32; 64-bit integer → FP32 | Default FP32 |
+| `ftof(x, dtype, *, rounding="r", saturate=False)` | Distinct FP16/BF16/FP32 pairs | Optional finite-overflow saturation |
+| `mul_i32toi64(x, y, *, unsigned=False)` | INT32 → INT64 | Full signed/unsigned product in an INT64 bit carrier |
+| `div(x, y, *, precision="intrinsic")` | FP32 → FP32 | Also accepts `precision_0ulp_ftz_true`; target flush-to-zero behavior |
+| `rem(x, y)` | FP32 → FP32 | Truncated quotient, fmod-style dividend sign; not floor modulo |
+
+`rounding` is a compile-time string: `r` = nearest, ties to even; `a` = nearest,
+ties away from zero; `f` = toward −∞; `c` = toward +∞; `z` = toward zero.
+`ftof` additionally accepts `o` (round to odd) only for FP32→FP16. Identity
+`ftof`, hybrid `h`, unsupported pairs and non-boolean flags are rejected. Float-to-integer saturation
+is mandatory in PTOAS: out-of-range values clamp to the destination integer
+range. On A5, saturated NaN conversion yields zero. `unsigned=True` interprets
+a signed integer carrier as unsigned without changing its IR dtype. Explicit
+UINT32/UINT64 dtypes always use unsigned conversion, including with the default
+flag; ordinary arithmetic follows the IR dtype.
+
+The text parser treats positional and keyword scalar operands identically.
+Evaluated numeric attributes such as `math.pi`, `math.inf`, and `-math.inf`
+become typed IR constants, just like numeric literals and closure names.
+Printing and reparsing raw IR preserves omitted conversion attributes; their
+defaults apply during lowering without adding attributes to the parsed IR.
+
+For `prmt`, each low selector nibble controls one result byte, from least to
+most significant. Its low three bits select bytes 0–3 of `y` or 4–7 of `x` (the
+right operand supplies the low bytes of the combined source). Nibble bit 3 and
+bits above the low 16 selector bits are ignored on A5.
+
+PTOAS sin/cos use software math with FP32 range reduction. Numerical acceptance
+covers angles in `[-4, 4]` radians; large-angle accuracy is not guaranteed.
+
+No implicit dtype promotion is performed. Existing explicit math functions
+remain FP32-only. Wider storage, collectives, atomics and conversions use the
+per-operation matrix; packed support belongs to the short-vector milestone. Floating functions follow target
+math accuracy and special-value behavior, without portable NaN payload guarantees.
+`pl.cast`, signed floor division/modulo and the diagnostic for scalar `**` retain
+their existing semantics; use `pl.simt.pow` for explicitly supported FP32 power.
+
+```python
+# Inside pl.simt_scope; x is an FP32 scalar loaded from storage.
+y = pl.const(1.0, pl.FP32) / (pl.const(1.0, pl.FP32) + pl.simt.exp(-x))
+index = pl.simt.ftoi(y, rounding="f")
+```
+
+### Scalar bitcast and physical lane masks
+
+`pl.simt.bitcast(value, dtype)` accepts FP16/BF16/FP32 and signed/unsigned
+8/16/32/64-bit integer types with equal source/destination bit widths.
+It preserves every bit, including NaN payloads and signed zeros; no numerical
+conversion or memory reinterpretation occurs. Ordinary `pl.cast` is unchanged.
+
+`pl.simt.lanemask_eq/le/lt/ge/gt()` return INT32 masks whose bit i describes
+physical lane i relative to the calling lane. These masks cover all 32 physical
+lanes regardless of divergence; use `vote_ballot(True)` for active lanes.
+Bit 31 makes the signed carrier negative without changing its bit pattern.
+
+## Warp collectives
+
+The public `pl.simt` and IR `pypto.ir.op.simt` namespaces expose:
+
+| Operation | Input → result | Meaning |
+| --------- | -------------- | ------- |
+| `vote_all`, `vote_any`, `vote_uni` | BOOL → BOOL | All true, any true, or all predicates equal |
+| `vote_ballot` | BOOL → INT32 | Bit i is set for active lane i with a true predicate |
+| `shuffle_idx(value, index, *, width=32, bound=None)` | FP16/FP32 or 32/64-bit integer → same type | Read subgroup-relative source lane |
+| `shuffle_up`, `shuffle_down` | FP16/FP32 or 32/64-bit integer → same type | Read lower/higher source lane by an offset |
+| `shuffle_bfly(value, mask, *, width=32, bound=None)` | FP16/FP32 or 32/64-bit integer → same type | Read source lane selected by local-lane XOR mask |
+| `redux_add`, `redux_min`, `redux_max` | FP16/FP32 or 32-bit integer → same type | Reduce active lanes; return the result to each active lane |
+
+The A5 warp contains 32 lanes. Participation is the current active execution
+mask at the instruction; there is no explicit participation-mask argument.
+Inactive lanes contribute nothing. These are register collectives, not memory
+fences or block barriers. Their results depend on control flow, so they must
+not be hoisted across branches or iterations that change active lanes.
+
+Shuffle widths are **16 or 32**, defaulting to 32. Width splits the warp into
+contiguous subgroups; it does not alter vote or redux participation. Lane controls
+are INT32 (Python integer literals are normalized). A shuffle source must be
+active when selected. Optional `bound` must be in `[0, width)` and selects a
+subgroup-relative source window: `[bound, width)` for `shuffle_up`,
+`[0, bound]` for the other modes. Omission selects the full window. Sources
+outside that window or subgroup return the caller value; inactive sources
+remain undefined. `shuffle_idx` wraps its index modulo width before the window check.
+
+Ballot returns an INT32 bit carrier, so bit 31 can make its numeric value
+negative. Use bit operations to inspect it. INT32 min/max default to signed
+comparisons; `unsigned=True` selects unsigned comparison of the same INT32 bit carriers (FP32 rejects this option);
+integer sums wrap at 32 bits. FP32 follows the target reduction order and
+special-value rules, without a promise of sequential summation or portable
+NaN/signed-zero selection. UINT32 min/max automatically use unsigned comparison.
+BF16 collectives, 64-bit redux and packed values remain unsupported.
+
+The native mapping is `pto.vote_*`, `pto.shuffle_*` and `pto.redux_{add,min,max}{i,f}`;
+integer min/max explicitly carry `signed` or `unsigned`. Tests compile all forms
+through the public JIT and PTOAS LLVM export. Opt-in device acceptance lives in
+`tests/st/runtime/vpto/test_simt_collectives_onboard.py`, covering two warps,
+partial active sets, ballot bit 31, signed reductions, shuffle subgroups and
+untouched inactive outputs. Compile-only tests do not establish device execution.
+
+### Stable routing indices and composed scan
+
+[`examples/advanced/04_simt_compaction.py`](../../../../examples/advanced/04_simt_compaction.py)
+compacts nonzero INT32 flags into ordered input indices, independently within
+each of two warps. For flags `[0, 1, 0, -1, ...]`, the first output row starts
+with `[1, 3]` and its count is `2`. Each row has capacity 32; cells after its
+count keep their initial value. The caller supplies `0 <= valid <= 64`.
+
+The `USE_BALLOT` constexpr selects two implementations:
+
+- **Ballot:** count the set bits below the current lane to obtain its exclusive
+  rank. `lanemask_lt()` excludes bit 31 without a shift by 32;
+  scalar bit operations implement population count using existing IR.
+- **Scan:** compose five `shuffle_up` stages at distances 1, 2, 4, 8 and 16.
+  Every lane executes each shuffle; only lanes with an in-range source add its
+  result. Subtracting the lane's flag yields its exclusive rank.
+
+Both implementations reconverge after guarded input loads. Lanes past `valid`
+contribute zero but still participate, so lane 31 can broadcast the total even
+for an empty or partial warp. `ranks[tid]` records the exclusive count for every
+physical lane, including the zero-padded tail. Selected lanes scatter their
+input index to `indices[warp, rank]`; lane zero writes `counts[warp]`.
+
+The ranks can also index a routing payload. Combining rows requires a separate
+prefix sum of warp counts and a scatter; this example does not provide global
+compaction, cross-AIV synchronization, or complete dispatch/combine. The scan is
+a composition of existing operations, not a new native instruction.
+
+### Tile/SIMT mixed row updates
+
+[`examples/advanced/06_simt_row_update.py`](../../../../examples/advanced/06_simt_row_update.py)
+compares two ways to update a `[8, 64]` FP32 Tile with eight per-row coefficients.
+For each row, columns below the runtime `valid` use `(src + 1) * scale`; the
+remaining columns retain the seed. A Tile consumer adds 2 to all elements and
+stores the result. A second output reads the original seed Tile **after** the
+update, checking that the original value remains distinct from the new version.
+
+The SIMT path uses `dims=(64, 8, 1)` and reads coefficients from their original
+loaded `[1, 8]` Tile. It captures the producer Tile and writable seed, then
+automatically rebinds the seed to the scope result. The comparison uses Tile
+`row_expand_mul` followed by masked SIMD stores in `reg_scope`; it computes the
+same outputs, including tails and the original Tile snapshot. Both rely on
+normal compiler-generated MTE/Vector/helper dependencies, without manual fences.
+The caller supplies `0 <= valid <= 64` and separate input/output storage.
+
+This example demonstrates a mixed pipeline, not an assertion that SIMT is
+faster than vector operations for regular row arithmetic. See
+[integration acceptance](../codegen/05-simt-lowering.md#mixed-row-update-acceptance)
+for device checks and the timing methodology.
+
+## Atomics and synchronization
+
+`pl.simt.atomic_add/sub/and/or/xor/min/max/exch(storage, indices, value)` and
+`pl.simt.atomic_cas(storage, indices, compare, value)` return the **old scalar**.
+The same names exist in `pypto.ir.op.simt`. All operands must match the storage
+dtype. Indices use the same logical coordinates and physical strides
+as `load`/`store`; addresses must be naturally aligned to the element width and in bounds.
+The following table describes the original 32-bit forms.
+
+| Operation | INT32 | FP32 | Storage / result |
+| --------- | ----- | ---- | ---------------- |
+| `atomic_add`, `atomic_sub` | 32-bit wrapping addition/subtraction | Target floating addition/subtraction | GM and Vec/UB; old scalar |
+| `atomic_and`, `atomic_or`, `atomic_xor` | Bitwise update | Unsupported | GM and Vec/UB; old scalar |
+| `atomic_min`, `atomic_max` | Signed by default; `unsigned=True` interprets INT32 bits as unsigned | Numeric operand wins over one NaN; both NaN yield NaN | GM and Vec/UB; old scalar |
+| `atomic_exch` | Replace | Replace | GM and Vec/UB; old scalar |
+| `atomic_cas` | Bitwise comparison | Bitwise comparison, including NaN payloads and signed zeros | GM and Vec/UB; old scalar |
+
+On the validated A5 target, min selects negative zero and max positive zero when
+comparing opposite signed zeros. NaN result payloads from arithmetic are not
+promised. Add/sub/min/max/exch also accept FP16/BF16 and signed/unsigned
+32/64-bit integers; bitwise atomics accept 32/64-bit integers; CAS accepts
+32/64-bit integers and FP32 only. All 64-bit atomics require GM: UB rejects them.
+Unsigned dtypes automatically select unsigned min/max. Packed atomics are excluded. There is no selectable memory-order
+or scope argument: each operation uses the native address-space atomic contract.
+No acquire/release or sequential-consistency guarantee is added for other addresses.
+Optional `l2cache=` uses store cache tokens and is allowed only on GM.
+A `DistributedTensor` window is accessed as this rank's local GM slice, with
+the same physical strides, initialization requirements and read/write effects.
+These operations do not provide remote-rank atomics.
+
+An atomic is always `ReadWrite`, including Exch and an unused return value.
+Targets must already be initialized; an atomic cannot establish full initialization
+of an `Out` capture. A prior full ordinary store can initialize it. Atomic updates
+remain in the program when their old values are unused. Contending threads observe
+a serialized order for the same location, without a guaranteed thread order.
+
+```python
+@pl.jit.aiv
+def increment(counter: pl.InOut[pl.Tensor[[1], pl.INT32]]):
+    with pl.simt_scope(dims=(64, 1, 1)):
+        pl.simt.atomic_add(counter, (0,), pl.const(1, pl.INT32))
+    return counter
+```
+
+The caller initializes `counter`; one invocation adds 64.
+
+| Operation | Contract |
+| --------- | -------- |
+| `syncthreads()` | Current SIMT entry rendezvous; prior participating memory effects precede subsequent effects |
+| `threadfence()` | Native target workitem fence; orders the calling thread's memory effects |
+| `threadfence_block()` | Native block-scoped workitem fence; orders the calling thread's memory effects |
+
+These operations return void and are retained as ordered calls. Fences do not
+wait for peers. They are not a cross-AIV/global barrier, and the name `threadfence`
+does not imply CUDA device/system-scope or CPU visibility semantics.
+Use a rendezvous before reading another thread's writes; a fence alone does not
+make an unsynchronized producer/consumer protocol safe.
+
+This version conservatively requires `syncthreads` outside **all branches and
+loops**, including apparently uniform ones. It may follow a reconverged branch.
+Helpers with a barrier cannot contain early returns, break or continue. Warp votes
+cannot establish block-wide arrival. Fences may appear in divergent control flow
+because they do not rendezvous. Outer MTE/Vector → SIMT → MTE/Vector dependencies
+still use the launch's storage effects and PTOAS synchronization; these builtins
+do not replace that protocol.
+
+## Effects and validation
+
+`analyze_simt_access(helper)` reports physical reads/writes per parameter.
+A physical store is `Write`; a writable launch parameter is logically `InOut`
+because unwritten elements keep their contents. The launch result is an updated
+storage version, not a scalar return or a runtime task handle.
+
+The `SimtValid` structural verifier checks helper signatures, operation domains,
+argument types, writable mappings, and duplicate writable arguments. Helpers
+accept scalar parameters and borrowed Tile/Tensor handles. Storage cannot be
+allocated, rebound, or carried through helper control-flow results. Only scalar
+control flow and SIMT builtins are allowed. `Out` parameters, ordinary calls or
+runtime submissions to helpers, and nested launches are rejected. Launch callers
+are AIV or pre-expansion InCore functions. A VMI register is not a supported storage operand;
+helpers borrow UB or GM storage instead.
+Launching inside an active VMI register scope is also rejected. Mixed-kernel
+expansion assigns SIMT launches to AIV rather than duplicating them across cores.
+
+## Compiler preparation
+
+The default pipeline now preserves storage semantics before memory planning:
+
+- [MaterializeSimtOutputs](../passes/36-materialize_simt_outputs.md) initializes
+  a dedicated copy for each writable Tile. Partial writes preserve untouched
+  elements and old Tile values remain readable across branches and loops.
+- [SpecializeSimtHelpers](../passes/37-specialize_simt_helpers.md) derives helper
+  variants from full block dimensions, types/layouts, and the target. Dynamic
+  metadata becomes scalar arguments; allocation addresses do not enter the key.
+- GM results retain the original tensor identity. `simt.store` uses the `Simt`
+  write channel, separate from scalar-controller and DMA stores. Kernel parameter
+  directions propagate as InOut to outer Call and Submit sites, where ordinary
+  task dependency analysis applies. Device statement scheduling preserves launch
+  order even when a later read uses the old GM handle.
+- Mixed-kernel splitting keeps launches on AIV and preserves their borrowed GM
+  handles on AIC before cleanup. Tensor views retain their shape, strides and
+  layout, including views and aliases carried through loops and branches.
+  GM handle bookkeeping alone does not create a cube kernel.
+
+Known overlapping writable arguments are rejected before copying. Distinct GM
+arguments may still alias at runtime; guaranteeing nonoverlap remains the caller's
+responsibility. Helper parameters borrow storage and receive no independent
+allocations. SIMT kernels stay in Functional IR under automatic Buffer IR selection.
+
+## Derived resources and implementation boundary
+
+`infer_simt_resources(launch)` consults the current target's `BackendHandler`
+through `PassContext`. Ascend950 accepts at most 2,048 threads, including the
+product of all three dimensions, and derives these limits:
+
+| Threads | Maximum registers |
+| ------- | ----------------- |
+| 1–256 | 128 |
+| 257–512 | 64 |
+| 513–1,024 | 32 |
+| 1,025–2,048 | 16 |
+
+Users do not provide `simt_max_threads` or `simt_max_regs`. Other backends report
+SIMT resource inference as unsupported.
+
+Canonical IR, validation, storage preparation, memory-planner integration,
+resource specialization and the A5 executable subset are implemented.
+[SIMT lowering and execution](../codegen/05-simt-lowering.md) describes its ABI,
+synchronization, supported types and acceptance tests. The independent
+[native SIMT probe](../codegen/04-simt-native-validation.md) retains the earlier
+P0 ABI fixture. The public scope path uses the same backend and runtime contract.
+
+## Runtime diagnostics
+
+`pl.simt.trap()` and `pl.simt.assert_(cond)` are void runtime operations; `cond`
+must be BOOL. They retain their execution effects even when no scalar result is
+used. They are distinct from Python assertions and compile-time checks. Device
+termination and host error propagation depend on the runtime and are not yet
+validated on hardware. Guard invalid accesses with explicit control flow;
+assert/trap do not establish a compiler guarantee that following code cannot run.

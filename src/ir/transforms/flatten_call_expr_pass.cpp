@@ -52,7 +52,8 @@ namespace {
  */
 class FlattenCallExprMutator : public IRMutator {
  public:
-  FlattenCallExprMutator() = default;
+  explicit FlattenCallExprMutator(bool preserve_while_conditions)
+      : preserve_while_conditions_(preserve_while_conditions) {}
 
   // Statement visitors
   StmtPtr VisitStmt_(const SeqStmtsPtr& op) override;
@@ -68,10 +69,19 @@ class FlattenCallExprMutator : public IRMutator {
   StmtPtr VisitStmt_(const SplitAivScopeStmtPtr& op) override;
   StmtPtr VisitStmt_(const RuntimeScopeStmtPtr& op) override;
   StmtPtr VisitStmt_(const GraphScopeStmtPtr& op) override;
+  StmtPtr VisitStmt_(const RegScopeStmtPtr& op) override;
 
   // Expression visitors
+  // Types are declarative expressions, not statement evaluation sites. Walking
+  // a Var's type with this mutator would extract shape calls into temporaries
+  // in the current body, rebuild the Var, and strand loop/header references.
+  // Preserve both variable identities and their embedded shape expressions.
+  ExprPtr VisitExpr_(const VarPtr& op) override { return op; }
+  ExprPtr VisitExpr_(const IterArgPtr& op) override { return op; }
   ExprPtr VisitExpr_(const CallPtr& op) override;
   ExprPtr VisitExpr_(const SubmitPtr& op) override;
+  ExprPtr VisitExpr_(const MakeTuplePtr& op) override;
+  ExprPtr VisitExpr_(const TupleGetItemExprPtr& op) override;
   ExprPtr VisitExpr_(const AddPtr& op) override;
   ExprPtr VisitExpr_(const SubPtr& op) override;
   ExprPtr VisitExpr_(const MulPtr& op) override;
@@ -124,6 +134,7 @@ class FlattenCallExprMutator : public IRMutator {
   }
 
  private:
+  bool preserve_while_conditions_;
   int temp_var_counter_ = 0;
   std::vector<StmtPtr> pending_stmts_;
 
@@ -189,16 +200,10 @@ class FlattenCallExprMutator : public IRMutator {
    */
   template <typename BinaryExprType>
   ExprPtr ProcessBinaryExpr(const std::shared_ptr<const BinaryExprType>& op) {
-    auto new_left = VisitExpr(op->left_);
-    auto new_right = VisitExpr(op->right_);
-
-    // Extract calls from operands
-    if (As<Call>(new_left)) {
-      new_left = ExtractCallToTemp(new_left);
-    }
-    if (As<Call>(new_right)) {
-      new_right = ExtractCallToTemp(new_right);
-    }
+    // Finish evaluating the left operand before descending into the right.
+    // Otherwise f() - (g() + 1) queues g before f, reversing atomic effects.
+    auto new_left = ExtractCallToTemp(VisitExpr(op->left_));
+    auto new_right = ExtractCallToTemp(VisitExpr(op->right_));
 
     bool changed = (new_left.get() != op->left_.get()) || (new_right.get() != op->right_.get());
     if (changed) {
@@ -292,20 +297,11 @@ StmtPtr FlattenCallExprMutator::VisitStmt_(const IfStmtPtr& op) {
 StmtPtr FlattenCallExprMutator::VisitStmt_(const ForStmtPtr& op) {
   // Note: Don't clear pending_stmts_, preserve previous state
 
-  auto new_start = VisitExpr(op->start_);
-  auto new_stop = VisitExpr(op->stop_);
-  auto new_step = VisitExpr(op->step_);
-
-  // Extract calls from range
-  if (As<Call>(new_start)) {
-    new_start = ExtractCallToTemp(new_start);
-  }
-  if (As<Call>(new_stop)) {
-    new_stop = ExtractCallToTemp(new_stop);
-  }
-  if (As<Call>(new_step)) {
-    new_step = ExtractCallToTemp(new_step);
-  }
+  // Range operands have the same left-to-right evaluation contract as binary
+  // operands, including calls nested more deeply in a later bound.
+  auto new_start = ExtractCallToTemp(VisitExpr(op->start_));
+  auto new_stop = ExtractCallToTemp(VisitExpr(op->stop_));
+  auto new_step = ExtractCallToTemp(VisitExpr(op->step_));
 
   // Flatten the body through FlattenScopeBody. It saves/restores the range's
   // own pending stmts for the parent SeqStmts, and — when the body is a single
@@ -326,17 +322,18 @@ StmtPtr FlattenCallExprMutator::VisitStmt_(const ForStmtPtr& op) {
 StmtPtr FlattenCallExprMutator::VisitStmt_(const WhileStmtPtr& op) {
   // Note: Don't clear pending_stmts_, preserve previous state
 
-  auto new_condition = VisitExpr(op->condition_);
-
-  // Extract calls from condition
-  if (As<Call>(new_condition)) {
-    new_condition = ExtractCallToTemp(new_condition);
+  // SIMT codegen evaluates the complete condition in scf.while's before
+  // region. Extracting any nested call here would evaluate it only once and
+  // move loop-carried IterArgs out of scope. Preserve the whole expression,
+  // including nested lane operations and scalar expressions around them.
+  auto new_condition = op->condition_;
+  if (!preserve_while_conditions_) {
+    new_condition = VisitExpr(new_condition);
+    if (As<Call>(new_condition)) new_condition = ExtractCallToTemp(new_condition);
   }
 
-  // Flatten the body through FlattenScopeBody so a single-statement
-  // (non-SeqStmts) loop body still materializes its hoisted temporaries
-  // (issue #1708). The condition's own pending stmts are preserved for the
-  // parent SeqStmts.
+  // Body temporaries still belong inside the loop, including for a bare
+  // single-statement body. Preserve any pending statements from the caller.
   auto new_body = FlattenScopeBody(op->body_);
 
   auto result = MutableCopy(op);
@@ -434,6 +431,14 @@ StmtPtr FlattenCallExprMutator::VisitStmt_(const GraphScopeStmtPtr& op) {
                                                 op->leading_comments_, op->attrs_);
 }
 
+StmtPtr FlattenCallExprMutator::VisitStmt_(const RegScopeStmtPtr& op) {
+  auto new_body = FlattenScopeBody(op->body_);
+  if (new_body.get() == op->body_.get()) return op;
+  auto result = MutableCopy(op);
+  result->body_ = std::move(new_body);
+  return result;
+}
+
 StmtPtr FlattenCallExprMutator::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   auto new_body = FlattenScopeBody(op->body_);
   if (new_body.get() == op->body_.get()) return op;
@@ -466,6 +471,30 @@ StmtPtr FlattenCallExprMutator::VisitStmt_(const RuntimeScopeStmtPtr& op) {
 }
 
 // Expression visitors implementation
+
+ExprPtr FlattenCallExprMutator::VisitExpr_(const MakeTuplePtr& op) {
+  std::vector<ExprPtr> elements;
+  elements.reserve(op->elements_.size());
+  bool changed = false;
+  for (const auto& element : op->elements_) {
+    // Tuple construction eagerly evaluates every element, even if a later
+    // projection selects another slot. Materialize calls before visiting the
+    // next element so folding that projection cannot drop or reorder effects.
+    auto visited = ExtractCallToTemp(VisitExpr(element));
+    changed |= visited.get() != element.get();
+    elements.push_back(std::move(visited));
+  }
+  if (!changed) return op;
+  return std::make_shared<MakeTuple>(std::move(elements), op->span_);
+}
+
+ExprPtr FlattenCallExprMutator::VisitExpr_(const TupleGetItemExprPtr& op) {
+  // A tuple-returning Call/Submit must also be evaluated at this position,
+  // rather than remaining nested until a later consumer visits the tuple.
+  auto tuple = ExtractCallToTemp(VisitExpr(op->tuple_));
+  if (tuple.get() == op->tuple_.get()) return op;
+  return std::make_shared<TupleGetItemExpr>(tuple, op->index_, op->span_);
+}
 
 ExprPtr FlattenCallExprMutator::VisitExpr_(const CallPtr& op) {
   std::vector<ExprPtr> new_args;
@@ -563,7 +592,7 @@ ExprPtr FlattenCallExprMutator::VisitExpr_(const CastPtr& op) { return ProcessUn
 FunctionPtr TransformFlattenCallExpr(const FunctionPtr& func) {
   INTERNAL_CHECK(func) << "FlattenCallExpr cannot run on null function";
 
-  FlattenCallExprMutator mutator;
+  FlattenCallExprMutator mutator(func->func_type_ == FunctionType::SIMT);
   auto new_body = mutator.FlattenFunctionBody(func->body_);
   auto result = MutableCopy(func);
   result->body_ = new_body;

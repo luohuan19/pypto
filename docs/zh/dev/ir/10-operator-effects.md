@@ -73,12 +73,16 @@ REGISTER_OP("tile.store")
 检查，而它原地更新的那个参数仍然默认为 `Read`。`no_arg_writes()` 显式记录"对所有参数
 的裁决"，且与 `set_arg_effect` 同时使用会被判为自相矛盾而拒绝。
 
-`set_write_channel` 记录写入走的是 MTE3/DMA 通路还是标量 D-cache 通路。PyPTO 无法为
-同一个 GM tensor 排序这两者，因此会拒绝在同一缓冲区上混用两者的函数；有了通路声明，
+`set_write_channel` 区分 MTE3/DMA、标量 D-cache 和 SIMT lane 写入。PyPTO 无法为
+同一个 GM tensor 排序 DMA 与标量 D-cache 存储，因此会拒绝在同一缓冲区上混用两者的函数；有了通路声明，
 该诊断可以查询注册表而不必再列一遍算子清单。
 
-只为写入确实走这两条通路之一的算子声明它，其余一律留空——留空会把该算子排除在该诊断
-之外，而当两条通路都无法描述它时，这正是它该待的位置：
+`simt.store` 声明 `WriteChannel::Simt`，参与外层核函数的 InOut 传播，同时不会被
+误判成 DMA 或控制器 D-cache 存储。该分类不保证 SIMT 与其他写通路之间的硬件同步，
+后者属于设备 lowering 的契约。
+
+只为写入确实走这些通路之一的算子声明它，其余一律留空——留空会把该算子排除在该诊断
+之外，而当这些通路都无法描述它时，这正是它该待的位置：
 
 - `pld.system.notify` 发出的是 `pto.comm.tnotify`，一条独立的 comm 指令。声明任一通路
   都会让该诊断拒绝合法程序。
@@ -106,9 +110,9 @@ AIC 上的那份副本可能在 AIV 通路的 TPUT 尚未把该信号所释放�
 通路上是有实际作用的。把它钉在向量通路上，会让 matmul 越过它本应等待的对端数据。
 请把该标记读作「不得在第二个核上运行」，而不是「不幂等」。
 
-读取该维度的查询是 `IsNoDuplicate()`。它唯一的消费者是 `LowerAutoVectorSplit`
-（pass 23）的 `pl.split_aiv` 区域放置标记：该 pass 恰好把区域内的 no-duplicate 调用
-钉在 AIV 通路上。没有任何 verifier 在这个维度上做拒绝。
+读取该维度的查询是 `IsNoDuplicate()`。消费显式区域时，`ExpandMixedKernel`
+将 `pl.split_aiv` 区域内核无关的 no-duplicate 调用固定在 AIV 通路上。
+软件流水分析也将这些调用视为不可复制。没有 verifier 仅因该维度而拒绝调用。
 
 被 `set_core_affinity(...)` 固定在单条通路上的算子本来就不会被复制，因此无需该标记。
 这个标记正是为核无关（core-agnostic）的算子准备的 —— 对它们而言，没有任何 affinity

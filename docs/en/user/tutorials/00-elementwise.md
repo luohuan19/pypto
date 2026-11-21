@@ -1,5 +1,9 @@
 # Your First Operator
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Building `c = a + b` four times over, each version closer to how real kernels are written.
 
 > **Prerequisites:** [Types](../language/00-types.md) and
@@ -39,7 +43,8 @@ def add_tensor(
 a = torch.randn(128, 128)
 b = torch.randn(128, 128)
 out = torch.zeros(128, 128)
-add_tensor(a, b, out, config=RunConfig(platform="a2a3sim"))
+compiled = add_tensor.compile(a, b, out, config=RunConfig(platform="a2a3sim"))
+compiled(a, b, out, config=RunConfig(platform="a2a3sim"))
 assert torch.allclose(out, a + b, rtol=1e-5, atol=1e-5)
 ```
 
@@ -150,7 +155,8 @@ torch.manual_seed(0)
 a = torch.randn(512, 128)
 b = torch.randn(512, 128)
 out = torch.zeros(512, 128)
-add_chunked(a, b, out, config=RunConfig(platform="a2a3sim"))
+compiled = add_chunked.compile(a, b, out, config=RunConfig(platform="a2a3sim"))
+compiled(a, b, out, config=RunConfig(platform="a2a3sim"))
 assert torch.allclose(out, a + b, rtol=1e-5, atol=1e-5)
 ```
 

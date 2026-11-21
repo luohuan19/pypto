@@ -1,12 +1,25 @@
 # 运行
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 派发一个 `CompiledProgram`，并让常驻数据真的常驻。
 
 ## 概念
 
-`CompiledProgram` 是一个句柄：指向编译产物，外加运行时启动它们所需的元数据。`ChipWorker` 持有设备连接与那些注册；派发要么是隐式的 —— 在 `@pl.jit` 函数上直接 `kernel(*args)` —— 要么是显式的，经由 worker，适用于库代码需要把 worker 传来传去、或服务化运行时想预注册许多 kernel 的场合。
+`CompiledProgram` 是一个句柄：指向编译产物，外加运行时启动它们所需的元数据。
+`ChipWorker` 持有设备连接与注册。program 执行先通过
+`compiled = kernel.compile(*args, config=cfg)` 取得句柄，再调用
+`compiled(*args, config=cfg)`；库代码需要显式 worker 或服务化运行时预注册 kernel 时，
+也可以使用 `worker.run(compiled, *args)`。
 
-早点搞清楚的一件事是：每次 launch 有什么东西跨过了 PCIe。默认每个张量实参都会 H2D 拷进去、再 D2H 拷回来。`DeviceTensor` 让一块 buffer 同时免掉这两次拷贝 —— 常驻权重或 KV cache 能成立，靠的就是它。
+program 执行按参数方向传输主机 Tensor；`DeviceTensor` 跳过这些传输，使常驻权重和
+KV cache 成为可能。直接 `kernel(*args)` 使用独立的 eager 路径：要求先调用
+`pypto.torch.init()` 并传入真实 NPU Tensor，在当前 Torch stream 上借用其 storage，
+使用 KERNEL 契约/缓存，与 `.compile()` 的 PROGRAM 契约/缓存分开。
+它不提供主机 Tensor 或模拟器的 program 派发。eager 前置条件见
+[kernel 模式](../../dev/runtime/kernel-mode.md)。
 
 ## 快速上手：把权重留在设备上
 
@@ -101,6 +114,32 @@ finally:
 | **显式释放** | `w.free_tensor(t)`；`close()` 是兜底，不是方案 |
 | **绑定在它的 worker 上** | 不能移交给另一个 `ChipWorker` |
 
+A2/A3 上可用 `exportable=True` 分配 VMM 内存，再调用
+`worker.export_buffer(tensor)`。同机消费者在自己的当前 ACL context 中通过
+`simpler.buffer_export.BufferMapping` 导入返回的租约；原 worker 仍持有内存所有权。
+调用方必须保持 worker 和 mapping 存活。释放 tensor 或关闭 worker 前，依次完成：
+等待外部访问结束、注销外部资源、成功关闭 mapping、调用
+`worker.release_export(exported)`。仍有导出租约时，free 和 close 会拒绝清理。
+`BufferExportError` 通过 `error.exported` 提供尚未确认的租约，调用
+`release_export(error.exported)` 确认并释放它。`BufferImportError` 通过
+`error.mapping` 提供可重试清理的映射；应在导入 context 中完成清理后再释放源租约。
+
+真实控制超时会保留原始载荷。迟到回执到达后重试 `release_export`，将对账同一条
+RETAIN/RELEASE，而不重新执行原命令。这只恢复清理能力，不重新开放已隔离的计算
+endpoint；应关闭该 worker 并创建新实例。分配回执未决时 close 会拒绝；分配回滚
+未完成的资源仍由 worker 持有，可再次 close。VMM free 失败会撤销使用资格，同时
+保留仅用于清理的身份：可重试 `free_tensor` 或 close，不可继续计算、复制或导出该 tensor。
+
+共享范围限定为同机可信进程。native 导出关闭 PID 白名单校验，租约是生命周期合同，
+不代表目标进程授权。同一 backing 应复用一个消费者 mapping；重复导入同一 shareable
+handle 受 CANN 自身约束。
+
+### 低精度张量分配的数据类型
+
+运行时用 `FP8E5M2` 表示 E5M2 张量。如果所安装的 PyTorch 提供
+`torch.float8_e5m2`，主机端可直接使用它。编排代码将 `pl.HF8` 和
+`pl.FP4E1M2X2` 的分配描述为 `UINT8` 字节缓冲区，核内代码保留声明的元素类型。
+
 ### 影响派发的 `RunConfig` 字段
 
 `RunConfig` 同时携带编译侧与运行时侧设置；编译侧那些见[上一页](00-compile.md)。派发时要紧的是：
@@ -119,7 +158,7 @@ finally:
 | 现象 | 原因 | 修法 |
 | ---- | ---- | ---- |
 | **worker 在首次派发前就拒绝该程序** | 产物的 `platform` 与 worker 不一致 | 用你要派发的平台去编译 |
-| **`missing inferred tensor metadata for parameter`** | 把 `DeviceTensor` 传给了 `@pl.jit` 入口 | 派发**已编译**的程序；特化器读不到它的 shape/dtype |
+| **JIT 入口拒绝 `DeviceTensor`** | eager 调用要求真实 Torch NPU Tensor；`.compile()` 无法从 `DeviceTensor` 推断 shape/dtype | 使用主机 metadata 样本或完整注解编译，再派发已编译的 program |
 | **设备内存随 launch 增长** | `DeviceTensor` 没释放 | `free_tensor`，或用 `with` 圈住 worker |
 | **派发不给 host/device 拆分** | `execution_time` 是整段墙上时间 | 用 `pypto.runtime.benchmark` 取 `device_wall_us` / `host_wall_us` |
 

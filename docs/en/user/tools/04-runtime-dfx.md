@@ -1,5 +1,9 @@
 # Runtime DFX
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Five independent collection flags. What each one records, where it lands, and what opens it.
 
 ## Concept
@@ -38,7 +42,8 @@ cfg = RunConfig(
     enable_dep_gen=True,        # the task DAG the timing is joined against
     save_kernels=True,          # forced anyway; be explicit about wanting the directory
 )
-out = kernel(a, b, torch.zeros(...), config=cfg)
+compiled = kernel.compile(a, b, torch.zeros(...), config=cfg)
+out = compiled(a, b, torch.zeros(...), config=cfg)
 ```
 
 From pytest, the same two:

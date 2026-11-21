@@ -89,6 +89,37 @@ def _window(*values):
     return ir.MakeTuple([_int(value) if isinstance(value, int) else value for value in values], SPAN)
 
 
+@pytest.mark.parametrize("rows", [0, 8, None])
+def test_empty_buffer_memory_windows(tmp_path, rows):
+    """Explicit Buffer IR shares the empty-region memory contract with Tile IR."""
+    extent = _scalar("rows") if rows is None else _int(rows)
+    tensor_type = ir.TensorType([16, 32], DataType.FP32)
+    source = ir.Var("source", tensor_type, SPAN)
+    output = ir.Var("output", tensor_type, SPAN)
+    tile, alloc = _alloc("tile", _type(valid=(-1, -1)), [extent, _int(32)])
+    params = [source, (output, ir.ParamDirection.Out)] + ([extent] if rows is None else [])
+    text = _emit(
+        _program(
+            [
+                alloc,
+                _eval("buffer.load", source, _window(0, 0), _window(extent, 32), tile),
+                _eval("buffer.store", tile, _window(0, 0), _window(extent, 32), output),
+            ],
+            params,
+        ),
+        flag=False,
+    )
+    if rows == 0:
+        assert "pto.partition_view" not in text, text
+        assert "pto.tload" not in text and "pto.tstore" not in text, text
+    elif rows is None:
+        assert text.count("scf.if") == 2, text
+    else:
+        assert "scf.if" not in text, text
+        assert "pto.tload" in text and "pto.tstore" in text, text
+    _compile_native(tmp_path, text, addressed=False)
+
+
 def _gm_program(
     addressed=False, source_name="input", valid_shape=None, ir_stage=ir.FunctionIRStage.Functional
 ):
@@ -257,6 +288,19 @@ def test_gm_transfers_reject_incompatible_parameter_directions(name, direction):
         [(tensor, direction)],
     )
     with pytest.raises(ValueError, match="parameter direction"):
+        _emit(program)
+
+
+@pytest.mark.parametrize("name", ["buffer.load", "buffer.store"])
+def test_gm_transfers_reject_reduction_columns(name):
+    tensor = ir.Var("tensor", ir.TensorType([16, 64], DataType.FP32), SPAN)
+    buffer, allocation = _alloc("column", _type((16, 1), blayout=ir.TileLayout.col_major))
+    source, destination = (tensor, buffer) if name == "buffer.load" else (buffer, tensor)
+    program = _program(
+        [allocation, _eval(name, source, _window(0, 0), _window(16, 1), destination)],
+        [(tensor, ir.ParamDirection.InOut)],
+    )
+    with pytest.raises(ValueError, match="GM transfers do not support reduction column vectors"):
         _emit(program)
 
 
@@ -610,7 +654,6 @@ def test_unsigned_for_bound_fails_before_emission():
     [
         (_type(shape=(2, 16, 32)), "rank-1 or rank-2"),
         (_type(blayout=ir.TileLayout.col_major), "dense row-major Vec"),
-        (ir.BufferType([16, 32], DataType.FP4, ir.MemorySpace.Vec), "dense row-major Vec"),
     ],
 )
 def test_unsupported_physical_descriptors_fail_explicitly(descriptor, message):
@@ -791,6 +834,63 @@ def test_native_explicit_buffer_stage_handles_empty_and_scalar_only_kernels(tmp_
     assert not _allocations(text)
     assert "tile_buf" not in text
     assert ("scf.if %arg0" in text) == with_scalar_body
+    _compile_native(tmp_path, text, addressed=False)
+
+
+@pytest.mark.parametrize(
+    "ir_stage", [ir.FunctionIRStage.Functional, ir.FunctionIRStage.Buffer], ids=["tile", "buffer"]
+)
+def test_loop_floor_divmod_uses_prepared_truncation(ir_stage):
+    """Both entry points keep the fast form inside a loop and full floor semantics for unknown signs."""
+    index = _scalar("i")
+    count = _scalar("count")
+    divisor = _scalar("divisor")
+    offset = ir.Sub(index, _int(8), DataType.INDEX, SPAN)
+    block = _int(24)
+    quotient = ir.FloorDiv(offset, block, DataType.INDEX, SPAN)
+    remainder = ir.FloorMod(quotient, block, DataType.INDEX, SPAN)
+    loop = ir.ForStmt(
+        index,
+        _int(8),
+        count,
+        _int(1),
+        [],
+        ir.AssignStmt(_scalar("r"), remainder, SPAN),
+        [],
+        SPAN,
+    )
+    text = _emit(
+        _program(
+            [
+                loop,
+                ir.AssignStmt(_scalar("floor_q"), ir.FloorDiv(count, divisor, DataType.INDEX, SPAN), SPAN),
+                ir.AssignStmt(_scalar("floor_r"), ir.FloorMod(count, divisor, DataType.INDEX, SPAN), SPAN),
+            ],
+            [count, divisor],
+            ir_stage=ir_stage,
+        )
+    )
+
+    assert text.count("arith.divsi") == 1
+    assert text.count("arith.floordivsi") == 1
+    assert text.count("arith.remsi") == 2
+    assert text.count("arith.select") == 1
+    assert text.index("scf.for") < text.index("arith.divsi") < text.index("arith.floordivsi")
+
+
+@pytest.mark.parametrize("dtype", [DataType.UINT8, DataType.UINT16, DataType.UINT32, DataType.UINT64])
+def test_explicit_buffer_stage_accepts_bool_to_unsigned_cast(tmp_path, dtype):
+    """The Buffer validator must admit the shared emitter's BOOL-to-unsigned recipe."""
+    flag = _scalar("flag", DataType.BOOL)
+    value = _scalar("value", dtype)
+    program = _program(
+        [ir.AssignStmt(value, ir.Cast(flag, dtype, SPAN), SPAN)],
+        [flag],
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    text = _emit(program)
+    assert "arith.extui %arg0 : i1 to i" in text
+    assert "builtin.unrealized_conversion_cast" in text
     _compile_native(tmp_path, text, addressed=False)
 
 

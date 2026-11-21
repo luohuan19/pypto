@@ -1,5 +1,9 @@
 # 快速上手
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 编写、编译并查看你的第一批 PyPTO kernel —— 在张量级，数据放置由编译器替你决定。
 
 > **前置**：PyPTO 已安装且可导入 —— 见[安装](01-installation.md)。
@@ -58,7 +62,8 @@ compiled = add.compile()
 print(f"Generated code in: {compiled.output_dir}")
 
 out = torch.zeros(128, 128, dtype=torch.float32)
-add(A, B, out, config=CFG)
+compiled = add.compile(A, B, out, config=CFG)
+compiled(A, B, out, config=CFG)
 torch.testing.assert_close(out, A + B, rtol=1e-4, atol=1e-4)
 ```
 
@@ -106,7 +111,8 @@ def add_then_square(
 
 
 out = torch.zeros(128, 128, dtype=torch.float32)
-add_then_square(A, B, out, config=CFG)
+compiled = add_then_square.compile(A, B, out, config=CFG)
+compiled(A, B, out, config=CFG)
 torch.testing.assert_close(out, (A + B) * (A + B), rtol=1e-4, atol=1e-4)
 ```
 
@@ -260,13 +266,16 @@ a = torch.full((128, 128), 2.0, dtype=torch.float32)
 b = torch.full((128, 128), 3.0, dtype=torch.float32)
 out = torch.zeros((128, 128), dtype=torch.float32)
 
-add(a, b, out, config=RunConfig())          # 编译、缓存、派发
+compiled = add.compile(a, b, out, config=RunConfig())
+compiled(a, b, out, config=RunConfig())          # 编译、缓存、派发
 assert torch.allclose(out, a + b, rtol=1e-5, atol=1e-5)
 ```
 
-直接调用一个 `@pl.jit` 函数会一次做完全部事情：按实参的形状与 dtype 特化、编译、缓存、派发。
-后续用相同形状调用会复用缓存的编译产物。`examples/beginner/01_hello_world.py` 就是这个模式，
-只是写在 tile 级。
+显式 `compile()` 特化并缓存 program；调用返回的 program 时，通过 `RunConfig`
+派发执行。该路径支持主机 Tensor，以及设备或模拟器平台，
+`examples/beginner/01_hello_world.py` 展示了这种用法。直接 `@pl.jit` 调用则要求
+先执行 `pypto.torch.init()` 并传入 NPU Tensor；见
+[Torch eager kernel](../dev/runtime/kernel-mode.md)。
 
 ## 边界情况
 

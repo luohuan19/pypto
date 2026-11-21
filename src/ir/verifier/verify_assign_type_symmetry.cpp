@@ -24,6 +24,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/verifier/verifier.h"
 
 namespace pypto {
@@ -39,6 +40,14 @@ namespace {
 /// value to agree with.
 class AssignCountVisitor : public IRVisitor {
  public:
+  explicit AssignCountVisitor(const std::vector<VarPtr>& params) {
+    // A parameter is already defined on entry; its first assignment is a
+    // pre-SSA rebind, even when it is the only AssignStmt targeting that Var.
+    for (const auto& param : params) {
+      if (param) ++counts_[param.get()];
+    }
+  }
+
   [[nodiscard]] const std::unordered_map<const Var*, size_t>& counts() const { return counts_; }
 
  protected:
@@ -63,7 +72,7 @@ class AssignCountVisitor : public IRVisitor {
 /// so a single check covers the "pass mutated one side of an assignment" bug
 /// class (e.g. #1262 TileType memory_space, #1278 tile_view). ``memref_``
 /// (inherited from ShapedType) is intentionally NOT compared by
-/// ``structural_equal`` — it is an allocation detail bound to the Var, governed
+/// this verifier — it is an allocation detail bound to the Var, governed
 /// by ``HasMemRefs`` / ``AllocatedMemoryAddr`` — so MemRef asymmetry,
 /// legitimate after ``InitMemRef``, is out of scope here. Note ``memory_space``
 /// exists only on TileType, not TensorType.
@@ -87,8 +96,10 @@ class AssignTypeSymmetryVisitor : public IRVisitor {
 
  private:
   void CheckAssign(const AssignStmtPtr& op) {
-    const auto& var_type = op->var_->GetType();
-    const auto& rhs_type = op->value_->GetType();
+    // InitMemRef attaches allocation metadata to the binding, while the RHS
+    // keeps its inferred value type. Compare value descriptors explicitly.
+    const auto var_type = CloneTypeWithoutMemRef(op->var_->GetType());
+    const auto rhs_type = CloneTypeWithoutMemRef(op->value_->GetType());
     // Only compare when both sides carry a type. A null type means the value
     // has not been typed yet (legal in pre-type-check IR); flagging that here
     // would be a TypeCheck concern, not an asymmetry concern.
@@ -124,7 +135,7 @@ class AssignTypeSymmetryPropertyVerifierImpl : public PropertyVerifier {
     if (!program) return;
     for (const auto& [global_var, func] : program->functions_) {
       if (!func || !func->body_) continue;
-      AssignCountVisitor counter;
+      AssignCountVisitor counter(func->params_);
       counter.VisitStmt(func->body_);
       AssignTypeSymmetryVisitor visitor(diagnostics, func->name_, counter.counts());
       visitor.VisitStmt(func->body_);

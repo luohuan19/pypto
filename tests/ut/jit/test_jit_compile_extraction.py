@@ -18,16 +18,18 @@ import ctypes
 import importlib
 import re
 import warnings
+from pathlib import Path
 
 import pypto.language as pl
 import pytest
+from pypto.backend import BackendType
 from pypto.compile_profiling import CompileProfiler
 from pypto.ir import OptimizationStrategy, PassDumpLevel
 from pypto.ir.compiled_program import CompiledProgram
 from pypto.jit.decorator import jit
-from pypto.language.parser.diagnostics.exceptions import ParserTypeError
+from pypto.language.diagnostics import ParserTypeError
 from pypto.pypto_core import ir, passes
-from pypto.runtime.runner import RunConfig
+from pypto.runtime.runner import ExecutionMode, RunConfig
 
 
 @pytest.fixture(autouse=True)
@@ -52,8 +54,34 @@ def add_kernel(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
     return c
 
 
+@jit
+def add_returns_nothing(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+    M, N = a.shape
+    with pl.at(level=pl.Level.CORE_GROUP):
+        pl.store(pl.add(pl.load(a, [0, 0], [M, N]), pl.load(b, [0, 0], [M, N])), [0, 0], c)
+
+
 class TestCompileReturnsCompiledProgram:
     """Verify ``kernel.compile(*sample_args)`` returns a usable CompiledProgram."""
+
+    def test_compile_valueless_scope_with_local_write_alias(self):
+        """A local in-place Tile result must survive the pipeline without escaping.
+
+        Compile through codegen: lower() alone does not verify that the
+        orchestration caller can represent the outlined kernel's interface.
+        """
+        torch = pytest.importorskip("torch")
+
+        @jit
+        def copy_with_padding(a: pl.Tensor, out: pl.Out[pl.Tensor]):
+            M, N = a.shape
+            with pl.at(level=pl.Level.CORE_GROUP):
+                tile = pl.load(a, [0, 0], [M, N])
+                padded = pl.tile.fillpad_inplace(tile)
+                pl.store(padded, [0, 0], out)
+
+        compiled = copy_with_padding.compile(torch.zeros(16, 32), torch.empty(16, 32))
+        assert isinstance(compiled, CompiledProgram)
 
     def test_compile_returns_compiled_program_instance(self):
         torch = pytest.importorskip("torch")
@@ -77,8 +105,8 @@ class TestCompileReturnsCompiledProgram:
         second = add_kernel.compile(a, b, c)
         assert first is second
 
-    def test_call_then_compile_returns_cached_instance(self, monkeypatch):
-        """``__call__`` and ``compile()`` share the same cached program."""
+    def test_program_dispatch_then_compile_returns_cached_instance(self, monkeypatch):
+        """Explicit program dispatch preserves the compile() cache after the JIT mode switch."""
         torch = pytest.importorskip("torch")
 
         a = torch.zeros(96, 96, dtype=torch.float32)
@@ -87,7 +115,7 @@ class TestCompileReturnsCompiledProgram:
 
         compiled = add_kernel.compile(a, b, c)
         monkeypatch.setattr(CompiledProgram, "__call__", lambda self, *_args, **_kwargs: "called")
-        assert add_kernel(a, b, c) == "called"
+        assert compiled(a, b, c) == "called"
         assert add_kernel.compile(a, b, c) is compiled
 
     def test_compile_cache_miss_on_different_shape(self):
@@ -121,6 +149,21 @@ class TestCompileReturnsCompiledProgram:
 
 class TestLowerReturnsProgram:
     """Verify ``lower()`` specializes and runs passes without compiling."""
+
+    def test_lower_runs_the_pipeline_for_a_valueless_entry(self):
+        """A kernel that writes its Out parameter and returns nothing lowers.
+
+        The InCore outliner used to export the terminal scope's dead
+        intermediates as tile-typed returns, which the tile conversion
+        rejects with an INTERNAL_CHECK — a bug-class failure for this legal
+        entry shape.
+        """
+        torch = pytest.importorskip("torch")
+        a = torch.zeros(24, 24)
+        b = torch.zeros(24, 24)
+        c = torch.empty(24, 24)
+        program = add_returns_nothing.lower(a, b, c)
+        assert isinstance(program, ir.Program)
 
     def test_lower_returns_post_pass_program_without_compiling(self, monkeypatch):
         torch = pytest.importorskip("torch")
@@ -712,6 +755,192 @@ class TestNzOnTensorIsNotJitSpecific:
         assert param_type.tensor_view.layout == ir.TensorLayout.NZ
 
 
+def test_nz_whole_tensor_flatten_reaches_explicit_incore_helper():
+    """Issue #3062: a physical NZ byte range can cross an explicit helper boundary."""
+
+    @jit.incore
+    def copy_head(flat: pl.Tensor[[131072], pl.INT8], out: pl.Out[pl.Tensor[[16], pl.INT8]]):
+        tile = pl.load(flat, [0], [16])
+        out = pl.store(tile, [0], out)
+        return out
+
+    @jit
+    def entry(weight: pl.Tensor[[256, 512], pl.INT8, pl.NZ], out: pl.Out[pl.Tensor[[16], pl.INT8]]):
+        flat = pl.reshape(weight, [131072])
+        with pl.spmd(1):
+            out = copy_head(flat, out)
+        return out
+
+    # The whole-buffer flatten describes raw contiguous storage. Its consumer
+    # needs an ordinary rank-1 tensor, while the original weight stays NZ.
+    program = entry.specialize()
+    weight_type = program.get_function("entry").params[0].type
+    assert isinstance(weight_type, ir.TensorType)
+    for dim, extent in zip(weight_type.shape, [256, 512], strict=True):
+        assert isinstance(dim, ir.ConstInt)
+        assert dim.value == extent
+    assert weight_type.tensor_view is not None
+    assert weight_type.tensor_view.layout == ir.TensorLayout.NZ
+
+    flat_type = program.get_function("copy_head").params[0].type
+    assert isinstance(flat_type, ir.TensorType)
+    assert len(flat_type.shape) == 1
+    flat_extent = flat_type.shape[0]
+    assert isinstance(flat_extent, ir.ConstInt)
+    assert flat_extent.value == 131072
+    assert flat_type.dtype == pl.INT8
+    assert flat_type.tensor_view is None
+
+
+def test_nz_whole_tensor_flatten_compiles_with_explicit_incore_helper():
+    """The inferred view also survives passes and code generation with a legal tile store."""
+
+    @jit.incore
+    def copy_head(flat: pl.Tensor[[131072], pl.INT8], out: pl.Out[pl.Tensor[[1, 32], pl.INT8]]):
+        tile = pl.load(flat, [0], [32], target_memory=pl.Mem.Vec)
+        # PTO stores need a 2D valid_shape and a 32-byte-aligned INT8 row.
+        row = pl.tile.reshape(tile, [1, 32])
+        pl.store(row, [0, 0], out)
+        return out
+
+    @jit
+    def entry(weight: pl.Tensor[[256, 512], pl.INT8, pl.NZ], out: pl.Out[pl.Tensor[[1, 32], pl.INT8]]):
+        flat = pl.reshape(weight, [131072])
+        with pl.spmd(1):
+            out = copy_head(flat, out)
+        return out
+
+    # The module fixture keeps this source-only, without an assembler or NPU.
+    compiled = entry.compile()
+    assert isinstance(compiled, CompiledProgram)
+    pto_files = list(Path(compiled.output_dir).rglob("*.pto"))
+    assert pto_files
+    source = "\n".join(path.read_text() for path in pto_files)
+    assert "pto.tload" in source
+    assert "pto.tstore" in source
+
+
+@pytest.mark.parametrize("clustered", [False, True], ids=["separate", "clustered"])
+def test_group_rebinds_dynamic_internal_workspace_extents(clustered, tmp_path):
+    """Issue #3138: a mixed Group must bind local and loop-carried workspace types."""
+    caller_extent = pl.dynamic("MIX_CALLER_T")
+    member_extent = pl.dynamic("MIX_MEMBER_N")
+    group_extent = pl.dynamic("MIX_GROUP_M")
+
+    @jit.incore
+    def cube(
+        left: pl.Tensor[[16, 16], pl.BF16],
+        right: pl.Tensor[[16, 16], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        a = pl.load(left, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+        b = pl.load(right, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+        value = pl.matmul(a, b, out_dtype=pl.FP32)
+        pl.store(value, [0, 0], out)
+        return out
+
+    @jit.incore
+    def vector(
+        work: pl.InOut[pl.Tensor[[8, member_extent], pl.FP32]],
+        out: pl.Out[pl.Tensor[[2, 16], pl.FP32]],
+    ):
+        pl.func_attr({"split_aiv": True})
+        lane = pl.tile.get_subblock_idx()
+        saved = work
+        for part in pl.range(2):
+            value = pl.full([1, 16], dtype=pl.FP32, value=1.0)
+            work[lane : lane + 1, part * 16 : part * 16 + 16] = value
+        first = pl.read(work, [lane, 0])
+        pl.write(out, [lane, 0], first)
+        return saved, out
+
+    @jit.inline(auto_scope=False)
+    def mixed_group(
+        work: pl.Tensor[[8, group_extent], pl.FP32],
+        left: pl.Tensor[[16, 16], pl.BF16],
+        right: pl.Tensor[[16, 16], pl.BF16],
+        cube_out: pl.Tensor[[16, 16], pl.FP32],
+        vec_out: pl.Tensor[[2, 16], pl.FP32],
+    ):
+        with pl.cluster(name_hint="mixed_extent"):
+            cube_out = cube(left, right, cube_out)
+            work, vec_out = vector(work, vec_out)
+        return work, cube_out, vec_out
+
+    @jit
+    def clustered_entry(
+        size: pl.Tensor[[caller_extent], pl.INT32],
+        left: pl.Tensor[[16, 16], pl.BF16],
+        right: pl.Tensor[[16, 16], pl.BF16],
+        cube_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        vec_out: pl.Out[pl.Tensor[[2, 16], pl.FP32]],
+    ):
+        t = pl.tensor.dim(size, 0)
+        work = pl.create_tensor([8, t + 32], dtype=pl.FP32)
+        work, cube_out, vec_out = mixed_group(work, left, right, cube_out, vec_out)
+
+    @jit
+    def separate_entry(
+        size: pl.Tensor[[caller_extent], pl.INT32],
+        left: pl.Tensor[[16, 16], pl.BF16],
+        right: pl.Tensor[[16, 16], pl.BF16],
+        cube_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        vec_out: pl.Out[pl.Tensor[[2, 16], pl.FP32]],
+    ):
+        t = pl.tensor.dim(size, 0)
+        work = pl.create_tensor([8, t + 32], dtype=pl.FP32)
+        with pl.spmd(1):
+            cube_out = cube(left, right, cube_out)
+        with pl.spmd(1):
+            work, vec_out = vector(work, vec_out)
+
+    # Both paths use the same incore helpers and workspace. The mixed path
+    # used to leave MIX_GROUP_M in the vector alias/loop types after replacing
+    # the parameter's physical extent, failing later during PTO emission.
+    entry = clustered_entry if clustered else separate_entry
+    compiled = entry.compile(
+        config=RunConfig(
+            backend_type=BackendType.Ascend910,
+            execution_mode=ExecutionMode.ONBOARD,
+            memory_planner=passes.MemoryPlanner.PYPTO,
+            save_kernels_dir=str(tmp_path / "compiled"),
+        )
+    )
+    assert isinstance(compiled, CompiledProgram)
+    # Full source generation, rather than lower(), exercises the failing
+    # symbol materialization without requiring PTOAS or an NPU.
+    assert list(Path(compiled.output_dir).rglob("*.pto"))
+
+
+@pytest.mark.parametrize("source_layout", [pl.ND, pl.NZ])
+def test_reshape_nd_result_is_not_overridden_by_helper_layout(source_layout):
+    """Known reshape metadata takes precedence over the helper's declared layout."""
+
+    @jit.incore
+    def copy_head(flat: pl.Tensor[[131072], pl.INT8, pl.NZ], out: pl.Out[pl.Tensor[[1, 32], pl.INT8]]):
+        tile = pl.load(flat, [0], [32], target_memory=pl.Mem.Vec)
+        row = pl.tile.reshape(tile, [1, 32])
+        pl.store(row, [0, 0], out)
+        return out
+
+    @jit
+    def entry(
+        weight: pl.Tensor[[256, 512], pl.INT8, source_layout],
+        out: pl.Out[pl.Tensor[[1, 32], pl.INT8]],
+    ):
+        flat = pl.reshape(weight, [131072])
+        with pl.spmd(1):
+            out = copy_head(flat, out)
+        return out
+
+    flat_type = entry.specialize().get_function("copy_head").params[0].type
+    assert isinstance(flat_type, ir.TensorType)
+    assert flat_type.tensor_view is None
+    # Compilation runs the layout verifier too: the physical ND view must not
+    # be restamped NZ merely because the helper's source annotation says NZ.
+    assert isinstance(entry.compile(), CompiledProgram)
+
+
 def _request_kernel(x: pl.Tensor[[32, 32], pl.FP32]) -> pl.Tensor[[32, 32], pl.FP32]:
     with pl.at(level=pl.Level.CORE_GROUP):
         result = pl.add(x, x)
@@ -750,7 +979,9 @@ def test_default_and_runtime_only_requests_share_cache(kernel, compile_calls):
         assert kernel.compile() is cached
     assert len(compile_calls) == 1
     kwargs = compile_calls[0][0]
-    assert kwargs["platform"] == "a2a3sim"
+    assert kwargs["backend_type"] == BackendType.Ascend910
+    assert kwargs["execution_mode"] is ExecutionMode.SIM
+    assert "platform" not in kwargs
     assert kwargs["dump_passes"] is PassDumpLevel.NONE
 
 
@@ -785,7 +1016,7 @@ def test_diagnostic_requests_neither_lookup_nor_insert(kernel, compile_calls, mo
         assert kernel.compile() is cached
 
 
-@pytest.mark.parametrize("env_name", ["PYPTO_PROG_BUILD_DIR", "PYPTO_COMPILE_PROFILING"])
+@pytest.mark.parametrize("env_name", ["PYPTO_COMPILE_PROFILING"])
 def test_environment_request_bypasses_warm_cache(kernel, compile_calls, monkeypatch, tmp_path, env_name):
     kernel.compile()
     before = dict(kernel._cache)
@@ -828,6 +1059,43 @@ def test_pass_context_conflict_is_rejected_before_cache_lookup(kernel, compile_c
     with passes.PassContext([]), pytest.raises(RuntimeError, match="memory_planner.*PassContext"):
         kernel.compile(config=config)
     assert len(compile_calls) == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_software_pipeline_conflict_is_rejected_before_cache_lookup(kernel, compile_calls, enabled):
+    config = RunConfig(enable_software_pipeline=enabled)
+    kernel.compile(config=config)
+    with passes.PassContext([]), pytest.raises(RuntimeError, match="enable_software_pipeline.*PassContext"):
+        kernel.compile(config=config)
+    assert len(compile_calls) == 1
+
+
+def test_software_pipeline_cache_separates_effective_modes(kernel, compile_calls):
+    ordinary = kernel.compile()
+    enabled = kernel.compile(config=RunConfig(enable_software_pipeline=True))
+    assert enabled is not ordinary
+    assert kernel.compile(config=RunConfig(enable_software_pipeline=False)) is ordinary
+    with passes.PassContext([], enable_buffer_ir=False, enable_software_pipeline=True):
+        assert kernel.compile() is enabled
+    assert kernel.compile() is ordinary
+    assert len(compile_calls) == 2
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("entrypoint", ["lower", "compile"])
+def test_run_config_selects_software_pipeline_during_lowering(kernel, monkeypatch, enabled, entrypoint):
+    """Both JIT entrypoints apply RunConfig to the shared lowering pipeline."""
+    compile_module = importlib.import_module("pypto.ir.compile")
+    seen = []
+    run_pipeline = compile_module._run_pass_pipeline
+
+    def observe_pipeline(*args, **kwargs):
+        seen.append(kwargs["enable_software_pipeline"])
+        return run_pipeline(*args, **kwargs)
+
+    monkeypatch.setattr(compile_module, "_run_pass_pipeline", observe_pipeline)
+    getattr(kernel, entrypoint)(config=RunConfig(enable_software_pipeline=enabled))
+    assert seen == [enabled]
 
 
 def test_failed_diagnostic_compile_preserves_ordinary_entry(kernel, compile_calls, monkeypatch):
@@ -1402,6 +1670,52 @@ def test_jit_fixture_detects_printer_failure(monkeypatch, pass_verification_inst
     else:
         # Explicit basic/none modes do not request a print/reparse check.
         assert isinstance(add_kernel.lower(x, x, torch.empty_like(x)), ir.Program)
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
+def test_deprecated_and_explicit_target_share_cache(kernel, compile_calls, platform):
+    with pytest.warns(DeprecationWarning, match=r"RunConfig\(platform="):
+        legacy = RunConfig(platform=platform)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        explicit = RunConfig(backend_type=legacy.backend_type, execution_mode=legacy.execution_mode)
+        artifact = kernel.compile(config=explicit)
+        assert kernel.compile(config=legacy) is artifact
+    assert len(compile_calls) == 1
+    assert next(iter(kernel._cache)).platform == platform
+
+
+@pytest.mark.parametrize("env_name", ["PYPTO_EMIT_DEBUG_RUNNER", "PYPTO_REBUILD_FROM_PTO"])
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", " no "])
+def test_disabled_debug_request_preserves_warm_cache(kernel, compile_calls, monkeypatch, env_name, value):
+    cached = kernel.compile()
+    monkeypatch.setenv(env_name, value)
+    assert kernel.compile() is cached
+    assert len(compile_calls) == 1
+
+
+@pytest.mark.parametrize("env_name", ["PYPTO_EMIT_DEBUG_RUNNER", "PYPTO_REBUILD_FROM_PTO"])
+@pytest.mark.parametrize("value", ["1", "true", ""])
+def test_explicit_debug_request_still_runs_compilation(kernel, compile_calls, monkeypatch, env_name, value):
+    # Empty-but-set retains the existing consumers' enabled/default spelling.
+    kernel.compile()
+    monkeypatch.setenv(env_name, value)
+    kernel.compile()
+    kernel.compile()
+    assert len(compile_calls) == 3
+
+
+def test_build_directory_selects_placement_without_forcing_compilation(
+    kernel, compile_calls, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(tmp_path / "private"))
+    cached = kernel.compile()
+    assert kernel.compile() is cached
+    monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(tmp_path / "other"))
+    # Already-created objects keep their placement; there is no directory copy
+    # or recompilation just because a later request selects a different base.
+    assert kernel.compile() is cached
+    assert len(compile_calls) == 1
 
 
 if __name__ == "__main__":

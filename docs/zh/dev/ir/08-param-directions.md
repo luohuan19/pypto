@@ -84,7 +84,7 @@ REGISTER_OP("system.set_ffts")
 被调函数的槽位被累积为两个独立标志——`In`/`InOut` 记为读、`Out`/`InOut` 记为写
 ——最后一次性推导出方向。
 
-参见 [Outline InCore Scopes](../passes/09-outline_incore_scopes.md)。
+参见 [Outline InCore Scopes](../passes/10-outline_incore_scopes.md)。
 
 ### 2. 调用方传播（pass 11）
 
@@ -121,7 +121,7 @@ for _ in pl.range(4):
 `OutputExisting`、`InOut`、`NoDep`、`Scalar`——这才是依赖分析与 codegen 实际消费的
 东西。
 
-参见 [Derive Call Directions](../passes/42-derive_call_directions.md)。
+参见 [Derive Call Directions](../passes/46-derive_call_directions.md)。
 
 ### 4. 一致性警告（PostPipeline）
 
@@ -179,7 +179,14 @@ t = buf2                                  # ……但映射说 t -> buf2
 ## 参见
 
 - [算子系统](05-operators.md) —— 完整的声明面。
-- [Outline InCore Scopes](../passes/09-outline_incore_scopes.md) —— 阶段 1。
-- [Convert Tensor to Tile Ops](../passes/11-convert_tensor_to_tile_ops.md) —— 阶段 2。
-- [Derive Call Directions](../passes/42-derive_call_directions.md) —— 阶段 3。
+- [Outline InCore Scopes](../passes/10-outline_incore_scopes.md) —— 阶段 1。
+- [Convert Tensor to Tile Ops](../passes/13-convert_tensor_to_tile_ops.md) —— 阶段 2。
+- [Derive Call Directions](../passes/46-derive_call_directions.md) —— 阶段 3。
 - [IR 验证器](../passes/99-verifier.md) —— 阶段 4。
+
+## VF 存储借用
+
+早期寄存器提取复用同一套参数方向声明：只读捕获为 `In`，store/scatter 的目的
+参数保守声明为 `InOut`，包括掩码写入。VF 调用借用已有 Tile 存储，不按普通任务
+调用的 InOut 规则使 caller 的原 handle 失效。Tile 返回值通过现有返回来源契约
+关联到参数。初始化状态按 caller 的实际存储检查，不由 `InOut` 方向推定。
