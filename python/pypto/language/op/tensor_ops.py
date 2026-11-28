@@ -18,7 +18,6 @@ from collections.abc import Sequence
 from typing import Any, TypeVar, overload
 
 __all__ = [
-    "create_tensor",
     "create",
     "no_dep",
     "dump_tag",
@@ -116,6 +115,8 @@ __all__ = [
     "sort32",
     "mrgsort",
     "gather",
+    "gather_mask",
+    "gather_compare",
     "paged_gather",
     "create_l1",
     "gather_row",
@@ -127,12 +128,19 @@ __all__ = [
 ]
 
 from pypto.ir.op import tensor_ops as _ir_ops
-from pypto.ir.utils import _normalize_expr, caller_warning_stacklevel, has_partial_valid_region
+from pypto.ir.utils import (
+    _get_span_or_capture,
+    _normalize_expr,
+    _normalize_scalar_operand,
+    caller_warning_stacklevel,
+    has_partial_valid_region,
+)
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import AtomicType, CachePolicy, Expr, MemorySpace, PadValue, TensorLayout
 
 from ..typing import BoolLike, IntLike, Ptr, Scalar, Tensor, Tile, predicate_to_expr
+from ._utils import _normalize_intlike
 
 # Bound TypeVar lets slice / assemble propagate the caller's concrete tensor
 # class (Tensor or its DistributedTensor subclass) through to the return type.
@@ -157,11 +165,6 @@ def _unwrap_rhs(rhs: "_RhsT | Tensor | Scalar") -> "_RhsT | Expr":
     if isinstance(rhs, (Tensor, Scalar)):
         return rhs.unwrap()
     return rhs
-
-
-def _normalize_intlike(seq: Sequence[IntLike]) -> list[int | Expr]:
-    """Unwrap Scalar elements to Expr so the sequence matches C++ binding types."""
-    return [elem.unwrap() if isinstance(elem, Scalar) else elem for elem in seq]
 
 
 def create(
@@ -215,9 +218,6 @@ def create(
         _normalize_intlike(shape), dtype, layout, manual_dep=manual_dep, init_value=init_value
     )
     return Tensor(expr=call_expr)
-
-
-create_tensor = create
 
 
 def no_dep(tensor: Tensor) -> Tensor:
@@ -382,11 +382,15 @@ def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
       and that **nothing writes those bytes while the kernel runs**. Mixing a
       cached write and a bypassing read of the same bytes is a coherency bug
       the compiler cannot detect, so coherency is the author's contract. This
-      is why the policy is never a default and never inferred. Declaring
-      BYPASS on a tensor the scope itself writes is rejected at outlining.
+      is why the policy is never a default and never inferred. All non-allocating
+      scope policies (BYPASS and every NOT_ALLOC_* mode) require a read-only
+      tensor; declaring one on a tensor the scope writes is rejected at outlining.
     * **Tracked by Var identity, never by name.** The declaration names the
-      binding live at the scope, so rebinding the name afterwards
-      (``b = self.foo(b)``) yields a new value the declaration does not cover.
+      binding live at the scope and follows compiler-recognized aliases.
+      Rebinding the name to different GM storage loses the declaration; handles
+      returned by ``pl.store`` or ``pl.assemble`` retain the scope read policy
+      when they preserve the declared destination's storage. The declaration
+      does not configure stores.
     * **Consumed at parse time.** It emits no IR statement of its own: the
       parser records it on the enclosing scope, the scope outliner resolves it
       to the outlined kernel's parameters, and ``ConvertTensorToTileOps`` turns
@@ -397,22 +401,27 @@ def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
       ``cache=pl.CachePolicy.DEFAULT`` opts a single read back into the cache
       inside a bypassing scope.
 
-    Requires PTOAS >= v0.64. **On A2/A3** a declared read compiles to a
+    Requires PTOAS >= v0.77. **On A2/A3** a declared read compiles to a
     ``cache_policy`` attribute on ``pto.tload`` plus the device's no-cache alias
     offset, which the assembler adds to that one load's source address; the
     offset comes from the driver through the dispatch payload, and a device that
-    reports no alias reports zero, leaving the read ordinary and correct. Other
-    architectures do not map GM twice — A5 expresses the policy on the load
-    instruction instead — and PTOAS lowers the bare attribute to an ordinary
-    load, so a declaration there is accepted and currently does nothing.
+    reports no alias reports zero, leaving the read ordinary and correct.
+    For new A5 code, use ``CachePolicy.NORMAL_*`` or
+    ``CachePolicy.NOT_ALLOC_*`` to select an ISA mode, for example
+    ``CachePolicy.NOT_ALLOC_KEEP`` for a non-allocating read. Existing
+    ``CachePolicy.BYPASS`` reads retain their A5 NotAllocKeep lowering for
+    compatibility.
+    BYPASS remains load-only. Explicit A5 policies are unsupported in binary
+    VPTO compilation units and are rejected before assembly.
     ``CachePolicy.DEFAULT`` emits nothing, so a read that declares no policy
     generates exactly the code it did before.
 
     Args:
         tensor: The tensor whose reads the policy applies to. Must be a
             ``Tensor`` value bound outside the scope and read inside it.
-        policy: ``CachePolicy.BYPASS`` to declare a streaming, non-cached read;
-            ``CachePolicy.DEFAULT`` for an ordinary cached read.
+        policy: ``CachePolicy.DEFAULT/BYPASS`` on A2/A3, or one of the six
+            A5-specific ``CachePolicy`` modes on A5. The same enum is used
+            on both targets. Scope policies configure reads only.
 
     Returns:
         Nothing. The marker is consumed at parse time and produces no value.
@@ -728,6 +737,8 @@ def matmul(
     a_trans: bool = False,
     b_trans: bool = False,
     c_matrix_nz: bool = False,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tensor:
     """Matrix multiplication with optional transpose.
 
@@ -747,13 +758,17 @@ def matmul(
         a_trans: Whether to transpose lhs (requires a 2D+ lhs)
         b_trans: Whether to transpose rhs (requires a 2D+ rhs)
         c_matrix_nz: C matrix non-zero flag
+        tf32_mode: Optional HF32 input rounding: "round_even" or "round_away".
+            Requires 2D FP32 operands, Ascend950, and PTOAS 0.77+. None preserves FP32.
 
     Returns:
         Tensor wrapping the matmul operation
     """
     lhs_expr = lhs.unwrap()
     rhs_expr = rhs.unwrap()
-    call_expr = _ir_ops.matmul(lhs_expr, rhs_expr, out_dtype, a_trans, b_trans, c_matrix_nz)
+    call_expr = _ir_ops.matmul(
+        lhs_expr, rhs_expr, out_dtype, a_trans, b_trans, c_matrix_nz, tf32_mode=tf32_mode
+    )
     return Tensor(expr=call_expr)
 
 
@@ -762,8 +777,9 @@ def quant_mx(
     *,
     group_axis: int,
     dtype: DataType = DataType.FP8E4M3FN,
+    quant_scale_alg: str = "ocp",
 ) -> tuple[Tensor, Tensor]:
-    """Quantize a 2D tensor to MXFP8 data and its packed FP8E8M0 scale.
+    """Quantize a 2D tensor to MXFP8/MXFP4 data and its packed FP8E8M0 scale.
 
     ``group_axis=1`` produces A-oriented ``[M, K]`` data and an
     ``MX_A_ZZ`` scale tensor ``[M, K/32]``. ``group_axis=0`` accepts B input
@@ -774,7 +790,10 @@ def quant_mx(
         src: Source tensor. Must be a static-rank 2D FP16, BF16, or FP32 tensor.
         group_axis: Quantization group axis. Use ``1`` for A/LHS data and ``0``
             for B/RHS data.
-        dtype: Quantized MX data dtype. Defaults to ``FP8E4M3FN``.
+        dtype: Quantized MX data dtype. Defaults to ``FP8E4M3FN``. ``FP8E5M2`` uses OCP scaling.
+            ``FP4E2M1X2`` requires FP16/BF16 input and halves the output's last dimension.
+        quant_scale_alg: ``"ocp"`` (default) or ``"nv"``. FP16/BF16 NV requires axis 0.
+            FP8E5M2 requires ``"ocp"``.
 
     Returns:
         A pair ``(data, scale)``. ``data`` is the quantized MX tensor and
@@ -788,7 +807,9 @@ def quant_mx(
             ``group_axis`` is not supported, or ``dtype`` is not a supported MX
             data dtype.
     """
-    call_expr = _ir_ops.quant_mx(src.unwrap(), group_axis=group_axis, dtype=dtype)
+    call_expr = _ir_ops.quant_mx(
+        src.unwrap(), group_axis=group_axis, dtype=dtype, quant_scale_alg=quant_scale_alg
+    )
     span = call_expr.span
     return (
         Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),
@@ -797,17 +818,26 @@ def quant_mx(
 
 
 def matmul_mx(lhs: Tensor, lhs_scale: Tensor, rhs: Tensor, rhs_scale: Tensor) -> Tensor:
-    """MXFP8 matrix multiplication returning an FP32 tensor.
+    """MXFP8/MXFP4 matrix multiplication returning an FP32 tensor.
 
-    Inputs must use the oriented outputs of :func:`quant_mx`: A data/scale as
-    ``[M, K]`` / ``MX_A_ZZ[M, K/32]`` and B data/scale as
-    ``[K, N]`` / ``MX_B_NN[K/32, N]``.
+    Both data tensors must be FP8E4M3FN or both packed FP4 (E2M1x2,
+    E1M2x2, or one of each). FP4 ND carriers have shapes ``[M, K/2]``
+    and ``[K, N/2]``; DN carriers have ``[M/2, K]`` and ``[K/2, N]``.
+    Each operand may independently use ND or DN. Scale shapes always count
+    logical values: ``[M, K/32]`` and ``[K/32, N]``. Both operands must have
+    matching logical valid K extents. For packed FP4, valid K must be
+    positive and use the same number of 32-element scale groups as physical K.
+    Packed A and B scale layouts require fully valid M and N respectively.
+    Row-major MX_A_ND scales may match a partial logical M. To form complete
+    pairs during the Mat load, the valid extent on axis 0 (ND) or axis 1 (DN)
+    must be provably even. Native FP4 requires Ascend950 and PTOAS v0.77 or a
+    compatible newer build.
 
     Args:
-        lhs: A-side quantized data tensor with shape ``[M, K]``.
-        lhs_scale: A-side ``MX_A_ZZ`` FP8E8M0 scale tensor with shape
+        lhs: A-side quantized data tensor (logical shape ``[M, K]``).
+        lhs_scale: A-side ``MX_A_ZZ`` or row-major ``MX_A_ND`` FP8E8M0 scale tensor with shape
             ``[M, K/32]``.
-        rhs: B-side quantized data tensor with shape ``[K, N]``.
+        rhs: B-side quantized data tensor (logical shape ``[K, N]``).
         rhs_scale: B-side ``MX_B_NN`` FP8E8M0 scale tensor with shape
             ``[K/32, N]``.
 
@@ -816,8 +846,8 @@ def matmul_mx(lhs: Tensor, lhs_scale: Tensor, rhs: Tensor, rhs_scale: Tensor) ->
 
     Raises:
         ValueError: If the operands are not supported static 2D MX tensors, the
-            M/N/K dimensions are inconsistent, M is not divisible by 16, N is
-            not divisible by 32, K is not divisible by 64, or the scale tensors
+            M/N/K dimensions are inconsistent, M is not divisible by 16 (32 for FP4), N is
+            not divisible by 32 (64 for FP4), K is not divisible by 64, or the scale tensors
             have the wrong dtype, shape, or MX layout.
     """
     return Tensor(expr=_ir_ops.matmul_mx(lhs.unwrap(), lhs_scale.unwrap(), rhs.unwrap(), rhs_scale.unwrap()))
@@ -830,6 +860,8 @@ def matmul_acc(
     a_trans: bool = False,
     b_trans: bool = False,
     init_cond: BoolLike | None = None,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tensor:
     """Matrix multiplication with accumulation: acc += lhs @ rhs.
 
@@ -853,6 +885,8 @@ def matmul_acc(
         a_trans: Whether to transpose lhs
         b_trans: Whether to transpose rhs
         init_cond: Optional predicate selecting overwrite over accumulate
+        tf32_mode: Optional HF32 input rounding: "round_even" or "round_away".
+            Requires 2D FP32 operands, Ascend950, and PTOAS 0.77+. None preserves FP32.
 
     Returns:
         Tensor wrapping the matmul_acc operation
@@ -864,6 +898,7 @@ def matmul_acc(
         a_trans,
         b_trans,
         init_cond=predicate_to_expr(init_cond),
+        tf32_mode=tf32_mode,
     )
     return Tensor(expr=call_expr)
 
@@ -2045,7 +2080,7 @@ def assemble(
             floating-point results are non-deterministic. The target must be
             zero-initialised before the kernel runs. Supported dtypes:
             fp32 / bf16 / fp16 / int32 / int16 / int8. bf16 atomic-add is
-            available on the Ascend910B (A2/A3) profile; it is not supported on
+            available on the Ascend910 (A2/A3) profile; it is not supported on
             A5, where an fp32 accumulator + cast is required instead.
 
     Returns:
@@ -2141,9 +2176,24 @@ def view(
     shape: Sequence[IntLike] | None = None,
     valid_shape: Sequence[IntLike] | None = None,
     *,
+    offsets: Sequence[IntLike] | None = None,
+    steps: Sequence[IntLike] | None = None,
     layout: TensorLayout | None = None,
 ) -> _TensorT:
     """Reinterpret a tensor over the same physical memory.
+
+    With ``offsets`` or ``steps``, select a same-rank window in the immediate
+    parent GM tensor. Coordinates and sampling steps are in parent elements.
+    Each window axis must fit the parent shape, and valid samples must fit the
+    parent valid region. Dynamic geometry must obey these bounds at runtime.
+    When a shape, offset, step or valid extent comes from a memory read, bind the
+    result to a scalar before constructing the window.
+    Window creation only describes addresses. A distributed tensor keeps its
+    window buffer. Scalar tensor reads and writes address elements using the
+    window strides. Tile load/store require a provable unit physical inner
+    stride (last axis for ND, penultimate for DN).
+    The source layout is preserved. Without window geometry, the following
+    shape/layout reinterpretation rules apply.
 
     At least one of ``shape`` or ``layout`` must be provided: ``shape`` derives
     canonical strides for the requested shape, ``layout`` derives the canonical
@@ -2152,15 +2202,18 @@ def view(
 
     Args:
         tensor: Source tensor.
-        shape: New shape for the view. Must be product-preserving unless
-            symbolic dimensions are present. Rank-zero views are not supported.
-        valid_shape: Explicit valid dimensions for a packed ND
+        shape: Window extents or new shape for a reinterpretation.
+            Static reinterpretation preserves the element count. The result must have at least one axis.
+        valid_shape: Window valid extents, or explicit valid dimensions for a packed ND
             leading-dimension collapse to 2D or contiguous-prefix linear
             collapse to ``[1, product(shape)]``. Required when either supported
             collapse reinterprets a source with partial validity.
+        offsets: Per-axis starting indices for an InCore ND/DN GM window.
+            Omitted offsets default to zero when steps are given.
+        steps: Positive per-axis sampling steps for the window. Defaults to one.
         layout: Target ``TensorLayout`` (ND or DN); DN requires rank at least 2.
             Orchestration supports ND shape reinterprets and shaped
-            ND/MX_A_ZZ/MX_B_NN backing and consumer views for dynamic FP8E8M0
+            ND/MX_A_ZZ/MX_B_NN/MX_A_ND backing and consumer views for dynamic FP8E8M0
             MX scales. Other layout-changing shape views are limited to in-core
             lowering.
 
@@ -2175,6 +2228,8 @@ def view(
         tensor.unwrap(),
         None if shape is None else _normalize_intlike(shape),
         None if valid_shape is None else _normalize_intlike(valid_shape),
+        offsets=None if offsets is None else _normalize_intlike(offsets),
+        steps=None if steps is None else _normalize_intlike(steps),
         layout=layout,
     )
     return tensor.__class__(expr=call_expr)
@@ -2362,8 +2417,10 @@ def gather(
 ) -> Tensor | tuple[Tensor, Tensor]:
     """Gather elements of ``input`` — flat / axis / mask / compare form.
 
-    The tensor layer exposes a single unified ``gather``. Based on the arguments
-    you pass, it selects the matching form and lowering:
+    Use ``gather`` for flat or axis indexing. For mask selection and threshold
+    comparisons, use ``pl.tensor.gather_mask`` and ``pl.tensor.gather_compare``.
+    The mask and compare forms of ``gather`` are deprecated and emit
+    ``DeprecationWarning`` when used.
 
     Flat form (``index``, no ``dim``)::
 
@@ -2429,9 +2486,9 @@ def gather(
         out = gather(input, index=flat_idx)
         out = gather(input, flat_idx)
         out = gather(input, dim=-1, index=idx)
-        out = gather(input, mask_pattern=1)
-        out = gather(input, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.UINT32)
-        dst, cdst = gather(input, kvalue=kv, cmp_mode="eq", out_cols=8)
+        out = pl.tensor.gather_mask(input, mask_pattern=1)
+        out = pl.tensor.gather_mask(input, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.UINT32)
+        dst, cdst = pl.tensor.gather_compare(input, kv, cmp_mode="eq", out_cols=8)
     """
     kv_expr = None
     if kvalue is not None:
@@ -2449,12 +2506,67 @@ def gather(
         count_dtype=count_dtype,
     )
     if isinstance(call_expr.type, _ir_core.TupleType):
-        span = call_expr.span
-        return (
-            Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),
-            Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 1, span)),
+        warnings.warn(
+            "gather(..., kvalue=..., cmp_mode=..., out_cols=...) is deprecated; "
+            "use pl.tensor.gather_compare instead.",
+            DeprecationWarning,
+            stacklevel=caller_warning_stacklevel(),
+        )
+        return _gather_compare_results(call_expr)
+    if mask_pattern is not None:
+        warnings.warn(
+            "gather(..., mask_pattern=...) is deprecated; use pl.tensor.gather_mask instead.",
+            DeprecationWarning,
+            stacklevel=caller_warning_stacklevel(),
         )
     return Tensor(expr=call_expr)
+
+
+def gather_mask(
+    input: Tensor,
+    mask_pattern: int | _ir_core.ConstInt,
+    output_dtype: int | DataType | _ir_core.ConstInt | None = None,
+) -> Tensor:
+    """Select columns from each row by mask pattern, optionally reinterpreting their dtype."""
+    # Positional integer literals reach DSL wrappers as typed IR constants.
+    if isinstance(mask_pattern, _ir_core.ConstInt):
+        mask_pattern = mask_pattern.value
+    if isinstance(output_dtype, _ir_core.ConstInt):
+        output_dtype = output_dtype.value
+    return Tensor(expr=_ir_ops.gather_mask(input.unwrap(), mask_pattern, output_dtype))
+
+
+def gather_compare(
+    input: Tensor,
+    kvalue: int | Scalar | Expr,
+    *,
+    cmp_mode: str | int,
+    out_cols: int,
+    offset: int = 0,
+    count_dtype: int | DataType | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Return matching indices and per-row counts. An integer literal takes the input element dtype."""
+    src = input.unwrap()
+    if isinstance(kvalue, int):
+        threshold = _normalize_scalar_operand(src, kvalue, _get_span_or_capture())
+    else:
+        threshold = kvalue.unwrap() if isinstance(kvalue, Scalar) else _normalize_expr(kvalue)
+    call_expr = _ir_ops.gather_compare(
+        src,
+        threshold,
+        cmp_mode=cmp_mode,
+        out_cols=out_cols,
+        offset=offset,
+        count_dtype=count_dtype,
+    )
+    return _gather_compare_results(call_expr)
+
+
+def _gather_compare_results(call_expr: _ir_core.Call) -> tuple[Tensor, Tensor]:
+    return (
+        Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 0, call_expr.span)),
+        Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 1, call_expr.span)),
+    )
 
 
 def paged_gather(  # noqa: PLR0913

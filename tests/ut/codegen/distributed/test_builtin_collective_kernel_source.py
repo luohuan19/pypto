@@ -40,7 +40,8 @@ import re
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
-from pypto import ir
+from pypto import codegen, ir
+from pypto.backend import pto_backend
 from pypto.ir import DistributedConfig
 from pypto.pypto_core import passes
 
@@ -301,6 +302,759 @@ def test_host_rail_still_emits_its_builtin_chip_dispatch(tmp_path):
 
     next_levels = sorted(p.name for p in (host.output_dir / "next_levels").iterdir())
     assert _variant_of("fp32") in next_levels, next_levels
+
+
+def _build_indexed_rail_program(*, host: bool, dtype_name: str):
+    dtype = _dtype_of(dtype_name)
+    input_bytes = 13 * SIZE * dtype.get_byte()
+    target_bytes = TOTAL * SIZE * dtype.get_byte()
+
+    @pl.program
+    class IndexedRail:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_pipeline(
+            self,
+            inp: pld.DistributedTensor[[13, SIZE], dtype],
+            data: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], dtype]],
+            signal: pl.InOut[pld.DistributedTensor[[NR, NR], pl.INT32]],
+            counts: pld.DistributedTensor[[NR, 1], pl.INT32],
+            recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            index: pld.DistributedTensor[[NR, MAX_RECV], pl.INT32],
+        ) -> pld.DistributedTensor[[TOTAL, SIZE], dtype]:
+            return pld.tensor.indexed_all_to_all_v(inp, data, signal, counts, recv, index, core_num=NR)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            inp_buf = pld.alloc_window_buffer(input_bytes)
+            data_buf = pld.alloc_window_buffer(target_bytes)
+            sig_buf = pld.alloc_window_buffer(NR * NR * 4)
+            counts_buf = pld.alloc_window_buffer(NR * 4)
+            recv_buf = pld.alloc_window_buffer(NR * 4)
+            index_buf = pld.alloc_window_buffer(NR * MAX_RECV * 4)
+            for r in pl.range(pld.world_size()):
+                inp = pld.window(inp_buf, [13, SIZE], dtype=dtype)
+                data = pld.window(data_buf, [TOTAL, SIZE], dtype=dtype)
+                sig = pld.window(sig_buf, [NR, NR], dtype=pl.INT32)
+                counts = pld.window(counts_buf, [NR, 1], dtype=pl.INT32)
+                recv = pld.window(recv_buf, [NR, 1], dtype=pl.INT32)
+                index = pld.window(index_buf, [NR, MAX_RECV], dtype=pl.INT32)
+                self.chip_pipeline(inp, data, sig, counts, recv, index, device=r)
+
+    if not host:
+        return IndexedRail
+    # Keep the same windows/domain registration while moving the exchange to HOST.
+    source = ir.python_print(IndexedRail, format=False)
+    source, replacements = re.subn(
+        r"return pld\.tensor\.indexed_all_to_all_v\(inp, data, signal, counts, recv, index, core_num=2\)",
+        "return data",
+        source,
+    )
+    assert replacements == 1, source
+    # This registration dispatch only reads its windows after moving the exchange.
+    source = re.sub(r"pl\.InOut\[(pld\.DistributedTensor\[\[[^]]+\], pl\.\w+\])\]", r"\1", source)
+    # HOST windows must be defined outside the registration loop to stay in scope.
+    lines = source.splitlines()
+    windows = [
+        line[4:] for line in lines if line.startswith("            ") and " = pld.tensor.window(" in line
+    ]
+    lines = [
+        line for line in lines if not (line.startswith("            ") and " = pld.tensor.window(" in line)
+    ]
+    loop = next(i for i, line in enumerate(lines) if line.startswith("        for r in "))
+    lines[loop:loop] = windows
+    source = "\n".join(lines)
+    # The HOST call belongs inside host_orch, after its dispatch loop.
+    source = source.rstrip() + (
+        "\n        pld.tensor.indexed_all_to_all_v(inp, data, sig, counts, recv, index, core_num=2)\n"
+    )
+    return pl.parse_program(source)
+
+
+@pytest.mark.parametrize("dtype_name", ["fp32", "int8"])
+def test_indexed_l2_compiles_six_operand_kernel(tmp_path, dtype_name):
+    result = ir.compile(
+        _build_indexed_rail_program(host=False, dtype_name=dtype_name),
+        output_dir=str(tmp_path / dtype_name),
+        platform="a5",
+        skip_ptoas=True,
+        dump_passes=False,
+        distributed_config=DistributedConfig(device_ids=list(range(NR)), num_sub_workers=0),
+    )
+    kernel = (
+        result.output_dir
+        / "next_levels"
+        / "chip_pipeline"
+        / "kernels"
+        / "aiv"
+        / f"__builtin_indexed_all_to_all_v__{dtype_name}.cpp"
+    )
+    assert kernel.is_file()
+
+
+@pytest.mark.parametrize("dtype_name", ["fp32", "int8"])
+def test_indexed_rejects_host_call(tmp_path, dtype_name):
+    with pytest.raises(ValueError, match="L2 orchestration.*HOST is unsupported"):
+        ir.compile(
+            _build_indexed_rail_program(host=True, dtype_name=dtype_name),
+            output_dir=str(tmp_path / dtype_name),
+            platform="a5",
+            skip_ptoas=True,
+            distributed_config=DistributedConfig(device_ids=list(range(NR)), num_sub_workers=0),
+        )
+
+
+_OPERANDS = ("input", "target", "signal", "send_counts", "recv_counts")
+
+
+def _assert_operand_guards(source: str, kernel: str, operands: tuple[str, ...]) -> None:
+    """One chained ``is_contiguous`` check per operand, in order, ahead of the submit."""
+    keywords = re.findall(r"(if|\} else if) \(!\w+\.is_contiguous\) \{", source)
+    assert keywords == ["if"] + ["} else if"] * (len(operands) - 1), source
+    for operand in operands:
+        fatal = f"{kernel}: {operand} must be a contiguous row-major view"
+        assert f'rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "{fatal}");' in source, source
+    assert source.rindex(".is_contiguous") < source.index("rt_submit_aiv_task"), source
+
+
+def test_chip_rail_checks_operand_contiguity_before_the_submit(tmp_path):
+    """RFC #2521 O1 criterion 7: the runtime backstop. The orchestration checks each
+    operand's ``is_contiguous`` flag ahead of the collective's submit, latching
+    ``SIMPLER_ERROR_INVALID_ARGS`` on the first violation (which also turns the submit
+    into a no-op). The compile-time proof lives in ``LowerL2TensorCollectives``."""
+    chip = _compile(_build_chip_rail_program(), tmp_path, "chip_contig")
+    _assert_operand_guards(
+        _chip_orchestration_sources(chip.output_dir), "__builtin_all_to_all_v__fp32", _OPERANDS
+    )
+
+
+def test_indexed_rail_checks_all_six_operands_before_the_submit(tmp_path):
+    """The indexed kernel reads `index` as dense row-major too, so it gets a sixth check."""
+    result = ir.compile(
+        _build_indexed_rail_program(host=False, dtype_name="fp32"),
+        output_dir=str(tmp_path / "indexed_contig"),
+        platform="a5",
+        skip_ptoas=True,
+        dump_passes=False,
+        distributed_config=DistributedConfig(device_ids=list(range(NR)), num_sub_workers=0),
+    )
+    _assert_operand_guards(
+        _chip_orchestration_sources(result.output_dir),
+        "__builtin_indexed_all_to_all_v__fp32",
+        (*_OPERANDS, "index"),
+    )
+
+
+def test_ordinary_chip_tasks_get_no_contiguity_check(tmp_path):
+    """Only the builtin kernel opts in; an ordinary InCore task is emitted as before.
+
+    The HOST rail's ``touch_orch`` dispatches a plain DSL kernel over the same
+    five windows. Its orchestration must carry no operand checks — the attribute,
+    not the operand types, is what decides.
+    """
+    host = _compile(_build_host_rail_program(), tmp_path, "host_no_contig")
+    sources = sorted((host.output_dir / "next_levels" / "touch_orch").rglob("*.cpp"))
+    orchestration = [s for s in sources if "orchestration" in s.parts]
+    assert orchestration, f"expected touch_orch's orchestration source under {host.output_dir}"
+    for path in orchestration:
+        assert "is_contiguous" not in path.read_text(), path
+
+
+def test_indexed_rail_requests_the_urma_workspace(tmp_path):
+    """The domain must provision the URMA descriptor the kernel reads.
+
+    After the runtime's per-engine workspace split, a domain that does not list
+    ``urma`` gets a zero descriptor, and the indexed kernel aborts on the
+    zero-workspace guard instead of falling back to another engine. The check is
+    on the emitted host orchestration because the request is an allocation-time
+    argument, not something the kernel can repair.
+    """
+    result = ir.compile(
+        _build_indexed_rail_program(host=False, dtype_name="fp32"),
+        output_dir=str(tmp_path / "indexed_workspace"),
+        platform="a5",
+        skip_ptoas=True,
+        dump_passes=False,
+        distributed_config=DistributedConfig(device_ids=list(range(NR)), num_sub_workers=0),
+    )
+    host_orch = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+    assert 'workspace_engines=("urma",)' in host_orch, host_orch
+
+
+def test_indexed_use_requests_urma_only_for_its_buffers(tmp_path):
+    """Trace URMA requirements to buffers, not every argument of a dispatch."""
+    dtype = _dtype_of("fp32")
+    dtype_bytes = dtype.get_byte()
+    i32_bytes = pl.INT32.get_byte()
+    input_bytes = 13 * SIZE * dtype_bytes
+    target_bytes = TOTAL * SIZE * dtype_bytes
+    signal_bytes = NR * NR * i32_bytes
+    counts_bytes = NR * i32_bytes
+    index_bytes = NR * MAX_RECV * i32_bytes
+    plain_bytes = SIZE * pl.FP32.get_byte()
+
+    @pl.program
+    class TwoDomains:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_indexed(
+            self,
+            inp: pld.DistributedTensor[[13, SIZE], dtype],
+            data: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], dtype]],
+            signal: pl.InOut[pld.DistributedTensor[[NR, NR], pl.INT32]],
+            counts: pld.DistributedTensor[[NR, 1], pl.INT32],
+            recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            index: pld.DistributedTensor[[NR, MAX_RECV], pl.INT32],
+        ) -> pld.DistributedTensor[[TOTAL, SIZE], dtype]:
+            return pld.tensor.indexed_all_to_all_v(inp, data, signal, counts, recv, index, core_num=NR)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_plain(
+            self, a: pld.DistributedTensor[[SIZE], pl.FP32]
+        ) -> pld.DistributedTensor[[SIZE], pl.FP32]:
+            return a
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(input_bytes)
+            data_buf = pld.alloc_window_buffer(target_bytes)
+            signal_buf = pld.alloc_window_buffer(signal_bytes)
+            counts_buf = pld.alloc_window_buffer(counts_bytes)
+            recv_buf = pld.alloc_window_buffer(counts_bytes)
+            index_buf = pld.alloc_window_buffer(index_bytes)
+            plain_buf = pld.alloc_window_buffer(plain_bytes)
+
+            inp = pld.window(input_buf, [13, SIZE], dtype=dtype)
+            data = pld.window(data_buf, [TOTAL, SIZE], dtype=dtype)
+            sig = pld.window(signal_buf, [NR, NR], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [NR, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [NR, 1], dtype=pl.INT32)
+            index = pld.window(index_buf, [NR, MAX_RECV], dtype=pl.INT32)
+            self.chip_indexed(inp, data, sig, counts, recv, index, device=0)
+
+            plain = pld.window(plain_buf, [SIZE], dtype=pl.FP32)
+            self.chip_plain(plain, device=1)
+            return 0
+
+    result = ir.compile(
+        TwoDomains,
+        output_dir=str(tmp_path / "two_domains"),
+        platform="a5",
+        skip_ptoas=True,
+        dump_passes=False,
+        distributed_config=DistributedConfig(device_ids=[0, 1], num_sub_workers=0),
+    )
+    host_orch = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+
+    assert host_orch.count('workspace_engines=("urma",)') == 1, host_orch
+    domains = _buffer_domains(host_orch)
+    assert domains["data_buf"][1] is True
+    assert domains["signal_buf"][1] is False
+    assert domains["counts_buf"][1] is False
+
+
+def test_shared_dispatch_keeps_unrelated_domains_without_urma(tmp_path):
+    """Trace URMA requirements to buffers, not every argument of a dispatch."""
+    dtype = _dtype_of("fp32")
+    dtype_bytes = dtype.get_byte()
+    i32_bytes = pl.INT32.get_byte()
+    input_bytes = 13 * SIZE * dtype_bytes
+    target_bytes = TOTAL * SIZE * dtype_bytes
+    signal_bytes = NR * NR * i32_bytes
+    counts_bytes = NR * i32_bytes
+    index_bytes = NR * MAX_RECV * i32_bytes
+    plain_bytes = SIZE * pl.FP32.get_byte()
+
+    @pl.program
+    class SharedDispatch:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_plain(
+            self, a: pld.DistributedTensor[[SIZE], pl.FP32]
+        ) -> pld.DistributedTensor[[SIZE], pl.FP32]:
+            return a
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_mixed(
+            self,
+            plain: pld.DistributedTensor[[SIZE], pl.FP32],
+            inp: pld.DistributedTensor[[13, SIZE], dtype],
+            data: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], dtype]],
+            signal: pl.InOut[pld.DistributedTensor[[NR, NR], pl.INT32]],
+            counts: pld.DistributedTensor[[NR, 1], pl.INT32],
+            recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            index: pld.DistributedTensor[[NR, MAX_RECV], pl.INT32],
+        ) -> pld.DistributedTensor[[TOTAL, SIZE], dtype]:
+            # ``plain`` links this dispatch to the sibling domain but carries no
+            # part of the indexed exchange.
+            return pld.tensor.indexed_all_to_all_v(inp, data, signal, counts, recv, index, core_num=NR)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(input_bytes)
+            data_buf = pld.alloc_window_buffer(target_bytes)
+            signal_buf = pld.alloc_window_buffer(signal_bytes)
+            counts_buf = pld.alloc_window_buffer(counts_bytes)
+            recv_buf = pld.alloc_window_buffer(counts_bytes)
+            index_buf = pld.alloc_window_buffer(index_bytes)
+            plain_buf = pld.alloc_window_buffer(plain_bytes)
+
+            inp = pld.window(input_buf, [13, SIZE], dtype=dtype)
+            data = pld.window(data_buf, [TOTAL, SIZE], dtype=dtype)
+            sig = pld.window(signal_buf, [NR, NR], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [NR, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [NR, 1], dtype=pl.INT32)
+            index = pld.window(index_buf, [NR, MAX_RECV], dtype=pl.INT32)
+            plain = pld.window(plain_buf, [SIZE], dtype=pl.FP32)
+
+            # Establishes the plain window's device coverage ({0, 1} after the
+            # mixed dispatch below) independently of the indexed domain ({0}).
+            self.chip_plain(plain, device=1)
+            # One dispatch, two domains' windows; only ``inp``..``index`` reach
+            # the indexed collective.
+            self.chip_mixed(plain, inp, data, sig, counts, recv, index, device=0)
+
+    result = ir.compile(
+        SharedDispatch,
+        output_dir=str(tmp_path / "shared_dispatch"),
+        platform="a5",
+        skip_ptoas=True,
+        dump_passes=False,
+        distributed_config=DistributedConfig(device_ids=[0, 1], num_sub_workers=0),
+    )
+    host_orch = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+
+    # The dispatch really is shared: one TaskArgs carries the sibling domain's
+    # ``plain`` window alongside the indexed domain's operands, plus one
+    # ordering token per domain. Only the indexed buffers receive the URMA requirement.
+    mixed = host_orch.split('_submit_chip(orch, callables["chip_mixed"]', 1)[0]
+    mixed = mixed[mixed.rindex("= TaskArgs()") :]
+    domains = _buffer_domains(host_orch)
+    for name in ("plain_buf", "input_buf", "data_buf"):
+        handle = domains[name][0]
+        assert f'{handle}[0].buffers["{name}' in mixed, host_orch
+        assert f"{handle}_ord" in mixed, host_orch
+
+    assert host_orch.count('workspace_engines=("urma",)') == 1, host_orch
+    domains = _buffer_domains(host_orch)
+    assert domains["data_buf"][1] is True
+    assert domains["signal_buf"][1] is False
+    assert domains["counts_buf"][1] is False
+
+
+def test_indexed_collective_fed_by_if_result_requests_urma(tmp_path):
+    """A collective nested behind control flow still contributes program engines."""
+    dtype = _dtype_of("fp32")
+    dtype_bytes = dtype.get_byte()
+    i32_bytes = pl.INT32.get_byte()
+    input_bytes = 13 * SIZE * dtype_bytes
+    target_bytes = TOTAL * SIZE * dtype_bytes
+    signal_bytes = NR * NR * i32_bytes
+    counts_bytes = NR * i32_bytes
+    index_bytes = NR * MAX_RECV * i32_bytes
+
+    @pl.program
+    class IfResult:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_pipeline(
+            self,
+            choose: pl.Scalar[pl.INT32],
+            inp: pld.DistributedTensor[[13, SIZE], dtype],
+            data: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], dtype]],
+            signal: pl.InOut[pld.DistributedTensor[[NR, NR], pl.INT32]],
+            counts: pld.DistributedTensor[[NR, 1], pl.INT32],
+            recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            index: pld.DistributedTensor[[NR, MAX_RECV], pl.INT32],
+        ) -> pld.DistributedTensor[[TOTAL, SIZE], dtype]:
+            # Route operands through the merge before invoking the collective.
+            if choose > 0:
+                c_inp, c_data = inp, data
+                c_signal, c_counts = signal, counts
+                c_recv, c_index = recv, index
+            else:
+                c_inp, c_data = inp, data
+                c_signal, c_counts = signal, counts
+                c_recv, c_index = recv, index
+            return pld.tensor.indexed_all_to_all_v(
+                c_inp, c_data, c_signal, c_counts, c_recv, c_index, core_num=NR
+            )
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(input_bytes)
+            data_buf = pld.alloc_window_buffer(target_bytes)
+            signal_buf = pld.alloc_window_buffer(signal_bytes)
+            counts_buf = pld.alloc_window_buffer(counts_bytes)
+            recv_buf = pld.alloc_window_buffer(counts_bytes)
+            index_buf = pld.alloc_window_buffer(index_bytes)
+
+            inp = pld.window(input_buf, [13, SIZE], dtype=dtype)
+            data = pld.window(data_buf, [TOTAL, SIZE], dtype=dtype)
+            sig = pld.window(signal_buf, [NR, NR], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [NR, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [NR, 1], dtype=pl.INT32)
+            index = pld.window(index_buf, [NR, MAX_RECV], dtype=pl.INT32)
+
+            self.chip_pipeline(1, inp, data, sig, counts, recv, index, device=0)
+
+    result = ir.compile(
+        IfResult,
+        output_dir=str(tmp_path / "if_result"),
+        platform="a5",
+        skip_ptoas=True,
+        dump_passes=False,
+        distributed_config=DistributedConfig(device_ids=[0], num_sub_workers=0),
+    )
+    host_orch = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+    assert 'workspace_engines=("urma",)' in host_orch, host_orch
+
+
+def test_local_operand_domain_does_not_require_urma(tmp_path):
+    """Trace URMA requirements to buffers, not every argument of a dispatch."""
+    dtype = _dtype_of("fp32")
+    dtype_bytes = dtype.get_byte()
+    i32_bytes = pl.INT32.get_byte()
+    input_bytes = 13 * SIZE * dtype_bytes
+    target_bytes = TOTAL * SIZE * dtype_bytes
+    signal_bytes = NR * NR * i32_bytes
+    counts_bytes = NR * i32_bytes
+    index_bytes = NR * MAX_RECV * i32_bytes
+
+    @pl.program
+    class LocalOperandDomain:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_indexed(
+            self,
+            inp: pld.DistributedTensor[[13, SIZE], dtype],
+            data: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], dtype]],
+            signal: pl.InOut[pld.DistributedTensor[[NR, NR], pl.INT32]],
+            counts: pld.DistributedTensor[[NR, 1], pl.INT32],
+            recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            index: pld.DistributedTensor[[NR, MAX_RECV], pl.INT32],
+        ) -> pld.DistributedTensor[[TOTAL, SIZE], dtype]:
+            return pld.tensor.indexed_all_to_all_v(inp, data, signal, counts, recv, index, core_num=NR)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_index_owner(
+            self, index: pld.DistributedTensor[[NR, MAX_RECV], pl.INT32]
+        ) -> pld.DistributedTensor[[NR, MAX_RECV], pl.INT32]:
+            return index
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(input_bytes)
+            data_buf = pld.alloc_window_buffer(target_bytes)
+            signal_buf = pld.alloc_window_buffer(signal_bytes)
+            counts_buf = pld.alloc_window_buffer(counts_bytes)
+            recv_buf = pld.alloc_window_buffer(counts_bytes)
+            index_buf = pld.alloc_window_buffer(index_bytes)
+
+            inp = pld.window(input_buf, [13, SIZE], dtype=dtype)
+            data = pld.window(data_buf, [TOTAL, SIZE], dtype=dtype)
+            sig = pld.window(signal_buf, [NR, NR], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [NR, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [NR, 1], dtype=pl.INT32)
+            index = pld.window(index_buf, [NR, MAX_RECV], dtype=pl.INT32)
+
+            self.chip_indexed(inp, data, sig, counts, recv, index, device=0)
+            # Also dispatched on device 1, so the index window merges to a
+            # different comm domain from the collective's context domain.
+            self.chip_index_owner(index, device=1)
+
+    result = ir.compile(
+        LocalOperandDomain,
+        output_dir=str(tmp_path / "local_operand_domain"),
+        platform="a5",
+        skip_ptoas=True,
+        dump_passes=False,
+        distributed_config=DistributedConfig(device_ids=[0, 1], num_sub_workers=0),
+    )
+    host_orch = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+
+    assert host_orch.count('workspace_engines=("urma",)') == 1, host_orch
+    domains = _buffer_domains(host_orch)
+    assert domains["data_buf"][1] is True
+    assert domains["signal_buf"][1] is False
+    assert domains["counts_buf"][1] is False
+
+
+@pytest.mark.parametrize("engines", [[], ["sdma"], ["urma"], ["sdma", "urma"]])
+def test_codegen_reads_explicit_domain_engines(engines):
+    """Codegen emits IR requirements even when the body contains no collective."""
+    span = ir.Span.unknown()
+    buffer = ir.WindowBuffer(ir.Var("buf", ir.PtrType(), span), ir.ConstInt(64, pl.INT64, span))
+    body = ir.CommDomainScopeStmt(
+        [0], [buffer], "comm_d0", body=ir.SeqStmts([], span), span=span, engines=engines
+    )
+    host = ir.Function("host_orch", [], [], body, span, level=ir.Level.HOST, role=ir.Role.Orchestrator)
+    program = ir.Program([host], "explicit_engines", span)
+    source = codegen.DistributedCodegen().generate(program)
+    if engines:
+        expected = "workspace_engines=(" + "".join(f'"{engine}",' for engine in engines) + "),"
+        assert expected in source
+    else:
+        assert "workspace_engines" not in source
+
+
+def test_chip_rail_requests_no_async_workspace(tmp_path):
+    """A domain whose body consumes no async engine provisions none."""
+    chip = _compile(_build_chip_rail_program(), tmp_path, "chip_no_workspace")
+    host_orch = (chip.output_dir / "orchestration" / "host_orch.py").read_text()
+    assert "allocate_domain" in host_orch, host_orch
+    assert "workspace_engines" not in host_orch, host_orch
+
+
+@pytest.mark.parametrize("skip_ptoas", [True, False])
+@pytest.mark.parametrize("memory_source", ["device", "host"])
+def test_async_transfer_requests_the_urma_workspace(tmp_path, monkeypatch, skip_ptoas, memory_source):
+    """End-to-end A9: an async transfer reaches the host domain's engine list.
+
+    The engine scan must recognise ``put_async`` on the chip function, the pass
+    must record ``urma`` on the remote operand's buffer, and codegen must
+    render the derived domain requirement as ``workspace_engines``. Nothing else in
+    the program asks for URMA, so a missing match would emit a domain with no
+    engine list and the runtime would hand the helper a zero workspace.
+    """
+    f32_bytes = pl.FP32.get_byte()
+    window_bytes = SIZE * f32_bytes
+    # Exercise both backend emission branches without requiring PTOAS. The
+    # generated MLIR and wrapper ABI are checked independently below.
+    emitted_mlir = []
+
+    def capture_ptoas(pto_code, *args, **kwargs):
+        emitted_mlir.append(pto_code)
+        return "// PTOAS output omitted in this host-codegen unit test\n"
+
+    monkeypatch.setattr(pto_backend, "_compile_pto_module", capture_ptoas)
+
+    @pl.program
+    class AsyncProgram:
+        # The transfer is issued by the task that owns the destination, so the
+        # op lives in the InCore body — exactly where the VECTOR placement puts
+        # it. An Orchestration body would only dispatch this kernel.
+        @pl.function(type=pl.FunctionType.InCore)
+        def async_kernel(
+            self,
+            dst: pld.DistributedTensor[[SIZE], pl.FP32],
+            src: pld.DistributedTensor[[SIZE], pl.FP32],
+        ) -> pld.DistributedTensor[[SIZE], pl.FP32]:
+            pld.tensor.put_async(dst, 1, src)
+            return dst
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_async(
+            self,
+            dst: pld.DistributedTensor[[SIZE], pl.FP32],
+            src: pld.DistributedTensor[[SIZE], pl.FP32],
+        ) -> pld.DistributedTensor[[SIZE], pl.FP32]:
+            return self.async_kernel(dst, src)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            dst_buf = pld.alloc_window_buffer(window_bytes, memory_source=memory_source)
+            src_buf = pld.alloc_window_buffer(window_bytes)
+            dst = pld.window(dst_buf, [SIZE], dtype=pl.FP32)
+            src = pld.window(src_buf, [SIZE], dtype=pl.FP32)
+            self.chip_async(dst, src, device=0)
+            return 0
+
+    result = ir.compile(
+        AsyncProgram,
+        output_dir=str(tmp_path / "async_workspace"),
+        platform="a5",
+        skip_ptoas=skip_ptoas,
+        dump_passes=False,
+        distributed_config=DistributedConfig(device_ids=list(range(NR)), num_sub_workers=0),
+    )
+    host_orch = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+
+    assert 'workspace_engines=("urma",)' in host_orch, host_orch
+    # The local-only source does not require URMA on its own domain.
+    assert host_orch.count('workspace_engines=("urma",)') == 1
+    if memory_source == "host":
+        assert "memory_source=AddressSpace.HOST" in host_orch
+        assert "__comm_d0.device_context(0)" in host_orch
+    # No synchronous fallback may be introduced by the lowering.
+    assert "DmaEngine" not in host_orch, host_orch
+    if skip_ptoas:
+        emitted_mlir = [p.read_text() for p in result.output_dir.rglob("*.pto")]
+    else:
+        wrappers = [p.read_text() for p in result.output_dir.rglob("*.cpp") if "kernels" in p.parts]
+        assert any("pypto_urma_put_async_f32" in wrapper and ", args);" in wrapper for wrapper in wrappers)
+    assert any("%__pypto_deferred_raw_args: !pto.ptr<i64>" in source for source in emitted_mlir)
+
+
+def _buffer_domains(source):
+    """Map source allocation names to generated domain handles and engine flags."""
+    result = {}
+    for body, handle in re.findall(
+        r"with \(_domain_provider or orch.allocate_domain\)\((.*?)\) as (\w+):", source, re.S
+    ):
+        for name in re.findall(r'CommBufferSpec\(name="([^"]+)"', body):
+            # WindowBuffer names retain the source allocation prefix after SSA.
+            result[name.split("__ssa_", 1)[0]] = (handle, 'workspace_engines=("urma",)' in body)
+    return result
+
+
+def _host_collective_operands(kind, *, async_operand=None):
+    input_rows = 1 if kind == "allgather" else 2
+    calls = {
+        "barrier": "pld.tensor.barrier(sig)",
+        "allreduce": "pld.tensor.allreduce(data, sig)",
+        "allreduce_ring": 'pld.tensor.allreduce(data, sig, mode="ring")',
+        "broadcast": "pld.tensor.broadcast(data, sig, root=0)",
+        "reduce_scatter": "pld.tensor.reduce_scatter(data, sig)",
+        "allgather": "pld.tensor.allgather(inp, data, sig)",
+        "all_to_all": "pld.tensor.all_to_all(inp, data, sig)",
+        "all_to_all_v": "pld.tensor.all_to_all_v(inp, data, sig, counts, recv)",
+    }
+    signal_shape = "[3, 2]" if kind == "allreduce_ring" else ("[2, 1]" if kind == "all_to_all_v" else "[2]")
+    async_definition = ""
+    async_call = ""
+    chip_return_type = "pld.DistributedTensor[[2, 64], pl.FP32]"
+    chip_return = "data"
+    host_result = ""
+    local_parameter = ""
+    host_parameter = ""
+    local_argument = ""
+    if async_operand:
+        shape, dtype = (f"[{input_rows}, 64]", "FP32") if async_operand == "inp" else (signal_shape, "INT32")
+        async_definition = f"""
+    @pl.function(type=pl.FunctionType.InCore)
+    def async_touch(self, x: pld.DistributedTensor[{shape}, pl.{dtype}],
+                    local: pl.InOut[pl.Tensor[{shape}, pl.{dtype}]]
+    ) -> pl.Tensor[{shape}, pl.{dtype}]:
+        return pld.tensor.get_async(local, 0, x)
+"""
+        async_call = f"        local = self.async_touch({async_operand}, local)\n"
+        chip_return_type = f"pl.Tensor[{shape}, pl.{dtype}]"
+        chip_return = "local"
+        host_result = "local = "
+        local_parameter = f", local: pl.InOut[pl.Tensor[{shape}, pl.{dtype}]]"
+        host_parameter = local_parameter
+        local_argument = ", local"
+    return pl.parse_program(f"""
+@pl.program
+class OperandDomains:
+{async_definition}
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def chip(self, inp: pld.DistributedTensor[[{input_rows}, 64], pl.FP32],
+             data: pld.DistributedTensor[[2, 64], pl.FP32],
+             sig: pld.DistributedTensor[{signal_shape}, pl.INT32],
+             counts: pld.DistributedTensor[[2, 1], pl.INT32],
+             recv: pld.DistributedTensor[[2, 1], pl.INT32]{local_parameter}
+    ) -> {chip_return_type}:
+{async_call}        return {chip_return}
+
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host(self{host_parameter}):
+        input_buf = pld.alloc_window_buffer(512)
+        data_buf = pld.alloc_window_buffer(512)
+        signal_buf = pld.alloc_window_buffer(64, memory_source="host")
+        counts_buf = pld.alloc_window_buffer(8)
+        recv_buf = pld.alloc_window_buffer(8)
+        inp = pld.window(input_buf, [{input_rows}, 64], dtype=pl.FP32)
+        data = pld.window(data_buf, [2, 64], dtype=pl.FP32)
+        sig = pld.window(signal_buf, {signal_shape}, dtype=pl.INT32)
+        counts = pld.window(counts_buf, [2, 1], dtype=pl.INT32)
+        recv = pld.window(recv_buf, [2, 1], dtype=pl.INT32)
+        for r in pl.range(2):
+            {host_result}self.chip(inp, data, sig, counts, recv{local_argument}, device=r)
+        {calls[kind]}
+""")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "barrier",
+        "allreduce",
+        "allreduce_ring",
+        "broadcast",
+        "reduce_scatter",
+        "allgather",
+        "all_to_all",
+        "all_to_all_v",
+    ],
+)
+def test_host_collective_uses_each_remote_operands_context(tmp_path, kind):
+    # Data and signal have identical participants but different backing domains.
+    result = ir.compile(
+        _host_collective_operands(kind),
+        output_dir=str(tmp_path / kind),
+        platform="a5",
+        skip_ptoas=True,
+        distributed_config=DistributedConfig(device_ids=[0, 1], num_sub_workers=0),
+    )
+    source = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+    domains = _buffer_domains(source)
+    data, signal = domains["data_buf"][0], domains["signal_buf"][0]
+    assert data != signal
+    assert not any(urma for _, urma in domains.values())
+    dispatch = source.split(f'_submit_chip(orch, callables["builtin.tensor.{kind}', 1)[0]
+    dispatch = dispatch[dispatch.rindex("= TaskArgs()") :]
+    assert f".add_scalar({signal}.device_context(" in dispatch
+    if kind != "barrier":
+        assert f".add_scalar({data}[" in dispatch and "].device_ctx)" in dispatch
+        assert f"{data}_ord" in dispatch and f"{signal}_ord" in dispatch
+    kernel = next((result.output_dir / "next_levels").glob(f"builtin.tensor.{kind}*/kernels/aiv/*.cpp"))
+    kernel_source = kernel.read_text()
+    if kind != "barrier":
+        assert "signal_ctx" in kernel_source
+        assert "CommRemotePtr(comm_ctx, signal_base" not in kernel_source.split("void kernel_entry", 1)[1]
+
+
+def test_host_allgather_accepts_urma_local_input(tmp_path):
+    # The local allgather input can independently be an URMA remote operand in
+    # another task. It must not dictate the allgather target or signal context.
+    result = ir.compile(
+        _host_collective_operands("allgather", async_operand="inp"),
+        output_dir=str(tmp_path / "local_urma"),
+        platform="a5",
+        skip_ptoas=True,
+        distributed_config=DistributedConfig(device_ids=[0, 1], num_sub_workers=0),
+    )
+    source = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+    domains = _buffer_domains(source)
+    assert domains["input_buf"][1]
+    assert not domains["data_buf"][1] and not domains["signal_buf"][1]
+    dispatch = source.split('_submit_chip(orch, callables["builtin.tensor.allgather', 1)[0]
+    dispatch = dispatch[dispatch.rindex("= TaskArgs()") :]
+    for handle, _ in domains.values():
+        if handle in {domains[name][0] for name in ("input_buf", "data_buf", "signal_buf")}:
+            assert f"{handle}_ord" in dispatch
+
+
+@pytest.mark.parametrize("kind", ["barrier", "allreduce", "allgather", "all_to_all_v"])
+def test_collective_signal_conflicts_with_urma(tmp_path, kind):
+    with pytest.raises(ValueError, match="cannot combine URMA"):
+        ir.compile(
+            _host_collective_operands(kind, async_operand="sig"),
+            output_dir=str(tmp_path / kind),
+            platform="a5",
+            skip_ptoas=True,
+            distributed_config=DistributedConfig(device_ids=[0, 1], num_sub_workers=0),
+        )
+
+
+def test_indexed_remote_operands_get_distinct_engine_contexts(tmp_path):
+    result = ir.compile(
+        _build_indexed_rail_program(host=False, dtype_name="fp32"),
+        output_dir=str(tmp_path / "indexed_contexts"),
+        platform="a5",
+        skip_ptoas=True,
+        distributed_config=DistributedConfig(device_ids=[0, 1], num_sub_workers=0),
+    )
+    source = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+    domains = _buffer_domains(source)
+    assert domains["data_buf"][1]
+    assert not domains["sig_buf"][1] and not domains["counts_buf"][1]
+    assert domains["data_buf"][0] != domains["sig_buf"][0]
+    kernel = next(
+        (result.output_dir / "next_levels").glob("*/kernels/aiv/__builtin_indexed_all_to_all_v__fp32.cpp")
+    )
+    text = kernel.read_text()
+    assert "signal_ctx = reinterpret_cast<__gm__ CommContext*>(args[7])" in text
+    assert "counts_ctx = reinterpret_cast<__gm__ CommContext*>(args[8])" in text
+    assert "ExchangeBarrier(signal_ctx, signal_base" in text
+    assert "CommRemotePtr(counts_ctx, send_counts_base" in text
 
 
 if __name__ == "__main__":

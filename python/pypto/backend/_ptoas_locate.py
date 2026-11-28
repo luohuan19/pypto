@@ -15,11 +15,13 @@ import shutil
 import subprocess
 import threading
 
-# Oldest PTOAS release that accepts the `.pto` this PyPTO generates. It is the
-# `PTOAS_VERSION` pin in toolchain/versions.env (what CI installs), restated here
-# because an installed wheel does not ship that file; bump both in one change.
+from pypto._environment import toolchain_probe_env
+
+# Minimum supported PTOAS release for code generation. Keep this in sync with
+# the `PTOAS_VERSION` pin in toolchain/versions.env that CI installs, since an
+# installed PyPTO wheel does not ship that file.
 # tests/ut/backend/test_ptoas_locate.py fails when they differ.
-PTOAS_MIN_VERSION = "v0.65"
+PTOAS_MIN_VERSION = "v0.79"
 PTOAS_RELEASES_URL = "https://github.com/hw-native-sys/PTOAS/releases"
 
 # `ptoas --version` prints e.g. "ptoas 0.61"; a dev build may append a suffix.
@@ -68,10 +70,9 @@ def _parse_version(text: str) -> tuple[int, ...]:
 def check_ptoas_version(ptoas_bin: str) -> str:
     """Reject a ``ptoas`` older than :data:`PTOAS_MIN_VERSION`.
 
-    An older assembler rejects instruction forms the current codegen emits, and
-    reports it against a line of a generated ``.pto`` without ever naming the
-    version as the cause. The ``ptoas --version`` probe runs once per executable
-    per process; concurrent callers wait for that result instead of re-probing.
+    Older assemblers can reject generated instruction forms or produce incorrect
+    code. The ``ptoas --version`` probe runs once per executable per process.
+    Concurrent callers wait for that result instead of re-probing.
     A failed check is not remembered, so fixing ``PTOAS_ROOT`` takes effect.
 
     Args:
@@ -103,6 +104,7 @@ def check_ptoas_version(ptoas_bin: str) -> str:
         try:
             result = subprocess.run(
                 [ptoas_bin, "--version"],
+                env=toolchain_probe_env(),
                 capture_output=True,
                 text=True,
                 check=False,

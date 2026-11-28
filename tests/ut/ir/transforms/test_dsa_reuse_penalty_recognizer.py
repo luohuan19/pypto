@@ -545,6 +545,34 @@ def test_dsa_rp_unknown_mutating_operand_stays_unpenalized():
     assert _overlap(ranges["prior"], ranges["next_value"])
 
 
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_dsa_rp_extract_into_unknown_access_poisons_source(ascend_backend):
+    """An explicit L0 write must not masquerade as a modeled terminal L1 read."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def main(
+            self,
+            input_a: pl.Tensor[[16, 16], pl.BF16],
+            input_b: pl.Tensor[[16, 16], pl.BF16],
+            rhs_input: pl.Tensor[[16, 16], pl.BF16],
+            output: pl.Tensor[[16, 16], pl.FP32],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            prior = pl.load(input_a, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            left = pl.tile.create([16, 16], pl.BF16, target_memory=pl.Mem.Left)
+            prior_l0 = pl.tile.extract_into(left, prior, 0, 0)
+            _later = pl.load(input_b, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            rhs_l1 = pl.load(rhs_input, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            rhs_l0 = pl.tile.move(rhs_l1, target_memory=pl.Mem.Right)
+            return pl.store(pl.matmul(prior_l0, rhs_l0), [0, 0], output)
+
+    assert testing.get_execution_memory_access_evidence("tile.extract_into") == "unknown"
+    # Unlike test_dsa_rp_recognizes_l1_to_l0_route's functional tile.move,
+    # this caller-owned destination write has no exact endpoint evidence.
+    assert frozenset(("prior", "_later")) not in _recognized_pairs(Before)
+
+
 def test_dsa_rp_scalar_subrange_read_stays_unpenalized():
     """A scalar tile.read does not masquerade as a whole-allocation terminal read."""
 
@@ -658,7 +686,8 @@ def test_dsa_rp_keeps_logically_ordered_cross_pipe_handoff():
     assert not _overlap(ranges["prior"], ranges["next_value"])
 
 
-def test_no_access_operation_has_no_exact_pipe(ascend_backend):
+@pytest.mark.parametrize("op_name", ["tile.create", "tensor.view"])
+def test_no_access_operation_has_no_exact_pipe(ascend_backend, op_name):
     """Declarations cannot acquire a synthetic execution resource."""
 
     @pl.program
@@ -669,10 +698,11 @@ def test_no_access_operation_has_no_exact_pipe(ascend_backend):
             output: pl.Tensor[[16, 16], pl.FP32],
         ) -> pl.Tensor[[16, 16], pl.FP32]:
             created = pl.tile.create([16, 16], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-            return pl.store(created, [0, 0], output)
+            viewed = pl.tensor.view(output, [16, 16])
+            return pl.store(created, [0, 0], viewed)
 
-    call = _find_call(Before, "tile.create")
-    assert testing.get_execution_memory_access_evidence("tile.create") == "no_access"
+    call = _find_call(Before, op_name)
+    assert testing.get_execution_memory_access_evidence(op_name) == "no_access"
     assert testing.try_infer_pipe(call) is None
 
 
@@ -815,7 +845,7 @@ def test_dsa_rp_recognizes_l0_to_l1_route(ascend_backend):
 
 @pytest.mark.parametrize(
     ("ascend_backend", "expect_edge"),
-    [(BackendType.Ascend910B, False), (BackendType.Ascend950, True)],
+    [(BackendType.Ascend910, False), (BackendType.Ascend950, True)],
     indirect=["ascend_backend"],
 )
 def test_dsa_rp_uses_backend_memory_graph_for_acc_to_vec_route(ascend_backend, expect_edge):

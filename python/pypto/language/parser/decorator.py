@@ -27,9 +27,18 @@ from pypto.pypto_core import ir
 
 from .ast_parser import ASTParser
 from .comment_extractor import extract_line_comments
-from .diagnostics import BUG_CLASS_EXCEPTIONS, ParserError, ParserSyntaxError, concise_error_message
+from .diagnostics import (
+    BUG_CLASS_EXCEPTIONS,
+    ParserError,
+    ParserSyntaxError,
+    ParserTypeError,
+    concise_error_message,
+)
+from .dispatch_semantics import validate_placement_callee
 from .enum_utils import FUNCTION_TYPE_MAP, LEVEL_MAP, ROLE_MAP, SPLIT_MODE_MAP, extract_enum_value
+from .parser_state import JIT_GRAPH_REBINDS_ATTR, JIT_SUBMIT_RETURNS_ATTR
 from .source_lookup import DuplicateClassDefinitionError, get_class_source_lines
+from .type_semantics import ParameterReturnDims, derive_return_types_from_body
 
 
 def _is_pl_func_attr_stmt(stmt: ast.stmt) -> bool:
@@ -1119,6 +1128,38 @@ def inline(func: Callable[..., Any]) -> InlineFunction:
     )
 
 
+def _bind_jit_submit_returns(ir_func: ir.Function, arity: int | None) -> ir.Function:
+    """Publish typed JIT Submit results after the ordinary body parser resolves them."""
+    if arity is None:
+        return ir_func
+    return_types = derive_return_types_from_body(ir_func.body)
+    if arity > 1 and len(return_types) == 1 and isinstance(return_types[0], ir.TupleType):
+        return_types = list(return_types[0].types)
+    if len(return_types) == arity:
+        dims = ParameterReturnDims(ir_func)
+        return_types = [dims.return_type(typ) for typ in return_types]
+        if dims.unresolved:
+            raise ParserTypeError(
+                f"Cannot express JIT Submit results of '{ir_func.name}' in its parameter dimensions",
+                span=ir_func.span,
+                hint="Express returned tensor extents using parameter dimensions and scalar arithmetic.",
+            )
+        return ir.Function(
+            ir_func.name,
+            list(zip(ir_func.params, ir_func.param_directions, strict=True)),
+            return_types,
+            ir_func.body,
+            ir_func.span,
+            ir_func.func_type,
+            ir_func.level,
+            ir_func.role,
+            ir_func.attrs,
+            ir_func.requires_runtime_binding,
+            ir_func.ir_stage,
+        )
+    return ir_func
+
+
 @overload
 def program(cls: type) -> ir.Program: ...
 
@@ -1226,6 +1267,7 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
             # can use return type information from earlier functions
             functions: list[ir.Function] = []
             gvar_to_func: dict[ir.GlobalVar, ir.Function] = {}
+            pending_placements: list[tuple[ir.Level | None, ir.GlobalVar, ir.Span]] = []
             external_functions: dict[str, ir.Function] = {}
 
             # Pre-scan: collect reserve_buffer metadata from all functions so that
@@ -1257,6 +1299,8 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                     end = max((fd.end_lineno or fd.lineno), max(pending_comments, default=fd.lineno))
                 method_boundaries[id(fd)] = (start, end)
 
+            submit_return_arities: dict[str, int] = getattr(c, JIT_SUBMIT_RETURNS_ATTR, {})
+            jit_graph_rebinds: dict[str, dict[str, str | int]] = getattr(c, JIT_GRAPH_REBINDS_ATTR, {})
             for func_def in func_defs:
                 # Extract function type, level/role, and attrs from decorator
                 func_type = _extract_function_type_from_decorator(func_def)
@@ -1326,6 +1370,7 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                     pending_comments=method_comments,
                     alloc_window_buffer_names=alloc_window_buffer_names,
                 )
+                parser.function.jit_graph_rebinds = jit_graph_rebinds.get(func_def.name)
 
                 try:
                     ir_func = parser.parse_function(
@@ -1355,10 +1400,11 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                         hint="Check your function definition for errors",
                     ) from e
 
+                ir_func = _bind_jit_submit_returns(ir_func, submit_return_arities.get(ir_func.name))
                 functions.append(ir_func)
+                pending_placements.extend(parser.bindings.pending_placements)
                 # Update gvar_to_func map so subsequent functions can use this function's return type
-                gvar = global_vars[ir_func.name]
-                gvar_to_func[gvar] = ir_func
+                gvar_to_func[global_vars[ir_func.name]] = ir_func
 
                 # Merge external functions discovered by the parser.
                 # The parser already validates against global_vars within each method,
@@ -1372,6 +1418,9 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                         )
                     external_functions[ext_name] = ext_func
 
+            for caller_level, target, span in pending_placements:
+                validate_placement_callee(caller_level, gvar_to_func[target], span)
+
             # Combine internal and external functions
             all_functions = functions + list(external_functions.values())
 
@@ -1379,9 +1428,7 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
             # class's indentation as a character count; Span columns are
             # 1-indexed, so a class at the left margin starts at column 1.
             program_span = ir.Span(source_file, starting_line, col_offset + 1)
-            prog = ir.Program(all_functions, c.__name__, program_span)
-
-            return prog
+            return ir.Program(all_functions, c.__name__, program_span)
 
         except ParserError as e:
             # Attach source lines if not already present

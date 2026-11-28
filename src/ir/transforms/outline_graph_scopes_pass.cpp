@@ -82,7 +82,8 @@ namespace pass {
  * @brief Pass to outline Graph scopes into separate Graph functions
  *
  * Transforms `GraphScopeStmt` (`with pl.graph("name"):`) into a
- * `FunctionType::Graph` definition plus a `Call` to it — the same shape a
+ * `FunctionType::Graph` definition plus a Call (or Submit for explicit deps /
+ * completion capture) — the same shape a
  * hand-written `@pl.jit.graph` function reaches this point in. The scope form is
  * therefore sugar: no downstream pass, verifier or codegen path needs to know
  * which surface the user wrote. Parameter *order* is the one thing that differs
@@ -106,7 +107,7 @@ namespace pass {
  * 2. Reject a surviving Graph scope in a function this pass does not outline,
  *    rather than skipping it and still advertising GraphOutlined.
  * 3. For each `GraphScopeStmt`, extract the body into a `Function(Graph)` named
- *    after the region, and replace the scope with a Call plus output bindings.
+ *    after the region, and replace the scope with a Call/Submit plus output bindings.
  * 4. Stamp the orchestration level/role on the outlined function, matching what
  *    the parser gives a `@pl.jit.graph` function.
  * 5. The parent function type is preserved — a Graph region does not change what
@@ -181,9 +182,7 @@ Pass OutlineGraphScopes() {
       // Build symbol table for this function
       outline_utils::VarCollector type_collector;
       for (const auto& var : func->params_) {
-        type_collector.var_types[var.get()] = var->GetType();
-        type_collector.var_objects[var.get()] = var;
-        type_collector.known_names.insert(var->name_hint_);
+        type_collector.CollectParameter(var);
       }
       type_collector.VisitStmt(func->body_);
 
@@ -202,8 +201,9 @@ Pass OutlineGraphScopes() {
       // against the pass's input program, which is what the region's calls name
       // — this pass only ever appends outlined functions.
       outline_utils::ScopeOutliner outliner(func->name_, type_collector.var_types, type_collector.var_objects,
-                                            type_collector.known_names, ScopeKind::Graph, FunctionType::Graph,
-                                            "_graph_", program, reserved_func_names);
+                                            type_collector.known_names, type_collector.runtime_bindings,
+                                            ScopeKind::Graph, FunctionType::Graph, "_graph_", program,
+                                            reserved_func_names);
       auto new_body = outliner.VisitStmt(func->body_);
 
       // Preserve the parent function type — containing a Graph region says

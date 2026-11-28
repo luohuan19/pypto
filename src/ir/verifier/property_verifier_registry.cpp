@@ -41,6 +41,7 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   // Register all built-in property verifiers
   Register(IRProperty::SSAForm, CreateSSAPropertyVerifier);
   Register(IRProperty::TypeChecked, CreateTypeCheckPropertyVerifier);
+  Register(IRProperty::AsyncHandleProvenance, CreateAsyncHandleProvenanceVerifier);
   Register(IRProperty::NoNestedCalls, CreateNoNestedCallPropertyVerifier);
   Register(IRProperty::NormalizedStmtStructure, CreateNormalizedStmtPropertyVerifier);
   Register(IRProperty::NoRedundantBlocks, CreateNoRedundantBlocksPropertyVerifier);
@@ -61,6 +62,8 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::StructuredCtrlFlow, CreateStructuredCtrlFlowPropertyVerifier);
   Register(IRProperty::OutParamNotShadowed, CreateOutParamNotShadowedPropertyVerifier);
   Register(IRProperty::ArrayNotEscaped, CreateArrayNotEscapedPropertyVerifier);
+  Register(IRProperty::RegScopeValid, CreateRegScopePropertyVerifier);
+  Register(IRProperty::HardwareLoopContractValid, CreateHardwareLoopContractPropertyVerifier);
   Register(IRProperty::NoNestedInCore, CreateNoNestedIncorePropertyVerifier);
   Register(IRProperty::InOutUseValid, CreateInOutUseValidPropertyVerifier);
   Register(IRProperty::PipelineLoopValid, CreatePipelineLoopValidPropertyVerifier);
@@ -92,6 +95,10 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   // synthesises one.
   Register(IRProperty::NoScalarKernelReturn, CreateNoScalarKernelReturnPropertyVerifier);
 
+  Register(IRProperty::SimtValid, CreateSimtValidPropertyVerifier);
+  Register(IRProperty::SimtOutputsMaterialized, CreateSimtOutputsMaterializedPropertyVerifier);
+  Register(IRProperty::SimtSpecialized, CreateSimtSpecializedPropertyVerifier);
+
   Register(IRProperty::InlineFunctionsEliminated, CreateInlineFunctionsEliminatedPropertyVerifier);
   Register(IRProperty::OrchestrationReferencesResolved,
            CreateOrchestrationReferencesResolvedPropertyVerifier);
@@ -111,9 +118,8 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::CommDomainScopesMaterialized, CreateCommDomainScopesMaterializedPropertyVerifier);
   Register(IRProperty::DistTensorCtxMaterialized, CreateDistTensorCtxMaterializedPropertyVerifier);
   // AssignTypeSymmetry (#1285): every AssignStmt(var, value) must satisfy
-  // structural_equal(var->GetType(), value->GetType()). Registered so callers
-  // can run it on demand via PropertyVerifierRegistry::verify; not yet promoted
-  // to GetStructuralProperties() (Phase 2).
+  // structural_equal(var->GetType(), value->GetType()). A structural property,
+  // so VerificationInstrument checks it before and after every pass.
   Register(IRProperty::AssignTypeSymmetry, CreateAssignTypeSymmetryPropertyVerifier);
   Register(IRProperty::ReturnParamsExplicit, CreateReturnParamsExplicitPropertyVerifier);
   // HardSyncallOccupancyValid (#1935): a hard (FFTS) system.syncall requires the

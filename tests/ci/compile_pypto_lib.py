@@ -1,0 +1,479 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Compile the configured pypto-lib cases without executing device code.
+
+Selection and per-case arguments are owned by pypto_lib_compile.json.
+The subprocess adapter supports older entries without a --compile-only CLI.
+"""
+
+import argparse
+import ast
+import importlib
+import inspect
+import json
+import os
+import re
+import runpy
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import count
+from pathlib import Path
+from typing import Any
+
+# These entry contracts use runtime-dir as a compile OUTPUT. Other library
+# CLIs use that spelling for replay inputs or only in checkpoint branches;
+# discovering an add_argument call is not sufficient to enable it (#3205).
+# No current kernel entry uses runtime-dir as a compile output.
+COMPILE_OUTPUT_ENTRIES: set[str] = set()
+
+
+DEFAULT_CASES = Path(__file__).with_name("pypto_lib_compile.json")
+
+
+def select_cases(lib: Path, platform: str, config: Path) -> list[dict[str, Any]]:
+    """Validate the explicit case list and select one platform without discovery."""
+    cases = json.loads(config.read_text(encoding="utf-8"))
+    if not isinstance(cases, list):
+        raise ValueError(f"Expected a case list in {config}, got {type(cases).__name__}")
+    names: set[str] = set()
+    selected = []
+    for case in cases:
+        if not isinstance(case, dict) or set(case) - {"name", "entry", "platforms", "args"}:
+            raise ValueError(f"Invalid case in {config}: {case!r}")
+        name = case.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+            raise ValueError(f"Invalid case name in {config}: {name!r}")
+        if name in {"manifest.json", "results.json"}:
+            raise ValueError(f"Reserved case name in {config}: {name} conflicts with an output artifact")
+        if name in names:
+            raise ValueError(f"Duplicate case name in {config}: {name}")
+        names.add(name)
+        entry = case.get("entry")
+        if not isinstance(entry, str) or not entry:
+            raise ValueError(f"Invalid entry for case {name}: {entry!r}")
+        path = Path(entry)
+        if (
+            not path.parts
+            or path.is_absolute()
+            or ".." in path.parts
+            or path.as_posix() != entry
+            or path.parts[0] not in ("examples", "models")
+            or path.suffix != ".py"
+            or path.name.endswith("_draft.py")
+            or not (lib / path).resolve().is_relative_to(lib.resolve())
+            or not (lib / path).is_file()
+        ):
+            raise ValueError(f"Invalid or missing entry for case {name}: {entry}")
+        platforms = case.get("platforms")
+        if (
+            not isinstance(platforms, list)
+            or not platforms
+            or any(item not in ("a2a3", "a5") for item in platforms)
+            or len(set(platforms)) != len(platforms)
+        ):
+            raise ValueError(f"Expected unique a2a3/a5 platforms for case {name}, got {platforms!r}")
+        args = case.get("args", [])
+        if not isinstance(args, list) or any(not isinstance(arg, str) or "\0" in arg for arg in args):
+            raise ValueError(f"Expected a string argument list for case {name}, got {args!r}")
+        for arg in args:
+            option = arg.partition("=")[0]
+            if (arg.startswith("-p") and not arg.startswith("--")) or (
+                option.startswith("--") and option != "--" and "--platform".startswith(option)
+            ):
+                raise ValueError(f"Case {name} must use platforms, not a platform argument: {arg}")
+        if platform in platforms:
+            selected.append({**case, "args": args})
+    if not selected:
+        raise ValueError(f"No pypto-lib cases selected for {platform} in {config}")
+    return selected
+
+
+def entry_args(
+    path: Path, platform: str, extra: list[str] | None = None, *, runtime_dir: Path | None = None
+) -> list[str]:
+    """Supply platform and declared logical ranks without acquiring devices."""
+    extra = extra or []
+    explicit_device = any(
+        arg == "--device"
+        or arg.startswith("--device=")
+        or (arg.startswith("-d") and not arg.startswith("--"))
+        for arg in extra
+    )
+    source = path.read_text()
+    args = [str(path), "-p", platform]
+    devices = re.search(r"^#\s*ci:\s*devices=(\d+)\b", source, re.MULTILINE)
+    if devices and not explicit_device:
+        count = int(devices.group(1))
+        if count < 1:
+            raise ValueError(f"Invalid device count in {path}: {count}")
+        args += ["-d", ",".join(str(rank) for rank in range(count))]
+    options = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+    ]
+    if (
+        not devices
+        and not explicit_device
+        and any(
+            any(isinstance(arg, ast.Constant) and arg.value == "--device" for arg in node.args)
+            and any(
+                kw.arg == "required" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                for kw in node.keywords
+            )
+            for node in options
+        )
+    ):
+        args += ["-d", "0"]
+    if runtime_dir is not None:
+        args += ["--runtime-dir", str(runtime_dir)]
+    return args + extra
+
+
+def read_receipt(receipt: Path) -> list[dict[str, Any]]:
+    """Reject absent or malformed compilation records without aborting the matrix."""
+    try:
+        results = json.loads(receipt.read_text()) if receipt.exists() else []
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(results, list) or any(
+        not isinstance(result, dict) or not isinstance(result.get("passed"), bool) for result in results
+    ):
+        return []
+    return results
+
+
+def _python_script_index(command: list[Any] | tuple[Any, ...]) -> int | None:
+    """Locate a Python script without mistaking interpreter options for paths."""
+    index = 1
+    while index < len(command):
+        argument = os.fsdecode(command[index])
+        if argument == "--":
+            return index + 1 if index + 1 < len(command) else None
+        if argument == "-":
+            return None
+        if not argument.startswith("-"):
+            return index
+        if argument == "--check-hash-based-pycs":
+            index += 2
+            continue
+        # Short flags may be grouped. -W/-X consume the rest of their group
+        # or the next argument; -c/-m and unknown options are not script runs.
+        # -x skips the entry's first line, which runpy would execute unchanged.
+        for offset, flag in enumerate(argument[1:], start=1):
+            if flag in "WX":
+                if offset == len(argument) - 1:
+                    index += 1
+                break
+            if flag not in "bBdEiIOPqRsSuv":
+                return None
+        index += 1
+    return None
+
+
+def compile_entry(lib: Path, entry: str, platform: str, receipt: Path, argv: list[str] | None = None) -> None:
+    """Force every golden.run call through its real compile-only pipeline."""
+    # A child's cwd must not change where its receipt is written or collected.
+    receipt = receipt.resolve()
+    sys.path[:0] = [str(lib), str((lib / entry).parent)]
+    golden: Any = importlib.import_module("golden")
+    runner: Any = importlib.import_module("golden.runner")
+
+    original = runner.run
+    signature = inspect.signature(original)
+    results: list[dict[str, Any]] = []
+    compile_module: Any = importlib.import_module("pypto.ir.compile")
+    ir_module: Any = importlib.import_module("pypto.ir")
+    original_compile = compile_module.compile
+    in_golden = False
+    original_popen = subprocess.Popen
+    original_parse_known_args = argparse.ArgumentParser.parse_known_args
+    popen_signature = inspect.signature(original_popen)
+    child_ids = count()
+    children: list[tuple[Path, subprocess.Popen[Any]]] = []
+    entry_path = (lib / entry).resolve()
+
+    class CompileOnlyPopen(subprocess.Popen):
+        def __init__(self, args: Any, *popenargs: Any, **kwargs: Any) -> None:
+            command = args
+            child_receipt = None
+            if (
+                isinstance(command, (list, tuple))
+                and len(command) >= 2
+                and Path(os.fsdecode(command[0])).resolve() == Path(sys.executable).resolve()
+            ):
+                options = popen_signature.bind(args, *popenargs, **kwargs).arguments
+                script_index = _python_script_index(command)
+                script = (
+                    Path(os.fsdecode(options.get("cwd") or Path.cwd())) / os.fsdecode(command[script_index])
+                    if script_index is not None
+                    else None
+                )
+                if (
+                    not options.get("shell")
+                    and not options.get("executable")
+                    and script_index is not None
+                    and script is not None
+                    and script.resolve() == entry_path
+                ):
+                    # Self-dispatching entries need the same audit in each fresh interpreter.
+                    child_receipt = receipt.with_name(f"{receipt.stem}.{next(child_ids)}.json")
+                    child_receipt.unlink(missing_ok=True)
+                    command = [
+                        *command[:script_index],
+                        str(Path(__file__).resolve()),
+                        "--lib",
+                        str(lib),
+                        "--platform",
+                        platform,
+                        "--entry",
+                        entry,
+                        "--receipt",
+                        str(child_receipt),
+                        "--entry-args",
+                        json.dumps([os.fsdecode(arg) for arg in command[script_index + 1 :]]),
+                    ]
+            try:
+                super().__init__(command, *popenargs, **kwargs)
+            except OSError as error:
+                if child_receipt is not None:
+                    results.append({"passed": False, "error": f"Child process failed to start: {error}"})
+                raise
+            self.args = args
+            if child_receipt is not None:
+                children.append((child_receipt, self))
+
+    def full_compile(*args: Any, **kwargs: Any) -> Any:
+        # JIT otherwise silently emits only MLIR when PTOAS is unavailable.
+        kwargs["skip_ptoas"] = False
+        record = {"passed": False, "error": "Compilation did not return successfully"}
+        if not in_golden:
+            results.append(record)
+        compiled = original_compile(*args, **kwargs)
+        record.update(passed=True, error="")
+        return compiled
+
+    def compile_only(*args: Any, **kwargs: Any) -> Any:
+        nonlocal in_golden
+        bound = signature.bind(*args, **kwargs)
+        bound.arguments["compile_only"] = True
+        bound.arguments["runtime_dir"] = None
+        record = {"passed": False, "error": "Compilation did not return successfully"}
+        results.append(record)
+        in_golden = True
+        try:
+            result = original(*bound.args, **bound.kwargs)
+        finally:
+            in_golden = False
+        record.update(passed=bool(result.passed), error=str(result.error or ""))
+        return result
+
+    def parse_compile_args(
+        self: argparse.ArgumentParser,
+        args: Iterable[str] | None = None,
+        namespace: Any = None,
+    ) -> tuple[Any, list[str]]:
+        # The live parser owns this contract: a helper or inactive constructor
+        # says nothing about the parser consuming argv. Setting the CLI mode
+        # also prevents runtime branches after golden.run has compiled a case.
+        arguments = list(sys.argv[1:] if args is None else args)
+        if "--compile-only" in self._option_string_actions:
+            arguments.insert(0, "--compile-only")
+        return original_parse_known_args(self, arguments, namespace)
+
+    def reject_execution(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("Compile-only audit attempted to prepare runtime inputs")
+
+    # Entries import either spelling. Install both before executing their main.
+    golden.run = runner.run = compile_only
+    runner._prepare_inputs = reject_execution
+    compile_module.compile = ir_module.compile = full_compile
+    subprocess.Popen = CompileOnlyPopen
+    # A fresh per-invocation directory prevents a retained manifest from turning
+    # this audit into a cache-load check. Keep artifacts beside the receipt.
+    if argv is None:
+        runtime_dir = (
+            Path(tempfile.mkdtemp(prefix="runtime-", dir=receipt.parent))
+            if entry in COMPILE_OUTPUT_ENTRIES
+            else None
+        )
+        sys.argv = entry_args(entry_path, platform, runtime_dir=runtime_dir)
+    else:
+        # Self-dispatched children inherit explicit CLI arguments. Replace the
+        # inherited manifest directory while preserving their case selection.
+        child_args = list(argv)
+        for index, arg in enumerate(child_args):
+            if entry not in COMPILE_OUTPUT_ENTRIES:
+                break
+            if arg == "--runtime-dir" and index + 1 < len(child_args):
+                child_args[index + 1] = tempfile.mkdtemp(prefix="runtime-", dir=receipt.parent)
+            elif arg.startswith("--runtime-dir="):
+                child_args[index] = "--runtime-dir=" + tempfile.mkdtemp(prefix="runtime-", dir=receipt.parent)
+        sys.argv = [str(entry_path), *child_args]
+    # parse_args delegates to parse_known_args, including component and
+    # subparser dispatch. Install only while executing this isolated entry.
+    argparse.ArgumentParser.parse_known_args = parse_compile_args
+    try:
+        runpy.run_path(str(entry_path), run_name="__main__")
+    finally:
+        argparse.ArgumentParser.parse_known_args = original_parse_known_args
+        subprocess.Popen = original_popen
+        for child_receipt, child in children:
+            child_results = read_receipt(child_receipt)
+            child_code = child.poll()
+            if not child_results or child_code != 0:
+                child_results.append(
+                    {
+                        "passed": False,
+                        "error": "Child process failed or produced no compilation receipts: "
+                        f"{child_receipt.name}, exit_code={child_code}",
+                    }
+                )
+            results.extend(child_results)
+        receipt.write_text(json.dumps(results, indent=2) + "\n")
+
+
+def run_case(lib: Path, case: dict[str, Any], platform: str, output: Path, timeout: int) -> dict[str, Any]:
+    """Run one isolated interpreter; kill its entire compiler process group on timeout."""
+    entry = case["entry"]
+    argv = entry_args(lib / entry, platform, case.get("args", []))[1:]
+    case_dir = output / case["name"]
+    case_dir.mkdir(parents=True, exist_ok=True)
+    receipt = case_dir / "compilations.json"
+    receipt.unlink(missing_ok=True)
+    log_path = case_dir / "compile.log"
+    env = os.environ | {"PYPTO_PROG_BUILD_DIR": str(case_dir / "build_output")}
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--lib",
+        str(lib),
+        "--platform",
+        platform,
+        "--entry",
+        entry,
+        "--receipt",
+        str(receipt),
+        "--entry-args",
+        json.dumps(argv),
+    ]
+    start = time.monotonic()
+    timed_out = False
+    with log_path.open("w") as log:
+        with subprocess.Popen(
+            command, cwd=lib, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        ) as proc:
+            try:
+                code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                os.killpg(proc.pid, signal.SIGKILL)
+                code = proc.wait()
+                log.write(f"\nTimed out after {timeout}s\n")
+    results = read_receipt(receipt)
+    passed = code == 0 and bool(results) and all(result["passed"] for result in results)
+    return {
+        "name": case["name"],
+        "entry": entry,
+        "args": argv,
+        "platform": platform,
+        "passed": passed,
+        "exit_code": code,
+        "timed_out": timed_out,
+        "seconds": round(time.monotonic() - start, 2),
+        "compilations": results,
+        "log": str(log_path.relative_to(output)),
+    }
+
+
+def positive_int(value: str) -> int:
+    """Reject zero and negative worker counts and timeouts."""
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"Expected a positive integer, got {value}")
+    return parsed
+
+
+def main() -> int:
+    """Run the configured matrix leg and write a reproducible manifest and result summary."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lib", type=Path, required=True)
+    parser.add_argument("--platform", choices=("a2a3", "a5"), required=True)
+    parser.add_argument("--cases", type=Path, default=DEFAULT_CASES, help="JSON list of named compile cases")
+    parser.add_argument("--output", type=Path, default=Path("build/lib-compile"))
+    parser.add_argument("--jobs", type=positive_int, default=4)
+    parser.add_argument("--timeout", type=positive_int, default=1200)
+    parser.add_argument("--entry", help=argparse.SUPPRESS)
+    parser.add_argument("--receipt", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--entry-args", type=json.loads, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    lib = args.lib.resolve()
+    if args.entry:
+        if args.receipt is None:
+            parser.error("--entry requires --receipt")
+        compile_entry(lib, args.entry, args.platform, args.receipt, args.entry_args)
+        return 0
+
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    cases = select_cases(lib, args.platform, args.cases)
+    revision = subprocess.check_output(["git", "-C", str(lib), "rev-parse", "HEAD"], text=True).strip()
+    manifest = {
+        "lib_revision": revision,
+        "platform": args.platform,
+        "entries": sorted({case["entry"] for case in cases}),
+        "cases": [
+            {**case, "argv": entry_args(lib / case["entry"], args.platform, case["args"])[1:]}
+            for case in cases
+        ],
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"Compiling {len(cases)} cases on {args.platform}; pypto-lib {revision}", flush=True)
+    results = []
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = {
+            pool.submit(run_case, lib, case, args.platform, output, args.timeout): case["name"]
+            for case in cases
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            status = "PASS" if result["passed"] else "FAIL"
+            print(
+                f"{status} {result['name']} ({result['entry']}) ({result['seconds']}s) [{result['log']}]",
+                flush=True,
+            )
+            if not result["passed"]:
+                print((output / result["log"]).read_text(errors="replace")[-12000:], flush=True)
+    results.sort(key=lambda result: result["name"])
+    (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+    passed = sum(result["passed"] for result in results)
+    summary = f"pypto-lib {args.platform}: {passed}/{len(results)} passed (library {revision})"
+    print(summary, flush=True)
+    if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(summary_path, "a") as summary_file:
+            summary_file.write(summary + "\n")
+            for result in results:
+                if not result["passed"]:
+                    summary_file.write(
+                        f"- FAIL: `{result['name']}` (`{result['entry']}`) — `{result['log']}`\n"
+                    )
+    return int(passed != len(results))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

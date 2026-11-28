@@ -80,12 +80,11 @@ bool IsFractalSpace(MemorySpace space) {
 /// accumulator seed as `tile.create(compact=True)` and narrows it immediately,
 /// and a buffer nothing has written yet re-interprets nothing.
 ///
-/// **(3) Only a fractal space carries a compact mode at all.** Compact is a
-/// property of a fractal pitch. A UB (`Vec`) tile has none, and no pto-isa Vec
-/// path reads `TileData::Compact` -- stamping it there is inert at best and, on
-/// the ops that *do* consult it (`TMov`, `TFillPad`), a silent layout change.
-/// Marking the Vec side of a C2V pop compact is a tempting non-fix for #2510;
-/// this rejects it up front.
+/// **(3) Compact modes belong to the memory spaces that use their pitch.**
+/// Normal compact mode describes an N-fractal pitch in Left, Right, or Acc.
+/// For example, marking the Vec side of a C2V pop normal compact would
+/// silently change layout on operations that consult the mode. RowPlusOne
+/// describes a padded NZ panel pitch in Vec for A5 TCVT and V2C transfer.
 class AccCompactVisitor : public IRVisitor {
  public:
   AccCompactVisitor(std::vector<Diagnostic>& diagnostics, std::string func_name)
@@ -142,13 +141,15 @@ class AccCompactVisitor : public IRVisitor {
     const TileView acc_view = tile_view_semantics::GetEffectiveTileView(*acc_type);
     if (acc_view.compact == CompactMode::normal) return;
 
-    const TileView lhs_view = tile_view_semantics::GetEffectiveTileView(*lhs_type);
-    if (lhs_view.valid_shape.empty()) return;
-    if (AccPitchesCoincide(lhs_view.valid_shape[0], acc_type->shape_[0])) return;
+    const auto lhs_valid = GetMatmulLogicalShape(lhs_type, /*use_valid_shape=*/true);
+    if (lhs_valid.empty()) return;
+    // Native FP4 L0A packs two logical M values per carrier row. Its byte
+    // extent must not be compared with the FP32 accumulator's value extent.
+    if (AccPitchesCoincide(lhs_valid[0], acc_type->shape_[0])) return;
 
     diagnostics_.emplace_back(
         DiagnosticSeverity::Error, "AccCompactValid", /*error_code=*/1,
-        "'" + call->op_->name_ + "' accumulates " + PythonPrint(lhs_view.valid_shape[0]) +
+        "'" + call->op_->name_ + "' accumulates " + PythonPrint(lhs_valid[0]) +
             " valid rows into an accumulator that is not compact (function '" + func_name_ +
             "'). mad lays the product out at a pitch of ceil(validRow/16)*16, but a non-compact "
             "accumulator is read back at its physical row count " +
@@ -214,15 +215,17 @@ class AccCompactVisitor : public IRVisitor {
     }
     auto tile_type = As<TileType>(type);
     if (!tile_type || !tile_type->tile_view_.has_value() || !tile_type->memory_space_.has_value()) return;
-    if (tile_type->tile_view_->compact == CompactMode::null) return;
-    if (IsFractalSpace(*tile_type->memory_space_)) return;
+    const auto compact = tile_type->tile_view_->compact;
+    const auto space = *tile_type->memory_space_;
+    if (compact == CompactMode::null) return;
+    if (compact == CompactMode::row_plus_one ? space == MemorySpace::Vec : IsFractalSpace(space)) return;
 
     diagnostics_.emplace_back(
         DiagnosticSeverity::Error, "AccCompactValid", /*error_code=*/3,
         "tile in memory space '" + MemorySpaceToString(*tile_type->memory_space_) +
             "' carries a compact mode (function '" + func_name_ +
-            "'). Compact describes an N-fractal pitch, so only Left/Right/Acc tiles may carry it; "
-            "no pto-isa path reads it for any other space.",
+            "'). For a normal compact N-fractal pitch, only Left/Right/Acc tiles may carry it. "
+            "RowPlusOne describes a padded Vec NZ pitch.",
         span);
   }
 

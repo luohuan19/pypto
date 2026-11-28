@@ -1,5 +1,9 @@
 # 运行时开销
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 在不改变任务算什么的前提下，让每个任务花得更少的五种办法。
 
 > **前置**：[任务粒度](01-task-granularity.md)。
@@ -40,20 +44,23 @@ def fresh(rows=ROWS):
 
 **何时适用：** 一个 cube 操作喂给一个 vector 操作。不管的话它们是两个任务：cube 任务跑完写 GM，vector 任务再被派发去把它读回来。
 
-**怎么做：** 一个 `pl.at` 作用域同时承载两者，并用一个 split 模式告诉编译器怎么把 vector 那一半分给共享同一个 cube 的两个 AIV：
+**怎么做：** 一个 `pl.at` 作用域同时承载两者，通过显式 shard 和每 lane 地址把 vector 工作分给共享同一个 cube 的两个 AIV：
 
 ```python
 with pl.at(
     level=pl.Level.CORE_GROUP,
-    optimizations=[pl.split(pl.SplitMode.UP_DOWN), pl.cross_core_slot(slot_num=2)],
+    optimizations=[pl.cross_core_slot(slot_num=1)],
 ):
     acc = pl.matmul(a, b, out_dtype=pl.FP32)   # cube (AIC)
-    out[:] = pl.add(acc, bias)                 # vector (AIV)
+    for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+        half = pl.aiv_shard(acc)
+        row = lane * HALF_ROWS
+        out[row:row + HALF_ROWS, :] = pl.add(half, bias[row:row + HALF_ROWS, :])
 ```
 
 `examples/advanced/03_mixed_kernel.py` 用三种模式跑了这个例子，[教程](../tutorials/03-mixed-kernel.md) 里有逐步讲解。
 
-**代价：** `pl.split` 只把 **vector** 子区域减半；cube 侧仍是全尺寸，所以 vector 缓冲变小而 cube 缓冲不变。另外在两个引擎之间搬运中间结果的那个跨核环是实打实的内存：它默认 **8 个槽**，对一个大中间结果来说远超 vector 预算能让出的量。`slot_num=` 通常不是可选项 —— 默认放不下时编译器会在编译期明说。
+**代价：** 显式分片划分 **vector** 工作；cube 侧仍是全尺寸，所以 vector 缓冲变小而 cube 缓冲不变。另外在两个引擎之间搬运中间结果的那个跨核环是实打实的内存：它默认 **2 个槽**，对一个大中间结果来说远超 vector 预算能让出的量。`slot_num=` 通常不是可选项 —— 默认放不下时编译器会在编译期明说。
 
 **怎么确认：** 看泳道图。两根首尾相接的条应当变成一根、且 cube 与 vector 的 span **重叠**。如果只是变成了一根总宽度不变的条，那说明两个引擎在 kernel 内部仍然是串的，该回头看 split 模式。
 
@@ -86,7 +93,8 @@ def spmd_blocks(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
 
 for kernel in (per_block_tasks, spmd_blocks):
     c = fresh()
-    kernel(A, B, c, config=CFG)
+    compiled = kernel.compile(A, B, c, config=CFG)
+    compiled(A, B, c, config=CFG)
     torch.testing.assert_close(c, A + B, rtol=1e-4, atol=1e-4)
 ```
 
@@ -130,7 +138,8 @@ def gated(a: pl.Tensor, gate: pl.Tensor, out: pl.Out[pl.Tensor]):
 for gate_value, expected in ((0, A * 2.0), (1, A * 2.0 + 1.0)):
     gate = torch.full((1, 1), gate_value, dtype=torch.int32)
     out = fresh()
-    gated(A, gate, out, config=CFG)
+    compiled = gated.compile(A, gate, out, config=CFG)
+    compiled(A, gate, out, config=CFG)
     torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 ```
 
@@ -167,7 +176,8 @@ def early_resolve(a: pl.Tensor, b: pl.Tensor, scratch: pl.Out[pl.Tensor], out: p
     return scratch, out
 
 scratch, out = fresh(TILE_ROWS), fresh(TILE_ROWS)
-early_resolve(A[:TILE_ROWS], B[:TILE_ROWS], scratch, out, config=CFG)
+compiled = early_resolve.compile(A[:TILE_ROWS], B[:TILE_ROWS], scratch, out, config=CFG)
+compiled(A[:TILE_ROWS], B[:TILE_ROWS], scratch, out, config=CFG)
 torch.testing.assert_close(out, torch.exp(A[:TILE_ROWS] + B[:TILE_ROWS]), rtol=1e-3, atol=1e-4)
 ```
 

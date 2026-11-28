@@ -29,8 +29,10 @@
 #include "pypto/core/any_cast.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
+#include "pypto/ir/acc_push_epilogue.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/reflection/field_traits.h"
+#include "pypto/ir/simt.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/type.h"
 
@@ -115,7 +117,7 @@ class Op {
    * This is used for validation when creating Call expressions.
    *
    * Only specific types are allowed: bool, int, std::string, double, DataType, MemorySpace,
-   * TensorLayout, and PadValue
+   * TensorLayout, TileLayout, PadValue, and AccPushEpilogue
    * This is enforced at compile-time via static_assert.
    *
    * @tparam T Expected type of the kwarg value (must be one of the allowed types)
@@ -127,9 +129,10 @@ class Op {
     static_assert(
         std::is_same_v<T, bool> || std::is_same_v<T, int> || std::is_same_v<T, std::string> ||
             std::is_same_v<T, double> || std::is_same_v<T, DataType> || std::is_same_v<T, MemorySpace> ||
-            std::is_same_v<T, TensorLayout> || std::is_same_v<T, TileLayout> || std::is_same_v<T, PadValue>,
+            std::is_same_v<T, TensorLayout> || std::is_same_v<T, TileLayout> || std::is_same_v<T, PadValue> ||
+            std::is_same_v<T, SimtAxis> || std::is_same_v<T, AccPushEpilogue>,
         "SetAttrType only accepts: bool, int, std::string, double, DataType, MemorySpace, TensorLayout, "
-        "TileLayout, PadValue");
+        "TileLayout, PadValue, SimtAxis, AccPushEpilogue");
 
     attrs_.emplace(key, std::type_index(typeid(T)));
   }
@@ -424,6 +427,21 @@ inline ArgDirection StringToArgDirection(const std::string& str) {
 inline constexpr const char* kAttrArgDirections = "arg_directions";
 
 /**
+ * @brief Logical immediate-child selector for hierarchical Call and Submit dispatch.
+ *
+ * Value type: ExprPtr. This is a child worker index in the caller's hierarchy,
+ * not a physical device ID. SSA, substitution and liveness walk this attr by
+ * stored type, including on Submit. Legacy serialized "device" keys and direct
+ * IR construction are normalized without cloning the referenced expression.
+ */
+inline constexpr const char* kAttrWorker = "worker";
+// Source compatibility for C++ callers; old wire keys are handled explicitly by normalization.
+inline constexpr const char* kAttrDevice = kAttrWorker;
+
+// Defined out of line so this header does not depend on logging macro include order.
+void NormalizeWorkerPlacementAttrs(std::vector<std::pair<std::string, std::any>>& attrs, const Span& span);
+
+/**
  * @brief Function call expression
  *
  * Represents a function call with an operation and arguments.
@@ -512,6 +530,7 @@ class Call : public Expr {
         args_(std::move(args)),
         attrs_(std::move(attrs)),
         kwargs_(std::move(kwargs)) {
+    NormalizeWorkerPlacementAttrs(attrs_, span_);
     detail::CheckValueOperands(args_, span_, "Call argument");
     detail::CheckValueAttrs(attrs_, span_, "Call attribute");
     detail::CheckValueAttrs(kwargs_, span_, "Call keyword argument");
@@ -793,21 +812,30 @@ inline std::vector<std::pair<std::string, std::any>> WithManualDepEdgesAttr(
 }
 
 /**
- * @brief GM cache-access policy for a tensor read.
+ * @brief Semantic GM cache policy, lowered by backend and transfer direction.
  *
  * A semantic contract the author states, never a hint the compiler invents:
  * ``kBypass`` asserts the kernel streams this tensor with no reuse worth
- * caching and that nothing writes those bytes while it runs. Mixing a cached
+ * caching and, for reads, that nothing writes those bytes while it runs. Mixing a cached
  * write and a bypassing read of the same bytes is a coherency bug, so this is
  * never a default and never inferred.
  */
 enum class CachePolicy : uint8_t {
   kDefault = 0,  ///< Ordinary cached GM access
   kBypass = 1,   ///< Streaming access, declared to bypass the cache
+  kNormalFirstVictim = 2,
+  kNormalLastVictim = 3,
+  kNormalPersistent = 4,
+  kNotAllocKeep = 5,
+  kNotAllocClean = 6,
+  kNotAllocDrop = 7,
 };
 
+bool IsValidCachePolicy(int policy);
+bool IsNonAllocatingCachePolicy(CachePolicy policy);
+
 /**
- * @brief Convert CachePolicy to string ("default" / "bypass")
+ * @brief Convert CachePolicy to its lowercase semantic name
  */
 std::string CachePolicyToString(CachePolicy policy);
 
@@ -896,22 +924,6 @@ inline std::vector<std::pair<std::string, std::any>> WithDumpVarsAttr(
 }
 
 /**
- * @brief Reserved attr key for the physical device selector on a
- * host-orchestrator dispatch to a chip-level Orchestration function.
- *
- * Value type: ``ExprPtr`` — either a ``ConstInt`` (fixed device) or a ``Var``
- * referring to the induction variable of an enclosing ``pl.range`` loop.
- * Written by the parser when the user writes ``self.chip_orch(..., device=r)``;
- * consumed by ``MaterializeCommDomainScopes`` to derive per-comm-domain device subsets and
- * by distributed codegen to emit ``submit_next_level(..., worker=<r>)``.
- *
- * SSA passes MUST substitute ``Var`` references inside this attr's value the
- * same way they do for Call args, otherwise the stored ``Var`` becomes a dead
- * reference once the loop's induction variable is versioned.
- */
-inline constexpr const char* kAttrDevice = "device";
-
-/**
  * @brief Reserved attr keys for an SPMD launch spec on a dispatch ``Call``.
  *
  * Value types: ``ExprPtr`` for ``core_num`` (a ``ConstInt``, a caller-local
@@ -929,7 +941,7 @@ inline constexpr const char* kAttrDevice = "device";
  * ``Submit::core_num_`` / ``sync_start_`` fields on the Submit path.
  *
  * SSA / substitution passes MUST rewrite Vars inside ``core_num`` — see
- * ``kAttrDevice`` for the same requirement and the same failure mode.
+ * ``kAttrWorker`` for the same requirement and the same failure mode.
  */
 inline constexpr const char* kAttrCoreNum = "core_num";
 inline constexpr const char* kAttrSyncStart = "sync_start";
@@ -947,24 +959,21 @@ inline constexpr const char* kAttrTaskTimingSlot = "task_timing_slot";
  * @brief True for a ``Call`` attr key whose value is a single ``ExprPtr``
  * naming an IR subtree evaluated in the node's own scope.
  *
- * Every walker that rewrites or collects Vars over Call attrs must recurse into
- * these — the visitor (def-use / liveness), the mutator (substitution), and the
- * SSA pass. They are listed here once because the set was previously spelled
- * out per-site, and a key added to some sites but not others silently dangles
- * in the ones that were missed.
+ * Keyed consumers may use this predicate to recognize the reserved Expr attrs.
+ * Generic traversal must instead use the stored-type helpers below so new
+ * expression-valued attrs are included without extending a per-key allowlist.
  *
- * Scope note: this covers the ``Call`` arms only. ``Submit`` keeps its
- * Expr-valued launch spec and predicate in first-class fields
- * (``core_num_`` / ``predicate_``) that the base walkers already visit, so the
- * Submit arms have no attr of this shape to consult. A ``kAttrDevice`` on a
- * Submit would not be walked — a pre-existing gap, unrelated to these keys.
+ * This predicate describes reserved Call attrs for compatibility with keyed
+ * consumers. Actual Call and Submit walkers use ForEachAttrExpr / MapAttrExprs
+ * below and recurse by stored type, including worker placement on either node.
+ * Submit additionally walks core_num_ / predicate_ as first-class fields.
  *
  * Not included: ``VarPtr`` / ``vector<VarPtr>`` attrs (kAttrTaskIdVar,
  * kAttrManualDepEdges, kAttrDumpVars, ...), which every walker handles
  * separately because a Var is remapped rather than recursed into.
  */
 [[nodiscard]] inline bool IsExprValuedCallAttr(const std::string& key) {
-  return key == kAttrDevice || key == kAttrCoreNum;
+  return key == kAttrWorker || key == kAttrCoreNum;
 }
 
 /**
@@ -979,8 +988,8 @@ inline constexpr const char* kAttrTaskTimingSlot = "task_timing_slot";
  *
  * A key-name-gated walk cannot offer that. The three former walk sites
  * (``VisitExpr_(CallPtr)``, ``VisitExpr_(SubmitPtr)``, ``VisitScopeAttrs``)
- * each carried a different hand-maintained list, which is how ``kAttrDevice``
- * came to be walked on a ``Call`` but not on a ``Submit``.
+ * each carried a different hand-maintained list, which once left the legacy
+ * device-placement attr walked on a Call but not on a Submit.
  *
  * Non-reference values (scalars, enums, ``vector<int32_t>``,
  * ``vector<ArgDirection>``) are ignored: they name nothing.
@@ -1029,7 +1038,7 @@ void ForEachAttrExpr(const std::any& value, F&& fn) {
  *
  * SSA passes MUST substitute ``Var`` references inside this attr's value —
  * the operand tensor and its index Vars are live SSA values. See
- * ``kAttrDevice`` for the same requirement on the Call side.
+ * ``kAttrWorker`` for the same requirement on the Call side.
  */
 inline constexpr const char* kAttrPredicate = "predicate";
 
@@ -1215,6 +1224,7 @@ class Submit : public Expr {
         predicate_(std::move(predicate)),
         attrs_(std::move(attrs)),
         kwargs_(std::move(kwargs)) {
+    NormalizeWorkerPlacementAttrs(attrs_, span_);
     detail::CheckValueType(type_, span_, "Submit result type");
     detail::CheckValueOperands(args_, span_, "Submit argument");
     detail::CheckValueOperands(deps_, span_, "Submit dependency");

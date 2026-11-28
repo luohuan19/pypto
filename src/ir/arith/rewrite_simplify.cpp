@@ -38,6 +38,7 @@
 #include "pypto/ir/transforms/base/functor.h"
 #include "pypto/ir/type.h"
 #include "src/ir/arith/constraint_extract.h"
+#include "src/ir/arith/simplify_utils.h"
 
 namespace pypto {
 namespace ir {
@@ -52,12 +53,25 @@ RewriteSimplifier::Impl::Impl(Analyzer* parent) : parent_(parent) {}
 ExprPtr RewriteSimplifier::Impl::VisitExpr(const ExprPtr& expr) {
   // Skip algebraic rewrite rules for float-typed expressions.
   // Integer-style identities (cancellation, associativity) are not
-  // semantics-preserving for floating-point (rounding, NaN).
+  // semantics-preserving for floating-point (rounding, NaN). Var/IterArg leaves
+  // still follow explicit bindings: substituting their known value changes no
+  // arithmetic and preserves the literal's dtype and signed zero.
   if (auto stype = std::dynamic_pointer_cast<const ScalarType>(expr->GetType());
-      stype && stype->dtype_.IsFloat()) {
+      stype && stype->dtype_.IsFloat() && !AsVarLike(expr)) {
     return expr;
   }
-  return ExprFunctor<ExprPtr>::VisitExpr(expr);
+  // Comparisons return BOOL, so the result-type guard above does not cover them.
+  // ConstFloat stores a double that may round differently in its declared dtype;
+  // preserve these comparisons until format-aware rounding is modeled. Negation
+  // patterns can also construct and fold comparisons, and must preserve NaNs.
+  auto binary = As<BinaryExpr>(expr);
+  if (auto negation = As<Not>(expr)) binary = As<BinaryExpr>(negation->operand_);
+  if (binary) {
+    auto lhs_type = As<ScalarType>(binary->left_->GetType());
+    auto rhs_type = As<ScalarType>(binary->right_->GetType());
+    if ((lhs_type && lhs_type->dtype_.IsFloat()) || (rhs_type && rhs_type->dtype_.IsFloat())) return expr;
+  }
+  return PreserveIntegerResultType(expr, ExprFunctor<ExprPtr>::VisitExpr(expr));
 }
 
 ExprPtr RewriteSimplifier::Impl::RecursiveRewrite(const ExprPtr& expr) {
@@ -452,7 +466,15 @@ ExprPtr RewriteSimplifier::Impl::VisitExpr_(const FloorDivPtr& op) {
   ExprPtr a = VisitExpr(op->left_);
   ExprPtr b = VisitExpr(op->right_);
 
-  if (auto folded = TryConstFoldBinary(ObjectKind::FloorDiv, a, b)) return folded;
+  // Bound-based rewrites also assume stored constants are mathematical values.
+  // Preserve this operation if a literal would wrap during runtime lowering.
+  const DataType dtype = GetScalarDtype(op);
+  if (!detail::FloorDivModOperandsFitDtype(a, b, dtype)) {
+    if (a.get() == op->left_.get() && b.get() == op->right_.get()) return op;
+    // Operand promotion here would change the width used to interpret the literal.
+    return std::make_shared<FloorDiv>(a, b, dtype, op->span_);
+  }
+  if (auto folded = TryConstFoldBinary(ObjectKind::FloorDiv, a, b, dtype)) return folded;
 
   ExprPtr ret = MutateBinary(op, a, b, MakeFloorDiv);
 
@@ -554,7 +576,15 @@ ExprPtr RewriteSimplifier::Impl::VisitExpr_(const FloorModPtr& op) {
   ExprPtr a = VisitExpr(op->left_);
   ExprPtr b = VisitExpr(op->right_);
 
-  if (auto folded = TryConstFoldBinary(ObjectKind::FloorMod, a, b)) return folded;
+  // Bound-based rewrites also assume stored constants are mathematical values.
+  // Preserve this operation if a literal would wrap during runtime lowering.
+  const DataType dtype = GetScalarDtype(op);
+  if (!detail::FloorDivModOperandsFitDtype(a, b, dtype)) {
+    if (a.get() == op->left_.get() && b.get() == op->right_.get()) return op;
+    // Operand promotion here would change the width used to interpret the literal.
+    return std::make_shared<FloorMod>(a, b, dtype, op->span_);
+  }
+  if (auto folded = TryConstFoldBinary(ObjectKind::FloorMod, a, b, dtype)) return folded;
 
   ExprPtr ret = MutateBinary(op, a, b, MakeFloorMod);
 

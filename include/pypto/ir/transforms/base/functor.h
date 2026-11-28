@@ -199,8 +199,11 @@ class StmtFunctor {
   virtual R VisitStmt_(const RuntimeScopeStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const CommDomainScopeStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const GraphScopeStmtPtr& op, Args... args) = 0;
+  virtual R VisitStmt_(const RegScopeStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const SeqStmtsPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const EvalStmtPtr& op, Args... args) = 0;
+  virtual R VisitStmt_(const SimtLaunchStmtPtr& op, Args... args) = 0;
+  virtual R VisitStmt_(const SimtScopeStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const BreakStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const ContinueStmtPtr& op, Args... args) = 0;
   virtual R VisitStmt_(const InlineStmtPtr& op, Args... args) = 0;
@@ -230,8 +233,11 @@ R StmtFunctor<R, Args...>::VisitStmt(const StmtPtr& stmt, Args... args) {
   STMT_FUNCTOR_DISPATCH(RuntimeScopeStmt);
   STMT_FUNCTOR_DISPATCH(CommDomainScopeStmt);
   STMT_FUNCTOR_DISPATCH(GraphScopeStmt);
+  STMT_FUNCTOR_DISPATCH(RegScopeStmt);
   STMT_FUNCTOR_DISPATCH(SeqStmts);
   STMT_FUNCTOR_DISPATCH(EvalStmt);
+  STMT_FUNCTOR_DISPATCH(SimtLaunchStmt);
+  STMT_FUNCTOR_DISPATCH(SimtScopeStmt);
   STMT_FUNCTOR_DISPATCH(BreakStmt);
   STMT_FUNCTOR_DISPATCH(ContinueStmt);
   STMT_FUNCTOR_DISPATCH(InlineStmt);

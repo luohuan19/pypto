@@ -110,6 +110,27 @@ void BindIRBuilder(nb::module_& m) {
           "    RuntimeError: If not inside a function context\n"
           "    ValueError: If a key is already present (attrs are unique-keyed)")
 
+      .def("begin_simt_scope", &IRBuilder::BeginSimtScope, nb::arg("block_dims"), nb::arg("span"))
+      .def("end_simt_scope", &IRBuilder::EndSimtScope, nb::arg("span"),
+           nb::arg("private_scalars") = std::vector<VarPtr>{})
+      .def("begin_reg_scope", &IRBuilder::BeginRegScope, nb::arg("span"), nb::arg("auto_sync") = true,
+           "Begin an implicit-capture register region")
+      .def("emit_reg_mem_bar", &IRBuilder::EmitRegMemBar, nb::arg("kind"), nb::arg("span"))
+      .def("end_reg_scope", &IRBuilder::EndRegScope, nb::arg("span"), "End a register region")
+      .def(
+          "emit_reg",
+          [](IRBuilder& self, const std::string& name, const std::string& op_name,
+             const std::vector<ExprPtr>& args, const nb::dict& kwargs,
+             const Span& span) { return self.EmitReg(name, op_name, args, ConvertKwargsDict(kwargs), span); },
+          nb::arg("name"), nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("span"),
+          "Infer, validate and assign a register operation inside the open RegScope.\n\n"
+          "Returns:\n"
+          "    Var: Variable bound to the operation result\n\n"
+          "Raises:\n"
+          "    ValueError: If op_name is not a reg.* operation or no RegScope is open")
+      .def("emit_reg_store", &IRBuilder::EmitRegStore, nb::arg("name"), nb::arg("tile"), nb::arg("offset"),
+           nb::arg("value"), nb::arg("mask").none(), nb::arg("span"), nb::kw_only(),
+           nb::arg("block_stride") = nb::none(), "Assign a register store's Tile alias result")
       .def("end_function", &IRBuilder::EndFunction, nb::arg("end_span"),
            "End building a function.\n\n"
            "Finalizes the function and returns it.\n\n"
@@ -124,11 +145,14 @@ void BindIRBuilder(nb::module_& m) {
       .def(
           "begin_for_loop",
           [](IRBuilder& self, const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop,
-             const ExprPtr& step, const Span& span, ForKind kind, const nb::object& attrs_or_none) {
-            self.BeginForLoop(loop_var, start, stop, step, span, kind, ConvertAttrsFromPython(attrs_or_none));
+             const ExprPtr& step, const Span& span, ForKind kind, const nb::object& attrs_or_none,
+             HardwareLoopPolicy policy) {
+            self.BeginForLoop(loop_var, start, stop, step, span, kind, ConvertAttrsFromPython(attrs_or_none),
+                              policy);
           },
           nb::arg("loop_var"), nb::arg("start"), nb::arg("stop"), nb::arg("step"), nb::arg("span"),
           nb::arg("kind") = ForKind::Sequential, nb::arg("attrs") = nb::none(),
+          nb::arg("hardware_loop_policy") = HardwareLoopPolicy::Auto,
           "Begin building a for loop.\n\n"
           "Creates a new for loop context. Must be closed with end_for_loop().\n\n"
           "Args:\n"
@@ -138,9 +162,12 @@ void BindIRBuilder(nb::module_& m) {
           "    step: Step value expression\n"
           "    span: Source location for loop definition\n"
           "    kind: Loop kind (Sequential or Parallel, default: Sequential)\n"
-          "    attrs: Loop-level attributes (default: empty)\n\n"
+          "    attrs: Loop-level attributes (default: empty)\n"
+          "    hardware_loop_policy: Auto (default) or Require. Require needs a Sequential\n"
+          "        loop inside RegScope, INDEX start=0 and step=1, and empty attrs.\n\n"
           "Raises:\n"
-          "    RuntimeError: If not inside a valid context")
+          "    RuntimeError: If not inside a valid context\n"
+          "    ValueError: If the current context is a program")
 
       .def("add_iter_arg", &IRBuilder::AddIterArg, nb::arg("iter_arg"),
            "Add an iteration argument to the current for loop.\n\n"
@@ -178,7 +205,8 @@ void BindIRBuilder(nb::module_& m) {
            "    condition: Condition expression\n"
            "    span: Source location for loop definition\n\n"
            "Raises:\n"
-           "    RuntimeError: If not inside a valid context")
+           "    RuntimeError: If not inside a valid context\n"
+           "    ValueError: If the current context is a program")
 
       .def("add_while_iter_arg", &IRBuilder::AddWhileIterArg, nb::arg("iter_arg"),
            "Add an iteration argument to the current while loop.\n\n"
@@ -224,7 +252,8 @@ void BindIRBuilder(nb::module_& m) {
            "    condition: Condition expression\n"
            "    span: Source location for if statement\n\n"
            "Raises:\n"
-           "    RuntimeError: If not inside a valid context")
+           "    RuntimeError: If not inside a valid context\n"
+           "    ValueError: If the current context is a program")
 
       .def("begin_else", &IRBuilder::BeginElse, nb::arg("span"),
            "Begin the else branch of the current if statement.\n\n"
@@ -285,16 +314,18 @@ void BindIRBuilder(nb::module_& m) {
           "        ``OutlineHierarchyScopes`` propagate onto the synthesised\n"
           "        ``Call``.\n\n"
           "Raises:\n"
-          "    RuntimeError: If not inside a function or loop")
+          "    ValueError: If there is no valid enclosing context or the current\n"
+          "        context is a program")
       .def(
           "end_scope",
           [](IRBuilder& self, const Span& end_span, std::vector<int64_t> devices,
-             std::vector<WindowBufferPtr> slots, const nb::object& attrs) {
+             std::vector<WindowBufferPtr> slots, const nb::object& attrs, std::vector<std::string> engines) {
             return self.EndScope(end_span, std::move(devices), std::move(slots),
-                                 ConvertAttrsFromPython(attrs, false));
+                                 ConvertAttrsFromPython(attrs, false), std::move(engines));
           },
           nb::arg("end_span"), nb::arg("devices") = std::vector<int64_t>{},
           nb::arg("slots") = std::vector<WindowBufferPtr>{}, nb::arg("attrs") = nb::none(),
+          nb::arg("engines") = std::vector<std::string>{},
           "End building a scope statement.\n\n"
           "Finalizes the scope statement and returns it.\n\n"
           "Args:\n"
@@ -398,7 +429,7 @@ void BindIRBuilder(nb::module_& m) {
            "    name: Program name\n"
            "    span: Source location for program definition\n\n"
            "Raises:\n"
-           "    RuntimeError: If already inside another program")
+           "    ValueError: If any builder context is already open")
 
       .def("declare_function", &IRBuilder::DeclareFunction, nb::arg("func_name"),
            "Declare a function in the current program.\n\n"
@@ -409,7 +440,8 @@ void BindIRBuilder(nb::module_& m) {
            "Returns:\n"
            "    GlobalVar: GlobalVar that can be used in Call expressions\n\n"
            "Raises:\n"
-           "    RuntimeError: If not inside a program context")
+           "    ValueError: If not inside a program context or if another\n"
+           "        builder context is currently open")
 
       .def("get_global_var", &IRBuilder::GetGlobalVar, nb::arg("func_name"),
            "Get a GlobalVar for a declared function.\n\n"
@@ -419,7 +451,9 @@ void BindIRBuilder(nb::module_& m) {
            "Returns:\n"
            "    GlobalVar: GlobalVar for the function\n\n"
            "Raises:\n"
-           "    RuntimeError: If not inside a program context or function not declared")
+           "    ValueError: If not inside a program context or if another\n"
+           "        builder context is currently open\n"
+           "    RuntimeError: If the function has not been declared")
 
       .def("add_function", &IRBuilder::AddFunction, nb::arg("func"),
            "Add a completed function to the current program.\n\n"
@@ -427,7 +461,8 @@ void BindIRBuilder(nb::module_& m) {
            "Args:\n"
            "    func: Completed function to add\n\n"
            "Raises:\n"
-           "    RuntimeError: If not inside a program context")
+           "    ValueError: If not inside a program context or if another\n"
+           "        builder context is currently open")
 
       .def("end_program", &IRBuilder::EndProgram, nb::arg("end_span"),
            "End building a program.\n\n"
@@ -437,7 +472,7 @@ void BindIRBuilder(nb::module_& m) {
            "Returns:\n"
            "    Program: The built program\n\n"
            "Raises:\n"
-           "    RuntimeError: If not inside a program context")
+           "    ValueError: If the current context is not the program")
 
       .def("get_function_return_types", &IRBuilder::GetFunctionReturnTypes, nb::arg("gvar"),
            "Get return types for a function by its GlobalVar.\n\n"

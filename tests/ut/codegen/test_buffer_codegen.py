@@ -89,6 +89,37 @@ def _window(*values):
     return ir.MakeTuple([_int(value) if isinstance(value, int) else value for value in values], SPAN)
 
 
+@pytest.mark.parametrize("rows", [0, 8, None])
+def test_empty_buffer_memory_windows(tmp_path, rows):
+    """Explicit Buffer IR shares the empty-region memory contract with Tile IR."""
+    extent = _scalar("rows") if rows is None else _int(rows)
+    tensor_type = ir.TensorType([16, 32], DataType.FP32)
+    source = ir.Var("source", tensor_type, SPAN)
+    output = ir.Var("output", tensor_type, SPAN)
+    tile, alloc = _alloc("tile", _type(valid=(-1, -1)), [extent, _int(32)])
+    params = [source, (output, ir.ParamDirection.Out)] + ([extent] if rows is None else [])
+    text = _emit(
+        _program(
+            [
+                alloc,
+                _eval("buffer.load", source, _window(0, 0), _window(extent, 32), tile),
+                _eval("buffer.store", tile, _window(0, 0), _window(extent, 32), output),
+            ],
+            params,
+        ),
+        flag=False,
+    )
+    if rows == 0:
+        assert "pto.partition_view" not in text, text
+        assert "pto.tload" not in text and "pto.tstore" not in text, text
+    elif rows is None:
+        assert text.count("scf.if") == 2, text
+    else:
+        assert "scf.if" not in text, text
+        assert "pto.tload" in text and "pto.tstore" in text, text
+    _compile_native(tmp_path, text, addressed=False)
+
+
 def _gm_program(
     addressed=False, source_name="input", valid_shape=None, ir_stage=ir.FunctionIRStage.Functional
 ):
@@ -195,12 +226,14 @@ def test_native_gm_runtime_windows_and_valid_casts_remain_inside_loop(tmp_path):
     source = ir.Var("source", tensor_type, SPAN)
     output = ir.Var("output", tensor_type, SPAN)
     rows = _scalar("rows", DataType.UINT8)
+    unused = ir.Var("unused", tensor_type, SPAN)
+    start = _scalar("start")
     index = _scalar("i")
     column = _scalar("column")
     buffer, allocation = _alloc("buffer", _type(shape=(256, 32), valid=(-1, -1)), [rows, _int(32)])
     loop = ir.ForStmt(
         index,
-        _int(0),
+        start,
         _int(2),
         _int(1),
         [],
@@ -219,13 +252,19 @@ def test_native_gm_runtime_windows_and_valid_casts_remain_inside_loop(tmp_path):
     )
     kernel = ir.Function(
         "kernel",
-        [rows, source, (output, ir.ParamDirection.Out)],
+        [rows, unused, source, start, (output, ir.ParamDirection.Out)],
         [tensor_type],
         ir.SeqStmts([loop, ir.ReturnStmt([output], SPAN)], SPAN),
         SPAN,
         type=ir.FunctionType.AIV,
     )
     text = _emit(ir.Program([kernel], "RuntimeGMWindows", SPAN))
+    # The unused tensor occupies slot 0 but needs no view. Both scalars retain
+    # their relative order after the tensor pointers, including the loop bound.
+    assert "func.func @kernel(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>, %arg2: !pto.ptr<f32>, " in text
+    assert "%arg3: ui8, %arg4: index)" in text
+    assert re.findall(r"pto.make_tensor_view (%arg\d+),", text) == ["%arg1", "%arg2"]
+    assert re.search(r"scf.for %\w+ = %arg4 to ", text)
     loop_position = text.index("scf.for")
     assert text.index("pto.alloc_tile") > loop_position
     partitions = re.findall(r"pto.partition_view [^\n]+", text)
@@ -234,11 +273,9 @@ def test_native_gm_runtime_windows_and_valid_casts_remain_inside_loop(tmp_path):
     for partition in partitions:
         extent = re.search(r"sizes = \[(%\w+),", partition)
         assert extent is not None
-        cast = re.search(rf"{re.escape(extent[1])} = arith.index_cast (%\w+) : i64 to index", text)
+        cast = re.search(rf"{re.escape(extent[1])} = arith\.index_castui (%\w+) : i8 to index", text)
         assert cast is not None
-        widen = re.search(rf"{re.escape(cast[1])} = arith.extui (%\w+) : i8 to i64", text)
-        assert widen is not None
-        assert f"{widen[1]} = builtin.unrealized_conversion_cast %arg2 : ui8 to i8" in text
+        assert f"{cast[1]} = builtin.unrealized_conversion_cast %arg3 : ui8 to i8" in text
         assert text.index(cast[0]) > loop_position
     assert len(_allocations(text)) == 1
     # This checks native syntax and unsigned dataflow, not numerical execution.
@@ -257,6 +294,19 @@ def test_gm_transfers_reject_incompatible_parameter_directions(name, direction):
         [(tensor, direction)],
     )
     with pytest.raises(ValueError, match="parameter direction"):
+        _emit(program)
+
+
+@pytest.mark.parametrize("name", ["buffer.load", "buffer.store"])
+def test_gm_transfers_reject_reduction_columns(name):
+    tensor = ir.Var("tensor", ir.TensorType([16, 64], DataType.FP32), SPAN)
+    buffer, allocation = _alloc("column", _type((16, 1), blayout=ir.TileLayout.col_major))
+    source, destination = (tensor, buffer) if name == "buffer.load" else (buffer, tensor)
+    program = _program(
+        [allocation, _eval(name, source, _window(0, 0), _window(16, 1), destination)],
+        [(tensor, ir.ParamDirection.InOut)],
+    )
+    with pytest.raises(ValueError, match="GM transfers do not support reduction column vectors"):
         _emit(program)
 
 
@@ -610,7 +660,6 @@ def test_unsigned_for_bound_fails_before_emission():
     [
         (_type(shape=(2, 16, 32)), "rank-1 or rank-2"),
         (_type(blayout=ir.TileLayout.col_major), "dense row-major Vec"),
-        (ir.BufferType([16, 32], DataType.FP4, ir.MemorySpace.Vec), "dense row-major Vec"),
     ],
 )
 def test_unsupported_physical_descriptors_fail_explicitly(descriptor, message):
@@ -729,8 +778,26 @@ def test_native_unsigned_address_and_valid_operands_use_signless_integer_casts(t
     text = _emit(program, False)
     assert "ui32 to i32" in text
     assert re.search(r"arith\.extui %\w+ : i32 to i64", text)
-    assert re.search(r"arith\.index_cast %\w+ : i64 to index", text)
-    assert not re.search(r"arith\.(extui|index_cast) %\w+ : ui32", text)
+    assert re.search(r"arith\.index_castui %\w+ : i32 to index", text)
+    assert not re.search(r"arith\.(extui|index_castui) %\w+ : ui32", text)
+    _compile_native(tmp_path, text, addressed=True)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "conversion"),
+    [
+        (DataType.INT16, "arith.extsi %arg0 : i16 to i64"),
+        (DataType.UINT64, "builtin.unrealized_conversion_cast %arg0 : ui64 to i64"),
+        (DataType.INDEX, "arith.index_cast %arg0 : index to i64"),
+    ],
+)
+def test_native_buffer_address_uses_i64_operand(tmp_path, dtype, conversion):
+    address = _scalar("address", dtype)
+    _, allocation = _alloc("storage", address=address)
+    text = _emit(_program([allocation], [address]))
+    allocated_address = re.search(r"addr = (%\w+)", text)
+    assert allocated_address is not None
+    assert f"{allocated_address[1]} = {conversion}" in text
     _compile_native(tmp_path, text, addressed=True)
 
 
@@ -746,11 +813,9 @@ def test_native_uint8_valid_extents_preserve_the_high_bit(tmp_path):
     updated_valid = re.search(r"pto\.set_validshape %\w+, %\w+, (%\w+)", text)
     assert allocated_valid is not None and updated_valid is not None
     for extent in (allocated_valid[1], updated_valid[1]):
-        index_cast = re.search(rf"{re.escape(extent)} = arith\.index_cast (%\w+) : i64 to index", text)
+        index_cast = re.search(rf"{re.escape(extent)} = arith\.index_castui (%\w+) : i8 to index", text)
         assert index_cast is not None
-        extension = re.search(rf"{re.escape(index_cast[1])} = arith\.extui (%\w+) : i8 to i64", text)
-        assert extension is not None
-        assert f"{extension[1]} = builtin.unrealized_conversion_cast %arg0 : ui8 to i8" in text
+        assert f"{index_cast[1]} = builtin.unrealized_conversion_cast %arg0 : ui8 to i8" in text
     assert not re.search(r"arith\.index_cast %\w+ : i8 to index", text)
     _compile_native(tmp_path, text, addressed=False)
 
@@ -791,6 +856,63 @@ def test_native_explicit_buffer_stage_handles_empty_and_scalar_only_kernels(tmp_
     assert not _allocations(text)
     assert "tile_buf" not in text
     assert ("scf.if %arg0" in text) == with_scalar_body
+    _compile_native(tmp_path, text, addressed=False)
+
+
+@pytest.mark.parametrize(
+    "ir_stage", [ir.FunctionIRStage.Functional, ir.FunctionIRStage.Buffer], ids=["tile", "buffer"]
+)
+def test_loop_floor_divmod_uses_prepared_truncation(ir_stage):
+    """Both entry points keep the fast form inside a loop and full floor semantics for unknown signs."""
+    index = _scalar("i")
+    count = _scalar("count")
+    divisor = _scalar("divisor")
+    offset = ir.Sub(index, _int(8), DataType.INDEX, SPAN)
+    block = _int(24)
+    quotient = ir.FloorDiv(offset, block, DataType.INDEX, SPAN)
+    remainder = ir.FloorMod(quotient, block, DataType.INDEX, SPAN)
+    loop = ir.ForStmt(
+        index,
+        _int(8),
+        count,
+        _int(1),
+        [],
+        ir.AssignStmt(_scalar("r"), remainder, SPAN),
+        [],
+        SPAN,
+    )
+    text = _emit(
+        _program(
+            [
+                loop,
+                ir.AssignStmt(_scalar("floor_q"), ir.FloorDiv(count, divisor, DataType.INDEX, SPAN), SPAN),
+                ir.AssignStmt(_scalar("floor_r"), ir.FloorMod(count, divisor, DataType.INDEX, SPAN), SPAN),
+            ],
+            [count, divisor],
+            ir_stage=ir_stage,
+        )
+    )
+
+    assert text.count("arith.divsi") == 1
+    assert text.count("arith.floordivsi") == 1
+    assert text.count("arith.remsi") == 2
+    assert text.count("arith.select") == 1
+    assert text.index("scf.for") < text.index("arith.divsi") < text.index("arith.floordivsi")
+
+
+@pytest.mark.parametrize("dtype", [DataType.UINT8, DataType.UINT16, DataType.UINT32, DataType.UINT64])
+def test_explicit_buffer_stage_accepts_bool_to_unsigned_cast(tmp_path, dtype):
+    """The Buffer validator must admit the shared emitter's BOOL-to-unsigned recipe."""
+    flag = _scalar("flag", DataType.BOOL)
+    value = _scalar("value", dtype)
+    program = _program(
+        [ir.AssignStmt(value, ir.Cast(flag, dtype, SPAN), SPAN)],
+        [flag],
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    text = _emit(program)
+    assert "arith.extui %arg0 : i1 to i" in text
+    assert "builtin.unrealized_conversion_cast" in text
     _compile_native(tmp_path, text, addressed=False)
 
 

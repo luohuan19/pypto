@@ -43,7 +43,10 @@ golden 的构造使每个分块唯一：`input[r, d, j] = r*1000 + d*100 + j`—
 
 ## 走读
 
-两种模式共享一个 `[nr, SIZE]` window。Rank `r` 在目标 `d` 的 window 的行 `r` 写入其给 `d` 的分块，然后读取自己 window 的行 `src`。手工内核使用步骤 06 的 `put`：
+两种模式共享一个 `[nr, SIZE]` window。Rank `r` 给目标 `d` 的分块最终落在目标
+`d` 的 window 的第 `r` 行，然后 rank `d` 读取自己 window 的第 `src` 行——在手工
+内核里，这次写入由调用方显式完成；而在下面的揭示中，push 发生在调用内部。手工
+内核使用步骤 06 的 `put`：
 
 ```python
 @pl.function(type=pl.FunctionType.InCore)
@@ -77,7 +80,7 @@ def hand_step(self, x, y, data, signal):
 - **notify 用 `Set` 而非 `AtomicAdd`。** 每个 rank 是其行的唯一写入者（`[my_rank, 0]`），因此这里的 barrier 使用步骤 04 走读中的单写入者形式 `Set`/`Ge(1)`。
 - **读回完成交换。** barrier 之后，我们自己 window 的行 `src` 保存着 rank `src` 发给我们的分块。
 
-揭示用一次调用替换阶段 1–3：
+揭示用一次调用替换阶段 1–2；阶段 3 的读回循环仍由调用方完成：
 
 ```python
     result = pld.tensor.all_to_all(x, data, signal)
@@ -92,9 +95,20 @@ def hand_step(self, x, y, data, signal):
 
 ### IR 对比（教学工件）
 
-- `--mode hand` lowering 为上述三个阶段：`P` 次 put（每个目标一次）、`Set`/`Ge(1)` barrier、以及读回循环。
-- `--mode builtin` 展开为相同形状：你的逐目标分块经 `pld.tile.put` 被 push，然后是 barrier，然后是行读回。注意这里 barrier 的作用——因为传输在*前*，它是一个完成 barrier，告诉你每个对端的 push 都已落地，而不是用来把关读取的就绪 barrier。composite 同样会追加自清理尾声，因此该信号下次调用仍可复用。（HOST 内置原语会对大传输增加编排级分块。）
+有趣的地方不在于搬运了哪些字节——两种模式都把同样的分块送到同样的目的地——而在于
+内置实现替你写了多少序列，以及它在哪里停下。
 
+- `--mode hand` lowering 为上述三个阶段：`P` 次 put（每个目标一次）、
+  `Set`/`Ge(1)` barrier、以及读回循环——barrier 位于你自己的 push *之后*，但在你
+  信任任何对端的数据*之前*，否则你的读取会与它们的 push 竞争。
+- `--mode builtin` 展开为相同形状：你的逐目标分块经 `pld.tile.put` 被 push，然后
+  是 barrier——但它到此为止。barrier 与手工版本处在传输的同一侧，因此含义也相同：
+  它是一个**完成** barrier，确认每个对端的 push 都已落地。内置实现*不*替你读回
+  这些行——window **就是**结果，读回循环留在你的代码里。
+- composite 会在 barrier 之后追加**自清理尾声**，把本次调用的信用额度再减回去，
+  因此同一个信号可以被后续集合通信复用
+  （[21-putting_it_together](21-putting_it_together.md)）。HOST 内置原语也会对大
+  传输分块，但那是在生成的 AIV kernel 内部、按固定大小的 tile 进行——不在编排层。
 **成本卡（每 rank）：** 每个 rank 向每个对端发送一个*不同的* `N/P` slice——收到 `(P-1)/P · N` 字节，且没有两个 rank 收到相同的字节。这正是 all-to-all 是最难调度的点对点模式的原因：每对都交换不同的数据。
 
 ## 边界情况
@@ -119,3 +133,62 @@ def hand_step(self, x, y, data, signal):
 - 更高级的应用（此处不重述）：pypto-lib [#869](https://github.com/hw-native-sys/pypto-lib/pull/869)（AllGather-GEMM，来自步骤 13 的 allgather 模式）与 DeepSeek-V4 分布式 MoE dispatch/combine（来自本步的 all-to-all 模式）
 - [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[21-putting_it_together](21-putting_it_together.md) — 在一个内核中组合三种集合通信
+
+## A5 URMA 索引 AllToAllV
+
+```python
+target = pld.tensor.indexed_all_to_all_v(
+    input, target, signal, send_counts, recv_counts, index, core_num=2,
+)
+```
+
+索引接口直接读取原始 `input[Nmax,H]` 行，无需完整 hidden 发送打包区。
+`index` 为连续 INT32 `[P,C]`，独立接收窗口 `target` 为 `[P*C,H]`。
+来源 s 将 `input_s[index_s[d,j]]` 写入目标 d 的 `target_d[s*C+j]`，
+其中 `j < send_counts_s[d]`。重复索引保留重复槽位；尾部不写，保留原值。
+消费者只读取各来源分区的 `recv_counts[s,0]` 行。MoE 的 token 到 rank
+去重及接收端专家展开由上层实现。
+
+首版仅支持 **A5 URMA、PER_PEER、L2**，payload 为 FP32 或 INT8。
+L2 的 input/index 和 recv_counts 可以是本地 Tensor，recv_counts 为 INT32
+`[P,1]`，只由本 rank 写入。send_counts 必须是窗口，
+因为 peer 会远程读取。`signal`、`send_counts` 和 `recv_counts` 必须使用两两
+不同的缓冲区。形状为静态，所有视图完整且连续。
+不支持 HOST、InCore、远端 MTE 或 SHARED_POOL。
+
+`core_num=B` 是正的精确启动核数，运行时按硬件 AIV 上限检查 sync-start。
+`B <= P` 时 AIV b 负责目标 `b,b+B,...`；`B > P` 时只有前 P 个 AIV 提交
+URMA，每个远端 rank 始终只有一个队列写入者。全部 B 个 AIV 平均分配本地接收行；
+每个 AIV 先提交自己的远端发送，再搬本地行，最后等待远端最终 CQE。
+一行 hidden 不跨 AIV 拆分。全部 B 个 AIV 都参与 barrier，包括分到零行的核。
+signal 为 INT32 `[P,S]`，`S >= B`，首次使用前清零。L2 要求编译期核数。各 rank 必须使用一致的布局、启动核数和 collective 顺序。
+
+counts 必须在 `[0,C]` 内，有效 index 必须在 `[0,Nmax)` 内。这些是设备数据
+前置条件；非法值会中止执行，不做 clamp。索引尾部可以是 -1，不会被读取。
+运行失败时需要终止整个通信组。
+
+SIMT 构造多 SGE WRITE SQE，每个 SQE 最多包含十二条完整输入行，固定占四个
+WQEBB，未使用的尾部 WQEBB 填 NOP。每个远端 peer 的整次发送必须装入其 SQ，
+即 `ceil(send_counts[peer] / 12) * 4 <= sqDepth`，内核在提交前断言检查。
+每段最多 64 个 SQE，构造完成后敲一次 doorbell，段间不等待。只有整次发送的
+最后一个 WRITE 使用 strong ordering、fence 并请求 CQE，全部提交后统一等待一次。
+SQ head 按 WQEBB 计数，ISA 的 submittedWqeCount 每次非空远端 peer 发送只加一。
+最后执行完成 barrier。
+self 直接使用 TLOAD/TSTORE，采用 8 个 8 KiB UB stage 的环形流水，每个本地
+搬运 AIV 使用 64 KiB UB。连续来源索引合并为区间，打散行也跨 token 保持流水。
+仅复用 stage 时等待旧 MTE3 store；后续 token 的 MTE2 load 可以与前面的 store
+重叠，末尾统一 drain 后再发布完成。不再逐 token 调用同步 TPUT。远端 payload
+直接通过 URMA 发送，运行时没有为 self rank 初始化 URMA loopback SQ/CQ。
+
+接口返回建立任务完成依赖，不提供仅提交即退核的异步 handle。input/index/counts
+生产者必须先完成，target/recv_counts 消费者必须等待 collective。输入保持存活到
+任务完成；接收窗口复用还必须等待上一轮本地消费者。
+
+通知与轮询均使用带退避的 SIMT 全局原子操作，不使用标量 TNOTIFY/TWAIT 实现，
+仍保留同一组 signal lane 上的双轮 credit 协议。接收计数通过非缓存标量写发布，
+避免控制窗口共用 cache line 时整行回写旧值。A5 系统测试覆盖输入变化后的持久
+窗口复用；不增加遍历完整 payload 的缓存扫描。
+
+共享 URMA 队列的交换必须由调用者保证串行。即使 payload 窗口不同，复用同一个
+signal 也会通过 InOut 建立任务依赖；使用独立 signal 时必须显式建立任务依赖。
+接口不会额外插入全局队列串行依赖。

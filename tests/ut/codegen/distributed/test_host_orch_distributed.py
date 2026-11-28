@@ -32,19 +32,24 @@ Plus regressions:
   ``allocate_domain`` wrapper.
 """
 
+import ast
+import operator
 import os
 import re
 import shutil
 import subprocess
+import sys
+from collections.abc import Callable
 from importlib import resources
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
-from pypto import codegen
+from pypto import codegen, ir
 from pypto.backend import BackendType, pto_backend
 from pypto.language.parser.diagnostics import ParserTypeError
 from pypto.pypto_core import passes  # match the import path used by ut/conftest.py
+from pypto.runtime.tensor_arg import check_window_capacity
 
 SIZE = 64
 
@@ -233,6 +238,112 @@ def test_dist_tensor_formal_emits_continuous_tensor_make():
     # ``device=r`` → rank-pinned dispatch routes through ``_submit_chip`` (which
     # namespaces the per-rank DFX ``output_prefix``), passing the rank last.
     assert re.search(r"_submit_chip\(orch, callables\[\"chip_orch\"\],.*config, \w+\)", code), code
+    # Static, fitting views keep the direct wire-tensor form; no host guard call.
+    assert "check_window_capacity(" not in code, code
+
+
+def test_host_slice_rejects_distributed_window():
+    """Window views have no host tensors-dict entry; reject them in the handler."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, data: pld.DistributedTensor[[16], pl.FP32]):
+            return
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self):
+            buf = pld.alloc_window_buffer(64)
+            data = pld.window(buf, [16], dtype=pl.FP32)
+            self.chip(data, device=0)
+            _part = pl.slice(data, [8], [0])
+
+    # Materialization is concerned with allocation identity and capacity, not
+    # the host codegen's supported operand kinds.
+    program = passes.materialize_comm_domain_scopes()(Prog)
+    with pytest.raises(ValueError, match="tensor.slice.*supports plain Tensor operands only"):
+        codegen.DistributedCodegen().generate(program)
+
+
+def test_symbolic_window_slot_emits_capacity_guard():
+    """A symbolic slot size is checked at the window declaration, before the loop."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            out: pl.Out[pl.Tensor[[SIZE], pl.FP32]],
+            data: pld.DistributedTensor[[SIZE], pl.FP32],
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
+            return out
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self,
+            outputs: pl.Out[pl.Tensor[[2, SIZE], pl.FP32]],
+        ) -> pl.Tensor[[2, SIZE], pl.FP32]:
+            data_buf = pld.alloc_window_buffer(pld.world_size() * SIZE * pl.FP32.get_byte())
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                out_r = outputs[r]
+                self.chip_orch(out_r, data, device=r)
+            return outputs
+
+    code = _lower(Prog)
+    assert "check_window_capacity(" in code, code
+    assert code.count("check_window_capacity(") == 1, code
+    # The check is outside the dispatch loop and does not create a Tensor.
+    tree = ast.parse(code)
+    check = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "check_window_capacity"
+    )
+    loop = next(n for n in ast.walk(tree) if isinstance(n, ast.For))
+    assert check.lineno < loop.lineno
+    assert {kw.arg for kw in check.keywords} == {"name", "shapes", "element_bytes", "slot_nbytes"}
+
+    # Execute the actual generated expression with an undersized dynamic slot.
+    with pytest.raises(ValueError, match="exceeds its backing window slot"):
+        eval(
+            compile(ast.Expression(check), "<window-check>", "eval"),
+            {"check_window_capacity": check_window_capacity, "world_size": 0},
+        )
+    assert re.search(r"slot_nbytes=\([^\n]*world_size[^\n]*\)", code), code
+    compile(code, "<host_orch>", "exec")
+
+
+def test_symbolic_window_guard_is_emitted_once_for_multiple_dispatches():
+    """A declaration checks capacity once even when multiple dispatches consume it."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            out: pl.Out[pl.Tensor[[SIZE], pl.FP32]],
+            data: pld.DistributedTensor[[SIZE], pl.FP32],
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
+            return out
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self,
+            outputs: pl.Out[pl.Tensor[[4, SIZE], pl.FP32]],
+        ) -> pl.Tensor[[4, SIZE], pl.FP32]:
+            data_buf = pld.alloc_window_buffer(pld.world_size() * SIZE * pl.FP32.get_byte())
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            out0 = outputs[0]
+            out1 = outputs[1]
+            self.chip_orch(out0, data, device=0)
+            self.chip_orch(out1, data, device=1)
+            return outputs
+
+    code = _lower(Prog)
+    assert code.count("check_window_capacity(") == 1, code
+    assert code.count('.buffers["data_buf"].tensor(') == 2, code
+    compile(code, "<host_orch>", "exec")
 
 
 def test_two_dist_tensor_formals_emit_two_explicit_ctx_scalars():
@@ -369,9 +480,9 @@ def test_comm_group_program_emits_domain_provider_with_block():
     # window_size is the sum of aligned physical slot sizes. Each spec keeps
     # its exact logical size in count and exposes only its physical size via
     # nbytes.
-    # Single slot → `window_size=((((64 * 4) + 31) // 32) * 32),`. The inner
+    # Single slot → `window_size=((((64 * 4) + 63) // 64) * 64),`. The inner
     # parentheses come from the Mul expression.
-    aligned_size = r"\(\(\(\(64 \* 4\) \+ 31\) // 32\) \* 32\)"
+    aligned_size = r"\(\(\(\(64 \* 4\) \+ 63\) // 64\) \* 64\)"
     assert re.search(rf"window_size=\({aligned_size}\),", code), code
     assert re.search(
         rf'CommBufferSpec\(name="data_buf", dtype="opaque", count=\(64 \* 4\), nbytes={aligned_size}\),',
@@ -408,8 +519,8 @@ def test_comm_buffer_specs_align_each_physical_allocation():
     code = _lower(Prog)
     data_logical = r"\(17 \* 2\)"
     signal_logical = r"\(2 \* 4\)"
-    data_alloc = rf"\(\(\({data_logical} \+ 31\) // 32\) \* 32\)"
-    signal_alloc = rf"\(\(\({signal_logical} \+ 31\) // 32\) \* 32\)"
+    data_alloc = rf"\(\(\({data_logical} \+ 63\) // 64\) \* 64\)"
+    signal_alloc = rf"\(\(\({signal_logical} \+ 63\) // 64\) \* 64\)"
     assert re.search(
         rf'CommBufferSpec\(name="data_buf", dtype="opaque", count={data_logical}, nbytes={data_alloc}\),',
         code,
@@ -422,6 +533,122 @@ def test_comm_buffer_specs_align_each_physical_allocation():
         code,
     ), code
     assert re.search(rf"window_size=\({data_alloc}\) \+ \({signal_alloc}\),", code), code
+
+
+def test_comm_buffer_specs_isolate_signal_and_counts_cache_lines():
+    """Scalar count writeback must not overwrite a peer's signal credits.
+
+    The L2 all_to_all_v P=2, B=4 layout places a 32-byte signal before
+    8-byte counts and recv slots. Rounding each to 32 bytes shares a 64-byte
+    cache line between signal and counts, so a counts DCCI can lose credits.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+        def chip_orch(
+            self,
+            stage: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            data: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            signal: pld.DistributedTensor[[2, 4], pl.INT32],
+            counts: pld.DistributedTensor[[2, 1], pl.INT32],
+            recv: pld.DistributedTensor[[2, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            stage_buf = pld.alloc_window_buffer(2048)
+            data_buf = pld.alloc_window_buffer(2048)
+            signal_buf = pld.alloc_window_buffer(32)
+            counts_buf = pld.alloc_window_buffer(8)
+            recv_buf = pld.alloc_window_buffer(8)
+            stage = pld.window(stage_buf, [8, SIZE], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [2, 4], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [2, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [2, 1], dtype=pl.INT32)
+            self.chip_orch(stage, data, signal, counts, recv, device=0)
+            return 0
+
+    code = _lower(Prog)
+    for name, logical_bytes in (("signal_buf", 32), ("counts_buf", 8), ("recv_buf", 8)):
+        # Each small slot gets one complete cache line; count still exposes
+        # the original logical bytes rather than the padded allocation.
+        alloc_bytes = f"((({logical_bytes} + 63) // 64) * 64)"
+        assert (
+            f'CommBufferSpec(name="{name}", dtype="opaque", count={logical_bytes}, nbytes={alloc_bytes}),'
+        ) in code, code
+
+
+@pytest.mark.parametrize("nr,stride", [(2, 1), (2, 4), (2, 17), (4, 4), (4, 17)])
+def test_comm_signal_and_counts_do_not_share_cache_lines(nr, stride):
+    """Counts staging must not flush stale signal credits from a shared line.
+
+    In the failing P=2/B=4 layout, the 32-byte signal was followed immediately
+    by send_counts. A slow rank staging counts could erase a faster peer's
+    Barrier A credits. Check the emitted sizes, including odd lane widths,
+    rather than merely checking that each start is DMA-aligned.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+        def chip_orch(
+            self,
+            signal: pld.DistributedTensor[[nr, stride], pl.INT32],
+            counts: pld.DistributedTensor[[nr, 1], pl.INT32],
+            recv: pld.DistributedTensor[[nr, 1], pl.INT32],
+        ):
+            return recv
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            signal_buf = pld.alloc_window_buffer(nr * stride * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+            signal = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(signal, counts, recv, device=r)
+            return recv
+
+    # Only constant arithmetic occurs in these generated allocation expressions.
+    # Interpret that AST directly so the test uses the allocator's emitted sizes.
+    operations: dict[type[ast.operator], Callable[[int, int], int]] = {
+        ast.Add: operator.add,
+        ast.Mult: operator.mul,
+        ast.FloorDiv: operator.floordiv,
+    }
+
+    def constant_size(node: ast.expr) -> int:
+        if isinstance(node, ast.Constant):
+            assert isinstance(node.value, int)
+            return node.value
+        assert isinstance(node, ast.BinOp), ast.dump(node)
+        return operations[type(node.op)](constant_size(node.left), constant_size(node.right))
+
+    specs = []
+    for node in ast.walk(ast.parse(_lower(Prog))):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "CommBufferSpec"
+        ):
+            fields = {kw.arg: kw.value for kw in node.keywords}
+            specs.append((constant_size(fields["count"]), constant_size(fields["nbytes"])))
+    assert [logical for logical, _ in specs] == [nr * stride * 4, nr * 4, nr * 4]
+    previous_lines = set()
+    offset = 0
+    for logical, physical in specs:
+        assert physical >= logical
+        assert offset % 32 == 0  # Preserve the existing MTE/CCU contract too.
+        lines = set(range(offset // 64, (offset + logical - 1) // 64 + 1))
+        assert previous_lines.isdisjoint(lines), "DCCI can overwrite another communication buffer"
+        previous_lines.update(lines)
+        offset += physical
+    assert offset % 64 == 0  # The last buffer's writeback must stay in the domain.
 
 
 # ---------------------------------------------------------------------------
@@ -439,18 +666,24 @@ def test_comm_less_dispatch_routes_through_submit_chip_unplaced():
     @pl.program
     class Prog:
         @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
-        def chip_worker(self, x: pl.Tensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
+        def chip_worker(
+            self, x: pl.Tensor[[SIZE], pl.FP32], out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
             y: pl.Tensor[[SIZE], pl.FP32] = pl.add(x, x)
-            return y
+            return pl.tensor.assemble(out, y, [0])
 
         @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
-        def chip_orch(self, x: pl.Tensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
-            y: pl.Tensor[[SIZE], pl.FP32] = self.chip_worker(x)
+        def chip_orch(
+            self, x: pl.Tensor[[SIZE], pl.FP32], out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
+            y: pl.Tensor[[SIZE], pl.FP32] = self.chip_worker(x, out)
             return y
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(self, x: pl.Tensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
-            y: pl.Tensor[[SIZE], pl.FP32] = self.chip_orch(x)
+        def host_orch(
+            self, x: pl.Tensor[[SIZE], pl.FP32], out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
+            y: pl.Tensor[[SIZE], pl.FP32] = self.chip_orch(x, out)
             return y
 
     code = _lower(Prog)
@@ -501,6 +734,8 @@ def test_world_size_lowers_to_kwarg_in_expression_context():
     # `world_size * 4` expression in place of a constant nbytes literal.
     assert re.search(r"window_size=\(.*\bworld_size\b.*\),", code), code
     assert re.search(r"CommBufferSpec\(.*\bworld_size\b.*\),", code), code
+    # Runtime-sized slots need the same cache-line isolation as static ones.
+    assert re.search(r"nbytes=\(\(\(.*\bworld_size\b.* \+ 63\) // 64\) \* 64\)", code), code
     # The legacy ``len(contexts)`` form must not survive.
     assert "len(contexts)" not in code, code
 
@@ -798,7 +1033,7 @@ def test_host_submit_rejects_nested_tuple_return():
         _lower(Prog)
 
 
-def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
+def test_host_allreduce_builtin_codegen_uses_submit_chip_with_callable_key():
     @pl.program
     class Prog:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -820,13 +1055,15 @@ def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
     generated, cg = _lower_host_collectives(Prog)
 
     assert 'callables["builtin.tensor.allreduce__sum__fp32"]' in generated, generated
-    assert "orch.submit_next_level" in generated, generated
-    assert "_ta_1_config = CallConfig()" in generated, generated
-    assert "_ta_1_config.aicpu_thread_num = config.aicpu_thread_num" in generated, generated
+    # The builtin collective must go through _submit_chip with the full run
+    # config, not a fresh CallConfig(): that wrapper is what carries the DFX
+    # output_prefix and stamps the per-dispatch program marker (plan 135).
     assert (
-        'orch.submit_next_level(callables["builtin.tensor.allreduce__sum__fp32"], _ta_1, _ta_1_config'
-        in generated
+        '_submit_chip(orch, callables["builtin.tensor.allreduce__sum__fp32"], _ta_1, config,' in generated
     ), generated
+    assert "_keep.append(_ta_1)" in generated, generated
+    assert "CallConfig()" not in generated, generated
+    assert "orch.submit_next_level" not in generated, generated
     assert ".add_scalar(__comm_d0[" in generated and "].domain_size)" in generated, generated
     assert ".add_scalar((64))" not in generated, generated
     assert "distributed_collectives" not in generated, generated
@@ -1012,7 +1249,7 @@ def test_implicit_host_allreduce_builtin_codegen_materializes_signal():
     assert 'buffers["__allreduce_signal_buf_0"]' in generated, generated
     assert 'buffers["data_buf"]' in generated, generated
     assert 'buffers["signal_buf"]' not in generated, generated
-    assert "orch.submit_next_level" in generated, generated
+    assert '_submit_chip(orch, callables["builtin.tensor.allreduce__sum__fp32"]' in generated, generated
     assert ".add_scalar(__comm_d0[" in generated and "].domain_size)" in generated, generated
     assert "data = data" not in generated, generated
 
@@ -1086,10 +1323,10 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
     entry_cpp = files[f"{base}/orchestration/builtin_tensor_allreduce__sum__fp32.cpp"]
     assert "builtin_tensor_allreduce__sum__fp32" in entry_cpp
     assert "submit_allreduce_kernel<ReduceOp::kSum>" in entry_cpp
-    assert "orch_args.scalar(2)" in entry_cpp
+    assert "orch_args.scalar(3)" in entry_cpp
     assert "params.launch_spec.set_block_num(core_num)" in entry_cpp
     assert "params.launch_spec.set_require_sync_start(true)" in entry_cpp
-    assert ".expected_arg_count = 5" in entry_cpp
+    assert ".expected_arg_count = 6" in entry_cpp
 
     kernel_config = files[f"{base}/kernel_config.py"]
     assert '"aicpu_thread_num": 0' in kernel_config
@@ -1113,10 +1350,16 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "runtime",
-    [passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER, passes.RuntimeKind.HOST_BUILD_GRAPH],
+    ("ascend_backend", "runtime", "name"),
+    [
+        (BackendType.Ascend910, passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER, "tensormap_and_ringbuffer"),
+        (BackendType.Ascend910, passes.RuntimeKind.HOST_BUILD_GRAPH, "host_build_graph"),
+        (BackendType.Ascend950, passes.RuntimeKind.HOST_BUILD_GRAPH, "percounter"),
+        (BackendType.Ascend950, passes.RuntimeKind.HOST_BUILD_GRAPH_EXPERIMENTAL, "host_build_graph"),
+    ],
+    indirect=["ascend_backend"],
 )
-def test_every_next_level_reports_the_selected_runtime(tmp_path, runtime):
+def test_every_next_level_reports_the_selected_runtime(tmp_path, ascend_backend, runtime, name):
     """All chip sub-builds in one distributed program must name the same runtime.
 
     The builtin collectives are materialized from templates rather than by the
@@ -1160,13 +1403,12 @@ def test_every_next_level_reports_the_selected_runtime(tmp_path, runtime):
     # Both a user chip Orchestration and a template-materialized builtin, so the
     # test would still pass vacuously if either side were missing.
     assert len(configs) >= 2, f"expected a user chip and a builtin config, got {sorted(configs)}"
-    name = passes.runtime_kind_to_name(runtime)
     for path, text in configs.items():
         assert f'"runtime": "{name}"' in text, f"{path} does not report runtime {name!r}"
 
 
 @pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
-def test_backend_950_materializes_allreduce_with_core_num_launch(tmp_path, ascend_backend):
+def test_backend_950_materializes_allreduce_with_block_num_launch(tmp_path, ascend_backend):
     @pl.program
     class Prog:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1192,7 +1434,7 @@ def test_backend_950_materializes_allreduce_with_core_num_launch(tmp_path, ascen
 
     base = "next_levels/builtin.tensor.allreduce__sum__fp32"
     entry_cpp = files[f"{base}/orchestration/builtin_tensor_allreduce__sum__fp32.cpp"]
-    assert "params.launch_spec.set_core_num(core_num)" in entry_cpp
+    assert "params.launch_spec.set_block_num(core_num)" in entry_cpp
 
 
 def test_host_allreduce_ring_builtin_codegen_uses_ring_next_level_callable_key():
@@ -1217,7 +1459,7 @@ def test_host_allreduce_ring_builtin_codegen_uses_ring_next_level_callable_key()
     generated, cg = _lower_host_collectives(Prog)
 
     assert 'callables["builtin.tensor.allreduce_ring__sum__fp32"]' in generated, generated
-    assert "orch.submit_next_level" in generated, generated
+    assert '_submit_chip(orch, callables["builtin.tensor.allreduce_ring__sum__fp32"]' in generated, generated
     assert "distributed_collectives" not in generated, generated
 
     specs = cg.get_builtin_next_level_specs()
@@ -2092,6 +2334,557 @@ def test_if_cross_branch_phi_yields_tensors() -> None:
     assert not re.search(r"boundary__ssa_v\d+\s*=.*\w+__ssa", then_block), (
         "Then-branch must not contain bare Python tensor assignments:\n" + code
     )
+
+
+def test_host_window_without_urma_uses_domain_context():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, x: pld.DistributedTensor[[64], pl.FP32]) -> pld.DistributedTensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self) -> pld.DistributedTensor[[64], pl.FP32]:
+            buf = pld.alloc_window_buffer(256, memory_source="host")
+            table = pld.window(buf, [64], dtype=pl.FP32)
+            self.chip(table, device=0)
+            return table
+
+    code = _lower(Prog)
+    compile(code, "host_domain.py", "exec")
+    assert "memory_source=AddressSpace.HOST" in code
+    assert "workspace_engines" not in code
+    assert "__comm_d0.device_context(0)" in code
+    assert "host._requires_host_domain = True" in code
+    assert "validate_host_domain_runtime" not in code
+
+
+@pytest.mark.parametrize("key", ["engram_l1", 'table"\\\nkey', "table_\u8868_\x01\x7f"])
+def test_host_window_initializer_is_only_a_runtime_binding(key, monkeypatch):
+    # Reproduce the compiler-only CI environment even when Simpler is installed.
+    monkeypatch.setitem(sys.modules, "simpler", None)
+    monkeypatch.setitem(sys.modules, "simpler.task_interface", None)
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, x: pld.DistributedTensor[[17], pl.FP32]) -> pld.DistributedTensor[[17], pl.FP32]:
+            return x
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self) -> pld.DistributedTensor[[17], pl.FP32]:
+            buf = pld.alloc_window_buffer(68, memory_source="host", init=key)
+            table = pld.window(buf, [17], dtype=pl.FP32)
+            self.chip(table, device=0)
+            return table
+
+    code = _lower(Prog)
+    compile(code, "host_init.py", "exec")
+    # Decode the emitted metadata without executing module imports: codegen UTs
+    # must work without Simpler installed, including for escaped source keys.
+    source_keys = [
+        ast.literal_eval(stmt.value)
+        for stmt in ast.parse(code).body
+        if isinstance(stmt, ast.Assign)
+        and any(ast.unparse(target) == "host._window_source_keys" for target in stmt.targets)
+    ]
+    assert source_keys == [(key,)]
+    assert "initializer=make_window_initializer(_window_sources," in code
+    assert '"buf",' in code
+    assert ", 68)," in code
+    assert "open(" not in code
+
+
+@pytest.mark.parametrize("use_urma", [False, True])
+def test_host_peer_mte_through_chip_call(use_urma):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def read(
+            self,
+            x: pld.DistributedTensor[[1, 64], pl.FP32],
+            out: pl.Out[pld.DistributedTensor[[1, 64], pl.FP32]],
+        ):
+            if use_urma:
+                pld.tensor.get_async(out, 1, x)
+            pld.tensor.get(out, 1, x)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            x: pld.DistributedTensor[[1, 64], pl.FP32],
+            out: pl.Out[pld.DistributedTensor[[1, 64], pl.FP32]],
+        ):
+            self.read(x, out)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self):
+            buf = pld.alloc_window_buffer(256, memory_source="host")
+            out_buf = pld.alloc_window_buffer(256)
+            table = pld.window(buf, [1, 64], dtype=pl.FP32)
+            out = pld.window(out_buf, [1, 64], dtype=pl.FP32)
+            self.chip(table, out, device=0)
+
+    # Both transfers address the same Host domain's remote rank.
+    program = passes.simplify()(Prog)
+    if use_urma:
+        with pytest.raises(ValueError, match="cannot combine URMA async transfers with MTE"):
+            _lower(program)
+        return
+    code = _lower(program)
+    compile(code, "host_peer_access.py", "exec")
+    assert "memory_source=AddressSpace.HOST" in code
+    assert code.count('workspace_engines=("urma",)') == (2 if use_urma else 0)
+    assert "__comm_d0.device_context(0)" in code
+
+
+def test_host_local_window_can_share_chip_with_device_peer_access():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def read(
+            self,
+            local: pld.DistributedTensor[[1, 64], pl.FP32],
+            peer: pld.DistributedTensor[[1, 64], pl.FP32],
+        ):
+            pld.tensor.get(local, 1, peer)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            local: pld.DistributedTensor[[1, 64], pl.FP32],
+            peer: pld.DistributedTensor[[1, 64], pl.FP32],
+        ):
+            self.read(local, peer)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self):
+            host_buf = pld.alloc_window_buffer(256, memory_source="host")
+            device_buf = pld.alloc_window_buffer(256)
+            local = pld.window(host_buf, [1, 64], dtype=pl.FP32)
+            peer = pld.window(device_buf, [1, 64], dtype=pl.FP32)
+            for rank in pl.range(2):
+                self.chip(local, peer, device=rank)
+
+    code = _lower(Prog)
+    assert code.count("with (_domain_provider or orch.allocate_domain)(") == 2
+    assert code.count("memory_source=AddressSpace.HOST") == 1
+
+
+def test_host_collective_allows_peer_mte_before_builtin_lowering():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, signal: pld.DistributedTensor[[64], pl.INT32]):
+            return signal
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self):
+            buf = pld.alloc_window_buffer(256, memory_source="host")
+            signal = pld.window(buf, [64], dtype=pl.INT32)
+            for rank in pl.range(2):
+                self.chip(signal, device=rank)
+            pld.tensor.barrier(signal)
+
+    code, _ = _lower_host_collectives(Prog)
+    compile(code, "host_collective.py", "exec")
+    assert "memory_source=AddressSpace.HOST" in code
+    assert "workspace_engines" not in code
+
+
+@pytest.mark.parametrize("indexed", [False, True], ids=["all_to_all_v", "indexed_all_to_all_v"])
+@pytest.mark.parametrize("host_operand", ["input", "target", "signal", "send_counts", "recv_counts"])
+def test_l2_collective_allows_host_peer_access_after_builtin_lowering(indexed, host_operand):
+    """Host backing does not force URMA or reject builtins that also use MTE."""
+    input_source = "host" if host_operand == "input" else "device"
+    target_source = "host" if host_operand == "target" else "device"
+    signal_source = "host" if host_operand == "signal" else "device"
+    counts_source = "host" if host_operand == "send_counts" else "device"
+    recv_source = "host" if host_operand == "recv_counts" else "device"
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            inp: pld.DistributedTensor[[8, 64], pl.FP32],
+            target: pl.InOut[pld.DistributedTensor[[8, 64], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+            counts: pld.DistributedTensor[[2, 1], pl.INT32],
+            recv: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+            index: pl.Tensor[[2, 4], pl.INT32],
+        ) -> pld.DistributedTensor[[8, 64], pl.FP32]:
+            if indexed:
+                result = pld.tensor.indexed_all_to_all_v(inp, target, signal, counts, recv, index, core_num=1)
+            else:
+                result = pld.tensor.all_to_all_v(inp, target, signal, counts, recv, core_num=1)
+            return result
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self, index: pl.Tensor[[2, 4], pl.INT32]):
+            input_buf = pld.alloc_window_buffer(2048, memory_source=input_source)
+            target_buf = pld.alloc_window_buffer(2048, memory_source=target_source)
+            signal_buf = pld.alloc_window_buffer(8, memory_source=signal_source)
+            counts_buf = pld.alloc_window_buffer(8, memory_source=counts_source)
+            recv_buf = pld.alloc_window_buffer(8, memory_source=recv_source)
+            for rank in pl.range(2):
+                inp = pld.window(input_buf, [8, 64], dtype=pl.FP32)
+                target = pld.window(target_buf, [8, 64], dtype=pl.FP32)
+                signal = pld.window(signal_buf, [2, 1], dtype=pl.INT32)
+                counts = pld.window(counts_buf, [2, 1], dtype=pl.INT32)
+                recv = pld.window(recv_buf, [2, 1], dtype=pl.INT32)
+                self.chip(inp, target, signal, counts, recv, index, device=rank)
+
+    # Fold the captured variant selector, then reproduce the production ordering:
+    # L2 collectives become builtins before domains and context are materialized.
+    program = passes.simplify()(Prog)
+    program = passes.normalize_return_order()(program)
+    program = passes.lower_l2_tensor_collectives()(program)
+    code = _lower(program)
+    compile(code, "host_l2_collective.py", "exec")
+    assert code.count("memory_source=AddressSpace.HOST") == 1
+    assert ('workspace_engines=("urma",)' in code) == indexed
+
+
+def _primitive_engine_program(
+    mte_op,
+    async_op,
+    *,
+    local_peer,
+    same_domain,
+    memory_source="host",
+    submit=False,
+    window_local=False,
+    rank_count=2,
+    same_buffer=False,
+    enable_engines=True,
+):
+    mte_source = memory_source if same_domain else ("device" if memory_source == "host" else "host")
+    async_get = async_op == "get"
+    session_only = async_op == "make_session"
+    single_rank = rank_count == 1
+    async_peer = 0 if single_rank else 1
+    mte_get = mte_op == "get"
+    mte_put = mte_op == "put"
+    mte_load = mte_op == "remote_load"
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def transfers(
+            self,
+            async_window: pld.DistributedTensor[[1, 64], pl.FP32],
+            mte_window: pld.DistributedTensor[[1, 64], pl.FP32],
+            local: pl.InOut[pl.Tensor[[1, 64], pl.FP32]],
+        ) -> pl.Tensor[[1, 64], pl.FP32]:
+            # Query another slot in the same domain. Explicit local rank and
+            # single-rank peer zero must still reject mixed primitives.
+            ctx = pld.get_comm_ctx(async_window)
+            rank = pld.rank(ctx)
+            if single_rank:
+                peer = pl.const(0, pl.INT32)
+            elif local_peer:
+                peer = rank
+            else:
+                peer = pl.const(1, pl.INT32)
+            if enable_engines:
+                if session_only:
+                    _session = pld.system.make_session(ctx)
+                elif async_get:
+                    if window_local:
+                        mte_window = pld.tensor.get_async(mte_window, async_peer, async_window)
+                    else:
+                        local = pld.tensor.get_async(local, async_peer, async_window)
+                elif window_local:
+                    pld.tensor.put_async(async_window, async_peer, mte_window)
+                else:
+                    pld.tensor.put_async(async_window, async_peer, local)
+                if mte_get:
+                    pld.tensor.get(local, peer, mte_window)
+                elif mte_put:
+                    pld.tensor.put(mte_window, peer, local)
+                elif mte_load:
+                    tile = pld.tile.remote_load(mte_window, peer, [0, 0], [1, 64])
+                    local = pl.tile.store(tile, [0, 0], local)
+                else:
+                    pld.tensor.remote_store(local, mte_window, peer, [0, 0])
+            return local
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            async_window: pld.DistributedTensor[[1, 64], pl.FP32],
+            mte_window: pld.DistributedTensor[[1, 64], pl.FP32],
+            local: pl.InOut[pl.Tensor[[1, 64], pl.FP32]],
+        ) -> pl.Tensor[[1, 64], pl.FP32]:
+            if submit:
+                with pl.manual_scope():
+                    local, _tid = pl.submit(self.transfers, async_window, mte_window, local)
+            else:
+                local = self.transfers(async_window, mte_window, local)
+            return local
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self, local: pl.InOut[pl.Tensor[[1, 64], pl.FP32]]):
+            async_buf = pld.alloc_window_buffer(256, memory_source=memory_source)
+            mte_buf = pld.alloc_window_buffer(256, memory_source=mte_source)
+            for rank in pl.range(rank_count):
+                async_window = pld.window(async_buf, [1, 64], dtype=pl.FP32)
+                mte_window = pld.window(mte_buf, [1, 64], dtype=pl.FP32)
+                local = self.chip(async_window, mte_window, local, device=rank)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_shared(self, local: pl.InOut[pl.Tensor[[1, 64], pl.FP32]]):
+            buf = pld.alloc_window_buffer(256, memory_source=memory_source)
+            for rank in pl.range(rank_count):
+                async_window = pld.window(buf, [1, 64], dtype=pl.FP32)
+                mte_window = pld.window(buf, [1, 64], dtype=pl.FP32)
+                local = self.chip(async_window, mte_window, local, device=rank)
+
+    excluded = "host" if same_buffer else "host_shared"
+    selected = ir.Program([f for f in Prog.functions.values() if f.name != excluded], "engines", Prog.span)
+    program = passes.convert_to_ssa()(selected)
+    program = passes.simplify()(program)
+    return passes.normalize_return_order()(program)
+
+
+@pytest.mark.parametrize("mte_op", ["get", "put", "remote_load", "remote_store"])
+@pytest.mark.parametrize("async_op", ["get", "put"])
+@pytest.mark.parametrize("memory_source", ["host", "device"])
+@pytest.mark.parametrize("local_peer", [False, True])
+@pytest.mark.parametrize("same_buffer", [False, True])
+def test_primitive_engines_split_buffers_or_reject_aliases(
+    mte_op, async_op, memory_source, local_peer, same_buffer
+):
+    program = _primitive_engine_program(
+        mte_op,
+        async_op,
+        local_peer=local_peer,
+        same_domain=True,
+        memory_source=memory_source,
+        same_buffer=same_buffer,
+    )
+    if same_buffer:
+        # Two views of one allocation cannot be separated by domain grouping.
+        with pytest.raises(ValueError, match="Communication buffer.*cannot combine URMA.*MTE"):
+            _lower(program)
+    else:
+        code = _lower(program)
+        assert code.count("with (_domain_provider or orch.allocate_domain)(") == 2
+        assert code.count('workspace_engines=("urma",)') == 1
+        assert 'workspace_engines=("mte",)' not in code
+
+
+@pytest.mark.parametrize("mte_op", ["get", "put", "remote_load", "remote_store"])
+@pytest.mark.parametrize("async_op", ["get", "put"])
+def test_primitive_remote_engines_different_domains(mte_op, async_op):
+    program = _primitive_engine_program(mte_op, async_op, local_peer=False, same_domain=False)
+    code = _lower(program)
+    assert code.count("with (_domain_provider or orch.allocate_domain)(") == 2
+
+
+@pytest.mark.parametrize("async_op", ["get", "put"])
+@pytest.mark.parametrize("same_domain", [False, True])
+def test_async_local_window_does_not_require_remote_urma(async_op, same_domain):
+    # The async local operand is also the MTE remote operand. Only the async
+    # peer's domain requires URMA; get_async's result preserves window lineage.
+    program = _primitive_engine_program(
+        "get", async_op, local_peer=False, same_domain=same_domain, window_local=True
+    )
+    code = _lower(program)
+    assert code.count("with (_domain_provider or orch.allocate_domain)(") == 2
+    assert code.count('workspace_engines=("urma",)') == 1
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_scatter_get_groups_both_endpoint_windows_with_urma(tmp_path):
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def fetch(
+            self,
+            src: pld.DistributedTensor[[32], pl.FP32],
+            dst: pl.InOut[pld.DistributedTensor[[32], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[1], pl.INT32]],
+        ):
+            ctx = pld.get_comm_ctx(src)
+            peer = 1 - pld.rank(ctx)
+            session = pld.system.make_session(ctx)
+            _after, event = pld.tile.get_async(dst, peer, src, session)
+            pld.system.defer_wait_event(event)
+            pld.system.notify(signal, peer=peer, offsets=[0], value=1, op=pld.NotifyOp.Set)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            src: pld.DistributedTensor[[32], pl.FP32],
+            dst: pl.InOut[pld.DistributedTensor[[32], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[1], pl.INT32]],
+        ):
+            self.fetch(src, dst, signal)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self):
+            src_buf = pld.alloc_window_buffer(128)
+            dst_buf = pld.alloc_window_buffer(128)
+            sig_buf = pld.alloc_window_buffer(64)
+            for rank in pl.range(2):
+                src = pld.window(src_buf, [32], dtype=pl.FP32)
+                dst = pld.window(dst_buf, [32], dtype=pl.FP32)
+                signal = pld.window(sig_buf, [1], dtype=pl.INT32)
+                self.chip(src, dst, signal, worker=rank)
+
+    result = ir.compile(P, output_dir=str(tmp_path), backend_type=BackendType.Ascend950, skip_ptoas=True)
+    code = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+    assert code.count('workspace_engines=("urma",)') == 1
+    # The independent MTE signal must not pull the local Scatter window out of the source MR.
+    buffers = {
+        name: domain
+        for domain, name in re.findall(r'(__comm_d\d+)\[[^\]]+\]\.buffers\["(\w+?)__ssa_v0"\]', code)
+    }
+    assert buffers["src_buf"] == buffers["dst_buf"]
+    assert buffers["sig_buf"] != buffers["src_buf"]
+
+
+def test_make_session_requests_urma_workspace_without_a_transfer():
+    program = _primitive_engine_program("get", "make_session", local_peer=False, same_domain=False)
+    assert _lower(program).count('workspace_engines=("urma",)') == 1
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("local_scratch", [False, True])
+@pytest.mark.parametrize("mixed_engines", [False, True])
+def test_external_window_session_without_transfer(tmp_path, local_scratch, mixed_engines):
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src: pld.DistributedTensor[[1, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            window: pld.DistributedTensor[[1, 64], pl.FP32],
+        ) -> pl.Tensor[[1, 64], pl.FP32]:
+            ctx = pld.get_comm_ctx(window)
+            _session = pld.system.make_session(ctx)
+            if mixed_engines:
+                tile = pld.tile.remote_load(window, 1, [0, 0], [1, 64])
+            else:
+                tile = pl.load(src, [0, 0], [1, 64])
+            return pl.store(tile, [0, 0], out)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            src: pld.DistributedTensor[[1, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            window: pld.DistributedTensor[[1, 64], pl.FP32],
+        ) -> pl.Tensor[[1, 64], pl.FP32]:
+            return self.kernel(src, out, window)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(
+            self,
+            window: pld.DistributedTensor[[1, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[2, 1, 64], pl.FP32]],
+            other: pld.DistributedTensor[[1, 64], pl.FP32],
+        ):
+            if local_scratch:
+                buf = pld.alloc_window_buffer(256)
+                src = pld.window(buf, [1, 64], dtype=pl.FP32)
+            else:
+                src = other
+            for rank in pl.range(2):
+                self.chip(src, out[rank], window, worker=rank)
+
+    if mixed_engines:
+        # The domain pass must reject this before codegen inspects the HOST entry.
+        program = passes.simplify()(passes.convert_to_ssa()(Program))
+        conflict = "Communication buffer 'window.*cannot combine URMA.*MTE"
+        with pytest.raises(ValueError, match=conflict):
+            passes.materialize_comm_domain_scopes()(program)
+        with pytest.raises(ValueError, match=conflict):
+            ir.compile(Program, output_dir=str(tmp_path), backend_type=BackendType.Ascend950, skip_ptoas=True)
+    else:
+        result = ir.compile(
+            Program, output_dir=str(tmp_path), backend_type=BackendType.Ascend950, skip_ptoas=True
+        )
+        host = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+        entry = next(line for line in host.splitlines() if line.startswith("_PYPTO_WINDOW_REQUIREMENTS = "))
+        requirements = ast.literal_eval(entry.split(" = ", 1)[1])
+        assert requirements[0] == (False, (0, 1), "urma")
+        assert requirements[2][2] is None
+
+
+@pytest.mark.parametrize("async_op", ["get", "put"])
+def test_single_rank_domain_rejects_mixed_primitives(async_op):
+    program = _primitive_engine_program(
+        "get", async_op, local_peer=True, same_domain=True, rank_count=1, same_buffer=True
+    )
+    with pytest.raises(ValueError, match="cannot combine URMA.*MTE"):
+        _lower(program)
+
+
+@pytest.mark.parametrize("local_peer", [False, True])
+def test_primitive_remote_engines_through_submit(local_peer):
+    program = _primitive_engine_program(
+        "get", "put", local_peer=local_peer, same_domain=True, submit=True, same_buffer=True
+    )
+    with pytest.raises(ValueError, match="cannot combine URMA.*MTE"):
+        _lower(program)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("mte_op", ["get", "put", "remote_load", "remote_store"])
+@pytest.mark.parametrize("local_peer", [False, True])
+@pytest.mark.parametrize("same_buffer", [False, True])
+def test_primitive_remote_engines_default_pipeline(tmp_path, mte_op, local_peer, same_buffer):
+    # The normal pipeline lowers tensor put/get/store into tile operations
+    # before checking domains. Exercise that path as well as the focused passes.
+    program = _primitive_engine_program(
+        mte_op, "get", local_peer=local_peer, same_domain=True, same_buffer=same_buffer
+    )
+    if same_buffer:
+        with pytest.raises(ValueError, match="cannot combine URMA.*MTE"):
+            ir.compile(program, output_dir=str(tmp_path), platform="a5", skip_ptoas=True)
+    else:
+        result = ir.compile(program, output_dir=str(tmp_path), platform="a5", skip_ptoas=True)
+        code = (result.output_dir / "orchestration" / "host_orch.py").read_text()
+        assert code.count("with (_domain_provider or orch.allocate_domain)(") == 2
+        assert code.count('workspace_engines=("urma",)') == 1
+
+
+def test_materialized_scope_splits_when_buffers_gain_distinct_engines():
+    before = _primitive_engine_program("get", "put", local_peer=False, same_domain=True, enable_engines=False)
+    initial = passes.materialize_comm_domain_scopes()(before)
+    host = initial.get_function("host")
+    assert host is not None
+    assert isinstance(host.body, ir.CommDomainScopeStmt)
+    original_slots = list(host.body.slots)
+    assert len(original_slots) == 2
+    assert list(host.body.engines) == []
+
+    # Replace the initially communication-free callable while keeping the
+    # already materialized HOST buffers and views. The pass must split the
+    # original scope, not replace the WindowBuffer identities its views hold.
+    with_engines = _primitive_engine_program("get", "put", local_peer=False, same_domain=True)
+    program = ir.Program(
+        [host, *[f for f in with_engines.functions.values() if f.name != "host"]], "rerun", host.span
+    )
+    updated = passes.materialize_comm_domain_scopes()(program)
+    updated_host = updated.get_function("host")
+    assert updated_host is not None
+    outer = updated_host.body
+    assert isinstance(outer, ir.CommDomainScopeStmt)
+    inner = outer.body
+    assert isinstance(inner, ir.CommDomainScopeStmt)
+    assert list(outer.engines) == ["urma"]
+    assert list(inner.engines) == []
+    assert outer.slots[0] is original_slots[0]
+    assert inner.slots[0] is original_slots[1]
+    ir.assert_structural_equal(updated, passes.materialize_comm_domain_scopes()(updated))
+    code = _lower(updated)
+    assert code.count("with (_domain_provider or orch.allocate_domain)(") == 2
+    assert code.count('workspace_engines=("urma",)') == 1
 
 
 if __name__ == "__main__":

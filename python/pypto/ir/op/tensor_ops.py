@@ -417,6 +417,8 @@ def matmul(
     b_trans: bool = False,
     c_matrix_nz: bool = False,
     span: Span | None = None,
+    *,
+    tf32_mode: str | None = None,
 ) -> Call:
     """Matrix multiplication with optional transpose.
 
@@ -434,6 +436,8 @@ def matmul(
         b_trans: Whether to transpose rhs (requires a 2D+ rhs)
         c_matrix_nz: C matrix non-zero flag
         span: Optional source span for debugging (auto-captured if not provided)
+        tf32_mode: Optional HF32 input rounding: "round_even" or "round_away".
+            Requires 2D FP32 operands, Ascend950, and PTOAS 0.77+. None preserves FP32.
 
     Returns:
         Call expression for matrix multiplication
@@ -446,6 +450,8 @@ def matmul(
         "b_trans": b_trans,
         "c_matrix_nz": c_matrix_nz,
     }
+    if tf32_mode is not None:
+        kwargs["tf32_mode"] = tf32_mode
     if out_dtype is not None:
         kwargs["out_dtype"] = out_dtype
 
@@ -457,9 +463,10 @@ def quant_mx(
     *,
     group_axis: int,
     dtype: DataType = DataType.FP8E4M3FN,
+    quant_scale_alg: str = "ocp",
     span: Span | None = None,
 ) -> Call:
-    """Quantize a 2D GM tensor into MXFP8 data and an MX scale tensor.
+    """Quantize a 2D GM tensor into MXFP8/MXFP4 data and an MX scale tensor.
 
     Args:
         src: Source tensor expression. Must be a static-rank 2D FP16, BF16, or
@@ -467,7 +474,10 @@ def quant_mx(
         group_axis: Quantization group axis. ``1`` produces A-oriented data
             and an ``MX_A_ZZ`` scale tensor; ``0`` produces B-oriented data
             and an ``MX_B_NN`` scale tensor.
-        dtype: Quantized data dtype. Defaults to ``FP8E4M3FN``.
+        dtype: Quantized data dtype. Defaults to ``FP8E4M3FN``. ``FP8E5M2`` uses OCP scaling.
+            ``FP4E2M1X2`` packs two values per output byte.
+        quant_scale_alg: ``"ocp"`` (default) or ``"nv"``. FP16/BF16 NV requires axis 0.
+            FP8E5M2 requires ``"ocp"``.
         span: Optional source span for debugging (auto-captured if not provided).
 
     Returns:
@@ -481,9 +491,10 @@ def quant_mx(
             data dtype.
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call(
-        "tensor.quant_mx", [src], {"group_axis": group_axis, "dtype": dtype}, actual_span
-    )
+    kwargs: dict[str, Any] = {"group_axis": group_axis, "dtype": dtype}
+    if quant_scale_alg != "ocp":
+        kwargs["quant_scale_alg"] = quant_scale_alg
+    return _ir_core.create_op_call("tensor.quant_mx", [src], kwargs, actual_span)
 
 
 def matmul_mx(
@@ -493,13 +504,21 @@ def matmul_mx(
     rhs_scale: Expr,
     span: Span | None = None,
 ) -> Call:
-    """MXFP8 matrix multiplication of oriented GM data and scale tensors.
+    """MXFP8/MXFP4 matrix multiplication of oriented GM data and scale tensors.
+
+    Both data tensors are FP8E4M3FN or both packed FP4 (either format).
+    FP4 ND data uses carrier shapes ``[M,K/2]`` / ``[K,N/2]``; DN uses
+    ``[M/2,K]`` / ``[K/2,N]``. Scales and results use logical dimensions,
+    and the operands must have matching logical valid K extents. For FP4,
+    valid K must be positive and use the physical K scale-group count.
+    Packed MX_A_ZZ and MX_B_NN scales require full M and N respectively.
+    MX_A_ND can match a partial logical M.
 
     Args:
-        lhs: A-side quantized data tensor with shape ``[M, K]``.
-        lhs_scale: A-side ``MX_A_ZZ`` FP8E8M0 scale tensor with shape
+        lhs: A-side quantized data tensor (logical shape ``[M, K]``).
+        lhs_scale: A-side ``MX_A_ZZ`` or row-major ``MX_A_ND`` FP8E8M0 scale tensor with shape
             ``[M, K/32]``.
-        rhs: B-side quantized data tensor with shape ``[K, N]``.
+        rhs: B-side quantized data tensor (logical shape ``[K, N]``).
         rhs_scale: B-side ``MX_B_NN`` FP8E8M0 scale tensor with shape
             ``[K/32, N]``.
         span: Optional source span for debugging (auto-captured if not provided).
@@ -509,8 +528,8 @@ def matmul_mx(
 
     Raises:
         ValueError: If data tensors are not static 2D MX data tensors, the inner
-            dimensions do not agree, M is not divisible by 16, N is not
-            divisible by 32, K is not divisible by 64, or either scale tensor
+            dimensions do not agree, M is not divisible by 16 (32 for FP4), N is not
+            divisible by 32 (64 for FP4), K is not divisible by 64, or either scale tensor
             has the wrong dtype, shape, or MX layout.
     """
     actual_span = _get_span_or_capture(span)
@@ -526,6 +545,7 @@ def matmul_acc(
     span: Span | None = None,
     *,
     init_cond: Expr | None = None,
+    tf32_mode: str | None = None,
 ) -> Call:
     """Matrix multiplication with accumulation: acc = acc + lhs @ rhs.
 
@@ -542,12 +562,16 @@ def matmul_acc(
         b_trans: Whether to transpose rhs
         span: Optional source span for debugging (auto-captured if not provided)
         init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
+        tf32_mode: Optional HF32 input rounding: "round_even" or "round_away".
+            Requires 2D FP32 operands, Ascend950, and PTOAS 0.77+. None preserves FP32.
 
     Returns:
         Call expression for matrix multiplication with accumulation
     """
     actual_span = _get_span_or_capture(span)
     kwargs: dict[str, Any] = {"a_trans": a_trans, "b_trans": b_trans}
+    if tf32_mode is not None:
+        kwargs["tf32_mode"] = tf32_mode
     args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
     return _ir_core.create_op_call("tensor.matmul_acc", args, kwargs, actual_span)
 
@@ -1941,10 +1965,21 @@ def view(
     shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
     valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
     *,
+    offsets: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    steps: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
     layout: TensorLayout | None = None,
     span: Span | None = None,
 ) -> Call:
     """Reinterpret ``tensor`` over the same physical memory.
+
+    With ``offsets`` or ``steps``, select a same-rank window in the immediate
+    parent GM tensor. Coordinates and sampling steps are in parent elements.
+    Each window axis must fit the parent shape, and valid samples must fit the
+    parent valid region. Dynamic geometry must obey these bounds at runtime.
+    When a shape, offset, step or valid extent comes from a memory read, bind the
+    result to a scalar before constructing the window.
+    The source layout is preserved. Without window geometry, the following
+    shape/layout reinterpretation rules apply.
 
     At least one of ``shape`` or ``layout`` must be provided. ``shape`` derives
     canonical strides for the requested shape; ``layout`` derives the canonical
@@ -1963,25 +1998,28 @@ def view(
        both require an explicit target ``valid_shape``.
     Combining ``shape`` with a layout change is valid for type deduction and
     PTO in-core lowering. Only orchestration lowering is restricted: it supports
-    ND shape reinterprets and shaped ND/MX_A_ZZ/MX_B_NN backing/consumer views
+    ND shape reinterprets and shaped ND/MX_A_ZZ/MX_B_NN/MX_A_ND backing/consumer views
     for FP8E8M0 MX scales; other layout-changing shape reinterprets are
     unsupported because the runtime ``Tensor::reshape`` cannot express an
     arbitrary-layout view.
 
     Args:
         tensor: Input tensor expression.
-        shape: New shape for the view. Must be product-preserving unless
-            symbolic dimensions are present. May introduce or remove unit
-            dimensions (RFC #1300 P4). Must be a sequence of ints or
+        shape: Window extents or new shape for a reinterpretation.
+            Reinterpretation preserves the static element count and may introduce or remove unit dimensions
+            (RFC #1300 P4). Must be a sequence of ints or
             Expr values, or a ``MakeTuple``. In an InCore function, the source
             must remain a GM Tensor through tensor-to-tile conversion.
-        valid_shape: Explicit valid dimensions for a packed ND
+        valid_shape: Window valid extents, or explicit valid dimensions for a packed ND
             leading-dimension collapse to 2D or contiguous-prefix linear
             collapse to ``[1, product(shape)]``. Required when either supported
             collapse reinterprets a source with partial validity.
+        offsets: Per-axis starting indices for an InCore ND/DN GM window.
+            Omitted offsets default to zero when steps are given.
+        steps: Positive per-axis sampling steps for the window. Defaults to one.
         layout: Target ``TensorLayout`` (ND or DN). Must not be ``NZ``.
             When provided without ``shape``, performs a layout-only flip.
-            Orchestration also permits shaped ND/MX_A_ZZ/MX_B_NN backing and
+            Orchestration also permits shaped ND/MX_A_ZZ/MX_B_NN/MX_A_ND backing and
             consumer views for FP8E8M0 MX scales; other layout-changing shape
             views remain limited to in-core lowering.
         span: Optional source span for debugging (auto-captured if not
@@ -1998,10 +2036,18 @@ def view(
         raise ValueError("tensor.view requires at least one of shape or layout")
     if valid_shape is not None and shape is None:
         raise ValueError("tensor.view valid_shape requires shape")
+    window = offsets is not None or steps is not None
+    if window and shape is None:
+        raise ValueError("tensor.view offsets/steps require a window shape")
     actual_span = _get_span_or_capture(span)
     args = [tensor]
     if shape is not None:
-        args.append(_to_make_tuple(shape, actual_span))
+        shape_tuple = _to_make_tuple(shape, actual_span)
+        args.append(shape_tuple)
+        if window:
+            rank = len(shape_tuple.elements)
+            args.append(_to_make_tuple([0] * rank if offsets is None else offsets, actual_span))
+            args.append(_to_make_tuple([1] * rank if steps is None else steps, actual_span))
     if valid_shape is not None:
         args.append(_to_make_tuple(valid_shape, actual_span))
     kwargs: dict[str, Any] = {}
@@ -2363,14 +2409,7 @@ def gather_mask(
     output_dtype: int | DataType | None = None,
     span: Span | None = None,
 ) -> Call:
-    """Parser-roundtrip entry for the mask form (printed op name ``tensor.gather_mask``).
-
-    The tensor DSL layer only exposes the unified ``gather``; this IR-builder
-    function exists so that round-trip parsing of printed ``pl.tensor.gather_mask(...)``
-    calls (which never happen in user code, but can appear in pass dumps) still
-    works via ``_dispatch_ir_builder_op``. Prefer ``gather(input, mask_pattern=...)``
-    in user code.
-    """
+    """Build a ``tensor.gather_mask`` call for fixed-pattern column selection."""
     return gather(input, mask_pattern=mask_pattern, output_dtype=output_dtype, span=span)
 
 
@@ -2384,14 +2423,7 @@ def gather_compare(
     count_dtype: int | DataType | None = None,
     span: Span | None = None,
 ) -> Call:
-    """Parser-roundtrip entry for the compare form (printed op name ``tensor.gather_compare``).
-
-    The tensor DSL layer only exposes the unified ``gather``; this IR-builder
-    function exists so that round-trip parsing of printed ``pl.tensor.gather_compare(...)``
-    calls (which never happen in user code, but can appear in pass dumps) still
-    works via ``_dispatch_ir_builder_op``. Prefer
-    ``gather(input, kvalue=..., cmp_mode=..., out_cols=...)`` in user code.
-    """
+    """Build a ``tensor.gather_compare`` call returning indices and per-row counts."""
     return gather(
         input,
         kvalue=kvalue,

@@ -79,7 +79,7 @@ data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum, core_num=4)
 
 - Defaults to `1` (single block — the previous behaviour).
 - Mesh only: `mode="ring"` requires `core_num == 1`.
-- Must not exceed the target's AIV core count (48 on 910B, 36 on 950) — the
+- Must not exceed the target's AIV core count (48 on 910, 36 on 950) — the
   launch requires all blocks to be admitted at once, so an over-subscribed
   request is rejected at compile time.
 - An explicit `signal` needs one lane per block: `[world_size(), stride]` with
@@ -240,7 +240,7 @@ build each collective by hand before the builtin is revealed:
 | barrier | — | `collectives/test_l3_tensor_barrier_intrinsic.py` | `test_l3_host_tensor_barrier.py` |
 | broadcast | `collectives/test_l3_broadcast.py` | `collectives/test_l3_tensor_broadcast_intrinsic.py` | `test_l3_host_tensor_broadcast.py` |
 | allgather | `collectives/test_l3_allgather.py` | `collectives/test_l3_tensor_allgather_intrinsic.py` | `test_l3_host_tensor_allgather.py` |
-| reduce_scatter | `collectives/test_l3_reduce_scatter.py` | `collectives/test_l3_tensor_reduce_scatter_intrinsic.py` | `test_l3_host_tensor_reduce_scatter.py` |
+| reduce_scatter | `collectives/test_l3_reduce_scatter.py` | `collectives/test_l3_tensor_reduce_scatter_intrinsic.py`, `collectives/test_l3_tensor_reduce_scatter_chunked.py`, `collectives/test_l3_tensor_reduce_scatter_runtime_size.py` | `test_l3_host_tensor_reduce_scatter.py` |
 | all_to_all | `collectives/test_l3_all_to_all.py` | `collectives/test_l3_tensor_all_to_all_intrinsic.py` | `test_l3_host_tensor_all_to_all.py` |
 
 ## See Also

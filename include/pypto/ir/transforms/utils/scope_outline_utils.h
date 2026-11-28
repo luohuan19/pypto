@@ -24,6 +24,7 @@
 #include "pypto/core/error.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/span.h"
@@ -65,6 +66,26 @@ class VarCollector : public IRVisitor {
   std::unordered_map<const Var*, TypePtr> var_types;
   std::unordered_map<const Var*, VarPtr> var_objects;
   std::unordered_set<std::string> known_names;
+  // Value definitions, excluding symbols merely visited through a type.
+  std::unordered_set<const Var*> runtime_bindings;
+
+  void CollectParameter(const VarPtr& var) {
+    var_types[var.get()] = var->GetType();
+    var_objects[var.get()] = var;
+    known_names.insert(var->name_hint_);
+    runtime_bindings.insert(var.get());
+    if (auto tensor = AsTensorTypeLike(var->GetType())) {
+      for (const auto& dim : tensor->shape_) {
+        // Orchestration extracts bare dimensions from its tensor arguments.
+        if (auto symbol = AsVarLike(dim)) {
+          runtime_bindings.insert(symbol.get());
+          // An unused parameter may be the only source of this symbol. In
+          // particular, the base visitor does not walk DistributedTensorType.
+          VisitExpr(symbol);
+        }
+      }
+    }
+  }
 
  protected:
   // Use VisitVarLike_ to collect both Var and IterArg references.
@@ -78,6 +99,7 @@ class VarCollector : public IRVisitor {
   }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
+    runtime_bindings.insert(op->var_.get());
     var_types[op->var_.get()] = op->var_->GetType();
     var_objects[op->var_.get()] = op->var_;
     known_names.insert(op->var_->name_hint_);
@@ -85,15 +107,18 @@ class VarCollector : public IRVisitor {
   }
 
   void VisitStmt_(const ForStmtPtr& op) override {
+    runtime_bindings.insert(op->loop_var_.get());
     var_types[op->loop_var_.get()] = op->loop_var_->GetType();
     var_objects[op->loop_var_.get()] = op->loop_var_;
     known_names.insert(op->loop_var_->name_hint_);
     for (const auto& iter_arg : op->iter_args_) {
+      runtime_bindings.insert(iter_arg.get());
       var_types[iter_arg.get()] = iter_arg->GetType();
       var_objects[iter_arg.get()] = iter_arg;
       known_names.insert(iter_arg->name_hint_);
     }
     for (const auto& return_var : op->return_vars_) {
+      runtime_bindings.insert(return_var.get());
       var_types[return_var.get()] = return_var->GetType();
       var_objects[return_var.get()] = return_var;
       known_names.insert(return_var->name_hint_);
@@ -103,11 +128,13 @@ class VarCollector : public IRVisitor {
 
   void VisitStmt_(const WhileStmtPtr& op) override {
     for (const auto& iter_arg : op->iter_args_) {
+      runtime_bindings.insert(iter_arg.get());
       var_types[iter_arg.get()] = iter_arg->GetType();
       var_objects[iter_arg.get()] = iter_arg;
       known_names.insert(iter_arg->name_hint_);
     }
     for (const auto& return_var : op->return_vars_) {
+      runtime_bindings.insert(return_var.get());
       var_types[return_var.get()] = return_var->GetType();
       var_objects[return_var.get()] = return_var;
       known_names.insert(return_var->name_hint_);
@@ -117,6 +144,7 @@ class VarCollector : public IRVisitor {
 
   void VisitStmt_(const IfStmtPtr& op) override {
     for (const auto& return_var : op->return_vars_) {
+      runtime_bindings.insert(return_var.get());
       var_types[return_var.get()] = return_var->GetType();
       var_objects[return_var.get()] = return_var;
       known_names.insert(return_var->name_hint_);
@@ -141,7 +169,8 @@ class ScopeOutliner : public IRMutator {
  public:
   ScopeOutliner(std::string func_name, const std::unordered_map<const Var*, TypePtr>& var_types,
                 const std::unordered_map<const Var*, VarPtr>& var_objects,
-                const std::unordered_set<std::string>& known_names, ScopeKind target_scope_kind,
+                const std::unordered_set<std::string>& known_names,
+                const std::unordered_set<const Var*>& runtime_bindings, ScopeKind target_scope_kind,
                 FunctionType outlined_func_type, std::string name_suffix, ProgramPtr program = nullptr,
                 std::shared_ptr<std::unordered_set<std::string>> reserved_func_names = nullptr);
 
@@ -163,19 +192,8 @@ class ScopeOutliner : public IRMutator {
    * ReturnStmt) resolves to the latest, never a stale intermediate.
    */
   ExprPtr VisitExpr_(const VarPtr& op) override;
-
-  /**
-   * @brief Compute used_after when no explicit context is available.
-   *
-   * Two regimes:
-   *   1. Scope is nested inside another (non-target) ScopeStmt — only store
-   *      targets escape, because scope boundaries confine locally-defined
-   *      variables.
-   *   2. Scope is at the top level or inside a control-flow body — retain the
-   *      original defensive fallback: all defined vars + store targets are
-   *      treated as outputs so the caller retains access.
-   */
-  [[nodiscard]] std::unordered_set<const Var*> ComputeFallbackUsedAfter(const ScopeStmtPtr& scope) const;
+  ExprPtr VisitExpr_(const IterArgPtr& op) override;
+  ExprPtr VisitVarDefinition(const VarPtr& var) override;
 
   /**
    * @brief Process SeqStmts to analyze scope outputs using subsequent statements.
@@ -185,19 +203,8 @@ class ScopeOutliner : public IRMutator {
    */
   StmtPtr VisitStmt_(const SeqStmtsPtr& op) override;
 
-  /**
-   * @brief Handle ScopeStmts that are direct children of another node (not
-   * inside a SeqStmts).
-   *
-   * The fallback honours scope nesting via ``inside_nested_scope_body_``: an
-   * inner scope whose only "context" is an enclosing non-target scope has no
-   * way for its locally-defined variables to escape, so we only expose store
-   * targets. Scopes at the true top level (outside any parent scope body)
-   * retain the original defensive "all defs are outputs" behaviour.
-   */
-  // Shared per-kind logic: outline if kind matches, else descend with the
-  // nested-scope flag set so any target-kind scope we find inside can make a
-  // correct used_after decision.
+  /// Direct-child scopes use the enclosing node's required_outputs_; other
+  /// scope kinds preserve those requirements while recursing into their body.
   template <typename ScopeT>
   StmtPtr VisitScopeKind(const std::shared_ptr<const ScopeT>& op);
 
@@ -257,6 +264,9 @@ class ScopeOutliner : public IRMutator {
 
   /// Record vars that become visible in the enclosing body after a child control-flow statement.
   void NoteLocalDefinitions(const std::vector<VarPtr>& vars);
+
+  /// Resolve an existing caller binding without rewriting its type or initializer.
+  [[nodiscard]] VarPtr ResolveCallerBinding(const VarPtr& var) const;
 
   /// Record @p fresh as the current value of store target @p original.
   ///
@@ -443,7 +453,14 @@ class ScopeOutliner : public IRMutator {
   std::string func_name_;
   std::unordered_map<const Var*, TypePtr> var_types_;
   std::unordered_map<const Var*, VarPtr> var_objects_;
+  std::unordered_set<const Var*> runtime_bindings_;
   std::unordered_set<std::string> known_names_;
+  /// Value requirements from outside the current subtree. All pass entry
+  /// points traverse a complete function body, whose external requirement set
+  /// is empty. SeqStmts adds local tail references before descending into any
+  /// child containing a target scope; OutlineScope supplies its selected
+  /// outputs when recursing into an extracted body. Thus an empty set means
+  /// known-empty requirements, never an unavailable analysis result.
   std::unordered_set<const Var*> required_outputs_;
   /// Accumulates across scopes intentionally (not saved/restored like func_name_
   /// etc.) so that subsequent scopes and statements see the renamed variables.
@@ -476,10 +493,9 @@ class ScopeOutliner : public IRMutator {
   /// not opt in to cross-function name reservation.
   std::shared_ptr<std::unordered_set<std::string>> reserved_func_names_;
   int scope_counter_ = 0;
-  /// True while we are visiting the body of a non-target ScopeStmt — a
-  /// target-kind scope encountered here cannot leak locally-defined vars to
-  /// any surrounding context (scope boundaries confine them), so the
-  /// used_after fallback exposes only store targets.
+  /// True while visiting a non-target scope's body. Deferred-completion
+  /// waiters must be task-level launches, so OutlineScope rejects them here.
+  /// This flag does not affect value-use analysis.
   bool inside_nested_scope_body_ = false;
   std::vector<FunctionPtr> outlined_functions_;
 };

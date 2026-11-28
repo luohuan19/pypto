@@ -9,6 +9,8 @@ pass 从不对 `BackendType` 做分支判断。所有与架构相关的内容 �
 | 页面 | 内容 |
 | ---- | ---- |
 | [BackendHandler：有原则的后端分派](00-backend_handler.md) | 该虚接口、pass 如何查询它，以及新增后端需要做什么 |
+| [同步硬件资源](01-sync_resources.md) | 资源域查询、ID 范围与编译器预留策略 |
+| [ISA 宏同步资源](02-macro_resources.md) | 后端维护的 ISA 信号占用声明与查询 |
 
 ## 已注册算子清单
 
@@ -17,7 +19,7 @@ pass 从不对 `BackendType` 做分支判断。所有与架构相关的内容 �
 ```python
 from pypto import backend
 
-target = backend.get_backend_instance(backend.BackendType.Ascend910B)
+target = backend.get_backend_instance(backend.BackendType.Ascend910)
 names = target.get_registered_op_names()
 ```
 
@@ -47,3 +49,10 @@ names = target.get_registered_op_names()
 
 - [Pass、PassContext、PassPipeline 与 PassManager](../passes/00-pass_manager.md) —— handler 的来源。
 - [PTO ISA 参考](../../reference/index.md) —— handler 所抽象掉的硬件差异。
+
+## 后端名称
+
+A2/A3 后端使用 `BackendType.Ascend910`，A5 使用 `BackendType.Ascend950`。
+A2/A3 的单例为 `Backend910.instance()`，其类型名称为 `910`，
+序列化的后端枚举名称为 `Ascend910`。加载使用旧名称的 A2/A3 产物前，请将其
+`backend_type` 字段更新为 `Ascend910`。平台仍为 `a2a3` 或 `a2a3sim`。

@@ -16,12 +16,15 @@ without the optional ``simpler`` runtime package.
 from __future__ import annotations
 
 import importlib
+import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
-from pypto.runtime import RunConfig
+from pypto.backend import BackendType
+from pypto.runtime import ExecutionMode, RunConfig
 
 # ``pypto.runtime.debug.__init__`` re-exports ``replay`` (the function),
 # which shadows the ``replay`` submodule on attribute lookup. Resolve the
@@ -247,12 +250,24 @@ def test_replay_routes_l3_through_distributed_compiled_program(tmp_path: Path) -
         patch.object(replay_module, "_execute_compiled") as ec,
     ):
         replay(work_dir, a, b, config=RunConfig(platform="a2a3sim"), rebuild_from_pto=False, recompile=False)
-    from_dir.assert_called_once_with(work_dir, platform="a2a3sim")
+    from_dir.assert_called_once_with(
+        work_dir, backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.SIM
+    )
     ec.assert_not_called()  # single-chip path must not be taken for L3
     compiled = from_dir.return_value
     compiled.assert_called_once()
     assert compiled.call_args.args == (a, b)
     assert compiled.call_args.kwargs["config"].platform == "a2a3sim"
+
+
+def test_replay_explains_how_to_bind_external_windows(tmp_path: Path) -> None:
+    work_dir = _make_l3_build_output(tmp_path)
+    with patch(_L3_FROM_DIR) as from_dir:
+        compiled = from_dir.return_value
+        compiled._get_metadata.return_value = ([SimpleNamespace(is_distributed=True)], [], [])
+        with pytest.raises(ValueError, match=r"cannot bind external communication windows.*domain\.tensor"):
+            replay(work_dir, config=RunConfig(platform="a2a3sim"), rebuild_from_pto=False, recompile=False)
+        compiled.assert_not_called()
 
 
 def test_replay_l3_runs_l3_aware_rebuild_and_invalidate(tmp_path: Path) -> None:
@@ -626,6 +641,38 @@ def test_cli_standalone_missing_golden_still_raises(tmp_path: Path) -> None:
     work_dir = _make_build_output(tmp_path)
     with pytest.raises(FileNotFoundError, match=r"golden\.py"):
         _main([str(work_dir)])
+
+
+@pytest.mark.parametrize("explicit_flag", [False, True])
+@pytest.mark.parametrize(
+    ("platform", "backend", "mode"),
+    [
+        ("a2a3", BackendType.Ascend910, ExecutionMode.ONBOARD),
+        ("a2a3sim", BackendType.Ascend910, ExecutionMode.SIM),
+        ("a5", BackendType.Ascend950, ExecutionMode.ONBOARD),
+        ("a5sim", BackendType.Ascend950, ExecutionMode.SIM),
+    ],
+)
+def test_cli_platform_remains_supported_with_warnings_as_errors(
+    tmp_path, platform, backend, mode, explicit_flag
+):
+    """CLI flags and generated runner defaults must not use deprecated Python inputs."""
+    work_dir = _make_build_output(tmp_path)
+    argv = [str(work_dir)]
+    if explicit_flag:
+        argv.extend(["--platform", platform])
+    with (
+        warnings.catch_warnings(),
+        patch.object(replay_module, "replay") as dispatch,
+        patch.object(replay_module, "_load_named_inputs_from_golden", return_value=[]),
+    ):
+        warnings.simplefilter("error", DeprecationWarning)
+        assert _main(argv, default_platform="a5sim" if explicit_flag else platform) == 0
+    dispatch.assert_called_once()
+    config = dispatch.call_args.kwargs["config"]
+    assert config.backend_type == backend
+    assert config.execution_mode is mode
+    assert config.platform == platform
 
 
 if __name__ == "__main__":

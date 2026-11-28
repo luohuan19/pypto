@@ -33,7 +33,9 @@
 
 namespace {
 
-static constexpr int64_t kTileCount = 256;
+// Budget each buffer in bytes so wider dtypes also use only 64 KiB of UB in total.
+static constexpr int64_t kTileBytes = 32 * 1024;
+static constexpr int64_t kTileCount = kTileBytes / sizeof({{dtype_cpp}});
 
 // Counts protocol: a peer PULL plus a TWO-ROUND credit barrier.
 // Every rank stages its own per-destination send vector into its OWN
@@ -116,21 +118,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   __gm__ Tensor *signal_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
   __gm__ Tensor *send_counts_tensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
   __gm__ Tensor *recv_counts_tensor = reinterpret_cast<__gm__ Tensor *>(args[4]);
-  // args[5] is the CommContext on BOTH rails, and the rank count comes from the
-  // context rather than from a scalar argument:
-  //
-  //   HOST/L3 builtin dispatch : args[5] = CommContext* (the dispatch emits no
-  //                              rank-count scalar for this builtin)
-  //   CHIP/L2 managed task     : args[5] = CommContext* — MaterializeDistTensorCtx
-  //                              appends one ctx per DistributedTensor param;
-  //                              all of them hold the same pointer, and args[6..]
-  //                              are the unread duplicates
-  //
-  // `rankNum` is the domain's rank count: the context is derived per comm
-  // domain, so it is exactly the `domain_size` the dispatch used to pass. One
-  // GM load at entry buys an argument layout — and therefore a kernel source —
-  // that is identical on both rails.
-  __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[5]);
+  // One context for each remote operand, in target/signal/send-count order.
+  __gm__ CommContext* comm_ctx = reinterpret_cast<__gm__ CommContext*>(args[5]);
+  __gm__ CommContext* signal_ctx = reinterpret_cast<__gm__ CommContext*>(args[6]);
+  __gm__ CommContext* counts_ctx = reinterpret_cast<__gm__ CommContext*>(args[7]);
   int nranks = static_cast<int>(comm_ctx->rankNum);
   int32_t block_idx = get_block_idx(args);
   int32_t block_num = get_block_num(args);
@@ -225,10 +216,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   using Global = pto::GlobalTensor<{{dtype_cpp}}, ShapeDyn, StrideDyn, pto::Layout::ND>;
   using TileData = pto::Tile<pto::TileType::Vec, {{dtype_cpp}}, 1, kTileCount, pto::BLayout::RowMajor, -1, -1>;
 
-  // Staging tile width is kTileCount; TPUT_IMPL chunks larger payloads against
-  // GetValidCol(), so one TPUT per destination is enough (RFC #2521 K1).
+  // Separate ping/pong buffers overlap the next load with the previous store.
+  // Valid columns below cap small payloads and tails; TPUT uses a single
+  // transfer when the payload fits, without copying unused buffer capacity.
   TileData send_tile(1, kTileCount);
+  TileData send_tile_pong(1, kTileCount);
   TASSIGN(send_tile, 0x0);
+  TASSIGN(send_tile_pong, kTileBytes);
 
   // ==================================================================
   // Phase 1 - Barrier A: all counts staged AND everyone done consuming the
@@ -246,7 +240,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   // whether block_num is 1 or many — no per-block ordering (e.g. block 0
   // leading the rest) is required for this barrier's own correctness.
   // Threshold GE(1): first of this call's two credit rounds.
-  ExchangeBarrier(comm_ctx, signal_base, my_rank, nranks, signal_stride, block_idx, static_cast<int32_t>(1));
+  ExchangeBarrier(signal_ctx, signal_base, my_rank, nranks, signal_stride, block_idx, static_cast<int32_t>(1));
 
   // ==================================================================
   // Phase 2 - scalar counts pull. Barrier A guarantees every peer's send
@@ -285,7 +279,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
       for (int src = 0; src < nranks; ++src) {
         if (src == my_rank) continue;
-        __gm__ int32_t *remote_slot = CommRemotePtr(comm_ctx, send_counts_base + my_rank, src);
+        __gm__ int32_t *remote_slot = CommRemotePtr(counts_ctx, send_counts_base + my_rank, src);
         int32_t pulled = static_cast<int32_t>(ld_dev(reinterpret_cast<__gm__ uint32_t *>(remote_slot), 0));
         if (pulled > max_recv) pulled = static_cast<int32_t>(max_recv);
         if (pulled < 0) pulled = 0;
@@ -380,6 +374,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
       // [end - begin] block internally against the staging tile.
       int64_t block_numel = end - begin;
       send_tile.ColMaskInternal = static_cast<int>(block_numel <= kTileCount ? block_numel : kTileCount);
+      send_tile_pong.ColMaskInternal = send_tile.ColMaskInternal;
 
       ShapeDyn shape(1, 1, 1, 1, block_numel);
       StrideDyn stride(block_numel, block_numel, block_numel, block_numel, 1);
@@ -387,7 +382,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
       Global dst_g(remote_block, shape, stride);
 
       pipe_barrier(PIPE_ALL);
-      pto::comm::TPUT(dst_g, src_g, send_tile);
+      pto::comm::TPUT(dst_g, src_g, send_tile, send_tile_pong);
       pipe_barrier(PIPE_ALL);
     }
   } else {
@@ -408,6 +403,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
       int64_t block_numel = rows64 * row_numel;
       if (block_numel > 0) {
         send_tile.ColMaskInternal = static_cast<int>(block_numel <= kTileCount ? block_numel : kTileCount);
+        send_tile_pong.ColMaskInternal = send_tile.ColMaskInternal;
 
         ShapeDyn shape(1, 1, 1, 1, block_numel);
         StrideDyn stride(block_numel, block_numel, block_numel, block_numel, 1);
@@ -415,7 +411,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         Global dst_g(remote_block, shape, stride);
 
         pipe_barrier(PIPE_ALL);
-        pto::comm::TPUT(dst_g, src_g, send_tile);
+        pto::comm::TPUT(dst_g, src_g, send_tile, send_tile_pong);
         pipe_barrier(PIPE_ALL);
       }
     }
@@ -433,7 +429,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   dsb(DSB_DDR);
   // Second credit round: credits accumulate across the call's two barrier
   // phases, so this rendezvous waits for GE(2) rather than GE(1).
-  ExchangeBarrier(comm_ctx, signal_base, my_rank, nranks, signal_stride, block_idx, static_cast<int32_t>(2));
+  ExchangeBarrier(signal_ctx, signal_base, my_rank, nranks, signal_stride, block_idx, static_cast<int32_t>(2));
 
   // Credit epilogue: this block added +1 (A) and +1 (B) to every peer's lane;
   // drop both in ONE AtomicAdd(-2) per lane. Never reset to zero - a credit

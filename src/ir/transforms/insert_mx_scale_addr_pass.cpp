@@ -14,8 +14,11 @@
  * @brief Insert tile.tget_scale_addr bindings before MX matmul consumers.
  *
  * Runs after InferTileMemorySpace so Left/LeftScale and Right/RightScale pairs
- * are already resolved. Because tget_scale_addr mutates shared physical scale
- * buffers in place, bindings are never reused across MX matmul consumers.
+ * are already resolved. Reuse an unchanged binding within a straight-line region:
+ * repeating it after a consumer would make PTOAS hoist it across that consumer
+ * to the original scale fill. Track only the latest binding on each scale side,
+ * since aliases can share mutable physical buffers. Other tile uses and control
+ * flow invalidate the corresponding state conservatively.
  */
 
 #include <cstddef>
@@ -43,6 +46,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace ir {
@@ -62,11 +66,20 @@ bool IsResolvedMxScaleDataPair(const VarPtr& scale, const VarPtr& data) {
 
 class MxScaleAddrInserter : public IRMutator {
  public:
+  StmtPtr VisitStmt(const StmtPtr& stmt) override {
+    const bool is_scope = As<ScopeStmt>(stmt) != nullptr;
+    if (is_scope) ClearBindings();
+    auto result = IRMutator::VisitStmt(stmt);
+    if (is_scope) ClearBindings();
+    return result;
+  }
+
   // Entry / control-flow body helper: NormalizedStmtStructure unwraps single-child
   // SeqStmts, so if/for/while (and even the function body) may be a bare AssignStmt.
   // SeqStmts bodies use VisitStmt_(SeqStmts); bare MX matmul assigns are wrapped
   // into a SeqStmts with the inserted bindings (same pattern as InsertCommFence).
   StmtPtr RewriteBody(const StmtPtr& body) {
+    ClearBindings();
     if (As<SeqStmts>(body)) return VisitStmt(body);
 
     auto visited = VisitStmt(body);
@@ -82,23 +95,43 @@ class MxScaleAddrInserter : public IRMutator {
   }
 
  protected:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    if (GetDataScalePairs(op).empty()) {
+      if (!LookupOpEntry(op->op_)) {
+        ClearBindings();
+      } else {
+        // Include reads and result tiles: this avoids depending on incomplete
+        // data/metadata effect contracts or assuming distinct SSA names cannot
+        // alias. Mat loads and Acc stores leave L0 data/scale bindings intact.
+        InvalidateBinding(op->GetType());
+        for (const auto& arg : op->args_) InvalidateBinding(arg->GetType());
+      }
+    }
+    return IRMutator::VisitExpr_(op);
+  }
+
   StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    ClearBindings();
     bool changed = false;
     std::vector<StmtPtr> new_stmts;
     new_stmts.reserve(op->stmts_.size());
 
     for (const auto& stmt : op->stmts_) {
-      auto rewritten = IRMutator::VisitStmt(stmt);
+      auto rewritten = VisitStmt(stmt);
       if (rewritten.get() != stmt.get()) changed = true;
 
       auto assign = As<AssignStmt>(rewritten);
       auto call = assign ? As<Call>(assign->value_) : nullptr;
       if (assign && call) {
+        RememberScaleExtract(assign, call, new_stmts.size());
         rewritten = InsertBindingsForMxMatmul(new_stmts, assign, call, changed);
+      } else if (assign) {
+        InvalidateBinding(assign->var_->GetType());
       }
       new_stmts.push_back(rewritten);
     }
 
+    ClearBindings();
     if (!changed) return op;
     return SeqStmts::Flatten(std::move(new_stmts), op->span_);
   }
@@ -107,8 +140,10 @@ class MxScaleAddrInserter : public IRMutator {
     auto new_then = RewriteBody(op->then_body_);
     std::optional<StmtPtr> new_else = op->else_body_;
     if (op->else_body_.has_value()) new_else = RewriteBody(op->else_body_.value());
+    ClearBindings();
     const bool then_changed = new_then.get() != op->then_body_.get();
-    const bool else_changed = op->else_body_.has_value() && new_else->get() != op->else_body_->get();
+    const bool else_changed =
+        op->else_body_.has_value() && new_else.has_value() && new_else->get() != op->else_body_->get();
     if (!then_changed && !else_changed) return op;
     auto result = MutableCopy(op);
     result->then_body_ = std::move(new_then);
@@ -120,11 +155,87 @@ class MxScaleAddrInserter : public IRMutator {
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override { return VisitLoop(op, op->body_); }
 
  private:
+  struct Binding {
+    VarPtr scale;
+    VarPtr data;
+    VarPtr bound;
+  };
+
+  struct ScaleExtract {
+    VarPtr result;
+    CallPtr call;
+    size_t statement_index;
+  };
+
+  std::optional<Binding> left_binding_;
+  std::optional<Binding> right_binding_;
+  std::optional<ScaleExtract> left_extract_;
+  std::optional<ScaleExtract> right_extract_;
+
+  void ClearBindings() {
+    left_binding_.reset();
+    right_binding_.reset();
+    left_extract_.reset();
+    right_extract_.reset();
+  }
+
+  void InvalidateBinding(const TypePtr& type) {
+    auto tile = As<TileType>(type);
+    if (!tile) return;
+    const auto space = tile->GetMemorySpace();
+    if (space == MemorySpace::Left || space == MemorySpace::LeftScale) {
+      left_binding_.reset();
+      left_extract_.reset();
+    }
+    if (space == MemorySpace::Right || space == MemorySpace::RightScale) {
+      right_binding_.reset();
+      right_extract_.reset();
+    }
+  }
+
+  void RememberScaleExtract(const AssignStmtPtr& assign, const CallPtr& call, size_t statement_index) {
+    if (!IsOp(call, "tile.extract")) return;
+    const auto dst = As<TileType>(assign->var_->GetType());
+    const auto src = As<TileType>(call->args_[0]->GetType());
+    if (!dst || !src || src->GetMemorySpace() != MemorySpace::Mat) return;
+    const auto space = dst->GetMemorySpace();
+    if (space == MemorySpace::LeftScale) left_extract_ = ScaleExtract{assign->var_, call, statement_index};
+    if (space == MemorySpace::RightScale) right_extract_ = ScaleExtract{assign->var_, call, statement_index};
+  }
+
+  static void BindExtractDestination(std::vector<StmtPtr>& stmts, const ScaleExtract& extract,
+                                     const VarPtr& payload) {
+    const auto& call = extract.call;
+    const auto scale_type = As<TileType>(extract.result->GetType());
+    const auto scale_space = scale_type->GetMemorySpace();
+    INTERNAL_CHECK_SPAN(scale_space.has_value(), call->span_)
+        << "The matched MX scale extract must have a resolved memory space";
+    const auto span = call->span_;
+    auto& registry = OpRegistry::GetInstance();
+    // Keep the copy at its original position. The payload is already in scope:
+    // any intervening definition or use on this L0 side invalidates the candidate.
+    auto valid_shape = std::make_shared<MakeTuple>(GetValidShape(scale_type), span);
+    auto bind = registry.Create("tile.bind_scale_addr", {payload, call->args_[3], valid_shape},
+                                {{"target_memory", *scale_space}}, span);
+    // The write aliases this handle, so carry any explicit scale slot onto
+    // the handle's allocation as well as the original result.
+    auto dst = std::make_shared<Var>(extract.result->name_hint_ + "_dst", scale_type, span);
+    auto copy =
+        registry.Create("tile.extract_into", {dst, call->args_[0], call->args_[1], call->args_[2]}, {}, span);
+    auto copy_with_attrs =
+        std::make_shared<Call>(copy->op_, copy->args_, copy->kwargs_, call->attrs_, copy->GetType(), span);
+    stmts.at(extract.statement_index) =
+        SeqStmts::Flatten({std::make_shared<AssignStmt>(dst, bind, span),
+                           std::make_shared<AssignStmt>(extract.result, copy_with_attrs, span)},
+                          span);
+  }
+
   static std::vector<std::pair<size_t, size_t>> GetDataScalePairs(const CallPtr& call) {
-    if (IsOp(call, "tile.matmul_mx") || IsOp(call, "tile.matmul_mx_bias")) {
+    if (IsOp(call, "tile.matmul_mx") || IsOp(call, "tile.matmul_mx_bias") || IsOp(call, "tile.gemv_mx") ||
+        IsOp(call, "tile.gemv_mx_bias")) {
       return {{0, 1}, {2, 3}};
     }
-    if (IsOp(call, "tile.matmul_mx_acc")) {
+    if (IsOp(call, "tile.matmul_mx_acc") || IsOp(call, "tile.gemv_mx_acc")) {
       return {{1, 2}, {3, 4}};
     }
     return {};
@@ -133,6 +244,7 @@ class MxScaleAddrInserter : public IRMutator {
   template <typename LoopPtr>
   StmtPtr VisitLoop(const LoopPtr& op, const StmtPtr& body) {
     auto new_body = RewriteBody(body);
+    ClearBindings();
     if (new_body.get() == body.get()) return op;
     auto result = MutableCopy(op);
     result->body_ = std::move(new_body);
@@ -170,11 +282,25 @@ class MxScaleAddrInserter : public IRMutator {
              "RightScale↔Right pairing before inserting tile.tget_scale_addr (run "
              "InferTileMemorySpace first)";
 
-      auto binding_call = registry.Create("tile.tget_scale_addr", {scale, data}, {}, call->span_);
-      auto bound_scale =
-          std::make_shared<Var>(scale->name_hint_ + "_bound", binding_call->GetType(), call->span_);
-      new_stmts.push_back(std::make_shared<AssignStmt>(bound_scale, binding_call, call->span_));
-      new_args[scale_index] = bound_scale;
+      const bool is_left = As<TileType>(scale->GetType())->GetMemorySpace() == MemorySpace::LeftScale;
+      auto& binding = is_left ? left_binding_ : right_binding_;
+      auto& extract = is_left ? left_extract_ : right_extract_;
+      if (extract && extract->result.get() == scale.get()) {
+        BindExtractDestination(new_stmts, *extract, data);
+        binding = Binding{scale, data, scale};
+        changed = true;
+      }
+      // The first MX use consumes the candidate even when it uses another scale.
+      extract.reset();
+      if (!binding || binding->scale.get() != scale.get() || binding->data.get() != data.get()) {
+        auto binding_call = registry.Create("tile.tget_scale_addr", {scale, data}, {}, call->span_);
+        auto bound_scale =
+            std::make_shared<Var>(scale->name_hint_ + "_bound", binding_call->GetType(), call->span_);
+        new_stmts.push_back(std::make_shared<AssignStmt>(bound_scale, binding_call, call->span_));
+        binding = Binding{scale, data, bound_scale};
+      }
+      if (new_args[scale_index] == binding->bound) continue;
+      new_args[scale_index] = binding->bound;
       call_changed = true;
       changed = true;
     }

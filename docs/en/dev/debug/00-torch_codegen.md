@@ -28,6 +28,8 @@ torch_codegen(node: _ir.Program | _ir.Function, check_shapes: bool = False) -> s
 - Simulate concurrent cross-core `tpush/tpop` behavior.
 - Provide actionable diagnostics for suspicious inputs (timeouts, invalid split dimensions, etc.).
 
+Addressed Vec and cube allocations share one byte pool per memory space and function invocation. Overlapping addresses therefore alias even across distinct allocation handles; addressless allocations remain independent. Window views retain their parent pitch and have independent valid metadata.
+
 ### Non-goals
 
 - No performance optimization.
@@ -129,10 +131,10 @@ accumulating matmul, so each honours the predicate through the one handler:
 
 The odd codes are validated against the tile's RUNTIME valid extent, not its
 physical box: an even box with an odd valid extent (16 with `valid_shape` 15)
-is exactly the case they exist for. `lane_stride` rides along only when
-[LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md) rebalanced a
-ragged boundary; the runtime then cuts the lanes there instead of at the box
-half. Odd codes are rejected on `push_to_aic` / `pop_from_aiv`, mirroring PTO
+is exactly the case they exist for. An explicitly supplied `lane_stride`
+selects the transport partition instead of the physical box half.
+[LowerAutoVectorSplit](../passes/25-lower_auto_vector_split.md) preserves that
+partition and does not rebalance a ragged body. Odd codes are rejected on `push_to_aic` / `pop_from_aiv`, mirroring PTO
 codegen — pto-isa has no odd Vector-to-Cube transport.
 
 ## Tile/Tensor Boundary and Valid-Region Semantics

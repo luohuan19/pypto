@@ -6,10 +6,13 @@ Some hardware intrinsics produce more than one value. PTOAS `TGATHER` in its
 compare form writes both the gathered indices and a per-row match count;
 `pto.tgather` names them as two `outs(...)` operands. An operator wrapping such
 an intrinsic is a **multi-output operator**, and PyPTO expresses its results as
-a `TupleType`, never as destination arguments.
+a `TupleType`.
 
-**The rule**: register the operator with its *inputs only*. Every output is an
-element of the `TupleType` that `f_deduce_type` returns.
+Every output is an element of the `TupleType` that `f_deduce_type` returns.
+A fresh tile output is allocated by the compiler. An operation that updates
+an existing GM tensor declares the corresponding tuple element and input with
+`set_tuple_result_alias(result, arg)`. For example, element 0 of
+`pld.tensor.get_async_event` aliases its destination and element 1 is a fresh event.
 
 See [Operator System](05-operators.md) for the general registration API and
 [Types and Examples](02-types.md#tupletype) for `TupleType` itself.
@@ -81,12 +84,14 @@ REGISTER_OP("tile.gather_compare")
 
 ### Workspace versus destination
 
-A written argument is one of two things, and the registration must say which:
+Declare the role of each written argument.
 
 | Kind | Example | Declaration |
 | ---- | ------- | ----------- |
 | **Workspace** — hardware scratch, no result the caller reads | `tile.gather_compare`'s `tmp`, synthesized by `ConvertTensorToTileOps` | `set_arg_effect(i, ArgEffect::Write)` + `set_workspace_arg(i)` |
-| **Destination** — a result the caller reads | `dst`, `cdst` | Not an argument at all — a `TupleType` element |
+| **Fresh destination** | Gathered indices and row counts | Return each as a tuple element |
+| **Existing destination** | Local GET destination or remote PUT window | Declare the effect and use `set_tuple_result_alias(result, arg)` |
+| **Mutable session** | The issue queue shared by tile PUT and GET | `set_mutable_session_arg(i)` declares a read-write `AsyncSession` operand |
 
 The distinction is not cosmetic. A workspace is allocated by the pass that
 synthesizes it and is never read, so it needs no SSA result; a destination is a
@@ -97,12 +102,12 @@ value the program goes on to use.
 Two checks, both of which fail loudly rather than letting a leak reach device.
 
 **At import** — `OpRegistry::ValidateMultiOutputOps()` walks every operator with
-arity > 1 and rejects three shapes:
+arity > 1 and rejects the following registrations.
 
 | Rejected | Why |
 | -------- | --- |
 | An argument with no declared effect | The default `Read` is indistinguishable from a destination in hiding |
-| A written argument not declared a workspace | It is either scratch that must say so, or a destination that belongs in the `TupleType` |
+| A written argument without a declared role | Identify scratch, an aliased destination tensor, or mutable session state |
 | `set_workspace_arg(i)` naming no argument | An index past the end is a typo that silently protects nothing |
 | A workspace argument the operator never writes | Scratch is hardware-written by definition. Declaring it `Read` — or reaching that through `no_arg_writes()` — is the same dropped dependency edge, wearing a marker that says otherwise |
 | `set_output_reuses_input(N)` | With several results, "the output reuses input N" cannot say which one |
@@ -143,6 +148,26 @@ The DSL wrapper returns one `TupleGetItemExpr` per output over the *same* call;
 `_unwrap_result` in `python/pypto/language/parser/_dsl_invoker.py` recognizes
 that shape generically and hands the parser back the bare `Call` to rebind.
 
+Each result's type must describe both its physical capacity and its valid region
+**before** memory planning. For `tile.gather_compare`, the per-row count output is
+one contiguous row of INT32/UINT32 values. Its physical shape is
+`[1, ceil_div(src_rows, 8) * 8]` to meet the 32-byte Vec row alignment; its valid
+shape is `[1, src_valid_rows]`. For example, nine source rows need a `[1, 16]`
+count tile with only nine valid entries. `tile.read(count, [0, i])` keeps the same
+element offsets, and `tile.store` uses the valid region rather than writing the
+padding. The tensor-level count shape remains `[1, rows]`: extra Vec capacity
+does not add logical counts or enlarge the caller's tensor.
+
+Explicit per-lane computation preserves each tuple element's operator-deduced
+type and valid region. Physical capacity and logical partition stride remain
+independent: if the author splits ten source rows into five rows per lane, each
+lane's count tile has physical shape `[1, 8]` with five valid entries. The author
+must store lane 1's counts at column five, not at the aligned capacity of eight.
+Mixed-kernel lowering preserves these authored shapes and offsets; it does not
+infer or propagate a new partition through tuple projections and consumers.
+See [LowerAutoVectorSplit](../passes/25-lower_auto_vector_split.md)
+for explicit boundary preparation.
+
 ## Codegen
 
 A multi-output op's `Call` does not carry its destinations in `args_` — the
@@ -179,8 +204,8 @@ body rescan per call.
 2. Classify **every** argument with `set_arg_effect`, or `no_arg_writes()` when
    the operator writes through none of them. The import-time check requires a
    verdict on each.
-3. Mark any written argument with `set_workspace_arg(i)` — and if it is not
-   scratch, it is a destination and does not belong in the argument list.
+3. Mark scratch with `set_workspace_arg(i)`. For a result that updates an existing
+   GM tensor, use `set_tuple_result_alias(result, i)` and declare its argument effect.
 4. Return an N-element `TupleType` from `f_deduce_type`.
 5. Write the DSL wrapper to return a tuple of `TupleGetItemExpr(call, i)` over
    one call — the parser's unpacking path recognizes that shape.
@@ -194,5 +219,5 @@ body rescan per call.
 - [Operator System](05-operators.md) — the general registration API and argument effects
 - [Types and Examples](02-types.md) — `TupleType` and the rest of the type system
 - [Parameter Directions](08-param-directions.md) — how an undeclared write loses its dependency edge
-- [InitMemRef](../passes/34-init_memref.md) — the pass that owns tile allocation
-- [MemoryReuse](../passes/36-memory_reuse.md) — lifetime reuse across tuple elements
+- [InitMemRef](../passes/38-init_memref.md) — the pass that owns tile allocation
+- [MemoryReuse](../passes/40-memory_reuse.md) — lifetime reuse across tuple elements

@@ -20,16 +20,16 @@ and call the returned :class:`RegistrationHandle`.
 
 Example — implicit reuse::
 
-    from pypto.runtime import ChipWorker, RunConfig
+    from pypto.runtime import ChipWorker, ExecutionMode, RunConfig
 
-    with ChipWorker(config=RunConfig(platform="a2a3")):
+    with ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD)):
         out1 = Add(*tensors1)   # uses active ChipWorker
         out2 = Mul(*tensors2)   # reuses same ChipWorker
     # close() runs once on exit
 
 Example — explicit dispatch::
 
-    w = ChipWorker(config=RunConfig(platform="a2a3"))
+    w = ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD))
     try:
         out = w.run(compiled_add, a, b)
         h = w.register(compiled_mul)        # pre-register hot path
@@ -48,6 +48,9 @@ import weakref
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
+from pypto._target import ExecutionMode
+from pypto.backend import BackendType
+from pypto.ir.param_info import collect_output_values
 from pypto.pypto_core.passes import RuntimeKind, runtime_kind_to_name
 
 from .runner import RunConfig
@@ -281,6 +284,9 @@ class ChipWorker(Worker):
         # Transcribing ``_config``'s rings here would instead build an arena no
         # dispatch asks for. A per-call RunConfig that sizes the rings differently
         # rebuilds once, as before. No-op without a prebuilt arena.
+        from ._execution_mode import claim_program_mode  # noqa: PLC0415
+
+        claim_program_mode()
         try:
             with _device_init_lock:
                 self._impl.init(prewarm_config=_get_simpler_call_config_cls()())
@@ -303,6 +309,7 @@ class ChipWorker(Worker):
         if not self._initialized and not self._impl_close_pending:
             return
         if self._initialized:
+            self._impl.check_exports_retired()
             # Auto-free tracked DeviceTensors while public memory ops are still
             # admitted. Any failed free is logged by the shared helper and the
             # backend's own close journal remains the final reclamation owner.
@@ -357,18 +364,22 @@ class ChipWorker(Worker):
         if worker_id != 0:
             raise ValueError(f"ChipWorker.{op}() only supports worker_id=0, got {worker_id}")
 
-    def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
+    def malloc(self, nbytes: int, *, worker_id: int = 0, exportable: bool = False) -> int:
         """Allocate ``nbytes`` of device memory; returns an opaque pointer.
 
         The returned pointer lives in *worker_id*'s address space.  Pair every
         ``malloc()`` with a matching :meth:`free` before this ChipWorker is
-        closed, otherwise the device memory is leaked.
+        closed, otherwise the device memory is leaked. exportable=True requests onboard VMM
+        storage; external consumer leases must retire before free() or close().
         """
         self._require_initialized("malloc")
         self._require_local_worker_id(worker_id, "malloc")
         if type(nbytes) is not int or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
-        handle = self._impl.malloc(nbytes)
+        if exportable:
+            handle = self._impl.malloc(nbytes, exportable=True)
+        else:
+            handle = self._impl.malloc(nbytes)
         try:
             ptr = int(handle.base)
         except (AttributeError, TypeError, ValueError) as e:
@@ -401,10 +412,9 @@ class ChipWorker(Worker):
         self._require_initialized("free")
         handle = self._device_buffer(ptr, worker_id, "free")
         self._impl.free(handle)
-        # Keep the mapping until backend admission + free succeeds. An error
-        # before simpler's provenance commit barrier is safely retryable; an
-        # error after it is rejected by simpler on retry and ultimately cleaned
-        # by Worker.close().
+        # Retain the owner handle until cleanup succeeds. Simpler keeps a
+        # cleanup-only identity after partial VMM release; retrying free does
+        # not authorize the retired Buffer for computation or copying.
         del self._device_buffers[(worker_id, ptr)]
 
     def copy_to(
@@ -456,6 +466,16 @@ class ChipWorker(Worker):
     @property
     def level(self) -> int:
         return self._level
+
+    @property
+    def backend_type(self) -> BackendType:
+        """Target architecture selected by this worker's configuration."""
+        return self._config.backend_type
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Simulator or onboard execution."""
+        return self._config.execution_mode
 
     @property
     def platform(self) -> str:
@@ -539,7 +559,8 @@ class ChipWorker(Worker):
             raise ValueError(
                 f"CompiledProgram.platform={compiled.platform!r} does not match "
                 f"ChipWorker.platform={self.platform!r}. Compile for the matching "
-                f"platform, or construct ChipWorker(config=RunConfig(platform={compiled.platform!r}))."
+                "platform, or construct ChipWorker(config=RunConfig("
+                "backend_type=compiled.backend_type, execution_mode=compiled.execution_mode))."
             )
         if compiled.runtime_name != self._runtime:
             raise ValueError(
@@ -624,10 +645,7 @@ class ChipWorker(Worker):
                     dfx_dir, self.platform, rc.dfx_options(), prebuilt_directory=runtime.directory
                 )
 
-        if not return_style:
-            return None
-        outputs = [coerced[i] for i in compiled.output_indices]
-        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+        return collect_output_values(coerced, compiled.output_indices, return_style=return_style)
 
     def register(self, compiled: CompiledProgram) -> RegistrationHandle:
         """Pre-register *compiled* on this ChipWorker. Returns a callable handle.

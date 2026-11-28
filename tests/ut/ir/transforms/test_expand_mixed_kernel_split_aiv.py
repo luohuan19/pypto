@@ -161,7 +161,7 @@ def test_aiv_shard_folds_into_cube_to_vector_boundary():
 
 
 def _build_aic_gather_program():
-    """half2[64,128]Vec --aic_gather(split=1)--> full[128,128], move->Left, matmul."""
+    """half2[64,128]Vec --aic_gather(split=1)--> full[128,128]Mat, move->Left, matmul."""
     span = ir.Span.unknown()
     a = ir.Var("a", _tile([64, 128], mem=MS.Vec), span)
     b = ir.Var("b", _tile([128, 128], mem=MS.Right), span)
@@ -172,7 +172,7 @@ def _build_aic_gather_program():
     half2 = ir.Var("half2", _tile(add.type.shape, add.type.tile_view, MS.Vec), span)
     gather = T.aic_gather(half2, split=1, span=span)
     assert isinstance(gather.type, ir.TileType)
-    full = ir.Var("full", _tile(gather.type.shape, gather.type.tile_view, MS.Vec), span)
+    full = ir.Var("full", _tile(gather.type.shape, gather.type.tile_view, MS.Mat), span)
     move_left = T.move(full, MS.Left, span=span)
     assert isinstance(move_left.type, ir.TileType)
     full_left = ir.Var("full_left", _tile(move_left.type.shape, move_left.type.tile_view, MS.Left), span)
@@ -214,7 +214,7 @@ def _build_aic_gather_program():
 # ---------------------------------------------------------------------------
 
 
-def _build_shard_program(box_rows, valid_rows, lane_stride=None):
+def _build_shard_program(box_rows, valid_rows, lane_stride=None, *, compact_acc=False):
     """The same C->V shard over a [box_rows, 128] cube tile valid to `valid_rows`.
 
     Only the split code is under test here, so the body stops at the shard: its
@@ -227,9 +227,10 @@ def _build_shard_program(box_rows, valid_rows, lane_stride=None):
         valid_shape=[
             ir.ConstInt(valid_rows, DataType.INDEX, span),
             ir.ConstInt(128, DataType.INDEX, span),
-        ]
+        ],
+        compact=ir.CompactMode.normal if compact_acc else ir.CompactMode.null,
     )
-    qk = ir.Var("qk", _tile([box_rows, 128], view, MS.Vec), span)
+    qk = ir.Var("qk", _tile([box_rows, 128], view, MS.Acc if compact_acc else MS.Vec), span)
     half_rows = (box_rows + 1) // 2
     out_0 = ir.Var("out_0", ir.TensorType([half_rows, 128], FP32), span)
 
@@ -288,6 +289,12 @@ def test_folded_transport_carries_the_pto_isa_split_code(
     stride_attr = "" if lane_stride is None else f", lane_stride={lane_stride}"
     assert f"pl.tile.tpush_to_aiv(qk, split={expected_code}{stride_attr})" in printed, why
     assert f"pl.tile.tpop_from_aic(split={expected_code}{stride_attr})" in printed, why
+
+
+def test_folded_a5_compact_shard_preserves_the_box_partition():
+    printed = ir.python_print(_expand(_build_shard_program(16, 8, compact_acc=True)))
+    assert "pl.tile.tpush_to_aiv(qk, split=1, lane_stride=8)" in printed
+    assert "pl.tile.tpop_from_aic(split=1)" in printed
 
 
 def test_folded_transport_carries_the_left_right_odd_code():

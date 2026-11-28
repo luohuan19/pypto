@@ -31,11 +31,10 @@ both planners against one golden is what shows the region form is equivalent.
 
 The double-buffer case is the shape the region form exists for — one slot live per
 iteration — and its golden checks the WAR edge ptoas derives from the slot index.
-Two slots live at once inside a loop is **rejected** under PTOAS. ptoas 0.54 guarded
-only the first ``multi_tile_get`` of an iteration, which was measured wrong on device
-(hw-native-sys/PTOAS#1118, fixed in 0.56); the pinned ptoas mis-syncs the
-prefetch form of the shape (hw-native-sys/PTOAS#1519: fixed in 0.63, broken again
-since 0.64), which codegen cannot tell apart. ``MultiBufferCoLiveProgram`` is the case that pins the refusal.
+The co-live case writes and consumes both rotating slots in the same iteration.
+Its golden checks that the second load preserves the first slot's value
+(hw-native-sys/PTOAS#1118). Loop-carried prefetch is guarded separately
+(hw-native-sys/PTOAS#1519).
 """
 
 from typing import Any
@@ -45,10 +44,6 @@ import pypto.language as pl
 import pytest
 import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
-from pypto import backend as _backend
-from pypto import ir
-from pypto.backend import BackendType
-from pypto.backend.pto_backend import PartialCodegenError
 from pypto.pypto_core.passes import MemoryPlanner
 
 
@@ -201,6 +196,13 @@ _MB_M, _MB_K, _MB_N = 64, 64, 256
 _MB_TN = 64
 _MB_NT = _MB_N // _MB_TN
 
+# Stepped pipeline: pl.pipeline(64, 320, 64, stage=2), a non-zero start.
+_ST_START, _ST_STOP, _ST_STEP = 64, 320, 64
+_ST_ROWS = _ST_STOP
+# Unaligned unit step: pl.pipeline(1, 8, 1, stage=3), 7 trips over 3 slots.
+_UA_START, _UA_STOP = 1, 8
+_UA_ROWS = _UA_STOP * _MB_TR
+
 MULTI_BUF_COLIVE = pl.MemRef(slots=2)
 MULTI_BUF_ACC = pl.MemRef(slots=2)
 MULTI_BUF_CONST = pl.MemRef(slots=2)
@@ -208,17 +210,7 @@ MULTI_BUF_CONST = pl.MemRef(slots=2)
 
 @pl.program
 class MultiBufferCoLiveProgram:
-    """Two UB slots co-live per iteration — rejected under PTOAS, correct under PYPTO.
-
-    ptoas 0.54 derived the per-slot WAR guard only for the first ``multi_tile_get`` of
-    a region in an iteration, so the second load raced the next iteration's write.
-    Measured wrong on device: ``out`` came back as ``a[block i+1] + a[block i]``
-    instead of ``a + b`` (hw-native-sys/PTOAS#1118, fixed in 0.56). The pinned ptoas
-    mis-syncs the prefetch form of this shape (hw-native-sys/PTOAS#1519: fixed in 0.63,
-    broken again since 0.64), and codegen cannot tell the forms apart, so it refuses
-    both; this kernel is the ST that pins that refusal — under PYPTO the same source is
-    fine.
-    """
+    """Fill two complementary UB slots each iteration and consume both in the sum."""
 
     @pl.function(type=pl.FunctionType.InCore)
     def kernel(
@@ -369,6 +361,74 @@ class MultiBufferAccProgram:
         return out
 
 
+@pl.program
+class SteppedPipelineProgram:
+    """``pl.pipeline(64, 320, 64, stage=2)``: slotted under PTOAS, replicated otherwise.
+
+    Slots and replication are two lowerings of the same loop, so every planner
+    must produce the same numbers; this compares them against one golden.
+    """
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        a: pl.Tensor[[_ST_ROWS, _MB_TC], pl.FP32],
+        out: pl.Out[pl.Tensor[[_MB_TR, _MB_TC], pl.FP32]],
+    ) -> pl.Tensor[[_MB_TR, _MB_TC], pl.FP32]:
+        seed: pl.Tile[[_MB_TR, _MB_TC], pl.FP32, pl.Mem.Vec] = pl.load(
+            a, [0, 0], [_MB_TR, _MB_TC], target_memory=pl.Mem.Vec
+        )
+        for i, (acc,) in pl.pipeline(_ST_START, _ST_STOP, _ST_STEP, stage=2, init_values=(seed,)):
+            t: pl.Tile[[_MB_TR, _MB_TC], pl.FP32, pl.Mem.Vec] = pl.load(
+                a, [i, 0], [_MB_TR, _MB_TC], target_memory=pl.Mem.Vec
+            )
+            nxt: pl.Tile[[_MB_TR, _MB_TC], pl.FP32, pl.Mem.Vec] = pl.add(acc, t)
+            r = pl.yield_(nxt)
+        out = pl.store(r, [0, 0], out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def orchestrator(
+        self,
+        a: pl.Tensor[[_ST_ROWS, _MB_TC], pl.FP32],
+        out: pl.Out[pl.Tensor[[_MB_TR, _MB_TC], pl.FP32]],
+    ) -> pl.Tensor[[_MB_TR, _MB_TC], pl.FP32]:
+        out = self.kernel(a, out)
+        return out
+
+
+@pl.program
+class UnalignedPipelineProgram:
+    """``pl.pipeline(1, 8, 1, stage=3)``: an unaligned start, 7 trips over 3 slots."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        a: pl.Tensor[[_UA_ROWS, _MB_TC], pl.FP32],
+        out: pl.Out[pl.Tensor[[_MB_TR, _MB_TC], pl.FP32]],
+    ) -> pl.Tensor[[_MB_TR, _MB_TC], pl.FP32]:
+        seed: pl.Tile[[_MB_TR, _MB_TC], pl.FP32, pl.Mem.Vec] = pl.load(
+            a, [0, 0], [_MB_TR, _MB_TC], target_memory=pl.Mem.Vec
+        )
+        for i, (acc,) in pl.pipeline(_UA_START, _UA_STOP, 1, stage=3, init_values=(seed,)):
+            t: pl.Tile[[_MB_TR, _MB_TC], pl.FP32, pl.Mem.Vec] = pl.load(
+                a, [i * _MB_TR, 0], [_MB_TR, _MB_TC], target_memory=pl.Mem.Vec
+            )
+            nxt: pl.Tile[[_MB_TR, _MB_TC], pl.FP32, pl.Mem.Vec] = pl.add(acc, t)
+            r = pl.yield_(nxt)
+        out = pl.store(r, [0, 0], out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def orchestrator(
+        self,
+        a: pl.Tensor[[_UA_ROWS, _MB_TC], pl.FP32],
+        out: pl.Out[pl.Tensor[[_MB_TR, _MB_TC], pl.FP32]],
+    ) -> pl.Tensor[[_MB_TR, _MB_TC], pl.FP32]:
+        out = self.kernel(a, out)
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Test cases (parametrized by memory planner)
 # ---------------------------------------------------------------------------
@@ -479,7 +539,7 @@ def _ramp(rows: int, cols: int, scale: float, bias: float) -> torch.Tensor:
 
 
 class MultiBufferCoLiveCase(PTOTestCase):
-    """Two co-live UB slots — runnable under PYPTO, refused by PTOAS codegen."""
+    """Check both co-live slot values against the elementwise sum."""
 
     def __init__(self, memory_planner: MemoryPlanner | None = None, *, platform=None, config=None):
         super().__init__(config, platform=platform, memory_planner=memory_planner)
@@ -579,6 +639,60 @@ class MultiBufferAccCase(PTOTestCase):
         tensors["out"][:] = tensors["a"] @ tensors["b"]
 
 
+class SteppedPipelineCase(PTOTestCase):
+    """The stepped A/B shape under the given memory planner."""
+
+    def __init__(self, memory_planner: MemoryPlanner | None = None, *, platform=None, config=None):
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
+        self._mp = memory_planner
+
+    def get_name(self) -> str:
+        return f"memplan_stepped_pipeline_{_planner_tag(self._mp)}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [_ST_ROWS, _MB_TC], DataType.FP32, init_value=_ramp(_ST_ROWS, _MB_TC, 1.0, 0.0)),
+            TensorSpec("out", [_MB_TR, _MB_TC], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return SteppedPipelineProgram
+
+    def compute_expected(self, tensors, params=None) -> None:
+        a = tensors["a"]
+        acc = a[0:_MB_TR, :].clone()
+        for i in range(_ST_START, _ST_STOP, _ST_STEP):
+            acc += a[i : i + _MB_TR, :]
+        tensors["out"][:] = acc
+
+
+class UnalignedPipelineCase(PTOTestCase):
+    """The unaligned unit-step shape under the given memory planner."""
+
+    def __init__(self, memory_planner: MemoryPlanner | None = None, *, platform=None, config=None):
+        super().__init__(config, platform=platform, memory_planner=memory_planner)
+        self._mp = memory_planner
+
+    def get_name(self) -> str:
+        return f"memplan_unaligned_pipeline_{_planner_tag(self._mp)}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [_UA_ROWS, _MB_TC], DataType.FP32, init_value=_ramp(_UA_ROWS, _MB_TC, 1.0, 0.0)),
+            TensorSpec("out", [_MB_TR, _MB_TC], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return UnalignedPipelineProgram
+
+    def compute_expected(self, tensors, params=None) -> None:
+        a = tensors["a"]
+        acc = a[0:_MB_TR, :].clone()
+        for i in range(_UA_START, _UA_STOP):
+            acc += a[i * _MB_TR : (i + 1) * _MB_TR, :]
+        tensors["out"][:] = acc
+
+
 # ---------------------------------------------------------------------------
 # pytest wrappers
 # ---------------------------------------------------------------------------
@@ -611,27 +725,10 @@ class TestMemoryPlannerPtoas:
         result = test_runner.run(ColVecIfPhiCarryCase(planner))
         assert result.passed, f"colvec if-phi carry ({_planner_tag(planner)}) failed: {result.error}"
 
-    @pytest.mark.parametrize("planner", [MemoryPlanner.PYPTO, MemoryPlanner.DSA_RP], ids=_planner_tag)
-    def test_multi_buffer_colive_slots_run_under_pypto_planners(self, test_runner, planner):
-        # Two co-live slots are a legal program — both PyPTO-owned address
-        # planners preserve the declared region and its per-slot offsets. This
-        # controls the PTOAS refusal below: the unsupported part is that
-        # lowering, not the source program.
+    @pytest.mark.parametrize("planner", _PLANNERS, ids=_planner_tag)
+    def test_multi_buffer_colive_slots(self, test_runner, planner):
         result = test_runner.run(MultiBufferCoLiveCase(planner))
         assert result.passed, f"multi-buffer co-live ({_planner_tag(planner)}) failed: {result.error}"
-
-    def test_multi_buffer_colive_slots_rejected_under_ptoas(self):
-        # Two co-live slots include a prefetch form the pinned ptoas mis-syncs
-        # (hw-native-sys/PTOAS#1519: fixed in 0.63, broken again since 0.64; 0.54 also got this
-        # same-iteration form wrong on device, #1118). Refuse rather than miscompile.
-        #
-        # Asserted here through the real `ir.compile` entry point, which surfaces a
-        # kernel's ValueError as PartialCodegenError; the exact reason string is
-        # pinned in tests/ut/codegen/test_multi_buffer_codegen.py.
-        _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
-        with pytest.raises(PartialCodegenError):
-            ir.compile(MultiBufferCoLiveProgram, memory_planner=MemoryPlanner.PTOAS)
 
     @pytest.mark.parametrize("planner", _PLANNERS, ids=_planner_tag)
     def test_multi_buffer_double_buffer(self, test_runner, planner):
@@ -652,6 +749,20 @@ class TestMemoryPlannerPtoas:
         # The Acc (L0C) space of a region: MAD writes the slot, FIXPIPE drains it.
         result = test_runner.run(MultiBufferAccCase(planner))
         assert result.passed, f"multi-buffer acc ({_planner_tag(planner)}) failed: {result.error}"
+
+    @pytest.mark.parametrize("planner", _PLANNERS, ids=_planner_tag)
+    def test_stepped_pipeline(self, test_runner, planner):
+        # PTOAS slots this loop with the counter form; PyPTO and DSA_RP replicate
+        # it. All three must match one golden.
+        result = test_runner.run(SteppedPipelineCase(planner))
+        assert result.passed, f"stepped pipeline ({_planner_tag(planner)}) failed: {result.error}"
+
+    @pytest.mark.parametrize("planner", _PLANNERS, ids=_planner_tag)
+    def test_unaligned_pipeline(self, test_runner, planner):
+        # An unaligned unit-step start over three slots and seven trips: the slot
+        # is (i - 1) % 3, so the last trip reuses slot 0 while the others drain.
+        result = test_runner.run(UnalignedPipelineCase(planner))
+        assert result.passed, f"unaligned pipeline ({_planner_tag(planner)}) failed: {result.error}"
 
 
 if __name__ == "__main__":

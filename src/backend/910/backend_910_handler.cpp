@@ -1,0 +1,97 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include "pypto/backend/910/backend_910_handler.h"
+
+#include <initializer_list>
+
+#include "pypto/backend/910/backend_910.h"
+#include "pypto/backend/common/backend_handler.h"
+#include "pypto/core/dtype.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/memory_space.h"
+#include "pypto/ir/type.h"
+#include "pypto/sync/resource_catalog.h"
+#include "src/backend/common/sync_resources.h"
+
+namespace pypto {
+namespace backend {
+
+Ascend910Handler::Ascend910Handler() : BackendHandler(Backend910::Instance()) {}
+
+const Ascend910Handler& Ascend910Handler::Instance() {
+  static const Ascend910Handler instance;
+  return instance;
+}
+
+/// Own the A2/A3 resource model independently of the process-global target.
+const sync::ResourceCatalog& Ascend910Handler::GetSyncResourceCatalog() const {
+  // PTOAS UnifiedSyncModel::ResourceModel uses K=0 for A3. Preserve that
+  // unavailable buffer-credit pool for PyPTO's combined a2a3 target.
+  static const auto catalog = MakeAscendSyncResourceCatalog(GetPtoTargetArch(), 0);
+  return catalog;
+}
+
+ir::TileView Ascend910Handler::BuildCrossCoreTransferView(ir::MemorySpace dest_ms,
+                                                          const ir::TileView& original_view) const {
+  // Ascend910 (a2a3): cross-core transfer goes through GM. All GM -> Mat
+  // transfers must be in NZ layout (hardware constraint), so Left / Right /
+  // Mat destinations all use NZ at the transfer boundary. The final
+  // Left/Right layout is later resolved by a Mat -> Left/Right move (MTE1).
+  //
+  // Vec destinations preserve the original Vec view: the GM-backed C2V pop
+  // materialises through an ND GlobalTensor on the consumer side and PTO-ISA
+  // only supports Vec loads for matching ND/DN/NZ layouts. Emitting an NZ Vec
+  // bridge tile would make the generated kernel invalid.
+  ir::TileView result = original_view;
+  switch (dest_ms) {
+    case ir::MemorySpace::Left:
+    case ir::MemorySpace::Right:
+    case ir::MemorySpace::Mat:
+      result.blayout = ir::TileLayout::col_major;
+      result.slayout = ir::TileLayout::row_major;
+      return result;
+    case ir::MemorySpace::Vec:
+      return original_view;
+    default:
+      INTERNAL_UNREACHABLE << "cross-core move destination must be Vec, Mat, Left, or Right, got "
+                           << static_cast<int>(dest_ms);
+  }
+}
+
+// ISA Supported Conversions (pto-isa tcvt docs, a2a3 column). a2a3 uniquely
+// provides INT32 -> FP16 as a deq instruction and the INT4 pair; it has no
+// FP8 / HF8 / FP4 support at all. Grouped by source, mirroring the ISA table.
+const TcvtAdjacency& Ascend910Handler::GetTcvtAdjacency() const {
+  static const TcvtAdjacency kTable = [] {
+    TcvtAdjacency t;
+    auto add = [&t](DataType from, std::initializer_list<DataType> tos) {
+      for (DataType to : tos) {
+        t.edges.emplace_back(from, to);
+      }
+    };
+    add(DataType::FP32, {DataType::FP16, DataType::BF16, DataType::INT16, DataType::INT32, DataType::INT64});
+    add(DataType::FP16, {DataType::FP32, DataType::INT32, DataType::INT16, DataType::INT8, DataType::UINT8});
+    add(DataType::FP16, {DataType::INT4});
+    add(DataType::BF16, {DataType::FP32, DataType::INT32});
+    add(DataType::INT16, {DataType::FP16, DataType::FP32});
+    add(DataType::INT32, {DataType::FP32, DataType::INT16, DataType::INT64, DataType::FP16});
+    add(DataType::INT64, {DataType::FP32, DataType::INT32});
+    add(DataType::UINT8, {DataType::FP16});
+    add(DataType::INT8, {DataType::FP16});
+    add(DataType::INT4, {DataType::FP16});
+    return t;
+  }();
+  return kTable;
+}
+
+}  // namespace backend
+}  // namespace pypto

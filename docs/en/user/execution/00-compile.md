@@ -1,5 +1,9 @@
 # Compiling
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Turning a program or a `@pl.jit` kernel into device kernels and host orchestration.
 
 ## Concept
@@ -63,7 +67,7 @@ move. All are keyword-only — only `program` is positional.
 | `output_dir` | `None` | Where artifacts land; `None` means a fresh `<base>/<name>_<YYYYmmdd_HHMMSS>_<random>` per call, under `PYPTO_PROG_BUILD_DIR` or `build_output`. The timestamp is for reading; the random tail keeps concurrent compiles apart, so read `compiled.output_dir` rather than deriving it |
 | `strategy` | `Default` | The pass pipeline. `Default` is the only strategy |
 | `dump_passes` | `True` | IR snapshot after every pass — see below |
-| `backend_type` | `Ascend910B` | Target for passes and codegen (`Ascend910B` / `Ascend950`) |
+| `backend_type` | `Ascend910` | Target for passes and codegen (`Ascend910` / `Ascend950`) |
 | `platform` | `None` | Execution platform the artifact is built for; must match the worker that dispatches it |
 | `skip_ptoas` | `False` | Stop at `.pto` (MLIR) instead of building the device binary |
 | `verification_level` | `None` | `NONE` / `BASIC` / `ROUNDTRIP`; `None` defers to `PYPTO_VERIFY_LEVEL`, else `BASIC` |
@@ -73,10 +77,10 @@ move. All are keyword-only — only `program` is positional.
 | `profiling` | `False` | Per-stage compile timing into `report/pipeline_profile.{txt,json}` |
 | `distributed_config` | `None` | Compile a HOST-level program per rank ([Distributed](../distributed/index.md)) |
 | `analyze_auto_scopes_for_deps` | `False` | Compiler-derived dependencies for AUTO scopes |
-| `enable_pypto_l0c_double_buffer` | `None` | L0C double buffering |
+| `enable_pypto_l0c_double_buffer` | `None` | Legacy flag; automatic dbC is disabled for PYPTO/DSA_RP, retained for PTOAS independently of this flag |
 | `emit_source_loc` | `None` | Carry DSL source locations into the emitted `.pto` |
 | `dump_ptoas_passes` | `False` | Also dump ptoas's own pass IR |
-| `runtime` | `None` | Simpler runtime ABI to target — `TENSORMAP_AND_RINGBUFFER` or `HOST_BUILD_GRAPH` (what `@pl.jit.graph` needs — [Functions](../language/01-functions.md)); `None` inherits the active `PassContext`. The worker must match it |
+| `runtime` | `None` | Simpler runtime ABI to target — `TENSORMAP_AND_RINGBUFFER` or `HOST_BUILD_GRAPH`. This selects the execution path for [Graph fragments](../language/01-functions.md). `None` inherits the active `PassContext`. The worker must match it |
 
 ### Pass dumps
 
@@ -105,11 +109,18 @@ want when the question is "which pass changed this".
 
 ### `JITFunction.compile`
 
-`@pl.jit` normally fuses specialize + compile + dispatch into one `kernel(*args)` call.
-`compile(*sample_args)` stops after compilation and returns the `CompiledProgram` the JIT
-cache holds — so a later call with the same specialization key gets the identical object.
+`kernel.compile(*sample_args, config=cfg)` specializes and compiles for the PROGRAM
+contract without dispatching. It returns a cached `CompiledProgram`; repeated explicit
+`.compile()` calls with the same specialization and compile configuration return the
+identical object. Run it with `compiled(*args, config=cfg)` or an explicit worker.
 
-It exposes the whole extraction surface, which is what a harness driving the runtime
+Direct `kernel(*args)` calls instead require `pypto.torch.init()` and real NPU tensors.
+They specialize, compile and submit through the eager KERNEL contract, whose cache entry
+is separate from PROGRAM compilation. Their optional `config` is `CompileOptions`, not
+`RunConfig`; host tensors and simulator execution use the explicit program path above.
+See [kernel mode](../../dev/runtime/kernel-mode.md) for the full eager contract.
+
+The PROGRAM artifact exposes the whole extraction surface, which a harness driving the runtime
 directly needs: `chip_callable`, `runtime_name`, `runtime_config`, `output_dir`,
 `platform`, `output_indices`, `param_names`, `orchestration_names`, `has_return`.
 Argument marshalling is not part of that surface — dispatch through

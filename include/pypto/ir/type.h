@@ -160,6 +160,58 @@ class ScalarType : public Type {
 
 using ScalarTypePtr = std::shared_ptr<const ScalarType>;
 
+enum class RegKind : uint8_t { VecReg = 0, MaskReg = 1, UReg = 2 };
+
+/**
+ * @brief Register value descriptor, independent of addressable tile storage.
+ *
+ * VecReg and MaskReg have one static logical lane dimension and an element
+ * dtype. UReg carries linear, region-local squeeze-store alignment state
+ * without a lane dimension or element dtype.
+ */
+class RegType : public Type {
+ public:
+  RegType(int64_t shape, DataType dtype, RegKind kind);
+  [[nodiscard]] static std::shared_ptr<const RegType> GetUReg();
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::RegType; }
+  [[nodiscard]] std::string TypeName() const override { return "RegType"; }
+  [[nodiscard]] int64_t GetShape() const;
+  [[nodiscard]] int64_t GetLanes() const { return GetShape(); }
+  [[nodiscard]] DataType GetDType() const;
+  [[nodiscard]] RegKind GetRegKind() const { return kind_; }
+
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Type::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&RegType::shape_, "shape"),
+                                          reflection::UsualField(&RegType::dtype_, "dtype"),
+                                          reflection::UsualField(&RegType::kind_, "kind")));
+  }
+
+ private:
+  RegType() : kind_(RegKind::UReg) {}
+
+  std::optional<int64_t> shape_;
+  std::optional<DataType> dtype_;
+  RegKind kind_;
+};
+
+using RegTypePtr = std::shared_ptr<const RegType>;
+
+inline bool IsVecRegType(const TypePtr& type) {
+  return type && type->GetKind() == ObjectKind::RegType &&
+         std::static_pointer_cast<const RegType>(type)->GetRegKind() == RegKind::VecReg;
+}
+inline bool IsMaskRegType(const TypePtr& type) {
+  return type && type->GetKind() == ObjectKind::RegType &&
+         std::static_pointer_cast<const RegType>(type)->GetRegKind() == RegKind::MaskReg;
+}
+
+inline bool IsURegType(const TypePtr& type) {
+  return type && type->GetKind() == ObjectKind::RegType &&
+         std::static_pointer_cast<const RegType>(type)->GetRegKind() == RegKind::UReg;
+}
+
 /**
  * @brief Tensor layout enumeration
  *
@@ -173,12 +225,14 @@ enum class TensorLayout {
   DN,       ///< DN layout
   NZ,       ///< NZ layout
   MX_A_ZZ,  ///< MX Left/A scale GM pack (ZZ)
-  MX_B_NN   ///< MX Right/B scale GM pack (NN)
+  MX_B_NN,  ///< MX Right/B scale GM pack (NN)
+  MX_A_ND   ///< Row-major MX Left/A scales; TLOAD converts ND to L1 ZZ
 };
 
 /** True when layout selects the MX scale GM load path (TLoadMxCube*). */
 inline bool IsMxTensorLayout(TensorLayout layout) {
-  return layout == TensorLayout::MX_A_ZZ || layout == TensorLayout::MX_B_NN;
+  return layout == TensorLayout::MX_A_ZZ || layout == TensorLayout::MX_B_NN ||
+         layout == TensorLayout::MX_A_ND;
 }
 
 /**
@@ -298,10 +352,12 @@ TileLayout StringToTileLayout(const std::string& str);
  * Controls how partial boxed tiles are packed by layout-changing operations:
  * - null: Use the ordinary physical-tile layout
  * - normal: Pack only the valid region for a boundary tile
+ * - row_plus_one: Add one physical row per Vec NZ panel
  */
 enum class CompactMode {
-  null,    ///< Ordinary non-compact layout
-  normal,  ///< Compact valid-region layout
+  null,          ///< Ordinary non-compact layout
+  normal,        ///< Compact valid-region layout
+  row_plus_one,  ///< Padded Vec NZ panel pitch
 };
 
 /**
@@ -313,6 +369,14 @@ std::string CompactModeToString(CompactMode mode);
  * @brief Convert string to CompactMode enum
  */
 CompactMode StringToCompactMode(const std::string& str);
+
+/**
+ * @brief Convert a serialized PadValue spelling to its enum value.
+ *
+ * Returns nullopt for an unknown spelling so each deserializer can keep its
+ * own error message and exception class.
+ */
+std::optional<PadValue> TryStringToPadValue(const std::string& str);
 
 /**
  * @brief Physical descriptor of an explicit on-chip buffer reference

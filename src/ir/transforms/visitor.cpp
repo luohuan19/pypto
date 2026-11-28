@@ -86,7 +86,7 @@ void IRVisitor::VisitExpr_(const CallPtr& op) {
     VisitExpr(op->args_[i]);
   }
   // Reference-typed attrs name Vars defined elsewhere in the IR — ``deps=[tid]``,
-  // ``dumps=[t]`` / ``pl.dump_tag``, ``device=``, an SPMD ``core_num``. They are
+  // ``dumps=[t]`` / ``pl.dump_tag``, ``worker=``, an SPMD ``core_num``. They are
   // real uses: without visiting them a scalar assigned only to size a launch
   // looks dead, gets eliminated, and leaves the attr dangling. Dispatch on the
   // stored type (see ``ForEachAttrExpr``) so a key nobody thought to enumerate
@@ -128,7 +128,7 @@ void IRVisitor::VisitExpr_(const SubmitPtr& op) {
   // must walk them too so unused-var / def-use / SSA-liveness analyses do not
   // silently drop a Var referenced only through an attr. Type-dispatched, so
   // this arm no longer diverges from the Call arm the way the old key lists did
-  // (``kAttrDevice`` was walked on a Call but not here).
+  // (the legacy device-placement attr was walked on a Call but not here).
   for (const auto& [k, v] : op->attrs_) {
     ForEachAttrExpr(v, [this](const ExprPtr& e) { VisitExpr(e); });
   }
@@ -308,6 +308,13 @@ void IRVisitor::VisitStmt_(const GraphScopeStmtPtr& op) {
   VisitStmt(op->body_);
 }
 
+void IRVisitor::VisitStmt_(const RegScopeStmtPtr& op) {
+  INTERNAL_CHECK_SPAN(op->body_, op->span_) << "RegScopeStmt has null body";
+  // A ``pl.dump_tag`` / ``dumps=`` puts ``kAttrDumpVars`` on this scope too.
+  VisitScopeAttrs(op);
+  VisitStmt(op->body_);
+}
+
 void IRVisitor::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "HierarchyScopeStmt has null body";
   VisitScopeAttrs(op);
@@ -364,6 +371,18 @@ void IRVisitor::VisitStmt_(const BreakStmtPtr& op) {}
 void IRVisitor::VisitStmt_(const ContinueStmtPtr& op) {}
 
 void IRVisitor::VisitStmt_(const InlineStmtPtr& op) {}
+
+void IRVisitor::VisitStmt_(const SimtScopeStmtPtr& op) {
+  for (const auto& var : op->private_scalars_) VisitExpr(var);
+  for (const auto& dim : op->block_dims_) VisitExpr(dim);
+  VisitStmt(op->body_);
+}
+
+void IRVisitor::VisitStmt_(const SimtLaunchStmtPtr& op) {
+  for (const auto& dim : op->block_dims_) VisitExpr(dim);
+  for (const auto& arg : op->args_) VisitExpr(arg);
+  for (const auto& result : op->results_) VisitExpr(result);
+}
 
 void IRVisitor::VisitStmt_(const StmtPtr& op) {}
 

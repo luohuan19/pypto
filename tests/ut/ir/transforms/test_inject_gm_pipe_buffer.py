@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Unit tests for the InjectGMPipeBuffer pass (Ascend910B-gated)."""
+"""Unit tests for the InjectGMPipeBuffer pass (Ascend910-gated)."""
 
 import pypto.language as pl
 import pytest
@@ -17,9 +17,9 @@ from pypto.backend import BackendType
 
 @pytest.fixture(autouse=True)
 def _setup_backend():
-    """Configure Ascend910B backend before each test and reset afterward."""
+    """Configure Ascend910 backend before each test and reset afterward."""
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
     yield
     backend.reset_for_testing()
 
@@ -85,7 +85,7 @@ def test_gm_pipe_injection_handles_submit_launched_group():
     """A Group launched via pl.submit from a manual_scope must be wired too.
 
     Submit is a first-class call-like IR kind (pass-submit-awareness.md). On
-    910B, an Orchestration that launches a pipe-using Group via
+    910, an Orchestration that launches a pipe-using Group via
     `result, tid = pl.submit(self.group_func, ...)` must, per doc 22 lines
     11-12 and Phase 3 (lines 61-65), receive a per-call-site placeholder
     `tensor.create` and forward that workspace as an extra Submit argument —

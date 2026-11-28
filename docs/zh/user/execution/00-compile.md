@@ -1,5 +1,9 @@
 # 编译
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 把一个程序或一个 `@pl.jit` kernel 变成设备 kernel 与主机编排。
 
 ## 概念
@@ -54,7 +58,7 @@ assert compiled.param_names == ["a", "b", "out"]
 | `output_dir` | `None` | 产物落点；`None` 表示每次调用在 `PYPTO_PROG_BUILD_DIR` 或 `build_output` 下新建一个 `<name>_<YYYYmmdd_HHMMSS>_<random>`。时间戳便于阅读，随机尾缀保证并发编译互不覆盖，因此路径不可推导 —— 请读 `compiled.output_dir` |
 | `strategy` | `Default` | pass 流水。`Default` 是唯一策略 |
 | `dump_passes` | `True` | 每个 pass 之后的 IR 快照 —— 见下 |
-| `backend_type` | `Ascend910B` | pass 与 codegen 的目标（`Ascend910B` / `Ascend950`） |
+| `backend_type` | `Ascend910` | pass 与 codegen 的目标（`Ascend910` / `Ascend950`） |
 | `platform` | `None` | 产物面向的执行平台；必须与派发它的 worker 一致 |
 | `skip_ptoas` | `False` | 停在 `.pto`（MLIR），不构建设备二进制 |
 | `verification_level` | `None` | `NONE` / `BASIC` / `ROUNDTRIP`；`None` 交给 `PYPTO_VERIFY_LEVEL`，否则 `BASIC` |
@@ -64,10 +68,10 @@ assert compiled.param_names == ["a", "b", "out"]
 | `profiling` | `False` | 逐阶段编译计时写入 `report/pipeline_profile.{txt,json}` |
 | `distributed_config` | `None` | 按 rank 编译 HOST 级程序（[分布式](../distributed/index.md)） |
 | `analyze_auto_scopes_for_deps` | `False` | 对 AUTO 作用域做编译器推导依赖 |
-| `enable_pypto_l0c_double_buffer` | `None` | L0C double buffer |
+| `enable_pypto_l0c_double_buffer` | `None` | 旧版开关；PYPTO/DSA_RP 禁用自动 dbC，PTOAS 保留自动 dbC 且不受此开关影响 |
 | `emit_source_loc` | `None` | 把 DSL 源位置带进发出的 `.pto` |
 | `dump_ptoas_passes` | `False` | 同时 dump ptoas 自己的 pass IR |
-| `runtime` | `None` | 面向哪个 Simpler 运行时 ABI —— `TENSORMAP_AND_RINGBUFFER` 或 `HOST_BUILD_GRAPH`（`@pl.jit.graph` 需要它 —— [函数](../language/01-functions.md)）；`None` 继承当前 `PassContext`。派发它的 worker 必须与之匹配 |
+| `runtime` | `None` | 面向哪个 Simpler 运行时 ABI —— `TENSORMAP_AND_RINGBUFFER` 或 `HOST_BUILD_GRAPH`。该目标决定 [Graph 片段](../language/01-functions.md)的执行路径。`None` 继承当前 `PassContext`。派发它的 worker 必须与之匹配 |
 
 ### Pass dump
 
@@ -94,9 +98,17 @@ assert compiled.param_names == ["a", "b", "out"]
 
 ### `JITFunction.compile`
 
-`@pl.jit` 平时把特化 + 编译 + 派发融成一次 `kernel(*args)` 调用。`compile(*sample_args)` 在编译后停下，返回 JIT 缓存持有的那个 `CompiledProgram` —— 所以之后用同一个特化键调用会拿到同一个对象。
+`kernel.compile(*sample_args, config=cfg)` 按 PROGRAM 契约完成特化与编译，不执行派发。
+它返回缓存的 `CompiledProgram`；以相同特化和编译配置重复显式调用 `.compile()`，
+会得到同一个对象。通过 `compiled(*args, config=cfg)` 或显式 worker 执行该对象。
 
-它暴露了完整的提取面，这正是直接驱动运行时的 harness 所需要的：`chip_callable`、`runtime_name`、`runtime_config`、`output_dir`、`platform`、`output_indices`、`param_names`、`orchestration_names`、`has_return`。实参编排不属于这个面 —— 交给 [`ChipWorker`](01-run.md#显式派发) 派发，它会替你完成。
+直接 `kernel(*args)` 则要求先调用 `pypto.torch.init()` 并传入真实 NPU Tensor，
+按 eager KERNEL 契约特化、编译并提交，其缓存项与 PROGRAM 编译分开。
+它的可选 `config` 为 `CompileOptions`，不接受 `RunConfig`；主机 Tensor 和模拟器
+执行应使用上述显式 program 路径。完整 eager 契约见
+[kernel 模式](../../dev/runtime/kernel-mode.md)。
+
+PROGRAM 产物暴露了完整的提取面，这正是直接驱动运行时的 harness 所需要的：`chip_callable`、`runtime_name`、`runtime_config`、`output_dir`、`platform`、`output_indices`、`param_names`、`orchestration_names`、`has_return`。实参编排不属于这个面 —— 交给 [`ChipWorker`](01-run.md#显式派发) 派发，它会替你完成。
 
 `lower(*args)` 比它早停一站：只跑 pass 并返回 `Program`，不写任何产物 —— 也就意味着没有 `passes_dump/`。它适合 [torch codegen](../tools/01-torch-codegen.md)，那里要的就是 IR 本身；而[内存图](../tools/02-memory-map.md)读的是磁盘上的 dump，因此需要 `compile()`。
 

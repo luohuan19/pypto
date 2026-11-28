@@ -1,0 +1,178 @@
+# LegalizeMxScaleTensorViews and legacy BlockMxScaleTensorViews
+
+## Default pipeline: logical views
+
+`LegalizeMxScaleTensorViews` replaces `BlockMxScaleTensorViews` in the default
+PTO pipeline for PTOAS. It runs after `FlattenTileNdTo2D` and
+`BlockNzTensorViews`, before `MaterializeTensorStrides`.
+
+The pass retains logical `MX_A_ZZ [M, G]`, `MX_B_NN [G, N]` and
+`MX_A_ND [M, G]` tensor shapes,
+load/store coordinates, and shaped ND/MX aliases. `MaterializeTensorStrides`
+emits logical contiguous strides `[cols, 1]`. Codegen transcribes these views
+directly; PTOAS constructs the physical SFractal descriptors.
+
+Shape and offset checks are shared with the legacy pass below. ZZ/NN require
+static positive extents aligned to 16 rows / 2 groups and provably non-negative
+aligned offsets. Distributed MX tensors remain unsupported; partial tensor
+valid shapes remain unsupported for ZZ/NN. A narrowed ZZ/NN load valid shape does not shrink the DMA box: the pass uses the full
+aligned logical load window while preserving the tile result's active extents.
+PTOAS does not accept a direct store from a fractal-32 Vec scale tile. For a
+fully valid, complete ZZ/NN destination buffer at zero offset, the pass instead
+flattens the packed source to a one-row tile and aliases the destination as a
+one-row ND tensor. The resulting `pto.tstore` writes the identical packed
+scale bytes; its SSA result is a shaped MX view again. This allows tensor
+`quant_mx` to return its payload and public MX scale tensor together. Partial
+packed stores remain unsupported: their physical boxes need not be contiguous.
+
+`MX_A_ND` preserves row-major GM storage and converts directly to ZZ Mat during
+TLOAD. Rows and row offsets may be dynamic and need not be multiples of 16;
+the positive static group dimension and group offsets must contain complete
+aligned pairs. Its exact valid-row tail is retained in the DMA window. See the
+`MX_A_ND` example below for K=2304 / 72 scale groups per row.
+With `clamp=True`, the DMA window uses the inferred source-valid extent rather
+than the authored request: a 32-row tile loaded from 19 valid source rows reads
+only those 19 rows. The clamped scale-group extent must still contain complete pairs.
+
+Functions are stamped `mx_tensor_views_legalized` to make repeated legalization
+idempotent. The public factory is `passes.legalize_mx_scale_tensor_views()`.
+
+## Legacy explicit blocking
+
+`passes.block_mx_scale_tensor_views()` retains the rank-5 transformation below
+for explicit callers. It is no longer in the default pipeline, and its output
+is not a valid MX tensor-view input to PTOAS. Do not chain it before the
+new logical legalization pass.
+
+## Overview
+
+`BlockMxScaleTensorViews` converts logical MX scale tensor views into the
+packed rank-5 SFractal form required by A5, and rewrites every operation whose
+coordinates depend on that physical form.
+
+This is a **migration of physical-view lowering** from the backend's former
+`EmitMxPhysicalView` helper into an explicit IR pass. After the pass, tensor
+types, load windows, aliases, stride materialization, verification, and generic
+codegen all see one canonical representation; codegen no longer reconstructs a
+different MX view privately.
+
+The pass is independent from `BlockNzTensorViews`. MX and NZ are different
+layouts and keep separate transformation and proof implementations.
+
+## Physical form
+
+The DSL exposes three logical rank-2 scale layouts:
+
+```text
+MX_A_ZZ [M, G] -> [1, M/16, G/2, 16, 2]
+MX_B_NN [G, N] -> [1, N/16, G/2, 16, 2]
+MX_A_ND [M, G] -> [M, G]
+```
+
+The trailing `[16, 2]` is one 32-byte FP8E8M0 scale box. Row-major strides over
+the blocked shape are the physical GlobalTensor strides, so
+`MaterializeTensorStrides` can use its ordinary packed-stride path after this
+pass.
+
+`MX_A_ND` keeps the existing row-major GM ABI, including compact expert rows.
+Its logical rank-2 view is already canonical; PTOAS builds the ISA's paired
+GlobalTensor descriptor and TLOAD converts directly into row-major ZZ Mat.
+The row extent may be dynamic or not divisible by 16. Scale groups are static,
+positive and even (for example, K=2304 has 72 groups). Group offsets must be
+non-negative multiples of 2; row offsets remain ordinary row coordinates.
+
+```python
+# In an @pl.jit.incore kernel, scales has layout pl.MX_A_ND.
+scale_mat = pl.load(scales, [compact_row_base, 0], [16, 72],
+                    valid_shape=[valid_rows, 72])
+left_scale = pl.move(scale_mat, pl.Mem.LeftScale)
+```
+
+The valid-row tail is preserved in the physical load, so it does not read
+into the next compact expert. `MX_A_ND` is a load descriptor; write row-major
+scale bytes through an ordinary ND tensor, then create a shaped FP8E8M0
+`tensor.view(..., layout=pl.MX_A_ND)` alias. A metadata view itself never packs
+or rearranges scale bytes. The usual `matmul_mx` LeftScale semantics remain
+unchanged, and B scales still use `MX_B_NN`.
+
+## Position in the pipeline
+
+```text
+... -> FlattenTileNdTo2D -> BlockNzTensorViews
+    -> BlockMxScaleTensorViews -> LegalizeTileCast -> ...
+```
+
+The pass runs after `FlattenTileNdTo2D`, when `tile.load` results are logical
+2-D tiles, and before all consumers that require a physical MX tensor shape.
+`MaterializeTensorStrides` later fills the rank-5 row-major strides.
+
+## Rewrites
+
+For every MX_A_ZZ or MX_B_NN tensor, the pass rewrites:
+
+- `TensorType` slots recursively inside parameters, returns, tuples, variables,
+  iteration arguments, Calls, and Submits;
+- `tile.load` offsets and shapes into rank-5 coordinates;
+- `tile.store` MX-scale destinations and optional partition shapes into the
+  matching rank-5 coordinates; stores require complete FP8E8M0 16x2 boxes;
+- physical `valid_shape` arguments to the complete aligned load box while
+  preserving a narrowed logical `TileType.valid_shape` as tile metadata;
+- shaped FP8E8M0 `tensor.view` aliases in both ND-to-MX and MX-to-ND directions;
+- Submit return types without changing dependencies, keyword arguments,
+  attributes, core count, predicate, or synchronization fields.
+
+The destination `TileType` of a load remains logical 2-D. Only the GM source
+partition becomes rank-5.
+
+## Offset mapping and proofs
+
+Logical coordinates map as follows:
+
+```text
+MX_A_ZZ [m0, g0] -> [0, m0/16, g0/2, 0, 0]
+MX_B_NN [g0, n0] -> [0, n0/16, g0/2, 0, 0]
+```
+
+Constants must be non-negative and aligned. Symbolic offsets are accepted only
+when the pass's private MX proof engine proves both divisibility and
+non-negativity. It understands:
+
+- scalar SSA definitions;
+- constants, multiplication, addition, and subtraction for divisibility;
+- positive power-of-two floor division, including forms such as `k0 // 32`;
+- loop variables with constant start and step;
+- the non-negative results of `tile.get_block_idx` and `tile.get_block_num`;
+- scalar arguments propagated through every Call and Submit site.
+
+Every caller must prove a callee parameter fact. Missing or malformed call
+mappings, recursion, and expressions that exceed the bounded 256-step proof
+budget are rejected conservatively. The bound keeps the pass O(N) and proof
+failure can never turn into assumed alignment.
+
+The quotient is emitted as `FloorDiv(offset, divisor)`, preserving the original
+fixed-width expression's evaluation before division.
+
+## Scope and diagnostics
+
+| Condition | Outcome |
+| --------- | ------- |
+| static, aligned rank-2 MX shape | converted to canonical rank-5 form |
+| aligned, provably non-negative symbolic offset | converted to rank-5 coordinates |
+| unprovable or negative offset | rejected |
+| partial tensor-level `valid_shape` | rejected |
+| narrowed load-level `valid_shape` | kept as tile metadata; physical box stays complete |
+| `target_memory != Mat` or missing in raw IR | rejected; public `pl.load` fills omitted target with `Mat` |
+| MX tensor used by an unsupported operator | rejected |
+| `tile.store` of complete FP8E8M0 16x2 scale boxes | rewritten to a rank-5 MX destination |
+| shaped FP8E8M0 ND/MX backing alias | rewritten |
+| distributed MX tensor | rejected |
+
+Functions receive the `mx_tensor_views_blocked` attribute after the pass. That
+provenance stamp makes a second invocation a no-op without trying to infer pass
+state from a shape that might coincidentally look blocked.
+
+## See also
+
+- [BlockNzTensorViews](17-block_nz_tensor_views.md)
+- [MaterializeTensorStrides](35-materialize_tensor_strides.md)
+- [InsertMxScaleAddr](23-insert_mx_scale_addr.md)

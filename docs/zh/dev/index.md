@@ -32,15 +32,245 @@ PyPTO 的构成：IR、pass 流水线、代码生成，以及围绕它们的基�
 | [编译与执行入口](08-entry-points.md) | 全部编译与执行入口、各自所属的层，以及何时该用哪一个 |
 | [分布式算子](distributed_ops.md) | N6 分布式算子家族 —— 对集合通信与低层原语的类型化 DSL 访问 |
 | [PTOAS 算子状态矩阵](ptoas-op-status.md) | 编译器当前会发射哪些 PTOAS 公开与兼容算子 |
-| [FP4](fp4.md) | 逻辑 vs packed FP4、cast 策略，以及手写 `FP4E2M1X2` 指引 |
+| [FP4](fp4.md) | 打包 E2M1x2/E1M2x2 类型、字节载体 ABI 与现有 E2M1 算子支持 |
+
+## 按需运行 A5 分布式 CI
+
+在以 `main` 为目标的开放 PR 中，等当前提交的自动 lint 通过后，在对话区新发一条 `/ci a5-distributed` 评论，
+即可对该 PR 的临时合并版本单独运行 `onboard-tests-a5-distributed`。
+若 lint 尚无运行记录、正在运行或已失败，请求会在设备排队前结束。lint 通过后需重新发送命令。
+PR 最新提交上的 `ci/a5-distributed` 检查链接到运行记录和测试产物。
+对同一 PR 提交重复发送命令会复用运行中或已成功的任务。若任务结束时未成功（包括超时），
+可重新发送命令，新请求会关闭该次运行遗留的检查。新检查会记录所属 PR 编号，即使工作流运行已删除，
+重新发命令也能关闭该 PR 遗留的检查。整条工作流重跑时，设备任务排队前就会显示本次尝试的检查。
+单独重试结果回写时，回写任务会直接完成先前挂起的检查。
+此任务仅由该评论命令触发。如果 PR 包含 `tests/st/distributed/test_l3_urma_async.py`，
+则使用两张 A5 卡运行测试并跳过四卡用例；否则运行占位测试。占位测试通过不代表已验证硬件行为。
+
+## 评论触发完整 CI
+
+PR 专用 `CI` 工作流（`ci.yml`）在创建或更新时自动运行 `changes`、`toolchain`、`pre-commit` 和
+`clang-tidy`，随后运行轻量 `lint-gate`；独立的 `Docs / build` 检查也会运行。纯文档 PR 保留自动跳过
+`clang-tidy` 的规则。PR 不再自动启动设备测试或 wheel 构建。
+
+包括 fork 在内的自动 PR 运行始终选择 lint，并从受信任的 PR base SHA 加载控制脚本。
+因此，PR 中修改 `ci_control.py` 不会改变档位选择。控制脚本必须已存在于 main。
+档位选择不依赖仓库变量，因为 fork PR 运行中这些变量可能为空。
+
+这是现有 `pull_request` 流程的调度约定，不提供完整的防恶意占用 runner 保障。
+PR 仍可以修改自己的 workflow、删除任务条件，或新增使用可用 runner 的任务。
+`/ci full` 命令会校验 PR 版本，结果发布器也会验证受信任的调度来源，但它们均不限制
+任意 PR 自行编写的工作流。强制执行该边界需要独立的 GitHub runner 访问策略
+和受信任工作流限制。本次不修改这些管理员配置。
+
+任何能够在 PR 下评论的用户，包括没有仓库写权限的外部贡献者，都可以在 PR 对话中
+发布内容恰好为以下命令的评论：
+
+```text
+/ci full
+```
+
+`CI Command` 工作流要求 PR 处于打开状态且目标为本仓库的 `main` 分支，
+从受信任的 `main` 调度 `CI Full`。
+它固定 PR head、base 和测试合并提交（test merge）的 SHA，并在测试开始前
+验证其 SHA 与 GitHub 当前测试合并提交一致，并验证父节点。支持 fork PR。
+Full 测试基线取自实际测试合并提交的第一个父节点，不使用 PR 缓存的 `base.sha`，
+也不把旧快照标记成最新 main；第二个父节点必须对应当前 PR head。
+当快照 base 是实时 `refs/heads/main` 的祖先，且**落后 0–10 个提交**时，允许直接使用。
+落后 11 个及以上、历史被重写或距离无法确定时拒绝请求。调度输入和运行标题记录实际
+被测的 base。Lint 选择同一 PR head 且 base 仍属于 main 历史的最新自动运行。
+放行 full 前，命令比较固定的 PR head 与实时 main：**落后 0–10 个提交允许继续，
+落后 11 个及以上则拒绝**。只统计 main 已有、PR 尚未包含的提交，不统计 PR 自身新增的提交。
+评论被拒绝后，会收到包含落后数量的回复，提示先 rebase 到最新 main、等待 lint，
+再重新评论 `/ci full`。检查发生在调度和写入 pending 之前，full 准备阶段也会重复检查，
+防止手动调度 PR full 绕过限制。自动 lint 和 main push CI 不受影响。
+GitHub 尚未完成合并计算，或返回的父节点与当前 PR head 不一致时，命令在
+GitHub 托管 runner 上每五秒轮询一次，重试窗口为 60 秒；符合条件的旧 base 快照会立即放行。
+等待期间固定最初的 head 和实时 main 引用：版本变化、PR 关闭、目标无效或确认存在冲突
+都会停止请求。Full 准备阶段再次验证固定的合并提交与 base、可合并状态，以及 PR head
+和快照 base 相对实时 main 的落后数量。有冲突时需更新分支、等待 lint，再评论 `/ci full`。
+API 错误、无效版本和不符合要求的快照 base 不会作为合并计算中的状态重试。
+校验或调度失败时，独立任务会在 PR 下回复原因和命令运行的日志链接。
+仅该任务持有评论写权限，准入任务仍为只读。回复按命令运行及其 attempt 去重。
+若脚本尚未输出原因就失败，回复会指向日志；Actions 总结也会记录错误。
+超时后需新发一条 `/ci full` 评论，编辑旧评论不会触发。API 错误后重试前，应先
+检查调度是否已经创建 full 运行。
+相同版本已有排队或运行中的请求时，不会重复调度。命令先直接验证当前状态
+链接的运行，再搜索运行历史，因此即使运行列表尚未索引到新运行，也会保留已绑定的
+pending 请求。原生 rerun 已开始、状态仍显示上次失败时，也会检查真实运行状态，
+即使 main 已前进也不会重复调度。同一 head
+已经有经过验证且仍符合落后提交数限制的 full 成功结果时，评论也不会重新调度或重置绿色门禁。评论权限允许用户
+请求设备测试，不授予仓库写权限或合入权限；重复检测也不提供通用限流。
+通过 PR 和版本校验后，命令会先写入 `ci/full=pending`，再调度运行，避免发布器
+排队期间仍沿用之前的成功状态。只读准入任务先验证 PR 并固定 head，再加入
+与发布器共享的 PR/head 队列。取得执行权后重新校验 PR 及其版本，写入 pending，
+调度运行，并将 pending 状态绑定到返回的运行 ID。head 已改变时拒绝操作，避免在错误的锁下写入。
+初始状态写入失败时不会调度。Pending 标记和 full 运行标题同时记录命令的运行 ID
+与 attempt，因此调度响应丢失或运行 ID 绑定失败后，已创建的 full 仍能回写自己的结果，
+旧运行不能清除新命令的标记。若未创建运行，可重新评论 `/ci full`。不带请求 ID 的
+历史标记仍需手动恢复。即使运行历史尚未索引到新运行，发布器也会保留已绑定的新运行状态。
+
+评论会在最新匹配的自动 PR 运行中 `pre-commit`、`clang-tidy` 通过后放行后续测试。
+匹配范围包括 PR 编号、head SHA、工作流和 fork 身份；不同事件记录的 base 可以不同，
+但仅当 base 是实时 main 的祖先时才可复用，避免 main 历史重写后沿用已脱离主线的 lint。
+选取符合条件的最新运行，不能绕过较新的失败或取消记录。纯文档 PR 在验证
+变更路径后可以复用已跳过的 `clang-tidy`。Lint 缺失、运行中或失败时拒绝请求，
+等待评论期间不占用 runner。PR head 变化后必须有匹配的新 lint 结果。仅主线前进、
+head 未变时不会重新运行 lint；full 测试固定的主线合并版本，复用该 head 的 lint 结果。
+
+后续运行跳过两个 lint 任务，轻量门禁确认复用有效后再启动测试；版本校验和工具链
+准备仍会执行。Full 包括复用的 lint 结果、wheel 预热、单元、示例、代码生成、系统、分布式、pypto-lib
+以及 A5 板上测试及模拟器测试。纯文档 PR 也执行核心测试。`docs-examples` 仅在文档变更
+时适用。变更 `PTOAS_VERSION` 的 PR 必须同时通过 `serving-guard-a2a3` 和 `serving-guard-a5`。
+两个任务调用 `hw-native-sys/pypto-serving@main` 的同一份 CI 工作流，分别选择 `unit-tests` 和
+`v41-a5-smoke`，并传入本次测试的 PyPTO 合并提交 SHA。PyPTO 通过 `runner-labels` 为 A2/A3 选择 `npu-xp`，
+为 A5 选择 `npu-a5`。Serving 维护模型测试和设备配置。在 PyPTO `main` 上手动启动 full 且不填写
+PR 参数时，测试的是触发时的提交，两个选中的 serving 任务都必须返回成功。
+Wheel 预热失败不单独
+阻止合入，因为测试任务可以自行构建；所有适用测试都必须成功。
+
+重测试仅定义在 `CI Full`（`ci-full.yml`）中，因此自动 PR 运行不会再创建整排重测试的
+skipped 检查。公共准备和 lint 任务以 `ci-full.yml` 为源，运行
+`python tests/lint/generate_ci_lint.py --write` 生成 PR 工作流；pre-commit 检查生成结果是否同步，
+保证 PR 和 main 使用相同的 lint 实现。
+
+发布器同时接受拆分前 `ci.yml` 和拆分后 `ci-full.yml` 创建的 full 运行，并校验各自的
+工作流 ID。旧 run ID 仍可补写状态，原生 rerun 继续使用原工作流。跨工作流的新旧请求
+按原始创建时间比较，不使用互相独立的运行序号。自动 lint 运行不能发布 full 成功状态。
+main push 和不填写 PR 输入的手动运行使用 `CI Full`；Daily CI 和 AI Review 的策略不变。
+已生成的历史 skipped 检查不会被删除，新运行使用拆分后的清晰列表。`ci.yml` 的身份和 lint
+任务名称保持不变，使部署这个拆分的 PR 也能通过旧版 main 控制器复用 lint。
+
+### 结果与重跑
+
+PR 保留原有 lint 检查，并在 PR 检查列表中以独立的 `full / <job name>` 提交状态
+（commit status）逐项展示后续任务，包括矩阵分支和直达原任务日志的链接。
+这些状态不会向 lint 工作流增加任务。使用提交状态可避开 Actions 的 `GITHUB_TOKEN`
+创建检查记录时的分组及 Details 链接覆盖问题。排队和运行均显示 pending，由说明文字区分；
+跳过或中立结果显示 success，说明文字保留真实结论。只有 `ci/full` 判定必需测试是否通过。
+切换前测过的提交还可能显示历史状态 `full / serving-guard`。
+`CI Full Progress` 使用 GitHub 托管 runner，单个 full 运行时约每分钟读取 GitHub
+元数据并刷新检查，不执行 PR 代码，也不向测试任务提供写入 token。并发运行增多或
+共享 API 配额不足时降低刷新频率，预留 200 次请求给门禁发布器和其他自动化，
+临时 API 错误（包括首次解析运行 ID 失败）使用有界退避重试。等待评论时
+不会启动监控。实时监控最长运行五小时；汇总任务会显式调度最终结果同步，也能在
+监控失败或超时后恢复。逐项检查仅用于展示：合入应要求 `ci/full`，不要逐项要求
+`full / ...`，因为部分任务按条件执行或仅提供预热。
+
+原生重跑向相同的 `full / ...` 状态项发布，包括沿用之前轮次的结果。GitHub 每个状态项
+仅展示最新值，底层状态历史采用追加方式；未变化的结果不会反复发布。完整执行历史保留在
+full 工作流中，每个状态链接到实际采用的任务。可信路由器按 PR 提交串行执行进度发布器，
+避免旧运行覆盖较新发布器的结果。旧版发布器的历史检查记录仍保留在原提交上；更新 PR
+分支后可得到仅使用新提交状态的干净展示。
+
+`ci/full` 是 PR head 的提交状态（commit status），由 `CI Command` 初始化，
+再由 `CI Full Status` 更新。绑定 full 运行 ID 后，`CI Command` 会显式调度
+`CI Full Progress`。监控确认源运行属于受信任的 PR full 后，退出时才请求状态发布；
+普通的 main 手动 CI 不会请求 PR 状态发布器。确认后的源运行 ID 会保留，因此
+后续监控失败仍能请求状态同步。隔离的 `full-result` 任务也会调度
+两个发布器，包括测试失败和原生重跑的情况。汇总任务发出的状态请求会先等待源运行
+结束，再进入写入队列；五分钟轮询窗口内，状态读取失败会继续重试。
+用于展示的逐项检查调度失败不会改变测试结果。因此不依赖 `GITHUB_TOKEN` 调度运行的 `workflow_run`
+事件投递；这些事件仍保留为补充入口。无需额外 token 或 App 配置。
+Full 运行时状态为 pending；只有 `full-result` 确认所有适用测试通过才会成功。
+必要测试被跳过、缺失、失败或取消均不能满足该检查。结果发布器使用全新的
+GitHub 托管 runner，只读取 GitHub 元数据，不执行 PR 代码或下载运行附件。
+进入状态写入并发组之前，路由任务会校验事件的 main 分支、工作流身份和仓库，
+再通过 REST 查询对应的精确运行轮次，读取完整运行标题。任务入口不再使用 webhook
+中的显示标题进行过滤。路由器将已验证的身份传给发布器，发布器写入前重新读取实时状态，
+防止无关运行挤掉正在排队的发布任务。命令和发布器共享设置了
+`queue: max` 的并发组，旧事件不会替换已经排队的完成通知。GitHub 每组允许 100 个
+等待任务，超出上限的新任务会被取消；被取消的命令或完成发布任务需要重试。
+
+若测试已通过，但因遗漏回写导致 `ci/full` 仍为 pending，可在
+**Actions → CI Full Status → Run workflow** 中选择 `main`，将已有 full 运行的
+ID 填入 `run_id`。该操作仅同步元数据，不调度测试或占用设备 runner。
+恢复入口使用相同的 PR/head/base 校验和写入队列，保留较新请求，不能将过期或失败的
+运行改为成功。更新后的工作流合入 main 后，该入口才可使用。逐项检查缺失时，
+同样可在 **Actions → CI Full Progress → Run workflow** 中填写该 `run_id` 进行恢复。
+
+测试任务不持有写入状态或修改 Actions 的 token。`CI` 和 `CI Full` 两个工作流均声明
+`cache-mode: read`，由 GitHub 缓存服务阻止写入，包括 PR 代码直接调用缓存 API。
+托管 runner 通过同一次运行的附件共享 wheel，每次构建尝试使用独立名称。
+附件过期或缺失时回退到本地构建。这也使 CI 的主分支运行只读 GitHub 缓存；
+其他工作流和自托管 runner 的磁盘缓存策略保持不变。
+
+在 GitHub Actions 的 full 运行页面选择 **Re-run failed jobs**。原测试版本保持
+不变；汇总任务结合之前已成功的依赖和本次重跑结果判断是否通过。如果仅缺少
+汇总任务，还需重跑该任务。汇总任务显式请求结果发布，发布器忽略被较新请求替代的运行。
+实时监控退出后发起的重跑，会在汇总任务结束时同步逐项结果；需要恢复实时进度时，
+使用现有运行 ID 调度 `CI Full Progress`。重跑旧运行仍使用原工作流代码，因此本修复
+之前创建的运行仍需要手动恢复入口。若重跑开始事件未投递，之前成功的运行在原生重跑
+期间可能保留绿色状态；需要重新执行合入门禁判定时，应提交新的 PR 版本。
+若路由器查询运行失败，但事件来源及完整 PR 标题仍可验证，会排队执行仅能标记失败的
+更新，避免旧绿色门禁因查询失败而保留。该路径保护经过验证的较新写入者，不能仅凭
+事件数据标记成功。无法验证 PR 身份的事件会被拒绝；逐任务进度仍按原有机制重试 API。
+发布时若发现 PR 已切换 head、关闭或改变目标，发布器会将原测试 head 标记失败，除非已有
+经过验证的较新请求拥有该状态。因此，恢复原 head 或重新打开 PR 不会恢复旧的绿色结果。
+只有从 `main` 发起的 dispatch 才参与请求去重或替代旧请求；
+其他分支或引用发起的 dispatch 会被忽略。去重扫描从 PR 创建时间开始，同时查询所有状态，
+达到 GitHub 搜索上限时拆分创建时间区间，避免状态切换使已有请求漏查。重跑旧请求不会取消新请求。新提交需要重新评论 `/ci full`。
+如果 main 在运行期间更新，逐项任务继续同步真实状态，`ci/full` 在运行期间保持 pending。
+成功结束后对 PR head 和实际被测 base 都按相同规则检查：落后 main 0–10 个提交可以通过，
+任意一项落后 11 个及以上标记失败，
+并在状态说明中提醒 rebase；主线历史不再包含测试 base 时也拒绝通过。
+重复评论会复用同一 head 的进行中运行，以及仍满足该规则的成功结果。
+此校验发生在发布时；成功发布后 main 再更新，不会自动撤销已有成功状态。合入时强制分支跟上最新 main 属于独立的 ruleset 策略，本 PR 不修改。
+变更路径分类使用固定的 base/head SHA 比较，后续 PR 推送不会改变本次运行应执行的条件检查。
+比较失败或达到 GitHub 的 300 文件上限时，会启用所有条件检查。
+
+如果无法读取实时运行信息，发布器先校验 GitHub 事件中的工作流、仓库、分支和运行身份，
+再撤销门禁成功状态。事件数据不能用于判定成功；已验证属于较新请求或同一运行较新
+attempt 的状态仍会保留。较新 attempt 必须通过对应轮次的元数据校验，不能仅信任状态 URL。
+如果历史检索达到 GitHub 搜索上限，或无法读取工作流/PR/任务元数据，发布器会保留
+能够验证属于较新请求或较新 attempt 的已发布状态；否则将 `ci/full` 标记失败，避免无法验证的
+重跑继续沿用旧的成功状态。
+此时重新评论 `/ci full`，即可创建历史查询窗口较小的新请求。
+外部 `pr-rerun` 服务保持不变：仍可重跑符合条件的普通 PR CI，但不能发现和
+授权这些手动调度的 full 运行。
+
+`main` push、不含 PR 参数的手动 CI、Daily CI 和 AI Review 保留原有策略。
+手动 PR 参数主要供评论处理器使用；四个参数均留空时，对 main 执行 CI。
+
+### 管理员启用步骤
+
+旧仓库变量 `CI_COMMENT_TIERS_ENABLED` 不再用作启用开关。PR 始终自动运行 lint；
+设置、清除或修改该变量均不会启用自动 full CI。无需 GitHub App 密钥、公网
+webhook 地址或服务升级。
+
+1. 确保 main 的 ruleset 已将 `ci/full` 设为必需状态检查，保留 `pre-commit`、
+   `clang-tidy` 和原有审批要求；可选来源时选择 GitHub Actions。
+   完成后续验证前保留旧的重测试必需检查。评论处理器和控制脚本必须已存在于
+   main，使本次升级 PR 能在合入前通过 `ci/full`。
+2. 将更新后的工作流和脚本合入 `main`。
+   更新测试 PR 分支以包含此版本，等待自动 lint 完成。没有包含 PR/head/base
+   的 lint 运行标题的旧运行不能复用。
+3. 在测试 PR 评论 `/ci full`，验证 fork 检出、实际测试失败、
+   **Re-run failed jobs** 和最终 `ci/full` 状态；确认外部用户评论可以启动 full，
+   不符合条件的 PR 无法启动 full，旧版本结果无法放行新提交。
+   不要直接要求 dispatch 的 `full-result` job，因为它属于主分支工作流版本，
+   并不直接挂在 PR head 上。
+4. 确认 `ci/full` 已成为必需检查后，移除旧的逐项重测试要求，包括
+   `unit-tests` 的矩阵检查。Lint 运行中这些检查可能被跳过或不出现，
+   测试覆盖由 `ci/full` 汇总强制保障。
+
+回滚时需要通过工作流和控制脚本代码恢复自动 full CI；清除旧变量不会生效。
+恢复旧的重测试必需检查并在新运行中验证后，才能移除 `ci/full` 要求。
+本实现针对当前 PR 合入流程；启用合并队列（merge queue）前
+需要额外实现 `merge_group` 支持。
 
 ## 自动 PR 审查
 
-`Codex Review` GitHub Actions 工作流仅审查目标分支为 `main` 的非草稿 PR，在其创建、重新打开、更新或标记为
+`AI Review` GitHub Actions 工作流仅审查目标分支为 `main` 的非草稿 PR，在其创建、重新打开、更新或标记为
 可审查（ready for review）时进行审查。工作流定义取自主分支的受信任版本，将 PR
 head 作为不可信输入检出，并由独立的 GitHub 托管任务（GitHub-hosted job）发布结果。
+这些 PR 事件创建四个检查。`prepare` 确认 PR 可审查后，`codex-review` 和
+`gemini-review` 并行运行，共用的 `publish` 任务将各自成功的结果发布到被审查的提交。
+两个模型都读取完整源码、从 merge base 到 head 的 diff 和本次 PR 讨论。两个模型均通过且 PR 满足审批条件时，
+`github-actions[bot]` 提交一份 **AI Review** 批准。Gemini 的反馈标为 **Gemini Review**，
+Codex 发现的问题标为 **Codex Review**。
 
-位置通过 diff 校验的问题会发布为行级审查评论，可以独立回复和标记解决。
+任一模型发现的问题在位置通过 diff 校验后会发布为行级审查评论，可以独立回复和标记解决。
 位于 diff 之外、没有位置或位置无效的问题会保留在审查总结中。diff 之外的
 已报告位置会在信息可用时链接到被审查的 head 或 merge-base 提交。可选的位置
 元数据请求失败时，问题仍保留在总结中，不附加行级锚点或不可用的链接。同一提交上，本工作流
@@ -51,8 +281,8 @@ head 作为不可信输入检出，并由独立的 GitHub 托管任务（GitHub-
 
 每轮审查都会获取当前 PR 描述、普通对话评论、review 正文以及全部行内讨论和回复，
 包括已解决（resolved）和过期（outdated）状态。这些内容作为审查证据，不能改变审查
-策略。Codex 必须结合专家解释和当前代码重新评估有争议的问题，并解释仍然存在的
-分歧。重复但仍有效的问题可以引用已有 Codex 讨论线程，不再创建重复行内评论；
+策略。两个模型都必须结合专家解释和当前代码重新评估有争议的问题，并解释仍然存在的
+分歧。重复但仍有效的问题可以引用同一模型先前的行级讨论线程，不再创建重复行内评论；
 该问题仍会阻止自动批准。模型根据历史讨论判断语义是否相同；发布器只接受当前 PR
 中由工作流机器人创建的根评论，并验证文件相同，或 PR 文件元数据明确记录旧评论
 所在文件已重命名为当前问题所在文件，不要求行号或 diff 侧相同。
@@ -67,25 +297,24 @@ PR 作者或具有 write、maintain、admin 权限的协作者可以在没有新
 （前面可以附上解释）：
 
 ```text
-@pypto-codex review
+/ai-review
 ```
 
 引用或代码块中的命令、编辑已有评论、机器人评论、普通 issue 评论以及其他用户
 的命令不会触发审查。引用文本与命令之间需要留一个空行；在该边界之前，
 即使后续行省略了 `>` 标记，也不会触发命令。行内回复会作为上下文读取，但不会触发工作流；请在
-Conversation 中发送命令。命令由 Actions 识别，不需要名为 `pypto-codex` 的
-GitHub 账号，也不会调用独立的 `@codex` Cloud 集成。
+Conversation 中发送命令。Actions 也支持原有的 `@pypto-codex review` 命令。
 
-评论触发的运行会先查找属于当前 PR、head 提交及目标分支的、可验证的
-`pull_request_target` Codex Review 运行。已排队或正在执行的运行会被复用；
+评论触发的运行会先查找 `AI Review` 或 `AI Review Retarget` 创建的
+`pull_request_target` 运行，并验证它对应当前 PR、head 提交及目标分支。已排队或正在执行的运行会被复用；
 已完成的运行会重跑**全部任务**（包括需要重新评估时的成功运行）。这样会更新
 PR 原有的 Actions 检查，并在同一次 attempt 中重新生成上下文和结果产物。
 评论本身仍会产生一个独立的短路由运行，其 Actions summary 会链接到选中的
 PR 运行。同一个 PR 的准备任务会串行执行，最多保留 100 个等待中的准备任务；
 队列已满时，新到达的任务会被取消。
 
-仓库需要配置 `CODEX_REVIEW_RERUN_TOKEN` secret：使用仅限本仓库、具有
-**Actions: write** 权限的专用细粒度 PAT。它只用于评论命令的可信准备步骤，
+将仓库 secret `AI_REVIEW_RERUN_TOKEN` 设为仅限本仓库、具有 **Actions: write** 权限的细粒度 PAT。
+未设置时会读取原有的 `CODEX_REVIEW_RERUN_TOKEN`。该 token 只用于评论命令的可信准备步骤，
 不会传入 PR checkout 或审查容器。缺少凭据或 API 请求失败会明确报错，
 避免静默保留旧的 PR 检查状态。只读查询使用具有 **Actions: read** 和 **Checks: read** 权限的
 `GITHUB_TOKEN`。
@@ -98,26 +327,39 @@ PR 运行。同一个 PR 的准备任务会串行执行，最多保留 100 个�
 也不会回退到独立审查。小型身份产物保留
 30 天，完整讨论快照仍只保留一天；旧运行可以通过未过期的讨论快照验证。
 若 GitHub 允许重跑的 30 天窗口内没有可验证的运行，则回退为独立审查，
-并明确提示它不会替换 PR 原有的 Actions 检查。重跑使用原运行的工作流版本，
-不会自动升级为新合并的工作流代码。
+并明确提示它不会替换 PR 原有的 Actions 检查。重跑使用原运行的工作流版本。
+审查命令跳过改名前仅使用 Codex 的运行。没有匹配的双模型运行时，命令会启动独立的 AI Review。
 
-对话记录（rollout）和 Codex 会话索引保存在专用 runner 的两个 Docker 卷中，
-按目标仓库 ID 和 PR 编号隔离。后续运行通过 `codex exec resume <session-id>`
-恢复准确的主会话；只有审查完整结束且结果校验通过后才更新会话检查点。凭据与配置仍是临时的。更换 runner 或删除这两个卷后，会使用
-完整的当前 GitHub 讨论开始新会话。复用会话可以保留之前的分析并可能利用提示词
-缓存，但不保证减少计费 token；长历史仍可能被压缩。每轮仍检查完整的当前 PR diff。
-关闭 PR 时会删除 `pypto-codex-sessions-<repository-id>-<pr-number>` 卷及其
-`-index` 配套卷，无论是否合并，也适用于草稿、机器人创建的 PR 和已禁用审查的情况。
-清理与审查共用 runner 锁。创建或恢复卷之前，可信宿主机查询会检查当前 PR 状态、
+每个模型在专用 runner 上分别使用两个 Docker 卷，按目标仓库 ID 和 PR 编号保存对话和检查点。
+Codex 通过 `codex exec resume` 恢复准确的根会话，Gemini 通过 `agy --conversation` 恢复保存的
+`conversation_id`。受信任的宿主机在更新检查点前校验实际返回的 ID。每轮都审查完整 diff、源码和最新讨论。
+更换 runner 或丢失持久卷后，审查会使用当前快照重新开始。
+
+关闭 PR 时，`AI Review Cleanup` 为两个模型分别删除
+`pypto-<provider>-sessions-<repository-id>-<pr-number>` 卷及其 `-index` 配套卷，
+无论是否合并，也适用于草稿、机器人创建的 PR 和已禁用审查的情况。
+每个模型的清理、审查和登录维护共用各自的 runner 锁。创建或恢复卷之前，可信宿主机查询会检查当前 PR 状态、
 head 和最近一次关闭事件；卷标签记录该关闭事件，使重新打开的 PR 开始新会话，
 延迟到达的清理保留新会话并删除旧卷。排队的审查发现 PR 已关闭、变为草稿或
 head 已更新时，会跳过审查和产物发布。GitHub 状态仍可能在读取后变化；排队的
 审查与清理任务会在锁内再次检查。
 
-管理员通过仓库 Actions 变量 `CODEX_REVIEW_ENABLED` 启用或禁用审查。将其设为
-`true` 即可启用；删除该变量或设为其他值可以立即禁用。关闭事件触发的会话清理仍保持启用。
+临时审查容器和私有网络带有仓库、运行及尝试次数标签，启动前先记录资源标识。
+Shell trap 和独立的 `always()` 步骤会删除本次尝试的容器、私有网络及凭据快照，
+也覆盖审查被取消的情况。会话卷及共享的出口网络（egress network）与 relay 会保留。
 
-审查任务（review job）需要标签为 `Linux`、`ARM64` 和 `cpu-codex` 的专用自托管
+开始下一次审查前，可信宿主机代码会在同一个 runner 锁内检查遗留资源。
+它使用 **Actions: read** 权限查询 GitHub，只有资源所属的准确运行尝试为
+`completed`，且仓库和工作流身份一致时才删除资源。只通过归属标签发现资源；
+缺少完整标签的历史遗留资源需要单独进行一次人工清理。仍在运行的尝试及其他仓库的资源
+会保留；API 失败时会在删除任何遗留资源前停止启动。
+Runner 故障可能阻止 `always()` 步骤执行，下一次在同一宿主机启动的审查会回收
+遗留 Docker 资源，但不会回收宿主机故障遗留的临时凭据文件。
+
+仓库 Actions 变量 `AI_REVIEW_ENABLED` 设为 `true` 时启用审查，设为 `false` 时禁用审查。
+未设置时会读取原有的 `CODEX_REVIEW_ENABLED`。关闭 PR 时均会清理会话。
+
+两个审查任务（review job）都需要标签为 `Linux`、`ARM64` 和 `cpu-codex` 的专用自托管
 运行器（self-hosted runner）。以下资源由宿主机管理，不取自 PR：
 
 - GitHub CLI（`gh`），用于可信宿主机状态检查；其只读 token 不会传入模型容器
@@ -127,6 +369,35 @@ head 已更新时，会跳过审查和产物发布。GitHub 状态仍可能在�
 - 监听 relay 端口 `17895` 且健康的 `pypto-codex-proxy-relay` 容器
 - 仅监听 loopback 的 mixed proxy `127.0.0.1:7895`
 
+Gemini 使用 runner 上已安装的 `~/.local/share/pypto-gemini-review/run`。启用前部署以下两个命令：
+
+```text
+run review-session --model MODEL --effort high --session-volume VOLUME [--conversation UUID] INPUT_DIR RESULTS_DIR
+run auth-maintenance --model MODEL
+```
+
+工作流选择 `gemini-4-neon-high` 和 high 推理强度。启动脚本沿用非 root 容器、临时 Google OAuth 副本、
+代理和固定镜像 `localhost:5000/pypto-gemini-review@sha256:886e02ba2f1612d52f7c4ec76ff8b6d25e1b8c586be90ee3c006fcf52af0b99e`。
+将输入目录的 `workspace`、`discussion.json`、`schema.json`、`pr.diff` 分别只读挂载到
+`/workspace`、`/review-discussion.json`、`/review-schema.json`、`/pr.diff`。
+runner 校验授权提交的完整 Git 对象，检出时禁用钩子，将仓库符号链接还原为记录目标的文本。
+指定的会话卷只保存当前 PR 的 Gemini 对话数据。独立检查点卷、持久登录态、其他 PR 的会话和 GitHub 凭据留在模型容器外。
+仅为每次运行新建的临时容器和专用网络设置 `org.pypto.gemini-review.` 前缀的
+`repository`、`run`、`attempt` 标签，分别取自启动器环境的 `GITHUB_REPOSITORY_ID`、`GITHUB_RUN_ID`、`GITHUB_RUN_ATTEMPT`。
+
+把受信任的 `INPUT_DIR/prompt.txt` 传给 `agy -p`，原样传入模型、推理强度、
+`--output-format json` 和 `--json-schema /review-schema.json`。从可信配置启动，禁用 PR 自带的指令、技能和命令。
+续聊时传入指定 UUID。原生 stdout 存入 `RESULTS_DIR/result.json`，stderr 单独私有保存，退出码原样返回。
+驱动校验 `SUCCESS`、会话 ID 和 `structured_output`，只上传提取的 `response.txt`。CLI 失败最多尝试三次。
+原有的 `run review` 可继续用于独立 diff 审查。原生响应格式见 [Antigravity CLI 无交互模式文档](https://antigravity.google/docs/cli/headless/)。
+
+部署验收使用独立测试卷和全新容器。同一 PR 恢复首轮会话并复述上轮随机值，换一个 PR 验证隔离；
+另验证模型能结合源文件和讨论给出带行号的问题，以及登录维护在无 PR 数据时可独立执行。
+在测试审查运行期间，使用同一组运行标识执行一次 `cleanup_ai_review_resources.py --current-gemini`。
+确认本次容器和专用网络已删除、会话卷仍在、共享代理仍然健康。遇到并发删除或网络端点正在脱离时，
+清理脚本会按原 Docker ID 重试，重试窗口为 20 秒。
+如 Google 要求重新交互授权，在 SSH 终端执行 `~/.local/share/pypto-gemini-review/run login`。
+
 `.github/scripts/` 中的独立 CI 辅助脚本支持 Python 3.8 及更新版本。
 脚本延迟求值类型注解，避免导入时依赖 Python 3.9 的内置泛型或 Python 3.10 的联合类型
 运算符。该兼容范围仅限这些宿主机脚本；PyPTO 本身仍要求 Python 3.10 及更新版本。
@@ -134,7 +405,7 @@ head 已更新时，会跳过审查和产物发布。GitHub 状态仍可能在�
 辅助脚本测试检查。审查工作流使用宿主机解释器，不安装 Python，也不依赖审查容器内的
 Python 版本。
 
-每次审查都将 PR 的精确 head 检出到唯一目录中的全新完整 Git 仓库，不复用运行器
+每次 Codex 审查都将 PR 的精确 head 检出到唯一目录中的全新完整 Git 仓库，不复用运行器
 缓存的对象库。启动容器前，宿主机获取 base、head 和可信工作流提交的完整历史，
 拒绝浅克隆（shallow clone）和部分克隆（partial clone），验证可达对象齐全，并生成
 merge base 到 head 的完整 diff，包括二进制内容。如果缺少对象，任务会在审查开始前
@@ -146,27 +417,27 @@ Codex 在只读容器中以 UID/GID `1002:1003` 运行；仓库以只读方式�
 凭据中的任何完整长字符串值，工作流会拒绝发布；正常评论也会明确标记为由不可信
 PR 内容生成的自动化结果。
 
-审查结果上传最多尝试三次，每次限时两分钟。失败后分别等待 10 秒和 30 秒再重试，
+两个模型的审查结果上传都最多尝试三次，每次限时两分钟。失败后分别等待 10 秒和 30 秒再重试，
 并替换当前运行对应的同名残留产物。上传成功或任务取消后停止重试。如果三次均失败，
-审查任务也会失败，发布任务不会运行；仅完成模型审查不会使整个任务成功。
+相应模型的检查会失败，另一模型已有的反馈仍可发布。
 
-由 ChatGPT 管理（ChatGPT-managed）的 Codex 凭据通过可信的每周或手动维护任务
-刷新。该任务不检出仓库，只在空的临时目录中运行，通过宿主机锁与审查任务串行，
-并原地更新持久凭据。PR 审查容器只接收临时快照，绝不会挂载或写入持久凭据。
+`AI Review Auth Maintenance` 每周运行，也可通过 **Run workflow** 手动触发。两个独立任务分别维护
+ChatGPT 和 Google 账号。Gemini 的 `auth-maintenance` 在空的可信环境中执行固定提示词，不挂载 PR 数据，
+需要刷新时在 OAuth 锁保护下保存凭据。常规审查容器仍只接收临时凭据副本。
 
 ### 自动批准
 
-设置 `CODEX_REVIEW_AUTO_APPROVE=true` 后，无问题的审查可以由
-`github-actions[bot]` 提交 `APPROVE` 审批。仓库 Actions 设置也必须允许
-GitHub Actions 创建和批准 PR。删除该变量或设为 `false` 可以单独关闭自动批准，
-审查结果仍会发布。仓库原有的必需 CI 检查仍然生效。
+在仓库 Actions 变量中设置 `AI_REVIEW_AUTO_APPROVE=true`，并允许 GitHub Actions 创建和批准 PR。
+将该变量设为 `false` 可只发布反馈。迁移时清除 `CODEX_REVIEW_AUTO_APPROVE`，
+这样手动重跑历史 Codex 单模型工作流时也无法发出批准。新变量未设置时，新工作流读取旧变量，
+审批仍要求两个模型均通过。仓库原有的必需 CI 检查仍然生效。
 由 `github-actions[bot]` 创建的 PR 只接收评论而不批准，因为 GitHub 不允许作者
 批准自己的 PR。
 
-工作流检出已授权快照对应的精确 head SHA，通过 `codex exec --output-schema` 请求
-结构化 JSON。Schema 和发布脚本取自提供工作流文件的提交（`github.workflow_sha`），
-与 PR 的 base 版本独立。发布器只有在完整审查返回
-`pass`、发现列表为空、且 head SHA、base 分支名和审查时的 merge base 均未改变时才批准。
+工作流检出已授权快照对应的精确 head SHA，通过 `codex exec --output-schema` 和 `agy --json-schema` 请求
+结构化 JSON。共用的提示词、Schema 和发布脚本取自提供工作流文件的提交（`github.workflow_sha`），
+与 PR 的 base 版本独立。发布器要求同一次运行、同一次尝试中的两个模型均返回有效的
+`pass` 和空的发现列表，并核对 head SHA、base 分支名和审查时的 merge base 均未改变。
 即使另一分支指向相同 SHA，修改目标分支也会使审查失效，因为被审查的目标分支已改变。
 无效、空白、超长、相互矛盾或不完整的输出均不会批准。
 发布器决定是否批准时，不读取分支保护规则、CI 结果或合并状态。
@@ -179,11 +450,12 @@ CI 检查和冲突。工作流不要求批准前 head 与 base 保持最新。
 如果无法核实 merge base，发布器仍会通过 `COMMENT` 总结发布审查发现，不附加未核实的
 行级位置，也不会批准。
 批准后再次核对提交；若发布期间发生更新或核验失败，则撤销刚提交的审批。
-替代审查结果发布前会先撤销本工作流之前的自动审批，不修改人工审批。
+重新审查时，即使模型失败或缺少结果文件，也会撤销本工作流之前的自动批准。
+另一模型已有的反馈照常发布，人工批准保留。
 
-修改 PR 的 base 分支也会在审查前触发审批撤销。独立的 GitHub 托管任务只运行
+`AI Review Retarget` 处理 PR 编辑事件。更换目标分支时，其 GitHub 托管任务只运行
 受信任工作流版本的代码，即使审查已禁用、PR 为草稿或由机器人修改目标分支，
-也会撤销本工作流之前的审批。符合条件的新审查只有在撤销成功后才启动。
+也会撤销之前的联合批准或历史 Codex 批准。符合条件的新审查只有在撤销成功后才启动。
 仅修改标题或正文不会启动审查，也不会取消已有审查。撤销任务使用独立的并发组，
 新事件不会取消正在执行的撤销。GitHub 事件投递和任务调度
 是异步的，因此撤销审批与修改目标分支并非原子操作。

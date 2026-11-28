@@ -153,17 +153,21 @@ class TestMxScaleMemSpaces:
         with pytest.raises(ValueError, match="does not support MX-layout source tensors"):
             tile.gather_row(tile_acc, src, [0, 0], [0, 0], [1, 8])
 
-    @pytest.mark.parametrize("invalid_cols", [31, 0])
-    def test_fp4_set_validshape_rejects_invalid_packed_dimension(self, invalid_cols):
-        src = _tile_var(_const_shape(16, 64), DataType.FP4, memory=ir.MemorySpace.Vec)
-        with pytest.raises(ValueError, match="packed FP4 valid dimension.*positive even"):
-            tile.set_validshape(src, 8, invalid_cols)
+    @pytest.mark.parametrize("dtype", [DataType.FP4E2M1X2, DataType.FP4E1M2X2])
+    def test_packed_fp4_set_validshape_preserves_odd_carrier_dimension(self, dtype):
+        src = _tile_var(_const_shape(16, 64), dtype, memory=ir.MemorySpace.Vec)
+        call = tile.set_validshape(src, 8, 31)
+        assert isinstance(call.type, ir.TileType)
+        valid = call.type.get_effective_tile_view().valid_shape
+        assert [dim.value for dim in valid if isinstance(dim, ir.ConstInt)] == [8, 31]
 
-    def test_fp4_set_validshape_rejects_dynamic_packed_dimension(self):
-        src = _tile_var(_const_shape(16, 64), DataType.FP4, memory=ir.MemorySpace.Vec)
+    @pytest.mark.parametrize("dtype", [DataType.FP4E2M1X2, DataType.FP4E1M2X2])
+    def test_packed_fp4_set_validshape_preserves_dynamic_carrier_dimension(self, dtype):
+        src = _tile_var(_const_shape(16, 64), dtype, memory=ir.MemorySpace.Vec)
         dynamic_cols = ir.Var("valid_cols", ir.ScalarType(DataType.INDEX), ir.Span.unknown())
-        with pytest.raises(ValueError, match="packed FP4 valid dimension.*static positive even"):
-            tile.set_validshape(src, 8, dynamic_cols)
+        call = tile.set_validshape(src, 8, dynamic_cols)
+        assert isinstance(call.type, ir.TileType)
+        assert str(call.type.get_effective_tile_view().valid_shape[1]) == "valid_cols"
 
     def test_mx_layout_rejects_non_2d_load_window(self):
         tensor = _mx_tensor_var("s", 16, 8)
@@ -426,7 +430,9 @@ class TestMxScaleMemSpaces:
 
         program = passes.classify_iter_arg_carry()(
             passes.materialize_runtime_scopes()(
-                passes.derive_call_directions()(passes.convert_to_ssa()(Input))
+                passes.derive_call_directions()(
+                    passes.normalize_return_order()(passes.convert_to_ssa()(Input))
+                )
             )
         )
         orchestration = next(
@@ -458,7 +464,7 @@ class TestMxScaleMemSpaces:
         )
         assert isinstance(call.type, ir.TileType)
 
-    def test_mx_load_pto_codegen_uses_packed_source_view(self):
+    def test_mx_load_pto_codegen_uses_logical_source_view(self):
         span = ir.Span.unknown()
         tensor_type = ir.TensorType(
             _const_shape(16, 2),
@@ -481,20 +487,54 @@ class TestMxScaleMemSpaces:
             builder.return_stmt(scale)
 
         program = ir.Program([function.get_result()], "mx_load_codegen", span)
-        program = passes.block_mx_scale_tensor_views()(program)
+        program = passes.legalize_mx_scale_tensor_views()(program)
         program = passes.materialize_tensor_strides()(program)
         pto = codegen.PTOCodegen().generate(program)
-        # The ordinary tensor-view path emits the packed rank-5 descriptor after
-        # BlockMxScaleTensorViews and MaterializeTensorStrides establish its contract.
+        # The ordinary tensor-view path emits logical rank-2 descriptors; PTOAS
+        # translates their MX layout into physical packed addressing.
         assert pto.count("pto.make_tensor_view") == 1
         assert "pto.make_tensor_view %arg0" in pto
         assert "mx5d_view" not in pto
-        # Logical [16, 2] MX_A_ZZ -> physical [1, 16/16, 2/2, 16, 2]
-        assert "shape = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in pto
-        assert "strides = [%c32_index, %c32_index, %c32_index, %c2_index, %c1_index]" in pto
-        assert "!pto.tensor_view<?x?x?x?x?x!pto.f8E8M0>" in pto
+        # Preserve the logical [16, 2] MX_A_ZZ shape and contiguous logical strides.
+        assert "shape = [%c16_index, %c2_index]" in pto
+        assert "strides = [%c2_index, %c1_index]" in pto
+        assert "!pto.tensor_view<?x?x!pto.f8E8M0>" in pto
         assert "pto.tload" in pto
         assert "{layout = #pto.layout<mx_a_zz>}" in pto
+
+
+def test_mx_scale_gather_valid_window_returns_whole_destination():
+    source = _mx_tensor_var("source", 96, 4, ir.TensorLayout.MX_A_ND)
+    dst = _tile_var(
+        _const_shape(64, 4),
+        DataType.FP8E8M0,
+        memory=ir.MemorySpace.Mat,
+        view=ir.TileView(blayout=ir.TileLayout.row_major, slayout=ir.TileLayout.row_major, fractal=32),
+    )
+    result = tile.gather_row(dst, source, [32, 0], [80, 0], [32, 4], valid_shape=[16, 4])
+    ir.assert_structural_equal(result.type, dst.type)
+    assert result.op.name == ir.get_op("tile.gather_row").name
+
+
+@pytest.mark.parametrize(
+    ("offsets", "shapes", "dst_offset", "message"),
+    [
+        ([0, 0], [8, 4], [0, 0], "complete 16x2 scale boxes"),
+        ([0, 0], [16, 2], [0, 0], "full span of paired source and destination groups"),
+        ([80, 0], [32, 4], [0, 0], "outside the source"),
+        ([0, 0], [32, 4], [48, 0], "outside the destination"),
+    ],
+)
+def test_mx_scale_gather_rejects_invalid_writeback_windows(offsets, shapes, dst_offset, message):
+    source = _mx_tensor_var("source", 96, 4, ir.TensorLayout.MX_A_ND)
+    dst = _tile_var(
+        _const_shape(64, 4),
+        DataType.FP8E8M0,
+        memory=ir.MemorySpace.Mat,
+        view=ir.TileView(blayout=ir.TileLayout.row_major, slayout=ir.TileLayout.row_major, fractal=32),
+    )
+    with pytest.raises(ValueError, match=message):
+        tile.gather_row(dst, source, dst_offset, offsets, shapes)
 
 
 if __name__ == "__main__":

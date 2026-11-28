@@ -11,23 +11,30 @@
 
 /**
  * @file block_mx_scale_tensor_views_pass.cpp
- * @brief BlockMxScaleTensorViews pass — physicalize logical MX scale tensor views.
+ * @brief Shared MX view legalization and legacy physical blocking.
  *
  * MX scale tensors use logical rank-2 shapes in the DSL, but A5 TLoadMxCube*
  * consumes packed rank-5 SFractal GlobalTensor views:
  *
  *   MX_A_ZZ [M, G] -> [1, M/16, G/2, 16, 2]
  *   MX_B_NN [G, N] -> [1, N/16, G/2, 16, 2]
+ *   MX_A_ND [M, G] -> [M, G] (packed row-major, TLOAD converts to L1 ZZ)
  *
- * This pass owns that conversion, including tensor types, tile.load windows,
+ * LegalizeMxScaleTensorViews retains logical rank-2 views for PTOAS v0.74.
+ * Fully populated packed scale stores use flat ND aliases of the same bytes:
+ * the A5 Vec TSTORE instruction cannot consume SFractal-32 tiles directly.
+ * BlockMxScaleTensorViews owns the legacy conversion, including tensor types, tile.load windows,
  * ND/MX backing aliases, Call/Submit result types, and symbolic offset proofs.
- * It runs after BlockNzTensorViews and before MaterializeTensorStrides.
+ * MX_A_ND keeps its compact row coordinates and valid-row tails; only its
+ * scale-group axis needs complete aligned pairs. It runs after
+ * BlockNzTensorViews and before MaterializeTensorStrides.
  */
 
 #include <any>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -55,6 +62,8 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -63,6 +72,7 @@ namespace ir {
 namespace {
 
 constexpr const char* kMxBlockedAttr = "mx_tensor_views_blocked";
+constexpr const char* kMxLogicalAttr = "mx_tensor_views_legalized";
 constexpr int kMxProofStepBudget = 256;
 
 struct MxOffsetFacts {
@@ -146,11 +156,22 @@ bool IsMxTensorType(const TypePtr& type) {
 
 std::vector<ExprPtr> BlockMxShape(const std::vector<ExprPtr>& shape, TensorLayout layout, const Span& span) {
   CHECK_SPAN(IsMxTensorLayout(layout), span)
-      << "BlockMxShape requires MX_A_ZZ or MX_B_NN, got " << TensorLayoutToString(layout);
+      << "BlockMxShape requires an MX layout, got " << TensorLayoutToString(layout);
   CHECK_SPAN(shape.size() == 2, span)
       << "MX layout requires a rank-2 logical shape, got rank " << shape.size();
 
-  const bool is_a = layout == TensorLayout::MX_A_ZZ;
+  // ND activation scales are already packed row-major in GM. Keep their
+  // logical coordinates so PTOAS selects MX_A_ND2ZZ during the Mat load;
+  // folding M into 16-row boxes would both change the ABI and reject compact
+  // expert bases. Only the contiguous scale-group axis is paired by the ISA.
+  if (layout == TensorLayout::MX_A_ND) {
+    CHECK_SPAN(tensor_view_semantics::IsCanonicalMxShape(shape, layout), span)
+        << "MX_A_ND requires a rank-2 shape [rows, groups] with positive rows and a static positive "
+           "even group dimension; rows may be dynamic and need not be multiples of 16";
+    return shape;
+  }
+
+  const bool is_a = layout != TensorLayout::MX_B_NN;
   const size_t block_axis = is_a ? 0 : 1;
   const size_t group_axis = is_a ? 1 : 0;
   constexpr int64_t kRows = tile_view_semantics::kMXSFractalRows;
@@ -179,7 +200,7 @@ std::vector<ExprPtr> BlockMxShape(const std::vector<ExprPtr>& shape, TensorLayou
 std::vector<ExprPtr> BlockMxOffsets(const std::vector<ExprPtr>& offsets, TensorLayout layout,
                                     const Span& span, const MxOffsetFacts& facts) {
   CHECK_SPAN(IsMxTensorLayout(layout), span)
-      << "BlockMxOffsets requires MX_A_ZZ or MX_B_NN, got " << TensorLayoutToString(layout);
+      << "BlockMxOffsets requires an MX layout, got " << TensorLayoutToString(layout);
   CHECK_SPAN(offsets.size() == 2, span) << "MX layout requires rank-2 offsets, got " << offsets.size();
 
   const bool is_a = layout == TensorLayout::MX_A_ZZ;
@@ -211,6 +232,13 @@ std::vector<ExprPtr> BlockMxOffsets(const std::vector<ExprPtr>& offsets, TensorL
     return MakeFloorDiv(offset, std::make_shared<ConstInt>(divisor, DataType::INDEX, span), span);
   };
 
+  // MX_A_ND addresses complete row-major scale pairs directly. Preserve the
+  // compact row base without an alignment/sign proof: no quotient is emitted
+  // on that axis and ordinary window-bounds validation still applies.
+  if (layout == TensorLayout::MX_A_ND) {
+    block_axis_offset(offsets[1], kCols, "group");
+    return offsets;
+  }
   auto block_offset = block_axis_offset(offsets[block_axis], kRows, "block");
   auto group_offset = block_axis_offset(offsets[group_axis], kCols, "group");
   auto make_index = [&span](int64_t value) {
@@ -219,33 +247,33 @@ std::vector<ExprPtr> BlockMxOffsets(const std::vector<ExprPtr>& offsets, TensorL
   return {make_index(0), std::move(block_offset), std::move(group_offset), make_index(0), make_index(0)};
 }
 
-TypePtr BlockMxType(const TypePtr& type, const Span& span) {
+TypePtr BlockMxType(const TypePtr& type, const Span& span, bool logical_views) {
   if (!type) return type;
   if (auto tuple_type = As<TupleType>(type)) {
     std::vector<TypePtr> new_elements;
     new_elements.reserve(tuple_type->types_.size());
     bool changed = false;
     for (const auto& element : tuple_type->types_) {
-      auto new_element = BlockMxType(element, span);
+      auto new_element = BlockMxType(element, span, logical_views);
       if (new_element.get() != element.get()) changed = true;
       new_elements.push_back(std::move(new_element));
     }
     if (!changed) return type;
     return std::make_shared<TupleType>(std::move(new_elements));
   }
-  if (As<DistributedTensorType>(type)) {
-    if (!IsMxTensorType(type)) return type;
-    CHECK_SPAN(false, span) << "MX layout is not supported on a distributed tensor yet. "
-                            << "Annotate the tensor as pl.ND.";
-  }
-  if (auto tensor_type = As<TensorType>(type)) {
-    if (!IsMxTensorType(type)) return type;
-    const auto& maybe_view = tensor_type->tensor_view_;
-    if (!maybe_view.has_value()) return type;
-    const TensorView& view = *maybe_view;
+  if (auto tensor_type = AsTensorTypeLike(type)) {
+    if (!tensor_type->tensor_view_ || !IsMxTensorLayout(tensor_type->tensor_view_->layout)) return type;
+    const TensorView& view = *tensor_type->tensor_view_;
+    // MX_A_ND describes dense row-major bytes in each rank's local GM and
+    // keeps that shape. The packed layouts require separate distributed support.
+    CHECK_SPAN(view.layout == TensorLayout::MX_A_ND || !As<DistributedTensorType>(type), span)
+        << "Packed MX layout is not supported on a distributed tensor. Annotate it as pl.ND or pl.MX_A_ND.";
     auto blocked_shape = BlockMxShape(tensor_type->shape_, view.layout, span);
+    if (view.layout == TensorLayout::MX_A_ND) return type;
     CHECK_SPAN(view.valid_shape.empty(), span)
         << "MX layout does not support a partial tensor valid_shape yet; the whole tensor must be valid.";
+    // PTOAS v0.74 owns physical packing; keep logical coordinates in the default pipeline.
+    if (logical_views) return type;
     TensorView blocked_view(/*stride=*/{}, view.layout, view.valid_shape, view.pad);
     return std::make_shared<TensorType>(std::move(blocked_shape), tensor_type->dtype_, tensor_type->memref_,
                                         blocked_view);
@@ -391,17 +419,19 @@ class MxOffsetFactStore {
 };
 
 ExprPtr BlockMxTupleArg(const ExprPtr& arg, TensorLayout layout, const Span& span, bool is_offsets,
-                        const MxOffsetFacts& facts) {
+                        const MxOffsetFacts& facts, bool logical_views) {
   auto tuple = As<MakeTuple>(arg);
   INTERNAL_CHECK_SPAN(tuple, span) << "Internal error: tile.load coordinate argument must be a MakeTuple";
   auto blocked = is_offsets ? BlockMxOffsets(tuple->elements_, layout, span, facts)
                             : BlockMxShape(tuple->elements_, layout, span);
+  if (logical_views) return arg;  // Retain the authored coordinates after checking alignment.
   return std::make_shared<MakeTuple>(std::move(blocked), tuple->span_);
 }
 
 class BlockMxMutator : public IRMutator {
  public:
-  explicit BlockMxMutator(MxOffsetFacts facts) : facts_(std::move(facts)) {}
+  BlockMxMutator(MxOffsetFacts facts, bool logical_views)
+      : facts_(std::move(facts)), logical_views_(logical_views) {}
 
   void AddSubstitution(const VarPtr& old_var, const VarPtr& new_var) { var_cache_[old_var] = new_var; }
 
@@ -409,7 +439,7 @@ class BlockMxMutator : public IRMutator {
   ExprPtr VisitExpr_(const VarPtr& op) override {
     auto cached = var_cache_.find(op);
     if (cached != var_cache_.end()) return cached->second;
-    auto new_type = BlockMxType(op->GetType(), op->span_);
+    auto new_type = BlockMxType(op->GetType(), op->span_, logical_views_);
     if (new_type.get() == op->GetType().get()) {
       var_cache_[op] = op;
       return op;
@@ -423,7 +453,7 @@ class BlockMxMutator : public IRMutator {
     auto cached = var_cache_.find(op);
     if (cached != var_cache_.end()) return cached->second;
     auto new_init = IRMutator::VisitExpr(op->initValue_);
-    auto new_type = BlockMxType(op->GetType(), op->span_);
+    auto new_type = BlockMxType(op->GetType(), op->span_, logical_views_);
     if (new_init.get() == op->initValue_.get() && new_type.get() == op->GetType().get()) {
       var_cache_[op] = op;
       return op;
@@ -453,10 +483,14 @@ class BlockMxMutator : public IRMutator {
     if (!mx_args.empty() && !is_function_call) {
       const bool is_store_destination = IsOp(op, "tile.store") && mx_args.size() == 1 && mx_args[0] == 2;
       const bool is_load_source = IsOp(op, "tile.load") && mx_args.size() == 1 && mx_args[0] == 0;
+      // MX_A_ND preserves its logical coordinates. Gather type inference already
+      // checks the complete-box window and the existing A/ZZ destination.
+      const bool is_gather_source =
+          op_predicates::IsMxScaleGather(op) && mx_args.size() == 1 && mx_args[0] == 1;
       const bool is_backing_alias = IsOp(op, "tensor.view") && mx_args.size() == 1 && mx_args[0] == 0;
-      CHECK_SPAN(is_load_source || is_store_destination || is_backing_alias, op->span_)
-          << "MX layout currently supports only 'tile.load', 'tile.store', and shaped FP8E8M0 "
-             "'tensor.view' backing aliases, but it is used by '"
+      CHECK_SPAN(is_load_source || is_gather_source || is_store_destination || is_backing_alias, op->span_)
+          << "MX layout currently supports only 'tile.load', 'tile.store', MX_A_ND 'tile.gather_row', "
+             "and shaped FP8E8M0 'tensor.view' backing aliases, but it is used by '"
           << op->op_->name_ << "' at argument " << mx_args[0] << ".";
       if (is_load_source) {
         new_args = BlockMxTileLoadArgs(op, std::move(new_args));
@@ -469,7 +503,7 @@ class BlockMxMutator : public IRMutator {
     }
 
     if (IsOp(op, "tensor.view") && IsMxTensorType(op->GetType())) {
-      auto output_type = As<TensorType>(op->GetType());
+      auto output_type = AsTensorTypeLike(op->GetType());
       INTERNAL_CHECK_SPAN(output_type, op->span_)
           << "Internal error: an MX tensor.view result must carry a TensorType";
       const auto& maybe_view = output_type->tensor_view_;
@@ -477,11 +511,12 @@ class BlockMxMutator : public IRMutator {
           << "Internal error: an MX tensor.view result must carry a TensorView";
       INTERNAL_CHECK_SPAN(new_args.size() >= 2, op->span_)
           << "Internal error: an ND-to-MX tensor.view backing alias must carry a shape argument";
-      new_args[1] = BlockMxTupleArg(new_args[1], maybe_view->layout, op->span_, /*is_offsets=*/false, facts_);
+      new_args[1] = BlockMxTupleArg(new_args[1], maybe_view->layout, op->span_, /*is_offsets=*/false, facts_,
+                                    logical_views_);
       args_changed = true;
     }
 
-    auto new_return_type = BlockMxType(op->GetType(), op->span_);
+    auto new_return_type = BlockMxType(op->GetType(), op->span_, logical_views_);
     std::vector<std::pair<std::string, std::any>> new_attrs;
     bool attrs_changed = false;
     new_attrs.reserve(op->attrs_.size());
@@ -511,7 +546,7 @@ class BlockMxMutator : public IRMutator {
     auto submit = As<Submit>(base);
     INTERNAL_CHECK_SPAN(submit, op->span_)
         << "Internal error: BlockMxScaleTensorViews visited a Submit to a non-Submit expression";
-    auto new_return_type = BlockMxType(submit->GetType(), submit->span_);
+    auto new_return_type = BlockMxType(submit->GetType(), submit->span_, logical_views_);
     if (new_return_type.get() == submit->GetType().get()) return submit;
     return std::make_shared<Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
                                     submit->attrs_, std::move(new_return_type), submit->span_,
@@ -525,11 +560,103 @@ class BlockMxMutator : public IRMutator {
     auto new_var = As<Var>(new_var_expr);
     INTERNAL_CHECK(new_var)
         << "Internal error: BlockMxScaleTensorViews visited an AssignStmt LHS to a non-Var";
+    if (auto call = As<Call>(new_value); call && IsOp(call, "tile.store")) {
+      if (auto lowered = LegalizeFullScaleStore(call, op->var_)) return lowered;
+    }
     if (new_var.get() == op->var_.get() && new_value.get() == op->value_.get()) return op;
     return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
   }
 
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    auto result = IRMutator::VisitStmt_(op);
+    auto eval = As<EvalStmt>(result);
+    INTERNAL_CHECK_SPAN(eval, op->span_) << "Internal error: MX view legalization must preserve EvalStmt";
+    if (auto call = As<Call>(eval->expr_); call && IsOp(call, "tile.store")) {
+      if (auto lowered = LegalizeFullScaleStore(call, nullptr)) return lowered;
+    }
+    return result;
+  }
+
  private:
+  // Only a whole, fully valid packed scale buffer is a contiguous byte range.
+  // A partition of a larger buffer can have gaps between SFractal boxes;
+  // retain the existing path for partial stores, rather than misaddressing GM.
+  StmtPtr LegalizeFullScaleStore(const CallPtr& store, const VarPtr& result) {
+    if (!logical_views_) return nullptr;
+    const auto src = As<TileType>(store->args_[0]->GetType());
+    // Distributed MX types are rejected by BlockMxType before rewriting uses.
+    const auto dst = AsTensorTypeLike(store->args_[2]->GetType());
+    if (!src || !dst) return nullptr;
+    const auto& dst_view = dst->tensor_view_;
+    if (!dst_view.has_value()) return nullptr;
+    const auto layout = dst_view->layout;
+    const auto memory = src->GetMemorySpace();
+    if ((layout != TensorLayout::MX_A_ZZ && layout != TensorLayout::MX_B_NN) ||
+        (memory.has_value() && memory != MemorySpace::Vec)) {
+      return nullptr;
+    }
+    const auto& shape = dst->shape_;
+    const auto src_view = tile_view_semantics::GetEffectiveTileView(*src);
+    if (shape.size() != 2 || !src_view.stride.empty() || src_view.start_offset ||
+        !tile_view_semantics::ShapeExprListsEquivalent(src->shape_, shape) ||
+        !tile_view_semantics::ShapeExprListsEquivalent(src_view.valid_shape, shape)) {
+      return nullptr;
+    }
+    const auto offsets = As<MakeTuple>(store->args_[1]);
+    INTERNAL_CHECK_SPAN(offsets, store->span_) << "Internal error: MX tile.store offsets must be a tuple";
+    for (const auto& offset : offsets->elements_) {
+      const auto constant = As<ConstInt>(offset);
+      if (!constant || constant->value_ != 0) return nullptr;
+    }
+    if (store->args_.size() == 4) {
+      const auto partition_shape = As<MakeTuple>(store->args_[3]);
+      INTERNAL_CHECK_SPAN(partition_shape, store->span_)
+          << "Internal error: MX tile.store partition shape must be a tuple";
+      if (!tile_view_semantics::ShapeExprListsEquivalent(partition_shape->elements_, shape)) return nullptr;
+    }
+    const auto rows = As<ConstInt>(shape[0]);
+    const auto cols = As<ConstInt>(shape[1]);
+    if (!rows || !cols || rows->value_ <= 0 || cols->value_ <= 0 ||
+        rows->value_ > std::numeric_limits<int64_t>::max() / cols->value_) {
+      return nullptr;
+    }
+
+    const auto& span = store->span_;
+    auto index = [&](int64_t value) { return std::make_shared<ConstInt>(value, DataType::INDEX, span); };
+    auto flat_shape =
+        std::make_shared<MakeTuple>(std::vector<ExprPtr>{index(1), index(rows->value_ * cols->value_)}, span);
+    auto& registry = OpRegistry::GetInstance();
+    std::vector<StmtPtr> stmts;
+    const auto prefix = "mx_store_" + std::to_string(store_index_++);
+    auto bind = [&](const CallPtr& call, const std::string& suffix) {
+      auto var = std::make_shared<Var>(prefix + suffix, call->GetType(), span);
+      stmts.push_back(std::make_shared<AssignStmt>(var, call, span));
+      return var;
+    };
+    // Reshape the packed UB tile and GM backing as 1 x bytes without a layout
+    // conversion. Both aliases keep FP8E8M0 and point to their original buffers.
+    auto flat_src = bind(registry.Create("tile.reshape", {store->args_[0], flat_shape}, span), "_src");
+    auto flat_dst = bind(
+        registry.Create("tensor.view", {store->args_[2], flat_shape}, {{"layout", TensorLayout::ND}}, span),
+        "_dst");
+    auto flat_store = MutableCopy(
+        registry.Create("tile.store", {flat_src, store->args_[1], flat_dst}, store->kwargs_, span));
+    flat_store->attrs_ = store->attrs_;
+    if (!result) {
+      stmts.push_back(std::make_shared<EvalStmt>(flat_store, span));
+    } else {
+      auto stored = bind(flat_store, "_stored");
+      // The SSA result keeps the original consumer layout and the dependency
+      // on the write, so public tensor returns and downstream cube loads agree.
+      auto restored = registry.Create("tensor.view", {stored, std::make_shared<MakeTuple>(shape, span)},
+                                      {{"layout", layout}}, span);
+      auto restored_var = std::make_shared<Var>(result->name_hint_, restored->GetType(), span);
+      stmts.push_back(std::make_shared<AssignStmt>(restored_var, restored, span));
+      var_cache_[result] = restored_var;
+    }
+    return SeqStmts::Flatten(std::move(stmts), span);
+  }
+
   std::vector<ExprPtr> BlockMxTileLoadArgs(const CallPtr& op, std::vector<ExprPtr> args) {
     INTERNAL_CHECK_SPAN(args.size() >= 3, op->span_)
         << "Internal error: tile.load expects at least (tensor, offsets, shapes), got " << args.size();
@@ -553,9 +680,34 @@ class BlockMxMutator : public IRMutator {
         << "MX layout currently supports only cube scale loads (target_memory=pl.Mem.Mat), got "
         << (target.has_value() ? MemorySpaceToString(*target) : std::string("no target_memory")) << ".";
 
-    args[1] = BlockMxTupleArg(args[1], layout, op->span_, /*is_offsets=*/true, facts_);
-    args[2] = BlockMxTupleArg(args[2], layout, op->span_, /*is_offsets=*/false, facts_);
-    if (args.size() >= 4) args[3] = args[2];
+    args[1] = BlockMxTupleArg(args[1], layout, op->span_, /*is_offsets=*/true, facts_, logical_views_);
+    args[2] = BlockMxTupleArg(args[2], layout, op->span_, /*is_offsets=*/false, facts_, logical_views_);
+    if (layout == TensorLayout::MX_A_ND) {
+      // Type inference intersects the request with the GM source valid region,
+      // including clamp=True and source-level valid_shape. The authored fourth
+      // operand can still contain the larger request, so using it here would
+      // emit a DMA partition that reads beyond the source's compact rows.
+      // Tile and GM coordinates agree for rank-two MX_A_ND; keep the allocated
+      // tile shape, but transfer only its already-inferred valid rectangle.
+      const auto result_type = As<TileType>(op->GetType());
+      INTERNAL_CHECK_SPAN(result_type, op->span_)
+          << "Internal error: MX_A_ND tile.load result must carry a TileType";
+      const auto valid = tile_view_semantics::GetEffectiveTileView(*result_type).valid_shape;
+      auto valid_arg = std::make_shared<MakeTuple>(valid, op->span_);
+      // Validate the effective group extent too: clamping must never truncate
+      // one of the two-byte scale pairs consumed by the ISA's ND-to-ZZ load.
+      auto checked_valid =
+          BlockMxTupleArg(valid_arg, layout, op->span_, /*is_offsets=*/false, facts_, logical_views_);
+      if (args.size() >= 4) {
+        args[3] = std::move(checked_valid);
+      } else {
+        args.push_back(std::move(checked_valid));
+      }
+    } else if (args.size() >= 4) {
+      // ZZ/NN loads still address complete physical boxes even when the
+      // logical tile's active rows are narrowed.
+      args[3] = args[2];
+    }
     return args;
   }
 
@@ -578,24 +730,29 @@ class BlockMxMutator : public IRMutator {
     const TensorLayout layout = maybe_view->layout;
     INTERNAL_CHECK_SPAN(IsMxTensorLayout(layout), op->span_)
         << "Internal error: MX tile.store destination must use an MX layout";
-    args[1] = BlockMxTupleArg(args[1], layout, op->span_, /*is_offsets=*/true, facts_);
-    if (args.size() == 4) args[3] = BlockMxTupleArg(args[3], layout, op->span_, /*is_offsets=*/false, facts_);
+    args[1] = BlockMxTupleArg(args[1], layout, op->span_, /*is_offsets=*/true, facts_, logical_views_);
+    if (args.size() == 4) {
+      args[3] = BlockMxTupleArg(args[3], layout, op->span_, /*is_offsets=*/false, facts_, logical_views_);
+    }
     return args;
   }
 
   MxOffsetFacts facts_;
+  bool logical_views_;
+  size_t store_index_ = 0;
   std::unordered_map<VarPtr, VarPtr> var_cache_;
 };
 
-FunctionPtr TransformFunction(const FunctionPtr& func, const MxOffsetFacts& facts) {
-  if (func->HasAttr(kMxBlockedAttr)) return func;
+FunctionPtr TransformFunction(const FunctionPtr& func, const MxOffsetFacts& facts, bool logical_views) {
+  const char* stamp = logical_views ? kMxLogicalAttr : kMxBlockedAttr;
+  if (func->HasAttr(stamp)) return func;
 
   bool params_changed = false;
   std::vector<VarPtr> new_params;
   new_params.reserve(func->params_.size());
   std::unordered_map<VarPtr, VarPtr> substitutions;
   for (const auto& old_param : func->params_) {
-    auto new_type = BlockMxType(old_param->GetType(), old_param->span_);
+    auto new_type = BlockMxType(old_param->GetType(), old_param->span_, logical_views);
     if (new_type.get() == old_param->GetType().get()) {
       new_params.push_back(old_param);
       continue;
@@ -610,12 +767,12 @@ FunctionPtr TransformFunction(const FunctionPtr& func, const MxOffsetFacts& fact
   std::vector<TypePtr> new_return_types;
   new_return_types.reserve(func->return_types_.size());
   for (const auto& return_type : func->return_types_) {
-    auto new_return_type = BlockMxType(return_type, func->span_);
+    auto new_return_type = BlockMxType(return_type, func->span_, logical_views);
     if (new_return_type.get() != return_type.get()) returns_changed = true;
     new_return_types.push_back(std::move(new_return_type));
   }
 
-  BlockMxMutator mutator(facts);
+  BlockMxMutator mutator(facts, logical_views);
   for (const auto& [old_var, new_var] : substitutions) mutator.AddSubstitution(old_var, new_var);
   StmtPtr new_body = func->body_;
   if (func->body_) new_body = mutator.VisitStmt(func->body_);
@@ -625,7 +782,15 @@ FunctionPtr TransformFunction(const FunctionPtr& func, const MxOffsetFacts& fact
   if (params_changed) new_func->params_ = std::move(new_params);
   if (returns_changed) new_func->return_types_ = std::move(new_return_types);
   if (body_changed) new_func->body_ = std::move(new_body);
-  new_func->attrs_.emplace_back(kMxBlockedAttr, std::any(true));
+  // Function attrs share the body's Var identities (e.g. extern return
+  // parameters), so they must follow the same cached substitutions.
+  for (auto& [key, value] : new_func->attrs_) {
+    if (auto remapped =
+            MapAttrExprs(value, [&mutator](const ExprPtr& expr) { return mutator.VisitExpr(expr); })) {
+      value = std::move(*remapped);
+    }
+  }
+  new_func->attrs_.emplace_back(stamp, std::any(true));
   return new_func;
 }
 
@@ -633,22 +798,28 @@ FunctionPtr TransformFunction(const FunctionPtr& func, const MxOffsetFacts& fact
 
 namespace pass {
 
-Pass BlockMxScaleTensorViews() {
-  auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
+static Pass CreateMxScaleTensorViewsPass(bool logical_views) {
+  auto pass_func = [logical_views](const ProgramPtr& program) -> ProgramPtr {
     MxOffsetFactStore fact_store(program);
     auto facts = fact_store.Facts();
     bool modified = false;
     std::map<GlobalVarPtr, FunctionPtr, GlobalVarPtrLess> new_functions;
     for (const auto& [gvar, func] : program->functions_) {
-      auto new_func = TransformFunction(func, facts);
+      auto new_func = TransformFunction(func, facts, logical_views);
       if (new_func.get() != func.get()) modified = true;
       new_functions[gvar] = std::move(new_func);
     }
     if (!modified) return program;
     return std::make_shared<Program>(std::move(new_functions), program->name_, program->span_);
   };
-  return CreateProgramPass(pass_func, "BlockMxScaleTensorViews", kBlockMxScaleTensorViewsProperties);
+  return CreateProgramPass(pass_func,
+                           logical_views ? "LegalizeMxScaleTensorViews" : "BlockMxScaleTensorViews",
+                           kBlockMxScaleTensorViewsProperties);
 }
+
+Pass BlockMxScaleTensorViews() { return CreateMxScaleTensorViewsPass(false); }
+
+Pass LegalizeMxScaleTensorViews() { return CreateMxScaleTensorViewsPass(true); }
 
 }  // namespace pass
 }  // namespace ir

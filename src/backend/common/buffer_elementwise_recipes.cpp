@@ -17,6 +17,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/pto_native_ops.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -34,7 +36,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
   static const std::vector<BufferElementwiseRecipe> recipes = {
       {"tile.add",
        "buffer.add",
-       "pto.tadd",
+       GetPtoNativeOpSpec("tile.add").native_op,
        {{0}, {1}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::MatchingVec,
@@ -42,7 +44,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.mul",
        "buffer.mul",
-       "pto.tmul",
+       GetPtoNativeOpSpec("tile.mul").native_op,
        {{0}, {1}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::MatchingVec,
@@ -50,7 +52,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.sub",
        "buffer.sub",
-       "pto.tsub",
+       GetPtoNativeOpSpec("tile.sub").native_op,
        {{0}, {1}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -58,7 +60,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.div",
        "buffer.div",
-       "pto.tdiv",
+       GetPtoNativeOpSpec("tile.div").native_op,
        {{0}, {1}},
        BufferPrecisionKind::Div,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -66,7 +68,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.maximum",
        "buffer.maximum",
-       "pto.tmax",
+       GetPtoNativeOpSpec("tile.maximum").native_op,
        {{0}, {1}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -74,7 +76,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.minimum",
        "buffer.minimum",
-       "pto.tmin",
+       GetPtoNativeOpSpec("tile.minimum").native_op,
        {{0}, {1}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -82,7 +84,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.abs",
        "buffer.abs",
-       "pto.tabs",
+       GetPtoNativeOpSpec("tile.abs").native_op,
        {{0}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -90,7 +92,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.exp",
        "buffer.exp",
-       "pto.texp",
+       GetPtoNativeOpSpec("tile.exp").native_op,
        {{0}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -98,7 +100,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.sqrt",
        "buffer.sqrt",
-       "pto.tsqrt",
+       GetPtoNativeOpSpec("tile.sqrt").native_op,
        {{0}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -106,7 +108,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.neg",
        "buffer.neg",
-       "pto.tneg",
+       GetPtoNativeOpSpec("tile.neg").native_op,
        {{0}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -114,7 +116,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.relu",
        "buffer.relu",
-       "pto.trelu",
+       GetPtoNativeOpSpec("tile.relu").native_op,
        {{0}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -122,7 +124,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.log",
        "buffer.log",
-       "pto.tlog",
+       GetPtoNativeOpSpec("tile.log").native_op,
        {{0}},
        BufferPrecisionKind::Log,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -130,7 +132,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.recip",
        "buffer.recip",
-       "pto.trecip",
+       GetPtoNativeOpSpec("tile.recip").native_op,
        {{0}},
        BufferPrecisionKind::Recip,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -138,7 +140,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.adds",
        "buffer.adds",
-       "pto.tadds",
+       GetPtoNativeOpSpec("tile.adds").native_op,
        {{0}, {1, Kind::ElementScalar}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -146,7 +148,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.subs",
        "buffer.subs",
-       "pto.tsubs",
+       GetPtoNativeOpSpec("tile.subs").native_op,
        {{0}, {1, Kind::ElementScalar}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -154,7 +156,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.muls",
        "buffer.muls",
-       "pto.tmuls",
+       GetPtoNativeOpSpec("tile.muls").native_op,
        {{0}, {1, Kind::ElementScalar}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -162,7 +164,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.divs",
        "buffer.divs",
-       "pto.tdivs",
+       GetPtoNativeOpSpec("tile.divs").native_op,
        {{0}, {1, Kind::ElementScalar}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -170,7 +172,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.maximums",
        "buffer.maximums",
-       "pto.tmaxs",
+       GetPtoNativeOpSpec("tile.maximums").native_op,
        {{0}, {1, Kind::ElementScalar}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -178,7 +180,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.minimums",
        "buffer.minimums",
-       "pto.tmins",
+       GetPtoNativeOpSpec("tile.minimums").native_op,
        {{0}, {1, Kind::ElementScalar}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -186,7 +188,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.lrelu",
        "buffer.lrelu",
-       "pto.tlrelu",
+       GetPtoNativeOpSpec("tile.lrelu").native_op,
        {{0}, {1, Kind::ElementScalar}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -194,7 +196,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        true},
       {"tile.full",
        "buffer.full",
-       "pto.texpands",
+       GetPtoNativeOpSpec("tile.full").native_op,
        {{1, Kind::ElementScalar}},
        BufferPrecisionKind::None,
        BufferElementwiseTypePolicy::DenseFP32,
@@ -244,6 +246,9 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
   const auto dtype = destination->dtype_;
   if (!SupportsElementwiseDtype(recipe, dtype)) return false;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*destination);
+  // Column-vector descriptors are admitted only by their row recipes. Do not
+  // broaden every existing arithmetic recipe when default type support grows.
+  if (!IsDenseVecBufferTile(destination, view)) return false;
   const auto& valid = view.valid_shape.empty() ? destination->shape_ : view.valid_shape;
   for (const auto& input : recipe.inputs) {
     if (input.logical_index >= call->args_.size()) return false;
@@ -324,11 +329,11 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
 const char* BufferPrecisionAttributeName(BufferPrecisionKind precision) {
   switch (precision) {
     case BufferPrecisionKind::Div:
-      return "div_precision";
+      return GetPtoNativeOpSpec("tile.div").precision_attribute;
     case BufferPrecisionKind::Log:
-      return "log_precision";
+      return GetPtoNativeOpSpec("tile.log").precision_attribute;
     case BufferPrecisionKind::Recip:
-      return "recip_precision";
+      return GetPtoNativeOpSpec("tile.recip").precision_attribute;
     case BufferPrecisionKind::None:
       return nullptr;
   }

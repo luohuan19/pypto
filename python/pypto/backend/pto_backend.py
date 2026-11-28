@@ -18,6 +18,7 @@ Orchestrates the full PTO backend output pipeline:
 Entry point: ``generate(program, output_dir) -> dict[str, str]``
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import resources
 
 # importlib.resources.abc is new in 3.11; older interpreters expose the same
@@ -47,15 +48,24 @@ from pypto._function_attrs import (
     BUILTIN_TEMPLATE_DIR_ATTR,
     BUILTIN_TEMPLATE_VARS_ATTR,
     DUAL_AIV_DISPATCH_ATTR,
+    EXTERNAL_BINARY_POLICY_ATTR,
+    EXTERNAL_PREFLIGHT_SOURCE_ATTR,
+    EXTERNAL_RUNTIME_ATTR,
     EXTERNAL_SOURCE_ATTR,
 )
+from pypto._target import runtime_implementation_name
+from pypto.backend._host_tensor_args import host_tensor_indices as _host_tensor_indices
+from pypto.backend._ptoas_config import PTOAS_BUFFER_ID_SYNC_MARKER
+from pypto.backend._ptoas_config import PTOAS_TIMEOUT_ENV as _PTOAS_TIMEOUT_ENV
+from pypto.backend._ptoas_config import get_ptoas_timeout as _get_ptoas_timeout
+from pypto.backend._ptoas_fp4 import check_native_fp4_mx_support, uses_native_fp4_mx
 from pypto.backend._ptoas_locate import PTOAS_RELATIVE_PATHS as _PTOAS_RELATIVE_PATHS
 from pypto.backend._ptoas_locate import PTOAS_RELEASES_URL as _PTOAS_RELEASES_URL
 from pypto.backend._ptoas_locate import check_ptoas_version as _check_ptoas_version
 from pypto.backend._ptoas_locate import find_ptoas_binary as _find_ptoas_binary
 from pypto.backend._ptoas_preprocess import preprocess_ptoas_output as _preprocess_ptoas_output
 from pypto.compile_profiling import CompileProfiler, StageRecord
-from pypto.pypto_core import DataType
+from pypto.pypto_core import DataType as _DataType
 from pypto.pypto_core import backend as _backend_core
 from pypto.pypto_core import codegen as _codegen_core
 from pypto.pypto_core import ir as _ir_core
@@ -205,6 +215,8 @@ def _run_ptoas(
     Locates ptoas via the PTOAS_ROOT env var, probing ``$PTOAS_ROOT/ptoas``
     (pre-v0.51 launcher), ``$PTOAS_ROOT/ptoas.sh`` (v0.55+ bundled-CPython
     launcher) then ``$PTOAS_ROOT/bin/ptoas``, or PATH fallback.
+    ``PYPTO_PTOAS_TIMEOUT_SECONDS`` overrides the default 60-second deadline
+    for each kernel. It must be a positive integer.
 
     Args:
         pto_path: Path to the input .pto file
@@ -213,6 +225,7 @@ def _run_ptoas(
 
     Raises:
         FileNotFoundError: If the ptoas binary cannot be found
+        ValueError: If PYPTO_PTOAS_TIMEOUT_SECONDS is not a positive integer
         RuntimeError: If ptoas is older than the pinned minimum, or compilation fails
     """
     ptoas_bin = _find_ptoas_binary()
@@ -230,6 +243,7 @@ def _run_ptoas(
         )
     _check_ptoas_version(ptoas_bin)
 
+    timeout = _get_ptoas_timeout()
     cmd = [ptoas_bin, pto_path, "-o", output_path]
     if ptoas_flags:
         cmd.extend(ptoas_flags)
@@ -240,12 +254,17 @@ def _run_ptoas(
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"ptoas compilation timed out after {exc.timeout}s") from exc
+        raise RuntimeError(
+            f"ptoas compilation timed out after {exc.timeout}s; "
+            f"set {_PTOAS_TIMEOUT_ENV} to adjust the per-kernel deadline"
+        ) from exc
     if result.returncode != 0:
-        raise RuntimeError(f"ptoas compilation failed: {result.stderr.strip()}")
+        status = f"signal {-result.returncode}" if result.returncode < 0 else f"exit code {result.returncode}"
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic output"
+        raise RuntimeError(f"ptoas compilation failed: ({status}) {detail}")
 
 
 _KERNEL_HEADER = """\
@@ -269,6 +288,7 @@ _KERNEL_HEADER = """\
 {subblock_override}#include <pto/pto-inst.hpp>
 #include "tensor.h"
 {deferred_completion_include}
+{urma_transfer_include}
 {spmd_override}
 
 using namespace pto;
@@ -293,14 +313,16 @@ _DEFERRED_COMPLETION_ADAPTER = """\
 // scheduler to observe it.
 //
 // The __has_include guard on that header only proves it exists, not that it
-// still matches. This static_assert is the sole automatic drift detector, and
-// it anchors kMaxDeferredConditionsPerWaiter in
+// still matches. Compile tests cover the helper API; this static_assert also
+// anchors kMaxDeferredConditionsPerWaiter in
 // include/pypto/ir/transforms/utils/scope_outline_utils.h, which bounds the
 // same budget at compile time without access to any runtime header.
 static_assert(MAX_COMPLETIONS_PER_TASK == 64,
     "PyPTO's DeferredWaitContractValidator hard-codes 64 conditions per waiter; "
     "update kMaxDeferredConditionsPerWaiter in scope_outline_utils.h to match");
 
+// Match the PTOAS C-linkage prototype while keeping this wrapper helper private.
+extern "C" {
 static __aicore__ void pypto_register_counter_completion(
     __gm__ int64_t* raw_args,
     __gm__ int32_t* counter_base,
@@ -312,13 +334,23 @@ static __aicore__ void pypto_register_counter_completion(
         // A supported dispatcher always supplies a live task token and slab.
         // If the token is corrupted but the slab pointers remain coherent,
         // publish a scheduler-visible error instead of returning as an
-        // ordinary completed task. defer_flush validates the token, so mark
-        // only this local AsyncCtx copy valid after recording the error.
+        // ordinary completed task. The task handle is opaque and remains
+        // invalid: flush the two error fields directly instead of minting one.
         if (ctx.completion_count != nullptr && ctx.completion_error_code != nullptr) {
             *ctx.completion_count = 0;
             *ctx.completion_error_code = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
-            ctx.task_token.raw = 0;
-            pto2::detail::defer_flush(ctx);
+            pto2::detail::defer_flush_range(ctx.completion_count, sizeof(*ctx.completion_count));
+            pto2::detail::defer_flush_range(ctx.completion_error_code, sizeof(*ctx.completion_error_code));
+#if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
+#if defined(__CPU_SIM)
+            dsb(0);
+#else
+            dsb(DSB_DDR);
+#endif
+            pipe_barrier(PIPE_ALL);
+#else
+            __asm__ __volatile__("" ::: "memory");
+#endif
             return;
         }
 #if defined(__CPU_SIM)
@@ -381,6 +413,7 @@ static __aicore__ void pypto_register_counter_completion(
         reinterpret_cast<volatile __gm__ void*>(base + offset * kElementBytes),
         static_cast<uint32_t>(expected));
 }
+} // extern "C"
 
 """
 
@@ -391,6 +424,217 @@ _DEFERRED_COMPLETION_INCLUDE = """\
 #endif
 #endif
 #include "async_kernel_api.h"
+"""
+
+_URMA_TRANSFER_INCLUDE = """\
+#if defined(__has_include)
+#if !__has_include("backend/urma/urma_completion_kernel.h")
+#error "put_async/get_async require Simpler's urma_completion_kernel.h"
+#endif
+#if !__has_include("platform_comm/comm_context.h")
+#error "put_async/get_async require Simpler's comm_context.h"
+#endif
+#endif
+#include "backend/urma/urma_completion_kernel.h"
+#include "platform_comm/comm_context.h"
+"""
+
+_URMA_SESSION_ADAPTER = """\
+#if defined(PTO_URMA_SUPPORTED)
+extern "C" {
+static __aicore__ void pypto_urma_make_session(
+    __gm__ int64_t* raw_args, __gm__ int64_t* comm_raw, simpler::urma::UrmaSession* session) {
+  AsyncCtx async = get_async_ctx(raw_args);
+  auto* comm = reinterpret_cast<__gm__ CommContext*>(comm_raw);
+  if (!simpler::urma::build_urma_session(async, comm_workspace<CommWorkspaceKind::URMA>(*comm), *session)) {
+    pto2::detail::set_urma_error(async, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    pto2::detail::defer_flush(async);
+  }
+}
+}
+#endif
+"""
+
+_URMA_SCATTER_ADAPTER = """\
+#if defined(PTO_URMA_SUPPORTED)
+// One cache line per physical sender in the task's GM scratch tensor. The
+// immediate submission consumes both descriptors before this slot is reused.
+struct alignas(64) PyptoScatterDescriptors {
+  pto::comm::ScatterSegment destination;
+  pto::comm::ScatterSource source;
+};
+static_assert(sizeof(PyptoScatterDescriptors) == 64);
+
+template <typename T>
+static __aicore__ void pypto_urma_scatter_get(
+    __gm__ int64_t* raw_args, __gm__ int64_t* comm_raw, simpler::urma::UrmaSession* session,
+    __gm__ uint8_t* scratch, __gm__ T* dst, __gm__ T* src, int64_t nbytes, int64_t peer) {
+  AsyncCtx async = get_async_ctx(raw_args);
+  if (!session->valid) return;  // The builder already published the error.
+  auto* comm = reinterpret_cast<__gm__ CommContext*>(comm_raw);
+  const auto offset = reinterpret_cast<uint64_t>(src) - comm->windowsIn[comm->rankId];
+  if (peer < 0 || static_cast<uint64_t>(peer) >= comm->rankNum ||
+      nbytes <= 0 || nbytes > (256LL << 20) || offset > comm->winSize ||
+      static_cast<uint64_t>(nbytes) > comm->winSize - offset) {
+    pto2::detail::set_urma_error(async, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    pto2::detail::defer_flush(async);
+    return;
+  }
+  auto& desc = reinterpret_cast<__gm__ PyptoScatterDescriptors*>(scratch)[async.urma_sender_id];
+  desc.destination.addr = reinterpret_cast<__gm__ uint8_t*>(dst);
+  desc.destination.length = static_cast<uint32_t>(nbytes);
+  desc.source.addr = pto2::urma_backend::peer_mr_ptr<uint8_t>(session->domain_workspace, peer, offset);
+  desc.source.segCount = 1;
+  desc.source.peer = static_cast<uint32_t>(peer);
+#if !defined(__CPU_SIM)
+  pto::comm::urma::DcciCachelines(reinterpret_cast<__gm__ uint8_t*>(&desc), sizeof(desc));
+  dsb(DSB_DDR);
+#endif
+  // Simpler publishes submission and registration failures to this task.
+  send_request_entry(async, UrmaTget(&desc.destination, 1, &desc.source, 1), *session);
+}
+#endif
+"""
+
+_URMA_TRANSFER_ADAPTER_TEMPLATE = """\
+// --- URMA async transfer adapter ---
+// V1 completion is owned by the enclosing task: the helpers below only submit
+// the request and register its completion condition. They never poll or wait,
+// and returning does not mean the transfer has completed.
+//
+// ABI: pypto codegen emits
+//   func.call @pypto_urma_{put,get}_async_<dtype>(
+//       raw_args, comm_ctx, dst_base, src_base,
+//       dst_byte_offset, src_byte_offset, nbytes, peer,
+//       dst_extent, src_extent)
+// The C++ definitions below use the same argument order. The local endpoint may
+// be a plain tensor; the remote address is resolved through the peer MR.
+// ``dst_extent``/``src_extent`` are each endpoint tensor view's byte span
+// (including any stride gaps). The window check alone cannot bound a dynamic
+// subregion to the tensor that owns it: the window holds every registered
+// buffer, so a runtime offset past one tensor but inside the window would
+// otherwise overwrite a neighbour. Static subregions are already bounded by
+// the IR verifier; these extents carry the same bound to runtime.
+static __aicore__ void pypto_urma_fail(AsyncCtx& ctx, int32_t code) {
+  pto2::detail::set_urma_error(ctx, code);
+  pto2::detail::defer_flush(ctx);
+}
+
+template <typename T, bool kPut>
+static __aicore__ void pypto_urma_transfer_impl(
+    __gm__ int64_t* raw_args,
+    __gm__ int64_t* comm_ctx_raw,
+    __gm__ T* dst_base,
+    __gm__ T* src_base,
+    int64_t dst_off,
+    int64_t src_off,
+    int64_t nbytes,
+    int64_t peer,
+    int64_t dst_extent,
+    int64_t src_extent)
+{
+  if (raw_args == nullptr) {
+#if defined(__CPU_SIM)
+    __builtin_trap();
+#else
+    trap();
+#endif
+    return;
+  }
+
+  AsyncCtx ctx = get_async_ctx(raw_args);
+
+  if (comm_ctx_raw == nullptr || dst_base == nullptr || src_base == nullptr ||
+      dst_off < 0 || src_off < 0 || nbytes <= 0 ||
+      dst_extent <= 0 || src_extent <= 0 ||
+      nbytes % static_cast<int64_t>(sizeof(T)) != 0) {
+    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+    return;
+  }
+
+  __gm__ CommContext* comm = reinterpret_cast<__gm__ CommContext*>(comm_ctx_raw);
+  const uint64_t workspace_addr =
+      comm_workspace<CommWorkspaceKind::URMA>(*comm).addr;
+  if (workspace_addr == 0 || peer < 0 ||
+      static_cast<uint64_t>(peer) >= static_cast<uint64_t>(comm->rankNum) ||
+      static_cast<uint64_t>(peer) == static_cast<uint64_t>(comm->rankId) ||
+      comm->windowsIn[comm->rankId] == 0) {
+    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+    return;
+  }
+
+  auto* workspace = reinterpret_cast<__gm__ uint8_t*>(workspace_addr);
+  const int64_t elems = static_cast<int64_t>(nbytes) / static_cast<int64_t>(sizeof(T));
+  // Address arithmetic stays in integers until every range is validated: a
+  // typed pointer formed past the end of an allocation is already undefined
+  // behavior, even if the next line would reject it. Bounds are checked with
+  // subtraction, not by adding nbytes, so an offset near the top of the
+  // address space cannot wrap the sum. The tensor extent is measured from the
+  // endpoint view's base, so the view-relative offset is the one to compare;
+  // `remote_off` is measured from the window base and is only for the window
+  // check and peer address.
+  constexpr uint64_t kMaxAddress = ~static_cast<uint64_t>(0);
+  const uint64_t bytes = static_cast<uint64_t>(nbytes);
+  const uint64_t local_off = static_cast<uint64_t>(kPut ? src_off : dst_off);
+  const uint64_t local_extent = static_cast<uint64_t>(kPut ? src_extent : dst_extent);
+  const uint64_t remote_view_off = static_cast<uint64_t>(kPut ? dst_off : src_off);
+  const uint64_t remote_extent = static_cast<uint64_t>(kPut ? dst_extent : src_extent);
+  const uint64_t local_base_abs =
+      reinterpret_cast<uint64_t>(kPut ? src_base : dst_base);
+  const uint64_t remote_base_abs =
+      reinterpret_cast<uint64_t>(kPut ? dst_base : src_base);
+  const uint64_t local_window = comm->windowsIn[comm->rankId];
+  // The local endpoint may be outside the remote endpoint's communication window.
+  if (local_off > local_extent || bytes > local_extent - local_off ||
+      remote_view_off > remote_extent || bytes > remote_extent - remote_view_off ||
+      local_off > kMaxAddress - local_base_abs ||
+      remote_view_off > kMaxAddress - remote_base_abs) {
+    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+    return;
+  }
+  const uint64_t local_abs = local_base_abs + local_off;
+  const uint64_t remote_abs = remote_base_abs + remote_view_off;
+  if (remote_abs < local_window) {
+    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+    return;
+  }
+  const uint64_t remote_off = remote_abs - local_window;
+  if (remote_off > comm->winSize || bytes > comm->winSize - remote_off) {
+    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+    return;
+  }
+  __gm__ T* local = reinterpret_cast<__gm__ T*>(local_abs);
+  __gm__ T* remote = pto2::urma_backend::peer_mr_ptr<T>(
+      workspace, static_cast<uint32_t>(peer), remote_off);
+
+  using FlatShape = pto::Shape<1, 1, 1, 1, pto::DYNAMIC>;
+  using FlatStride =
+      pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, 1>;
+  using Flat = pto::GlobalTensor<T, FlatShape, FlatStride>;
+  const auto shape = FlatShape(1, 1, 1, 1, elems);
+  const auto stride = FlatStride(elems, elems, elems, elems, 1);
+  Flat dst_tensor(kPut ? remote : local, shape, stride);
+  Flat src_tensor(kPut ? local : remote, shape, stride);
+
+  // TPUT reads a local source, and a TGET may read a peer source that was
+  // populated from a local store before the cross-rank handshake. In both
+  // directions the preceding local stores must be visible before submission.
+  pipe_barrier(PIPE_ALL);
+  const bool submitted =
+      kPut ? send_request_entry(
+                 ctx, UrmaTput(dst_tensor, src_tensor, workspace,
+                               static_cast<uint32_t>(peer)))
+           : send_request_entry(
+                 ctx, UrmaTget(dst_tensor, src_tensor, workspace,
+                               static_cast<uint32_t>(peer)));
+  if (!submitted) {
+    // The submission path already published the failing chunk's error code;
+    // flush the registered conditions so the scheduler observes them.
+    pto2::detail::defer_flush(ctx);
+  }
+}
+
+__PYPTO_URMA_WRAPPERS__
 """
 
 
@@ -419,20 +663,17 @@ def _invert_var_plus_minus_const(
     return None
 
 
-def _invert_var_mul_or_floordiv_const(
-    dim_expr: _ir_core.BinaryExpr, target_var: _ir_core.Var, shape_expr: str, *, floordiv: bool
+def _invert_var_mul_const(
+    dim_expr: _ir_core.BinaryExpr, target_var: _ir_core.Var, shape_expr: str
 ) -> str | None:
     # ``Mul`` is commutative: both ``(var, c)`` and ``(c, var)`` invert to ``shape / c``.
-    # ``FloorDiv`` is non-commutative: only ``(var, c)`` inverts (to ``shape * c``);
-    # ``(c, var)`` is rejected because ``c // var`` is not uniquely invertible
-    # against the runtime shape (e.g. ``10 // var = 2`` admits var = 4 or 5).
     left, right = dim_expr.left, dim_expr.right
     if isinstance(left, _ir_core.Var) and left.same_as(target_var):
         c = _const_int_from_shape_expr(right)
         if c is None or c == 0:
             return None
-        return f"({shape_expr} * {c})" if floordiv else f"({shape_expr} / {c})"
-    if not floordiv and isinstance(right, _ir_core.Var) and right.same_as(target_var):
+        return f"({shape_expr} / {c})"
+    if isinstance(right, _ir_core.Var) and right.same_as(target_var):
         c = _const_int_from_shape_expr(left)
         if c is None or c == 0:
             return None
@@ -445,12 +686,9 @@ def _invert_shape_dim_for_var(
     target_var: _ir_core.Var,
     tensor_name: str,
     dim_idx: int,
-    logical_scale: int = 1,
 ) -> str | None:
     """Return a C expression recovering target_var from shapes[dim_idx], or None if non-invertible."""
     shape_expr = f"static_cast<int64_t>({tensor_name}_tensor->shapes[{dim_idx}])"
-    if logical_scale != 1:
-        shape_expr = f"({shape_expr} * {logical_scale})"
     if isinstance(dim_expr, _ir_core.Var) and dim_expr.same_as(target_var):
         return shape_expr
     if isinstance(dim_expr, _ir_core.Add):
@@ -458,9 +696,9 @@ def _invert_shape_dim_for_var(
     if isinstance(dim_expr, _ir_core.Sub):
         return _invert_var_plus_minus_const(dim_expr, target_var, shape_expr, subtract=True)
     if isinstance(dim_expr, _ir_core.Mul):
-        return _invert_var_mul_or_floordiv_const(dim_expr, target_var, shape_expr, floordiv=False)
-    if isinstance(dim_expr, _ir_core.FloorDiv):
-        return _invert_var_mul_or_floordiv_const(dim_expr, target_var, shape_expr, floordiv=True)
+        return _invert_var_mul_const(dim_expr, target_var, shape_expr)
+    # FloorDiv loses the remainder. Without a divisibility proof, shape * c
+    # is not the original symbol (e.g. 11 // 5 == 2 but 2 * 5 != 11).
     return None
 
 
@@ -474,6 +712,7 @@ def _is_invertible_shape_dim_for_var(dim_expr: object, target_var: _ir_core.Var)
 
 
 def _append_dynamic_dim_unpacking(
+    func: _ir_core.Function,
     tensor_params: list[_ir_core.Var],
     used_c_names: set[str],
     lines: list[str],
@@ -490,38 +729,36 @@ def _append_dynamic_dim_unpacking(
     Python binding wrappers can differ for the same underlying C++ Var; the
     per-call dedup inside ``collect_vars_from_shape_expr`` uses raw ``Var*``.
     """
-    dyn_var_order: list[_ir_core.Var] = []
-    dyn_var_best: dict[int, tuple[_ir_core.Var, str, int, object]] = {}
+    # Use the exact same signature analysis as PTO codegen. A symbol explicitly
+    # passed as a scalar must never be reconstructed from a descriptor as well.
+    dyn_var_order = _codegen_core.collect_tensor_shape_dyn_vars(func)
+    required = {var.unique_id for var in dyn_var_order}
+    dyn_var_best: dict[int, tuple[_ir_core.Var, int, object]] = {}
     for param in tensor_params:
         assert isinstance(param.type, _ir_core.TensorType)
         for dim_idx, dim in enumerate(param.type.shape):
             for dyn_var in _codegen_core.collect_vars_from_shape_expr(dim):
                 key = dyn_var.unique_id
-                if key not in dyn_var_best:
-                    dyn_var_order.append(dyn_var)
-                    dyn_var_best[key] = (dyn_var, param.name_hint, dim_idx, dim)
+                if key not in required:
                     continue
-                _, _, _, src_expr = dyn_var_best[key]
+                if key not in dyn_var_best:
+                    dyn_var_best[key] = (param, dim_idx, dim)
+                    continue
+                _, _, src_expr = dyn_var_best[key]
                 # Upgrade source if the previous one was non-invertible and this one is.
                 if not _is_invertible_shape_dim_for_var(
                     src_expr, dyn_var
                 ) and _is_invertible_shape_dim_for_var(dim, dyn_var):
-                    dyn_var_best[key] = (dyn_var, param.name_hint, dim_idx, dim)
+                    dyn_var_best[key] = (param, dim_idx, dim)
 
     for dyn_var in dyn_var_order:
-        var_ref, source_tensor, source_dim_idx, source_expr = dyn_var_best[dyn_var.unique_id]
-        source_param = next(param for param in tensor_params if param.name_hint == source_tensor)
-        source_type = source_param.type
-        assert isinstance(source_type, _ir_core.TensorType)
-        logical_scale = (
-            2 if source_type.dtype == DataType.FP4 and source_dim_idx == len(source_type.shape) - 1 else 1
-        )
+        source_param, source_dim_idx, source_expr = dyn_var_best[dyn_var.unique_id]
+        source_tensor = source_param.name_hint
         value_expr = _invert_shape_dim_for_var(
             source_expr,
-            var_ref,
+            dyn_var,
             source_tensor,
             source_dim_idx,
-            logical_scale=logical_scale,
         )
         if value_expr is None:
             raise ValueError(
@@ -529,8 +766,8 @@ def _append_dynamic_dim_unpacking(
                 f"codegen: it only appears inside non-invertible shape expressions "
                 f"(seen as {source_tensor}.shapes[{source_dim_idx}] = {source_expr}). "
                 f"Wrapper extraction supports 'var' and single-var affine forms "
-                f"(var +/-/*// const_int) shape expressions; "
-                f"at least one tensor parameter must expose the variable in one of these "
+                f"(var +/-/* const_int) shape expressions; pass the variable as an explicit "
+                f"scalar parameter, or expose it in at least one tensor parameter in one of these "
                 f"forms so the runtime shape can be inverted back into the variable's value."
             )
         var_name = dyn_var.name_hint
@@ -578,6 +815,16 @@ def _generate_arg_unpacking(func: _ir_core.Function, *, uses_spmd: bool = False)
             f"Unsupported parameter type(s) for wrapper generation in function {func.name}: "
             + ", ".join(f"{p.name_hint}: {type(p.type).__name__}" for p in other_params)
         )
+
+    # CoreTaskArgs has fixed payload capacities (task_interface/arg_direction.h).
+    # Shape captures consume scalar slots; descriptor-derived dimensions and
+    # runtime-owned hidden arguments do not. Diagnose overflow before dispatch.
+    for kind, count, limit in (("tensor", len(tensor_params), 32), ("scalar", len(scalar_params), 16)):
+        if count > limit:
+            raise ValueError(
+                f"Kernel '{func.name}' requires {count} {kind} arguments; "
+                f"the runtime payload supports at most {limit}"
+            )
 
     scalar_start_idx = len(tensor_params)
 
@@ -649,7 +896,7 @@ def _generate_arg_unpacking(func: _ir_core.Function, *, uses_spmd: bool = False)
     used_c_names.update(
         f"{p.name_hint}_conv" for p in scalar_params if isinstance(p.type, _ir_core.ScalarType)
     )
-    _append_dynamic_dim_unpacking(tensor_params, used_c_names, lines, var_names)
+    _append_dynamic_dim_unpacking(func, tensor_params, used_c_names, lines, var_names)
 
     return "\n".join(lines), var_names
 
@@ -691,6 +938,11 @@ _AIV_FIFO_ENDPOINT_OPS = frozenset(
 )
 _SDMA_WORKSPACE_OPS = frozenset({_ir_core.get_op("prefetch.make_context").name})
 _DEFERRED_COMPLETION_OPS = frozenset({_ir_core.get_op("pld.system.defer_wait").name})
+_URMA_PUT_ASYNC_OP = _ir_core.get_op("pld.tensor.put_async").name
+_URMA_GET_ASYNC_OP = _ir_core.get_op("pld.tensor.get_async").name
+_URMA_SCATTER_OP = _ir_core.get_op("pld.tile.get_async").name
+_URMA_SESSION_OP = _ir_core.get_op("pld.system.make_session").name
+_URMA_TRANSFER_OPS = frozenset({_URMA_PUT_ASYNC_OP, _URMA_GET_ASYNC_OP, _URMA_SCATTER_OP, _URMA_SESSION_OP})
 _TILE_LOAD_OP = _ir_core.get_op("tile.load").name
 
 
@@ -740,6 +992,87 @@ def _uses_sdma_workspace(func: _ir_core.Function) -> bool:
 def _uses_deferred_completion(func: _ir_core.Function) -> bool:
     """Return whether the wrapper must expose the scheduler AsyncCtx."""
     return _function_uses_ops(func, _DEFERRED_COMPLETION_OPS)
+
+
+def _uses_urma_transfer(func: _ir_core.Function) -> bool:
+    """Return whether the wrapper must expose the URMA async transfer adapter."""
+    return _function_uses_ops(func, _URMA_TRANSFER_OPS)
+
+
+def _collect_urma_transfer_dtypes(func: _ir_core.Function) -> set[tuple[str, _DataType]]:
+    """Collect ``(op name, dtype)`` for every async transfer in *func*."""
+
+    class _UrmaFinder(_ir_core.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pairs: set[tuple[str, _DataType]] = set()
+
+        def visit_call(self, op: _ir_core.Call) -> None:
+            ir_op = getattr(op, "op", None)
+            if isinstance(ir_op, _ir_core.Op) and op.args:
+                if ir_op.name in {_URMA_PUT_ASYNC_OP, _URMA_GET_ASYNC_OP, _URMA_SCATTER_OP}:
+                    endpoint = op.args[0].type
+                    if isinstance(endpoint, _ir_core.TensorType):
+                        self.pairs.add((ir_op.name, endpoint.dtype))
+            super().visit_call(op)
+
+    finder = _UrmaFinder()
+    finder.visit_stmt(func.body)
+    return finder.pairs
+
+
+def _generate_urma_transfer_adapter(*functions: _ir_core.Function) -> str:
+    """Render the C++ adapter for the async transfers in *func*.
+
+    The PTOAS declaration is dtype-suffixed, so only the ``(put, dtype)`` /
+    ``(get, dtype)`` pairs actually present get a C++ definition. The generic
+    implementation is shared.
+    """
+    pairs = {pair for func in functions for pair in _collect_urma_transfer_dtypes(func)}
+    parts: list[str] = []
+    if any(_function_uses_ops(func, frozenset({_URMA_SESSION_OP})) for func in functions):
+        parts.append(_URMA_SESSION_ADAPTER)
+    wrappers: list[str] = []
+    scatter_wrappers: list[str] = []
+    for name, dtype in sorted(pairs, key=lambda item: (item[0], str(item[1]))):
+        suffix = _codegen_core.data_type_to_mlir(dtype)
+        if name == _URMA_SCATTER_OP:
+            suffix = suffix.removeprefix("!pto.")
+        if suffix.startswith("!pto.") or suffix in {"index", "i1"}:
+            raise ValueError(f"{name} does not support element type {suffix!r}")
+        cpp_type = dtype.to_c_type_string()
+        if name == _URMA_SCATTER_OP:
+            scatter_wrappers.append(
+                f'extern "C" {{ static __aicore__ void pypto_urma_scatter_get_{suffix}(\n'
+                "    __gm__ int64_t* args, __gm__ int64_t* comm, simpler::urma::UrmaSession* session,\n"
+                f"    __gm__ uint8_t* scratch, __gm__ {cpp_type}* dst, __gm__ {cpp_type}* src,\n"
+                "    int64_t bytes, int64_t peer) {\n"
+                "  pypto_urma_scatter_get(args, comm, session, scratch, dst, src, bytes, peer);\n} }"
+            )
+            continue
+        is_put = name == _URMA_PUT_ASYNC_OP
+        op = "put" if is_put else "get"
+        k_put = "true" if is_put else "false"
+        wrappers.append(
+            'extern "C" {\n'
+            f"static __aicore__ void pypto_urma_{op}_async_{suffix}(\n"
+            "    __gm__ int64_t* raw_args, __gm__ int64_t* comm_ctx_raw,\n"
+            f"    __gm__ {cpp_type}* dst_base, __gm__ {cpp_type}* src_base,\n"
+            "    int64_t dst_off, int64_t src_off, int64_t nbytes, int64_t peer,\n"
+            "    int64_t dst_extent, int64_t src_extent) {\n"
+            f"  pypto_urma_transfer_impl<{cpp_type}, {k_put}>(\n"
+            "      raw_args, comm_ctx_raw, dst_base, src_base, dst_off, src_off, nbytes, peer,\n"
+            "      dst_extent, src_extent);\n"
+            "}\n"
+            '} // extern "C"'
+        )
+    if wrappers:
+        parts.append(
+            _URMA_TRANSFER_ADAPTER_TEMPLATE.replace("__PYPTO_URMA_WRAPPERS__", "\n\n".join(wrappers))
+        )
+    if scatter_wrappers:
+        parts.extend([_URMA_SCATTER_ADAPTER, "#if defined(PTO_URMA_SUPPORTED)", *scatter_wrappers, "#endif"])
+    return "\n".join(parts)
 
 
 def _uses_l2_cache_offset(func: _ir_core.Function) -> bool:
@@ -875,6 +1208,49 @@ def _find_ptoas_function(
     return params_start, params_end, body_start, body_end
 
 
+def _honor_runtime_aiv_lane_control(func: _ir_core.Function, ptoas_code: str) -> str:
+    """Retain explicit runtime lane control across PTOAS's no-split lowering.
+
+    PTOAS recognizes its native subblock op as explicit control. PyPTO instead
+    forwards the runtime lane through a synthetic parameter, so pinned PTOAS
+    can add an extra hardware-AIV0 guard around even the shared pipe setup.
+    Remove only that generated prologue guard for an explicitly dual-dispatched
+    AIV function with a dynamic runtime lane. Its authored IR control remains.
+    """
+    if (
+        func.func_type != _ir_core.FunctionType.AIV
+        or not _requires_dual_aiv_dispatch(func)
+        or not _uses_dynamic_subblock_id(func)
+        or _backend_core.get_handler().get_pto_target_arch() != "a5"
+    ):
+        return ptoas_code
+    guard_pattern = re.compile(r"if\s*\(\s*get_subblockid\(\)\s*==\s*0\s*\)\s*\{")
+    if not guard_pattern.search(ptoas_code):
+        return ptoas_code
+    _, _, body_start, body_end = _find_ptoas_function(func.name, ptoas_code)
+    body = ptoas_code[body_start + 1 : body_end]
+    prologue = re.search(
+        r"#if\s+defined\(__DAV_VEC__\)\s*"
+        r"set_mask_norm\(\);\s*set_vector_mask\(-1,\s*-1\);\s*"
+        r"(?P<guard>if\s*\(\s*get_subblockid\(\)\s*==\s*0\s*\)\s*\{)",
+        body,
+    )
+    if prologue is None:
+        if guard_pattern.search(body):
+            raise RuntimeError(f"{func.name}: unrecognized PTOAS single-lane guard with runtime AIV control")
+        return ptoas_code
+    guard_start = body_start + 1 + prologue.start("guard")
+    opening = body_start + prologue.end("guard")
+    closing = _find_matching_delimiter(ptoas_code, opening, "{", "}")
+    if (
+        closing < 0
+        or closing >= body_end
+        or not re.match(r"\s*#endif\s*//\s*__DAV_VEC__", ptoas_code[closing + 1 : body_end])
+    ):
+        raise RuntimeError(f"{func.name}: malformed PTOAS no-split vector prologue guard")
+    return ptoas_code[:guard_start] + ptoas_code[opening + 1 : closing] + ptoas_code[closing + 1 :]
+
+
 _SPLIT_FIFO_TEMPLATE_MARKERS = (
     "TileSplitAxis::TILE_UP_DOWN",
     "TileSplitAxis::TILE_LEFT_RIGHT",
@@ -885,8 +1261,28 @@ _SPLIT_FIFO_TEMPLATE_MARKERS = (
 _RUNTIME_SPLIT_FIFO_LANE_ARG = "PYPTO_SPLIT_RUNTIME_LANE_ARG"
 
 
-def _second_call_argument_end(code: str, args_start: int, args_end: int, func_name: str) -> int:
-    """Return where a runtime lane argument belongs after a FIFO call's tile argument."""
+def _uses_explicit_aiv_fifo_lane(func: _ir_core.Function) -> bool:
+    """Identify authored logical lanes independently of the runtime bridge backend."""
+    arities = {
+        _ir_core.get_op("tile.tpush_to_aic").name: 2,
+        _ir_core.get_op("tile.tpop_from_aic").name: 1,
+    }
+
+    class Finder(_ir_core.IRVisitor):
+        found = False
+
+        def visit_call(self, op: _ir_core.Call) -> None:
+            if len(op.args) == arities.get(op.op.name):
+                self.found = True
+            super().visit_call(op)
+
+    finder = Finder()
+    finder.visit_stmt(func.body)
+    return finder.found
+
+
+def _second_call_argument_end(code: str, args_start: int, args_end: int, func_name: str) -> int | None:
+    """Return the insertion point, or None when the call already has an explicit lane."""
 
     depths = {"(": 0, "[": 0, "{": 0, "<": 0}
     closing_to_opening = {")": "(", "]": "[", "}": "{", ">": "<"}
@@ -901,10 +1297,10 @@ def _second_call_argument_end(code: str, args_start: int, args_end: int, func_na
                 depths[opening] -= 1
         elif char == "," and all(depth == 0 for depth in depths.values()):
             top_level_commas += 1
-            if top_level_commas == 2:
-                return index
+    if top_level_commas == 2:
+        return None
     if top_level_commas != 1:
-        raise RuntimeError(f"{func_name}: expected split TPUSH/TPOP to have at least pipe and tile arguments")
+        raise RuntimeError(f"{func_name}: expected split TPUSH/TPOP to have pipe, tile and an optional lane")
     return args_end
 
 
@@ -926,22 +1322,8 @@ def _forward_runtime_lane_to_split_fifo_calls(
         return ptoas_code, False
 
     params_start, params_end, body_start, body_end = _find_ptoas_function(func.name, ptoas_code)
-    add_runtime_param = not _uses_dynamic_subblock_id(func)
-    if add_runtime_param:
-        subblock_param = "__pypto_runtime_subblock_idx"
-    else:
-        trailing_param = re.search(
-            r"(?:^|,)\s*int32_t\s+([A-Za-z_]\w*)\s*$",
-            ptoas_code[params_start + 1 : params_end],
-        )
-        if trailing_param is None:
-            raise RuntimeError(
-                f"{func.name}: PTOAS function is missing its trailing runtime subblock parameter"
-            )
-        subblock_param = trailing_param.group(1)
-
     call_pattern = re.compile(r"\b(TPUSH|TPOP)\s*(<)")
-    insertions: list[tuple[int, str]] = []
+    lane_positions: list[int] = []
     rewritten_counts = {"TPUSH": 0, "TPOP": 0}
     position = body_start + 1
     while (match := call_pattern.search(ptoas_code, position, body_end)) is not None:
@@ -963,7 +1345,8 @@ def _forward_runtime_lane_to_split_fifo_calls(
         if args_end < 0 or args_end >= body_end:
             raise RuntimeError(f"{func.name}: unterminated split {match.group(1)} call")
         insertion_at = _second_call_argument_end(ptoas_code, args_start, args_end, func.name)
-        insertions.append((insertion_at, f" {_RUNTIME_SPLIT_FIFO_LANE_ARG}({subblock_param})"))
+        if insertion_at is not None:
+            lane_positions.append(insertion_at)
         rewritten_counts[match.group(1)] += 1
         position = args_end + 1
 
@@ -976,6 +1359,28 @@ def _forward_runtime_lane_to_split_fifo_calls(
             f"PTOAS push/pop={rewritten_counts['TPUSH']}/{rewritten_counts['TPOP']}"
         )
 
+    # Explicit operands already select their logical lanes. Do not append a
+    # second lane, or add an unused hidden parameter when every call is explicit.
+    # Counts above still include these endpoints to retain the fail-closed check.
+    if not lane_positions:
+        return ptoas_code, False
+
+    add_runtime_param = not _uses_dynamic_subblock_id(func)
+    if add_runtime_param:
+        subblock_param = "__pypto_runtime_subblock_idx"
+    else:
+        trailing_param = re.search(
+            r"(?:^|,)\s*int32_t\s+([A-Za-z_]\w*)\s*$",
+            ptoas_code[params_start + 1 : params_end],
+        )
+        if trailing_param is None:
+            raise RuntimeError(
+                f"{func.name}: PTOAS function is missing its trailing runtime subblock parameter"
+            )
+        subblock_param = trailing_param.group(1)
+    insertions = [
+        (position, f" {_RUNTIME_SPLIT_FIFO_LANE_ARG}({subblock_param})") for position in lane_positions
+    ]
     if add_runtime_param:
         separator = "" if not ptoas_code[params_start + 1 : params_end].strip() else ", "
         insertions.append((params_end, f"{separator}int32_t {subblock_param}"))
@@ -994,6 +1399,7 @@ def _generate_kernel_header(
     uses_sdma: bool | None = None,
     uses_l2_cache_offset: bool | None = None,
     uses_deferred_completion: bool | None = None,
+    uses_urma_transfer: bool | None = None,
 ) -> str:
     """Generate the wrapper header, including split lane overrides when needed."""
     fixed_subblock_id = _get_fixed_subblock_id(func)
@@ -1024,14 +1430,18 @@ def _generate_kernel_header(
         uses_l2_cache_offset = _uses_l2_cache_offset(func)
     if uses_deferred_completion is None:
         uses_deferred_completion = _uses_deferred_completion(func)
+    if uses_urma_transfer is None:
+        uses_urma_transfer = _uses_urma_transfer(func)
     needs_intrinsic = uses_spmd or uses_subblock or uses_sdma or uses_l2_cache_offset
     spmd_override = '#include "intrinsic.h"\n' if needs_intrinsic else ""
     deferred_completion_include = _DEFERRED_COMPLETION_INCLUDE if uses_deferred_completion else ""
+    urma_transfer_include = _URMA_TRANSFER_INCLUDE if uses_urma_transfer else ""
 
     return _KERNEL_HEADER.format(
         func_name=func.name,
         subblock_override=subblock_override,
         deferred_completion_include=deferred_completion_include,
+        urma_transfer_include=urma_transfer_include,
         spmd_override=spmd_override,
     )
 
@@ -1041,6 +1451,7 @@ def _generate_kernel_wrapper(
     ptoas_code: str,
     *,
     group_uses_spmd: bool = False,
+    module_urma_adapter: str | None = None,
 ) -> str:
     """Generate a complete kernel wrapper file for one InCore function.
 
@@ -1055,7 +1466,11 @@ def _generate_kernel_wrapper(
     func_uses_sdma = _uses_sdma_workspace(func)
     func_uses_l2_cache_offset = _uses_l2_cache_offset(func)
     func_uses_deferred_completion = _uses_deferred_completion(func)
+    func_uses_urma_transfer = _uses_urma_transfer(func)
+    if module_urma_adapter is None:
+        module_urma_adapter = _generate_urma_transfer_adapter(func) if func_uses_urma_transfer else ""
     ptoas_body = _preprocess_ptoas_output(ptoas_code)
+    ptoas_body = _honor_runtime_aiv_lane_control(func, ptoas_body)
     ptoas_body, fifo_uses_subblock = _forward_runtime_lane_to_split_fifo_calls(func, ptoas_body)
     wrapper_uses_subblock = func_uses_subblock or fifo_uses_subblock
     header = _generate_kernel_header(
@@ -1065,6 +1480,7 @@ def _generate_kernel_wrapper(
         uses_sdma=func_uses_sdma,
         uses_l2_cache_offset=func_uses_l2_cache_offset,
         uses_deferred_completion=func_uses_deferred_completion,
+        uses_urma_transfer=bool(module_urma_adapter),
     )
     unpacking_code, var_names = _generate_arg_unpacking(func, uses_spmd=uses_spmd)
 
@@ -1134,7 +1550,7 @@ def _generate_kernel_wrapper(
     # alias offset, and the synthetic i32 identity params in canonical order
     # (block_idx, block_num, subblock_idx). Mirror that exact order here.
     call_args_list = list(var_names)
-    if func_uses_deferred_completion:
+    if func_uses_deferred_completion or func_uses_urma_transfer:
         call_args_list.append("args")
     if func_uses_sdma:
         call_args_list.append("__pypto_sdma_workspace")
@@ -1170,8 +1586,18 @@ def _generate_kernel_wrapper(
     )
 
     deferred_completion_adapter = _DEFERRED_COMPLETION_ADAPTER if func_uses_deferred_completion else ""
+    # The current PTO-ISA CPU implementation has no logical-lane overload.
+    # Reject it explicitly instead of stripping the operand and changing data
+    # selection. Device builds retain the authored call unchanged.
+    explicit_lane_guard = ""
+    if _uses_explicit_aiv_fifo_lane(func):
+        explicit_lane_guard = (
+            "#if defined(__CPU_SIM)\n"
+            '#error "Explicit aiv_subblockid requires NPU execution; CPU simulation is unsupported."\n'
+            "#endif\n"
+        )
     return (
-        f"{header}\n{deferred_completion_adapter}{fifo_lane_arg_bridge}"
+        f"{explicit_lane_guard}{header}\n{deferred_completion_adapter}{module_urma_adapter}{fifo_lane_arg_bridge}"
         f"// --- ptoas-generated code ---\n{ptoas_body}\n{fifo_lane_arg_cleanup}{wrapper_func}"
     )
 
@@ -1185,32 +1611,43 @@ def _format_signature(directions: list[str]) -> str:
     return ", ".join(f"_D.{d}" for d in directions)
 
 
+def _runtime_name_for_codegen(runtime: _passes.RuntimeKind) -> str:
+    arch = (
+        _backend_core.get_handler().get_pto_target_arch() if _backend_core.is_backend_configured() else None
+    )
+    return runtime_implementation_name(runtime, arch)
+
+
+@dataclass
+class _KernelCompileRequirements:
+    """Per-member binary requirements retained in the generated runtime config."""
+
+    vpto_sources: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
+    binary_policy: dict[str, str] = field(default_factory=dict[str, str])
+
+
 def _generate_config_file(
     orch_func_name: str,
-    func_name_to_id: dict[str, int],
-    func_name_to_core_type: dict[str, _ir_core.CoreType],
-    func_name_to_signature: dict[str, list[str]] | None = None,
+    kernel_registrations: list[_codegen_core.KernelRegistration],
     orchestration_signature: list[str] | None = None,
     func_name_to_external_source: dict[str, str] | None = None,
     func_name_to_external_include_dirs: dict[str, tuple[str, ...]] | None = None,
     enable_sdma: bool = False,
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+    host_tensor_indices: list[int] | None = None,
+    unshared_code_names: set[str] | None = None,
+    compile_requirements: _KernelCompileRequirements | None = None,
 ) -> str:
     """Generate kernel_config.py content.
 
-    ``func_name_to_signature`` maps each kernel name to its runtime
-    ``ArgDirection`` names ("IN"/"OUT"/"INOUT") for its tensor args, in
-    task-payload (tensors-first) order. Scalars are excluded: the CoreCallable
-    signature array is sized to CORE_MAX_TENSOR_ARGS (a per-tensor-arg list), so
-    each entry lines up 1:1 with a payload tensor. When present, each KERNELS
-    entry gains a ``"signature"`` field of ``ArgDirection`` members so the
-    runtime builds a non-empty CoreCallable signature — required for the tensor
-    dump to match the task payload tensor_count. Kernels without an entry fall
-    back to an empty signature (the pre-existing behavior).
+    Each registration carries a final tensor signature and a code name. Several
+    registrations may reference the same generated source with different tensor
+    directions. Scalars are excluded from per-core tensor signatures.
 
     ``orchestration_signature`` is the orchestration entry's per-tensor
     ``ArgDirection`` names ("IN"/"OUT"/"INOUT"), in ``orch_args`` tensor order
-    (scalars excluded). When present, the ``ORCHESTRATION`` dict gains a
+    followed by SCALAR slots for KERNEL entry validation. PROGRAM signatures
+    exclude scalars. When present, the ``ORCHESTRATION`` dict gains a
     ``"signature"`` field so the runtime builds a non-empty ChipCallable
     signature, indexed by the orch tensor index in
     ``bind_callable_to_runtime_impl``. This lets read-only IN tensors skip the
@@ -1221,6 +1658,9 @@ def _generate_config_file(
     ``func_name_to_external_include_dirs`` maps external kernel names to their
     ordered CCEC include search paths. Non-external kernels ignore this map.
 
+    ``unshared_code_names`` excludes builtin-template kernels from generated-code
+    sharing; their existing compilation/cache contract is preserved.
+
     ``enable_sdma`` records that at least one emitted kernel consumes the
     runtime-owned SDMA workspace.
 
@@ -1229,18 +1669,20 @@ def _generate_config_file(
     reports and the one the ``ChipWorker`` reuse lookup matches against, so a
     program compiled for one runtime never binds to a worker running another.
     """
-    runtime_name = _passes.runtime_kind_to_name(runtime)
-    func_name_to_signature = func_name_to_signature or {}
+    compile_requirements = compile_requirements or _KernelCompileRequirements()
+    runtime_name = _runtime_name_for_codegen(runtime)
     func_name_to_external_source = func_name_to_external_source or {}
     func_name_to_external_include_dirs = func_name_to_external_include_dirs or {}
     orchestration_signature = orchestration_signature or []
-    has_signatures = any(func_name_to_signature.values()) or bool(orchestration_signature)
+    has_signatures = any(r.signature for r in kernel_registrations) or bool(orchestration_signature)
 
     runtime_lines = [
         "RUNTIME_CONFIG = {",
         f'\t"runtime": "{runtime_name}",',
         '\t"aicpu_thread_num": 0,',
     ]
+    if host_tensor_indices:
+        runtime_lines.append(f'\t"host_tensor_indices": {host_tensor_indices},')
     if enable_sdma:
         runtime_lines.append('\t"enable_sdma": True,')
     runtime_lines.append("}\n")
@@ -1271,8 +1713,9 @@ def _generate_config_file(
         "KERNELS = [",
     ]
 
-    for name, func_id in sorted(func_name_to_id.items(), key=lambda x: x[1]):
-        core_type = func_name_to_core_type[name]
+    for registration in sorted(kernel_registrations, key=lambda r: r.func_id):
+        name, func_id = registration.code_name, registration.func_id
+        core_type = registration.core_type
         ct_str = "aiv" if core_type == _ir_core.CoreType.VECTOR else "aic"
         # External kernels are referenced in place at their original path so the
         # entry .cpp keeps its sibling files (relative #include "../..." resolve);
@@ -1287,10 +1730,22 @@ def _generate_config_file(
         )
         if ext_source is not None:
             entry += ', "external": True'
+            policy = compile_requirements.binary_policy.get(name, "ordinary")
+            if policy != "ordinary":
+                entry += f', "binary_policy": {policy!r}'
             include_dirs = func_name_to_external_include_dirs.get(name)
             if include_dirs:
                 entry += f', "extra_include_dirs": {list(include_dirs)!r}'
-        signature = func_name_to_signature.get(name)
+        if ext_source is None:
+            if name in (unshared_code_names or set()):
+                entry += ', "builtin": True'
+            else:
+                entry += f', "code_name": "{name}"'
+        helpers = compile_requirements.vpto_sources.get(name, [])
+        if helpers:
+            paths = ", ".join(f"str(_ROOT_DIR / {path!r})" for path in helpers)
+            entry += f', "vpto_sources": [{paths}]'
+        signature = registration.signature
         if signature:
             entry += f', "signature": [{_format_signature(signature)}]'
         entry += "},"
@@ -1318,6 +1773,10 @@ class _CallCollector(_ir_core.IRVisitor):
         if isinstance(op.op, _ir_core.GlobalVar):
             self.callee_names.append(op.op.name)
         super().visit_call(op)
+
+    def visit_simt_launch_stmt(self, op: _ir_core.SimtLaunchStmt) -> None:
+        self.callee_names.append(op.callee.name)
+        super().visit_simt_launch_stmt(op)
 
     def visit_expr(self, expr: _ir_core.Expr) -> None:
         # ``Submit`` has no dedicated Python visitor hook, so collect its callee
@@ -1397,6 +1856,8 @@ def _build_group_mapping(
 def _get_ptoas_flags(
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     passes_dump_dir: str | None = None,
+    *,
+    buffer_id_sync: bool = False,
 ) -> list[str]:
     """Build the common ptoas flag list for kernel compilation.
 
@@ -1408,7 +1869,7 @@ def _get_ptoas_flags(
     """
     level = "level2" if memory_planner == _passes.MemoryPlanner.PTOAS else "level3"
     flags = [
-        "--enable-insert-sync",
+        "--enable-bufid_sync" if buffer_id_sync else "--enable-insert-sync",
         f"--pto-level={level}",
     ]
     if passes_dump_dir is not None:
@@ -1511,7 +1972,7 @@ def _compile_pto_module(
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     dump_ptoas_passes: bool = False,
 ) -> str:
-    """Run ptoas for one MLIR module and return the generated C++."""
+    """Run PTOAS and return EmitC text; VPTO writes its object beside the PTO."""
     ptoas_dir = os.path.join(output_dir, "ptoas")
     os.makedirs(ptoas_dir, exist_ok=True)
 
@@ -1524,15 +1985,41 @@ def _compile_pto_module(
         passes_dump_dir = os.path.join(output_dir, "ptoas_passes", unit_name)
         os.makedirs(passes_dump_dir, exist_ok=True)
 
-    cpp_path = os.path.join(ptoas_dir, f"{unit_name}.cpp")
+    # PTOCodegen stamps the top-level module attribute from structured IR.
+    # Do not scan operation spellings: comments and source locations can contain
+    # vecscope too. VPTO emits a host-linkable fat object, never C++ source.
+    is_vpto = 'pto.backend = "vpto"' in pto_code.partition("\n")[0]
+    suffix = "o" if is_vpto else "cpp"
+    compiled_path = os.path.join(ptoas_dir, f"{unit_name}.{suffix}")
+    buffer_id_sync = PTOAS_BUFFER_ID_SYNC_MARKER in pto_code.splitlines()
     _run_ptoas(
         pto_path,
-        cpp_path,
-        ptoas_flags=_get_ptoas_flags(memory_planner, passes_dump_dir),
+        compiled_path,
+        ptoas_flags=_get_ptoas_flags(memory_planner, passes_dump_dir, buffer_id_sync=buffer_id_sync),
     )
 
-    with open(cpp_path) as f:
+    if is_vpto:
+        # Binary output is persisted directly; the text-file API returns a marker.
+        return ""
+    with open(compiled_path) as f:
         return f.read()
+
+
+def _emit_vpto_object(result_files: dict[str, str], object_rel: str, content: bytes, output_dir: str) -> None:
+    """Persist binary objects separately from the existing text-file map.
+
+    The manifest records the artifact kind without changing every text consumer
+    to accept bytes. As with the PTOAS intermediates, object bytes are written
+    directly under output_dir and travel with the compiled artifact directory.
+    """
+    object_path = os.path.join(output_dir, object_rel)
+    os.makedirs(os.path.dirname(object_path), exist_ok=True)
+    with open(object_path, "wb") as output:
+        output.write(content)
+    result_files[object_rel + ".json"] = json.dumps(
+        {"backend": "vpto", "artifact_kind": "fatobj", "object": object_rel, "runtime_supported": False},
+        indent=2,
+    )
 
 
 def _emit_single_function_output(
@@ -1561,7 +2048,31 @@ def _emit_single_function_output(
         )
     else:
         ptoas_cpp = _compile_pto_module(pto_code, func.name, output_dir, memory_planner)
-    result_files[kernel_rel] = _generate_kernel_wrapper(func, ptoas_cpp)
+    if 'pto.backend = "vpto"' in pto_code.partition("\n")[0]:
+        object_path = os.path.join(output_dir, "ptoas", f"{func.name}.o")
+        with open(object_path, "rb") as object_file:
+            object_bytes = object_file.read()
+        _emit_vpto_object(result_files, _get_kernel_output_path(func, "o"), object_bytes, output_dir)
+    else:
+        result_files[kernel_rel] = _generate_kernel_wrapper(func, ptoas_cpp)
+
+
+def _requests_buffer_id_sync(func: _ir_core.Function) -> bool:
+    enabled = dict(func.attrs).get("ptoas_buffer_id_sync", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("ptoas_buffer_id_sync must be a Boolean function attribute")
+    return enabled
+
+
+def _group_memory_planner(
+    members: list[_ir_core.Function], default: _passes.MemoryPlanner
+) -> _passes.MemoryPlanner:
+    overrides = [func.attrs.get("ptoas_plan_memory", False) for func in members]
+    if any(overrides):
+        if not all(overrides):
+            raise ValueError("Grouped kernels must agree on ptoas_plan_memory")
+        return _passes.MemoryPlanner.PTOAS
+    return default
 
 
 def _emit_group_output(
@@ -1575,6 +2086,16 @@ def _emit_group_output(
     dump_ptoas_passes: bool = False,
 ) -> None:
     """Emit output files for one grouped MLIR module."""
+    memory_planner = _group_memory_planner(members, memory_planner)
+    member_buffer_id_sync = [_requests_buffer_id_sync(func) for func in members]
+    buffer_id_sync = any(member_buffer_id_sync)
+    if buffer_id_sync and not all(member_buffer_id_sync):
+        raise ValueError("Grouped kernels must agree on ptoas_buffer_id_sync")
+    if buffer_id_sync:
+        header, newline, body = pto_code.partition("\n")
+        if 'pto.target_arch = "a5"' not in header or 'pto.backend = "vpto"' in header:
+            raise ValueError("ptoas_buffer_id_sync requires A5 PTO code generation")
+        pto_code = f"{header}{newline}{PTOAS_BUFFER_ID_SYNC_MARKER}\n{body}"
     if skip_ptoas:
         result_files[os.path.join("kernels", f"{group_name}.pto")] = pto_code
         return
@@ -1589,10 +2110,19 @@ def _emit_group_output(
         )
     else:
         ptoas_cpp = _compile_pto_module(pto_code, group_name, output_dir, memory_planner)
+    if 'pto.backend = "vpto"' in pto_code.partition("\n")[0]:
+        object_path = os.path.join(output_dir, "ptoas", f"{group_name}.o")
+        with open(object_path, "rb") as object_file:
+            object_bytes = object_file.read()
+        _emit_vpto_object(result_files, os.path.join("kernels", f"{group_name}.o"), object_bytes, output_dir)
+        return
     group_uses_spmd = any(_uses_spmd_block_ops(f) for f in members)
+    # Each member compiles the whole PTOAS translation unit, including the
+    # sibling declarations that mention Simpler's session type.
+    module_urma_adapter = _generate_urma_transfer_adapter(*(f for f in members if _uses_urma_transfer(f)))
     for func in members:
         result_files[_get_kernel_output_path(func, "cpp")] = _generate_kernel_wrapper(
-            func, ptoas_cpp, group_uses_spmd=group_uses_spmd
+            func, ptoas_cpp, group_uses_spmd=group_uses_spmd, module_urma_adapter=module_urma_adapter
         )
 
 
@@ -1637,6 +2167,10 @@ class _CodegenUnit:
     funcs: list[_ir_core.Function]
     is_group: bool
     stage_record: StageRecord  # profiling record (started in Phase 1)
+    helpers: tuple[_codegen_core.VFHelper, ...] = ()
+    # Keys are emitted function names, not the group/compilation-unit name.
+    # The two AIV lanes share one entry and therefore the same helper objects.
+    entry_helpers: dict[str, list[str]] = field(default_factory=lambda: dict[str, list[str]]())
 
 
 @dataclass
@@ -1662,8 +2196,51 @@ def _emit_unit(
     PTOCodegen has already run; ``unit.pto_code`` contains the MLIR.
     """
     local_files: dict[str, str] = {}
+    # Each helper is self-contained. ABI data is retained beside the sources for
+    # review, while source contents participate in the runtime binary cache key.
+    for helper in unit.helpers:
+        local_files[f"vpto/{unit.name}/{helper.symbol}.pto"] = helper.source
+    if unit.helpers:
+        local_files[f"vpto/{unit.name}/manifest.json"] = (
+            json.dumps(
+                {
+                    "schema_version": 5,
+                    "entry_helpers": unit.entry_helpers,
+                    "target": "a5",
+                    "core_type": "aiv",
+                    "bridge": False,
+                    "synchronization": "ptoas-insert-sync",
+                    "effect_scope": "whole-storage"
+                    if any(h.kind == "simt" for h in unit.helpers)
+                    else "whole-tile",
+                    "helpers": [
+                        {
+                            "kind": h.kind,
+                            "symbol": h.symbol,
+                            "adapter_symbol": h.adapter_symbol,
+                            "parameter_types": h.parameter_types,
+                            "caller_parameter_types": h.caller_parameter_types,
+                            "parameter_effects": h.parameter_effects,
+                            "parameter_indices": h.parameter_indices,
+                            "capture_base_indices": h.capture_base_indices,
+                            "capture_byte_offsets": h.capture_byte_offsets,
+                            "source": f"{h.symbol}.pto",
+                            "source_sha256": hashlib.sha256(h.source.encode()).hexdigest(),
+                        }
+                        for h in unit.helpers
+                    ],
+                },
+                indent=2,
+            )
+            + "\n"
+        )
     ptoas_record = StageRecord(name="ptoas", start=time.perf_counter())
     try:
+        if unit.helpers and not skip_ptoas:
+            ptoas_bin = _find_ptoas_binary()
+            if ptoas_bin is None:
+                raise RuntimeError("VF/SIMT adapter compilation requires PTOAS; set PTOAS_ROOT.")
+            _check_ptoas_version(ptoas_bin)
         if unit.is_group:
             _emit_group_output(
                 local_files,
@@ -1793,6 +2370,7 @@ def generate(
     emit_source_loc: bool | None = None,
     dump_ptoas_passes: bool = False,
     runtime: _passes.RuntimeKind | None = None,
+    kernel_entry_scalar_count: int = 0,
 ) -> dict[str, str]:
     """Generate all PTO backend output files (kernels + orchestration + config).
 
@@ -1821,6 +2399,8 @@ def generate(
         runtime: Simpler runtime ABI to target; its wire name is written to
             ``RUNTIME_CONFIG["runtime"]`` in the generated ``kernel_config.py``.
             None uses ``RuntimeKind.TENSORMAP_AND_RINGBUFFER``.
+        kernel_entry_scalar_count: Runtime scalar slots for a KERNEL entry's
+            callable identity. PROGRAM keeps its tensor-only signature.
 
     Returns:
         Dict mapping relative file paths to their content.
@@ -1872,6 +2452,7 @@ def generate(
         emit_source_loc=emit_source_loc,
         dump_ptoas_passes=dump_ptoas_passes,
         runtime=runtime,
+        kernel_entry_scalar_count=kernel_entry_scalar_count,
     )
 
 
@@ -1998,7 +2579,12 @@ def _materialize_builtin_next_levels(
             "entry": spec.entry_symbol,
             "kernel_name": spec.entry_symbol + "_kernel",
             "template_package": spec.template_dir[1:],
-            "runtime": _passes.runtime_kind_to_name(runtime),
+            "runtime": _runtime_name_for_codegen(runtime),
+            # HBG orchestration has a host-only context; TMR uses its runtime
+            # context. Templates must select the API of their compiled runtime.
+            "orchestration_context_accessor": (
+                "current_orch_context" if _passes.is_host_build_graph(runtime) else "current_runtime"
+            ),
         }
         variables.update(spec.template_vars)
         for template in sorted(templates_dir.iterdir(), key=lambda item: item.name):
@@ -2092,6 +2678,8 @@ def _collect_chip_task_functions(
         _ir_core.FunctionType.Group,
         _ir_core.FunctionType.Spmd,
         _ir_core.FunctionType.Graph,
+        _ir_core.FunctionType.SIMT,
+        _ir_core.FunctionType.VF,
     )
 
     result: list[_ir_core.Function] = [orch_func]
@@ -2155,6 +2743,83 @@ def _generate_multi_chip(
     return result_files
 
 
+def _generate_pto_bundle(
+    program: _ir_core.Program,
+    *,
+    skip_ptoas: bool,
+    memory_planner: _passes.MemoryPlanner,
+    emit_source_loc: bool,
+    is_group: bool = False,
+) -> tuple[str, tuple[_codegen_core.VFHelper, ...], dict[str, list[str]]]:
+    """Retain combined diagnostic output; execution consumes structured artifacts."""
+    generator = _codegen_core.PTOCodegen()
+    emit_tile_addr = memory_planner != _passes.MemoryPlanner.PTOAS
+    if skip_ptoas:
+        return (
+            generator.generate(program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc),
+            (),
+            {},
+        )
+    if uses_native_fp4_mx(program):
+        check_native_fp4_mx_support()
+    bundle = generator.generate_bundle(
+        program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc
+    )
+    if bundle.helpers:
+        entries = [f for f in program.functions.values() if _ir_core.is_incore_type(f.func_type)]
+        if is_group:
+            if any(h.kind == "simt" for h in bundle.helpers):
+                raise ValueError("SIMT execution does not yet support grouped functions")
+            if len(entries) != 2 or {f.func_type for f in entries} != {
+                _ir_core.FunctionType.AIC,
+                _ir_core.FunctionType.AIV,
+            }:
+                raise ValueError("Grouped VF execution requires exactly one AIC and one AIV function")
+        if any(h.kind == "vf" for h in bundle.helpers):
+            if not is_group and len(entries) != 1:
+                raise ValueError("VF execution does not yet support ungrouped peer functions")
+            if memory_planner != _passes.MemoryPlanner.PYPTO:
+                raise ValueError("VF execution requires the PyPTO Tile memory planner")
+    return bundle.caller_source, tuple(bundle.helpers), bundle.entry_helpers
+
+
+def _with_device_helpers(
+    entries: list[_ir_core.Function], program: _ir_core.Program
+) -> list[_ir_core.Function]:
+    """Keep reachable device helpers in a unit without registering runtime tasks.
+
+    One body walk per entry/helper and a visited set give stable deduplication;
+    unused original helpers left behind by specialization need not be emitted.
+    """
+    functions = list(entries)
+    visited = {function.name for function in entries}
+    index = 0
+    while index < len(functions):
+        collector = _CallCollector()
+        collector.visit_stmt(functions[index].body)
+        index += 1
+        for name in collector.callee_names:
+            if name in visited:
+                continue
+            callee = program.get_function(name)
+            if callee is not None and callee.func_type in (
+                _ir_core.FunctionType.SIMT,
+                _ir_core.FunctionType.VF,
+            ):
+                visited.add(name)
+                functions.append(callee)
+    return functions
+
+
+def _validate_external_bridge_runtime(program: _ir_core.Program, runtime: _passes.RuntimeKind) -> None:
+    for function in program.functions.values():
+        if EXTERNAL_PREFLIGHT_SOURCE_ATTR in function.attrs:
+            # Older artifacts and c_pointer checkers use the TMR tensor ABI.
+            required = function.attrs.get(EXTERNAL_RUNTIME_ATTR, "tensormap_and_ringbuffer")
+            if _runtime_name_for_codegen(runtime) != required:
+                raise ValueError(f"External runtime bridge for {function.name} requires {required}")
+
+
 def _generate_single_chip(
     transformed_program: _ir_core.Program,
     output_dir: str,
@@ -2164,6 +2829,7 @@ def _generate_single_chip(
     emit_source_loc: bool = True,
     dump_ptoas_passes: bool = False,
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+    kernel_entry_scalar_count: int = 0,
 ) -> dict[str, str]:
     """Generate artifacts for a single-chip (L0-L2) program.
 
@@ -2184,6 +2850,8 @@ def _generate_single_chip(
         ),
         None,
     )
+
+    _validate_external_bridge_runtime(transformed_program, runtime)
 
     groups, ungrouped = _build_group_mapping(transformed_program)
 
@@ -2219,7 +2887,6 @@ def _generate_single_chip(
     # generation) and runs sequentially so that we don't contend on the GIL.
     # When ptoas owns memory planning, omit the physical `pto.alloc_tile addr`
     # so ptoas runs at --pto-level=level2 (which rejects any addr operand).
-    emit_tile_addr = memory_planner != _passes.MemoryPlanner.PTOAS
     # Source locations let ptoas name the user's .py line instead of a line in
     # the generated artifact (which, under @pl.jit, the user never sees).
     units: list[_CodegenUnit] = []
@@ -2240,15 +2907,31 @@ def _generate_single_chip(
                         f"(DSL members: {dsl}). A group must be all-external or all-DSL."
                     )
                 continue
-            grouped_program = _ir_core.Program(members, group_name, transformed_program.span)
+            grouped_program = _ir_core.Program(
+                _with_device_helpers(members, transformed_program), group_name, transformed_program.span
+            )
             stage = StageRecord(name=f"kernel_codegen:{group_name}", start=time.perf_counter())
             ir_record = StageRecord(name="ir_to_mlir", start=time.perf_counter())
-            pto_code = _codegen_core.PTOCodegen().generate(
-                grouped_program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc
+            pto_code, helpers, entry_helpers = _generate_pto_bundle(
+                grouped_program,
+                skip_ptoas=skip_ptoas,
+                memory_planner=_group_memory_planner(members, memory_planner),
+                emit_source_loc=emit_source_loc,
+                is_group=True,
             )
             ir_record.end = time.perf_counter()
             stage.children.append(ir_record)
-            units.append(_CodegenUnit(group_name, pto_code, members, is_group=True, stage_record=stage))
+            units.append(
+                _CodegenUnit(
+                    group_name,
+                    pto_code,
+                    members,
+                    is_group=True,
+                    stage_record=stage,
+                    helpers=helpers,
+                    entry_helpers=entry_helpers,
+                )
+            )
         except Exception as e:
             func_names = ", ".join(m.name for m in members)
             logger.error("Failed to compile group '%s' [%s]: %s", group_name, func_names, e)
@@ -2267,15 +2950,32 @@ def _generate_single_chip(
                 peer_func = transformed_program.get_function(name)
                 if peer_func is not None:
                     peer_funcs.append(peer_func)
-            single_program = _ir_core.Program([*peer_funcs, func], func.name, transformed_program.span)
+            single_program = _ir_core.Program(
+                _with_device_helpers([*peer_funcs, func], transformed_program),
+                func.name,
+                transformed_program.span,
+            )
             stage = StageRecord(name=f"kernel_codegen:{func.name}", start=time.perf_counter())
             ir_record = StageRecord(name="ir_to_mlir", start=time.perf_counter())
-            pto_code = _codegen_core.PTOCodegen().generate(
-                single_program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc
+            pto_code, helpers, entry_helpers = _generate_pto_bundle(
+                single_program,
+                skip_ptoas=skip_ptoas,
+                memory_planner=memory_planner,
+                emit_source_loc=emit_source_loc,
             )
             ir_record.end = time.perf_counter()
             stage.children.append(ir_record)
-            units.append(_CodegenUnit(func.name, pto_code, [func], is_group=False, stage_record=stage))
+            units.append(
+                _CodegenUnit(
+                    func.name,
+                    pto_code,
+                    [func],
+                    is_group=False,
+                    stage_record=stage,
+                    helpers=helpers,
+                    entry_helpers=entry_helpers,
+                )
+            )
         except Exception as e:
             logger.error("Failed to compile function '%s': %s", func.name, e)
             errors.append((func.name, e))
@@ -2298,6 +2998,14 @@ def _generate_single_chip(
     # Orchestration + config
     if orch_func is not None:
         try:
+            if not skip_ptoas and any(
+                'pto.backend = "vpto"' in unit.pto_code.partition("\n")[0] for unit in units
+            ):
+                raise NotImplementedError(
+                    "VPTO object compilation succeeded, but PTOAS does not yet expose the "
+                    "device direct-call ABI required by PyPTO runtime wrappers. "
+                    "The compiled .o files are retained; runtime execution is unsupported."
+                )
             with _profiling_stage(prof, "orchestration_codegen"):
                 orch_result = _codegen_core.generate_orchestration(transformed_program, orch_func)
             result_files[f"orchestration/{orch_func.name}.cpp"] = (
@@ -2311,18 +3019,39 @@ def _generate_single_chip(
             codegen_free_kernels = {
                 f.name for f in transformed_program.functions.values() if _skips_pto_codegen(f)
             }
-            all_kernels_external = all(name in codegen_free_kernels for name in orch_result.func_name_to_id)
+            all_kernels_external = all(
+                r.code_name in codegen_free_kernels for r in orch_result.kernel_registrations
+            )
             if not skip_ptoas or all_kernels_external:
+                host_indices = _host_tensor_indices(orch_func) if _passes.is_host_build_graph(runtime) else []
                 result_files["kernel_config.py"] = _generate_config_file(
                     orch_func.name,
-                    orch_result.func_name_to_id,
-                    orch_result.func_name_to_core_type,
-                    orch_result.func_name_to_signature,
-                    orch_result.orchestration_signature,
+                    orch_result.kernel_registrations,
+                    [*orch_result.orchestration_signature, *(["SCALAR"] * kernel_entry_scalar_count)],
                     func_name_to_external_source,
                     func_name_to_external_include_dirs,
                     enable_sdma=any(_uses_sdma_workspace(func) for func in emitted_incore_funcs),
                     runtime=runtime,
+                    host_tensor_indices=host_indices,
+                    unshared_code_names=codegen_free_kernels,
+                    compile_requirements=_KernelCompileRequirements(
+                        binary_policy={
+                            f.name: f.attrs[EXTERNAL_BINARY_POLICY_ATTR]
+                            for f in transformed_program.functions.values()
+                            if EXTERNAL_BINARY_POLICY_ATTR in f.attrs
+                        },
+                        vpto_sources={
+                            # Registration lookup uses each member's code_name. A
+                            # group name is not a callable entry and would silently
+                            # drop AIV dependencies (or attach them to the AIC).
+                            func.name: [
+                                f"vpto/{unit.name}/{symbol}.pto" for symbol in unit.entry_helpers[func.name]
+                            ]
+                            for unit in units
+                            if unit.helpers
+                            for func in unit.funcs
+                        },
+                    ),
                 )
         except Exception as e:
             logger.error("Failed to generate orchestration '%s': %s", orch_func.name, e)

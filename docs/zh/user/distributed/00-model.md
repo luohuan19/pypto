@@ -1,5 +1,9 @@
 # 分布式编程模型
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+>
 > **前置知识：** [快速入门](../00-getting_started.md) — 基本 PyPTO tensor/tile 模型。
 > 本指南使用 `pld` 命名空间（`import pypto.language.distributed as pld`）。
 >
@@ -104,7 +108,8 @@ cfg = RunConfig(platform="a2a3", distributed_config=dc)
 
 inputs = torch.randn(2, 1, SIZE)
 outputs = torch.zeros_like(inputs)
-orchestrator(inputs, outputs, config=cfg)   # 阻塞直到两个 rank 都完成
+compiled = orchestrator.compile(inputs, outputs, config=cfg)
+compiled(inputs, outputs, config=cfg)   # 阻塞直到两个 rank 都完成
 ```
 
 这是"one-shot"派发模式。`DistributedWorker`、持久 worker 和多程序派发见

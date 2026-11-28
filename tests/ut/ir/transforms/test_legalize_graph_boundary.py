@@ -437,6 +437,45 @@ class TestLaunchSpec:
     call — the rest of the blocks are never scheduled, with no diagnostic.
     """
 
+    @pytest.mark.parametrize("query", ["available_cluster_count", "available_aiv_count"])
+    @pytest.mark.parametrize("bind_width", [False, True])
+    def test_run_local_resource_query_width_is_accepted(self, query, bind_width):
+        """A run's resource cohort remains fixed while its Graph Definition lives."""
+        width = f"pl.system.{query}()"
+        binding = f"blocks = {width}\n                alias = blocks" if bind_width else ""
+        launch = "alias" if bind_width else width
+        before = pl.parse(f"""
+import pypto.language as pl
+@pl.program
+class Before:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(
+        self, a: pl.Tensor[[16, 128], pl.FP32], c: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        value = pl.load(a, [0, 0], [16, 128])
+        c = pl.store(value, [0, 0], c)
+        return c
+    @pl.function(type=pl.FunctionType.Graph)
+    def layer(
+        self, a: pl.Tensor[[16, 128], pl.FP32], c: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        with pl.manual_scope():
+                {binding}
+                c, done = pl.spmd_submit(self.kernel, a, c, core_num={launch})
+        return c
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self, a: pl.Tensor[[16, 128], pl.FP32], c: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        return self.layer(a, c)
+""")
+        assert isinstance(before, ir.Program)
+        after = _legalize_outlined(before)
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.GraphBoundaryLegalized)
+        diagnostics = passes.PropertyVerifierRegistry.verify(props, after)
+        assert not [d for d in diagnostics if d.rule_name == "GraphBoundaryLegalized"]
+
     def test_core_num_from_a_boundary_scalar_is_rejected(self):
         @pl.program
         class Before:
@@ -1009,8 +1048,8 @@ class TestRegionAllocationHoisting:
         # `InOut`, not `In`: the region writes it. Declared `In`, codegen emits
         # `add_input`, the launch never registers as a writer of the buffer, and
         # a caller that hoisted the allocation out of its own loop would get no
-        # ordering between successive launches over it. `Out` is illegal on a
-        # Graph boundary — it means the *runtime* allocates.
+        # ordering between successive launches over it. Hoisting runs after
+        # direction derivation, so it retains conservative InOut ordering.
         assert _param_directions(layer)["tmp"] == ir.ParamDirection.InOut
         # The region no longer allocates at all.
         assert "pl.tensor.create" not in python_print(layer), python_print(layer)
@@ -1122,7 +1161,8 @@ class TestRegionAllocationHoisting:
                 t: pl.Tile[[128, 128], pl.FP32] = pl.load(
                     a, [0, 0], [128, 128], target_memory=pl.MemorySpace.Vec
                 )
-                return pl.store(t, [0, 0], out)
+                written = pl.store(t, [0, 0], out)
+                return written
 
             @pl.function(type=pl.FunctionType.Graph)
             def layer(
@@ -1490,8 +1530,8 @@ class TestBoundaryLegality:
     def test_graph_returning_a_computed_value_is_rejected(self):
         """A return that aliases an InOut parameter is fine; a computed one is not.
 
-        ``rt_submit_graph`` yields a valid task id only on a cache hit, so a
-        graph cannot hand a computed value back to its caller.
+        A replay skips the Graph body, so its computed values cannot be
+        returned. The outer submit completion id is a separate result.
         """
 
         @pl.program
@@ -1572,6 +1612,60 @@ class TestBoundaryLegality:
         with pytest.raises(ValueError, match="returns a value it computed"):
             _legalize_outlined(Before)
 
+    @pytest.mark.parametrize("ctx_count", [0, 1, 2])
+    @pytest.mark.parametrize("omit_output", [False, True])
+    @pytest.mark.parametrize("return_input", [False, True])
+    @pytest.mark.parametrize("assign_projection", [False, True])
+    def test_submit_return_provenance_skips_runtime_output_gap(
+        self, ctx_count, omit_output, return_input, assign_projection
+    ):
+        """A materialized ctx suffix cannot stand in for a runtime-created Out.
+
+        Build the post-MaterializeDistTensorCtx IR directly: the callee has
+        [input, output, *ctxs], while an omitted-output Submit passes
+        [input, *ctxs]. Both direct and assigned tuple projections must reject
+        output provenance but retain the caller-supplied input/Out provenance.
+        """
+        span = ir.Span.unknown()
+        tensor_type = ir.TensorType([4], ir.DataType.FP32)
+        ctx_type = ir.CommCtxType.get()
+        source = ir.Var("source", tensor_type, span)
+        output = ir.Var("output", tensor_type, span)
+        ctxs = [ir.Var(f"ctx_{i}", ctx_type, span) for i in range(ctx_count)]
+        stage = ir.Function(
+            "stage",
+            [(source, ir.ParamDirection.In), (output, ir.ParamDirection.Out), *ctxs],
+            [tensor_type, tensor_type],
+            ir.ReturnStmt([output, source], span),
+            span,
+            ir.FunctionType.InCore,
+        )
+        graph_source = ir.Var("source", tensor_type, span)
+        graph_output = ir.Var("output", tensor_type, span)
+        graph_ctxs = [ir.Var(f"ctx_{i}", ctx_type, span) for i in range(ctx_count)]
+        args = [graph_source, *([] if omit_output else [graph_output]), *graph_ctxs]
+        pair_type = ir.TupleType([tensor_type, tensor_type, ir.ScalarType(ir.DataType.TASK_ID)])
+        pair = ir.Var("pair", pair_type, span)
+        launch = ir.Submit(ir.GlobalVar("stage"), args, [], pair_type, span)
+        projection = ir.TupleGetItemExpr(pair, int(return_input), span)
+        statements: list[ir.Stmt] = [ir.AssignStmt(pair, launch, span)]
+        returned: ir.Expr = projection
+        if assign_projection:
+            returned = ir.Var("result", tensor_type, span)
+            statements.append(ir.AssignStmt(returned, projection, span))
+        statements.append(ir.ReturnStmt([returned], span))
+        graph = ir.Function(
+            "layer", args, [tensor_type], ir.SeqStmts(statements, span), span, ir.FunctionType.Graph
+        )
+        before = ir.Program([stage, graph], "submit_gap", span)
+
+        with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+            if omit_output and not return_input:
+                with pytest.raises(ValueError, match="returns a value it computed"):
+                    passes.legalize_graph_boundary()(before)
+            else:
+                ir.assert_structural_equal(passes.legalize_graph_boundary()(before), before)
+
     def test_launch_in_a_loop_counts_per_iteration(self):
         """A lexical count would wave 2000 launches past the runtime's 1024 limit."""
 
@@ -1586,7 +1680,8 @@ class TestBoundaryLegality:
                 t: pl.Tile[[128, 128], pl.FP32] = pl.load(
                     a, [0, 0], [128, 128], target_memory=pl.MemorySpace.Vec
                 )
-                return pl.store(t, [0, 0], out)
+                written = pl.store(t, [0, 0], out)
+                return written
 
             @pl.function(type=pl.FunctionType.Graph)
             def layer(
@@ -1624,7 +1719,8 @@ class TestBoundaryLegality:
                 t: pl.Tile[[128, 128], pl.FP32] = pl.load(
                     a, [0, 0], [128, 128], target_memory=pl.MemorySpace.Vec
                 )
-                return pl.store(t, [0, 0], out)
+                written = pl.store(t, [0, 0], out)
+                return written
 
             @pl.function(type=pl.FunctionType.Graph)
             def layer(
@@ -1909,7 +2005,8 @@ class TestBoundaryLegality:
                 t: pl.Tile[[128, 128], pl.FP32] = pl.load(
                     a, [0, 0], [128, 128], target_memory=pl.MemorySpace.Vec
                 )
-                return pl.store(t, [0, 0], out)
+                written = pl.store(t, [0, 0], out)
+                return written
 
             @pl.function(type=pl.FunctionType.Graph)
             def layer(

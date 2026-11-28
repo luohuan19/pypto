@@ -23,6 +23,7 @@ import pytest
 from pypto import backend, ir, passes
 from pypto.backend import BackendType
 
+_OP_TILE_EXTRACT = ir.get_op("tile.extract").name
 _OP_TILE_GET_BLOCK_IDX = ir.get_op("tile.get_block_idx").name
 _OP_TILE_LOAD = ir.get_op("tile.load").name
 _OP_TILE_MATMUL = ir.get_op("tile.matmul").name
@@ -2703,7 +2704,7 @@ class TestInferTileMemorySpaceIterArgInherit:
         """
         # A backend is needed so the Mat tile.create carries the implicit NZ TileView,
         # matching the tile.assemble result type for the loop-carried reassignment.
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2748,7 +2749,7 @@ class TestInferTileMemorySpaceIterArgInherit:
         the ``tile.create``, the inner from the outer iter-arg via ``AsVarLike``). Pins
         the recursive seeding the single-loop test does not reach.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2805,7 +2806,7 @@ class TestInferTileMemorySpaceLoopCarriedOperand:
         target can execute -- and the property verifier stayed silent about it,
         so the violation only surfaced in the backend.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2859,7 +2860,7 @@ class TestInferTileMemorySpaceLoopCarriedOperand:
         carry edge the load defaulted to Vec and the operand was routed
         GM -> UB -> L0B, putting a cube-only operand on the vector core.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2950,7 +2951,7 @@ class TestInferTileMemorySpaceLoopCarriedOperand:
         operand reached `tile.matmul`'s Right slot with no memory space
         whatsoever.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3008,12 +3009,12 @@ class TestLoopInvariantMatResidency:
 
     @staticmethod
     def _run_infer(program):
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         return passes.infer_tile_memory_space()(passes.convert_to_ssa()(program))
 
     @staticmethod
     def _run_tensor_infer(program):
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         program = passes.convert_to_ssa()(program)
         program = passes.convert_tensor_to_tile_ops()(program)
         program = passes.flatten_tile_nd_to_2d()(program)
@@ -3225,7 +3226,7 @@ class RetargetedBridgeAttrs:
 
         Before = passes.convert_to_ssa()(pl.parse_program(program.format(body=before_body)))
         Expected = passes.convert_to_ssa()(pl.parse_program(program.format(body=expected_body)))
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
 
     def test_private_marker_stripped_when_function_has_no_tile_memory(self):
@@ -3257,7 +3258,7 @@ class MarkerOnlyScalarCall:
         Expected = passes.convert_to_ssa()(
             pl.parse_program(program.format(attrs='attrs={"residency_test_sentinel": 11}'))
         )
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
 
     def test_tensor_matmul_stationary_lhs_loads_once(self):
@@ -3267,7 +3268,7 @@ class MarkerOnlyScalarCall:
         loop.  This is the load-once QK shape reported in #2077, reduced to two
         N tiles so the test stays compact.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3317,7 +3318,7 @@ class MarkerOnlyScalarCall:
         GM->Mat load is invariant; the L0 staging remains in the inner
         pipeline.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4329,6 +4330,75 @@ for n in pl.range(0, 2, 1):
         assert self._line_index(printed, "tile.load(rhs") > loop
         assert "__compiler_tensor_to_tile_mat_bridge" not in printed
 
+    def test_marked_mx_scale_panel_hoists_load_but_keeps_extracts(self):
+        """On Ascend950, hoist the invariant Mat load of the compiler-created lhs scale panel.
+
+        Keep both L0 scale extracts in the loop so each iteration stages the
+        windows its MX matmuls consume. The external rhs scale load is the negative
+        control because its input lacks the compiler's read-only buffer proof.
+        """
+        params = """
+lhs: pl.Tensor[[16, 64], pl.FP8E4M3FN],
+rhs: pl.Tensor[[64, 128], pl.FP8E4M3FN],
+lhs_scale: pl.Tensor[[16, 4], pl.FP8E8M0, pl.MX_A_ZZ],
+rhs_scale: pl.Tensor[[2, 128], pl.FP8E8M0, pl.MX_B_NN],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(2):
+    panel = pl.tile.load(lhs_scale, [0, 0], [16, 4], target_memory=pl.Mem.Mat)
+    lhs_mat = pl.tile.load(lhs, [0, 0], [16, 64], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+    rhs_panel = pl.tile.load(rhs_scale, [0, 0], [2, 128], target_memory=pl.Mem.Mat)
+    sa0 = pl.tile.extract(panel, 0, n * 2, [16, 2], target_memory=pl.Mem.LeftScale)
+    sa1 = pl.tile.extract(panel, 0, 0, [16, 2], target_memory=pl.Mem.LeftScale)
+    sb = pl.tile.extract(rhs_panel, 0, 0, [2, 128], target_memory=pl.Mem.RightScale)
+    a = pl.tile.extract(lhs_mat, 0, 0, [16, 64], target_memory=pl.Mem.Left)
+    b = pl.tile.extract(rhs_mat, 0, 0, [64, 128], target_memory=pl.Mem.Right)
+    acc = pl.tile.matmul_mx(a, sa0, b, sb)
+    result = pl.tile.matmul_mx_acc(acc, a, sa1, b, sb)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, lhs_scale, rhs_scale, out",
+            body,
+            fresh_param="lhs_scale",
+            fresh_expr="pl.create_tensor([16, 4], dtype=pl.FP8E8M0, layout=pl.MX_A_ZZ)",
+        )
+        backend.set_backend_type(BackendType.Ascend950)
+        after = passes.infer_tile_memory_space()(passes.convert_to_ssa()(before))
+        kernel = after.get_function("kernel")
+        assert kernel is not None
+        assert isinstance(kernel.body, ir.SeqStmts)
+        lhs_scale, rhs_scale = kernel.params[2:4]
+
+        def loads_from(stmts, source):
+            return [
+                stmt
+                for stmt in stmts
+                if isinstance(stmt, ir.AssignStmt)
+                and isinstance(stmt.value, ir.Call)
+                and stmt.value.op.name == _OP_TILE_LOAD
+                and stmt.value.args[0].same_as(source)
+            ]
+
+        (loop,) = [stmt for stmt in kernel.body.stmts if isinstance(stmt, ir.ForStmt)]
+        assert isinstance(loop.body, ir.SeqStmts)
+        before_loop = kernel.body.stmts[: kernel.body.stmts.index(loop)]
+        (panel,) = loads_from(before_loop, lhs_scale)
+        assert not loads_from(loop.body.stmts, lhs_scale)
+        assert not loads_from(before_loop, rhs_scale)
+        assert len(loads_from(loop.body.stmts, rhs_scale)) == 1
+        extracts = [
+            stmt
+            for stmt in loop.body.stmts
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == _OP_TILE_EXTRACT
+            and stmt.value.args[0].same_as(panel.var)
+        ]
+        assert len(extracts) == 2
+
     def test_marked_transposed_mat_panel_fanout_hoists_only_load(self):
         """A transposed Mat view may fan out while its staging stays local."""
         params = """
@@ -4909,6 +4979,43 @@ class TestRewrittenTileLayout:
                 _output = result
 
         ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Before)
+
+
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+def test_packed_fp4_inferred_mat_load_retargets_carrier_shape(dtype):
+    backend.set_backend_type(BackendType.Ascend950)
+
+    # Matrix input constraints drive Mat staging; tile.move itself places no
+    # demand on its input. This tests inference only, before native MX codegen.
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[32, 64], dtype],
+            y: pl.Tensor[[64, 32], dtype, pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN)],
+        ):
+            loaded = pl.tile.load(x, [0, 0], [32, 64], valid_shape=[16, 32])
+            rhs_tile = pl.tile.load(y, [0, 0], [64, 32], valid_shape=[32, 16])
+            _product = pl.tile.matmul(loaded, rhs_tile)
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[32, 64], dtype],
+            y: pl.Tensor[[64, 32], dtype, pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN)],
+        ):
+            loaded = pl.tile.load(x, [0, 0], [32, 64], valid_shape=[16, 32], target_memory=pl.Mem.Mat)
+            rhs_tile = pl.tile.load(y, [0, 0], [64, 32], valid_shape=[32, 16], target_memory=pl.Mem.Mat)
+            loaded_Left = pl.tile.move(loaded, target_memory=pl.Mem.Left)
+            rhs_tile_Right = pl.tile.move(rhs_tile, target_memory=pl.Mem.Right)
+            _product = pl.tile.matmul(loaded_Left, rhs_tile_Right)
+
+    after = passes.infer_tile_memory_space()(Before)
+    ir.assert_structural_equal(after, Expected)
+    ir.assert_structural_equal(pl.parse_program(ir.python_print(after)), after)
 
 
 if __name__ == "__main__":

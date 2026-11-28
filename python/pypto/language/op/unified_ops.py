@@ -113,7 +113,7 @@ from pypto.ir.utils import (
 )
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import AtomicType, PadValue
+from pypto.pypto_core.ir import AccPhase, AtomicType, CompactMode, PadValue, TensorLayout
 
 from ..typing import BoolLike, IntLike, Scalar, Tensor, Tile
 from . import tensor_ops as _tensor
@@ -188,9 +188,6 @@ _TILE_TRANSPOSE_REMEDY = (
 _TILE_C_MATRIX_NZ_REMEDY = (
     "The tile matmul result layout is fixed by its Acc tile type; there is no "
     "tile-level equivalent of this tensor-level flag."
-)
-_TILE_RSQRT_PRECISION_REMEDY = (
-    "The tile form selects precision by taking a scratch tile: pl.tile.rsqrt(tile, tmp)."
 )
 
 
@@ -694,23 +691,28 @@ def sqrt(input: object) -> Tensor | Tile:
 
 
 @overload
-def rsqrt(input: Tensor, high_precision: bool = ...) -> Tensor: ...
+def rsqrt(input: Tensor, high_precision: bool = ..., *, tmp: None = ...) -> Tensor: ...
 @overload
-def rsqrt(input: Tile, high_precision: Literal[False] = ...) -> Tile: ...
-def rsqrt(input: object, high_precision: bool = False) -> Tensor | Tile:
-    """Element-wise reciprocal square root, dispatched by input type.
+def rsqrt(input: Tile, high_precision: Literal[False] = False, *, tmp: None = None) -> Tile: ...
+@overload
+def rsqrt(input: Tile, high_precision: Literal[True], *, tmp: Tile) -> Tile: ...
+def rsqrt(input: object, high_precision: bool = False, *, tmp: Tile | None = None) -> Tensor | Tile:
+    """Element-wise reciprocal square root with explicit precision selection.
 
-    ``high_precision`` is Tensor-only: the compiler allocates the scratch tile
-    during Tensor-to-Tile lowering. ``tile.rsqrt`` carries no such attribute —
-    precision is selected purely by *passing* that scratch tile — so tile
-    callers use ``pl.tile.rsqrt(tile, tmp)`` directly and passing
-    ``high_precision=True`` with a Tile raises rather than silently yielding the
-    low-precision path.
+    ``high_precision`` defaults to False on both paths. Tensor lowering allocates
+    scratch automatically. Tile callers must provide ``tmp`` when requesting
+    high precision and omit it in default mode; scratch alone never selects precision.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("rsqrt", tmp, "tmp")
         return _tensor.rsqrt(input, high_precision=high_precision)
     if isinstance(input, Tile):
-        _reject_unsupported("rsqrt", "Tile", high_precision=(high_precision, _TILE_RSQRT_PRECISION_REMEDY))
+        if high_precision:
+            if tmp is None:
+                raise ValueError("tile.rsqrt: high_precision=True requires a tmp tile")
+            return _tile.rsqrt(input, tmp=tmp, high_precision=True)
+        if tmp is not None:
+            raise ValueError("tile.rsqrt: tmp requires high_precision=True")
         return _tile.rsqrt(input)
     raise TypeError(f"pl.rsqrt: expected Tensor or Tile, got {type(input).__name__}")
 
@@ -976,6 +978,11 @@ def reinterpret_view(
 ) -> Tensor | Tile:
     """Reinterpret the same bytes with a different dtype.
 
+    Either packed FP4 format <-> UINT8/INT8 preserves the carrier shape. On A5, InCore
+    tensor and tile aliases require dense address-backed 2D row-major Vec
+    storage, a static UB offset, and PYPTO or DSA_RP memory planning.
+    Reshape the byte view separately; orchestration tensor aliases are unsupported.
+
     Args:
         data: Input tensor or tile.
         dtype: Target element dtype, which must differ from the source dtype.
@@ -1144,42 +1151,63 @@ def fillpad_expand(
 
 
 @overload
-def quant_mx(src: Tensor, *, group_axis: int, dtype: DataType = ...) -> tuple[Tensor, Tensor]: ...
+def quant_mx(
+    src: Tensor, *, group_axis: int, dtype: DataType = ..., quant_scale_alg: str = ...
+) -> tuple[Tensor, Tensor]: ...
 @overload
-def quant_mx(src: Tile, *, group_axis: int, dtype: DataType = ...) -> tuple[Tile, Tile]: ...
+def quant_mx(
+    src: Tile, *, group_axis: int, dtype: DataType = ..., quant_scale_alg: str = ...
+) -> tuple[Tile, Tile]: ...
 
 
 def quant_mx(
-    src: object, group_axis: int, dtype: DataType = DataType.FP8E4M3FN
+    src: object, group_axis: int, dtype: DataType = DataType.FP8E4M3FN, quant_scale_alg: str = "ocp"
 ) -> tuple[Tensor, Tensor] | tuple[Tile, Tile]:
-    """MXFP8 quantization, dispatched for GM tensors and tiles.
+    """MXFP8/MXFP4 quantization, dispatched for GM tensors and tiles.
 
     Tensor calls materialize data and correctly laid-out scale tensors in GM;
     tile calls retain the existing on-chip behavior. Both forms use
     ``group_axis=1`` for A-oriented input and ``group_axis=0`` for B-oriented
-    input.
+    input. ``dtype=FP8E5M2`` requires OCP scaling on A5.
     """
     if isinstance(src, Tensor):
-        return _tensor.quant_mx(src, group_axis=group_axis, dtype=dtype)
+        return _tensor.quant_mx(src, group_axis=group_axis, dtype=dtype, quant_scale_alg=quant_scale_alg)
     if isinstance(src, Tile):
-        return _tile.quant_mx(src, group_axis=group_axis, dtype=dtype)
+        return _tile.quant_mx(src, group_axis=group_axis, dtype=dtype, quant_scale_alg=quant_scale_alg)
     _raise_type_dispatch_error("quant_mx", src)
 
 
 @overload
 def matmul_mx(lhs: Tensor, lhs_scale: Tensor, rhs: Tensor, rhs_scale: Tensor) -> Tensor: ...
 @overload
-def matmul_mx(lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile) -> Tile: ...
+def matmul_mx(
+    lhs: Tile,
+    lhs_scale: Tile,
+    rhs: Tile,
+    rhs_scale: Tile,
+    *,
+    acc_phase: AccPhase = ...,
+) -> Tile: ...
 
 
-def matmul_mx(lhs: object, lhs_scale: object, rhs: object, rhs_scale: object) -> Tensor | Tile:
-    """MXFP8 matrix multiplication, dispatched for tensors and tiles."""
+def matmul_mx(
+    lhs: object,
+    lhs_scale: object,
+    rhs: object,
+    rhs_scale: object,
+    *,
+    acc_phase: AccPhase = AccPhase.Unspecified,
+) -> Tensor | Tile:
+    """MXFP8/MXFP4 matrix multiplication with an optional tile accumulator phase."""
+
     if (
         isinstance(lhs, Tensor)
         and isinstance(lhs_scale, Tensor)
         and isinstance(rhs, Tensor)
         and isinstance(rhs_scale, Tensor)
     ):
+        if acc_phase != AccPhase.Unspecified:
+            raise ValueError("matmul_mx acc_phase requires Tile operands")
         return _tensor.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
     if (
         isinstance(lhs, Tile)
@@ -1187,7 +1215,7 @@ def matmul_mx(lhs: object, lhs_scale: object, rhs: object, rhs_scale: object) ->
         and isinstance(rhs, Tile)
         and isinstance(rhs_scale, Tile)
     ):
-        return _tile.matmul_mx(lhs, lhs_scale, rhs, rhs_scale)
+        return _tile.matmul_mx(lhs, lhs_scale, rhs, rhs_scale, acc_phase=acc_phase)
     _raise_type_dispatch_error("matmul_mx", lhs, lhs_scale, rhs, rhs_scale)
 
 
@@ -1199,6 +1227,8 @@ def matmul(
     a_trans: bool = ...,
     b_trans: bool = ...,
     c_matrix_nz: bool = ...,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tensor: ...
 @overload
 def matmul(
@@ -1208,6 +1238,8 @@ def matmul(
     a_trans: Literal[False] = ...,
     b_trans: Literal[False] = ...,
     c_matrix_nz: Literal[False] = ...,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tile: ...
 
 
@@ -1218,8 +1250,14 @@ def matmul(
     a_trans: bool = False,
     b_trans: bool = False,
     c_matrix_nz: bool = False,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tensor | Tile:
     """Matrix multiplication, dispatched by input type.
+
+    ``tf32_mode`` opts rank-2 FP32 operands into HF32 input rounding on Ascend950:
+    ``"round_even"`` rounds ties to even and ``"round_away"`` rounds ties away
+    from zero. Accumulation stays FP32. ``None`` preserves ordinary FP32 matmul.
 
     ``a_trans`` / ``b_trans`` / ``c_matrix_nz`` are Tensor-only: a tensor value
     carries no layout, so a flag is the only place the information can live. At
@@ -1271,7 +1309,7 @@ def matmul(
     exempt: it names the same bytes, so it folds back to the parent.
     """
     if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
-        return _tensor.matmul(lhs, rhs, out_dtype, a_trans, b_trans, c_matrix_nz)
+        return _tensor.matmul(lhs, rhs, out_dtype, a_trans, b_trans, c_matrix_nz, tf32_mode=tf32_mode)
     if isinstance(lhs, Tile) and isinstance(rhs, Tile):
         _reject_unsupported(
             "matmul",
@@ -1280,7 +1318,7 @@ def matmul(
             b_trans=(b_trans, _TILE_TRANSPOSE_REMEDY),
             c_matrix_nz=(c_matrix_nz, _TILE_C_MATRIX_NZ_REMEDY),
         )
-        result = _tile.matmul(lhs, rhs)
+        result = _tile.matmul(lhs, rhs, tf32_mode=tf32_mode)
         _check_tile_matmul_out_dtype(result, out_dtype)
         return result
     _raise_type_dispatch_error("matmul", lhs, rhs)
@@ -1312,6 +1350,8 @@ def matmul_acc(
     a_trans: bool = ...,
     b_trans: bool = ...,
     init_cond: BoolLike | None = ...,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tensor: ...
 @overload
 def matmul_acc(
@@ -1321,6 +1361,8 @@ def matmul_acc(
     a_trans: Literal[False] = ...,
     b_trans: Literal[False] = ...,
     init_cond: BoolLike | None = ...,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tile: ...
 
 
@@ -1331,8 +1373,13 @@ def matmul_acc(
     a_trans: bool = False,
     b_trans: bool = False,
     init_cond: BoolLike | None = None,
+    *,
+    tf32_mode: str | None = None,
 ) -> Tensor | Tile:
     """Matrix multiplication with accumulation, dispatched by input type.
+
+    ``tf32_mode="round_even"`` or ``"round_away"`` selects HF32 input rounding
+    for 2D FP32 operands on Ascend950 (PTOAS 0.77+). ``None`` keeps ordinary FP32.
 
     ``a_trans`` / ``b_trans`` are Tensor-only for the same reason as in
     [`matmul`][pypto.language.matmul] — at tile level transposition is a type property, not an op
@@ -1350,7 +1397,7 @@ def matmul_acc(
     per-batch ``tile.matmul_acc`` by ``FlattenTileNdTo2D``.
     """
     if isinstance(acc, Tensor) and isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
-        return _tensor.matmul_acc(acc, lhs, rhs, a_trans, b_trans, init_cond)
+        return _tensor.matmul_acc(acc, lhs, rhs, a_trans, b_trans, init_cond, tf32_mode=tf32_mode)
     if isinstance(acc, Tile) and isinstance(lhs, Tile) and isinstance(rhs, Tile):
         _reject_unsupported(
             "matmul_acc",
@@ -1358,7 +1405,7 @@ def matmul_acc(
             a_trans=(a_trans, _TILE_TRANSPOSE_REMEDY),
             b_trans=(b_trans, _TILE_TRANSPOSE_REMEDY),
         )
-        return _tile.matmul_acc(acc, lhs, rhs, init_cond)
+        return _tile.matmul_acc(acc, lhs, rhs, init_cond, tf32_mode=tf32_mode)
     _raise_type_dispatch_error("matmul_acc", acc, lhs, rhs)
 
 
@@ -1616,6 +1663,8 @@ def cast(
     mode: str | int = "round",
     *,
     saturation_mode: str | int | None = None,
+    layout: TensorLayout | None = None,
+    compact: CompactMode | None = None,
 ) -> Tile: ...
 
 
@@ -1634,6 +1683,9 @@ def cast(
     target_type: int | DataType,
     mode: str | int = "round",
     saturation_mode: str | int | None = None,
+    *,
+    layout: TensorLayout | None = None,
+    compact: CompactMode | None = None,
 ) -> Tensor | Tile | Scalar:
     """Type casting, dispatched by input type.
 
@@ -1659,13 +1711,24 @@ def cast(
             input does not support this option, so passing it one is an error
             rather than a silent no-op.
 
+        layout: Tile-only output layout. ``pl.NZ`` selects the fused A5
+            E2M1-to-E4M3 decoder.
+        compact: Set ``pl.CompactMode.row_plus_one`` to pad each destination
+            NZ panel by one row.
+
     Example:
         >>> quantized = pl.cast(rounded_fp16, pl.INT8, mode="trunc", saturation_mode="on")
     """
+    if not isinstance(input, Tile) and layout is not None:
+        raise TypeError("pl.cast: layout is supported only for Tile inputs")
+    if not isinstance(input, Tile) and compact is not None:
+        raise TypeError("pl.cast: compact is supported only for Tile inputs")
     if isinstance(input, Tensor):
         return _tensor.cast(input, target_type, mode, saturation_mode=saturation_mode)
     if isinstance(input, Tile):
-        return _tile.cast(input, target_type, mode, saturation_mode=saturation_mode)
+        return _tile.cast(
+            input, target_type, mode, saturation_mode=saturation_mode, layout=layout, compact=compact
+        )
     if _is_scalar_like(input):
         # ``resolve_cast_mode`` runs first, so an invalid mode is still a ValueError;
         # only a *valid* mode this path cannot honour reaches the TypeError below.
@@ -2084,11 +2147,10 @@ def gather_row(
     *,
     valid_shape: Sequence[IntLike] | None = None,
 ) -> Tensor | Tile:
-    """Gather one GM row into a sub-region of an on-chip accumulator (DPS).
+    """Load a GM window into a sub-region of an on-chip accumulator in place.
 
-    Dispatched on ``dst`` — the destination accumulator. ``src`` is a ``Tensor``
-    on both paths: this op always reads from global memory, so it is the
-    destination, not the source, that names the level.
+    Dispatches on the type of ``dst``. For a tile destination, see
+    ``pypto.language.op.tile_ops.gather_row`` for ``MX_A_ND`` requirements.
     """
     args = (src, dst_offset, src_offset, shapes, transpose)
     if isinstance(dst, Tensor):

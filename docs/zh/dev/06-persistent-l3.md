@@ -55,10 +55,12 @@ data 状态；如果两者都没有，复用陈旧状态可能导致错误结果
 `Worker.run()` fence 返回后再释放，因此 staging 内存峰值是这些不同大小之和。
 reset copy 会计入每次重复请求的 host 开销。
 
-这种整 buffer staging 是当前 Simpler Buffer API 的限制：`copy_to` 根据源 `Buffer`
-决定拷贝长度，同时不提供目标 offset 或公开的 Buffer subview。PyPTO 生成的 domain
-会由具名 buffer 完整覆盖 window；如果 artifact 含有未命名的 window 空隙，reset
-会直接拒绝，因为当前 Buffer API 无法将该空隙恢复为 fresh-window 状态。
+PyPTO 使用 `copy_to(dst, src)` 重置每个具名 buffer，默认拷贝长度为源 `Buffer`
+的大小。生成的 domain 由具名 buffer 完整覆盖请求的 window；如果请求范围内含有
+未命名的空隙，reset 会直接拒绝，因为该区域没有可用于恢复内容的具名 buffer。
+运行时报告的物理映射（physical mapping）可能因分配对齐而大于请求大小，A5 就属于
+这种情况。reset 接受这部分额外容量，只拷贝具名 buffer，不暴露或重置物理映射尾部
+的填充区。如果物理映射小于请求的 window，则会在重置该 domain 的 buffer 之前报错。
 
 ## 多 compiled program
 
@@ -82,9 +84,27 @@ program 仍须满足原有的 platform、runtime 和 device ID 兼容性检查�
 ## Runtime 依赖
 
 该实现不修改 Simpler。每个请求都使用公开的 `Worker.submit()` boundary，其
-native handle 会一直挂在 PyPTO 的有界 dispatch handle 上直到完成。PyPTO 会让
-retained CommDomain 脱离 Simpler 的 per-run release set，并在 prepared worker
-关闭时统一释放。目前该保留机制仍依赖 Simpler 私有的 Worker 级 live-domain
-registry 和当前 run-resource journal（`_live_domains` 和
-`_building_run_resources.live_domains`）；后续应由公开的 retention API 封装该
-lifecycle。
+native handle 会一直挂在 PyPTO 的有界 dispatch handle 上直到完成。每个请求通过
+`Orchestrator.get_or_allocate_domain(..., retain_after_run=True)` 获取通信域
+（CommDomain）。Simpler 在复用时验证配置，将通信域登记到当前运行的完成栅栏
+（completion fence），并在成功运行之间保留其分配。prepared worker 关闭时，
+PyPTO 等待所有 dispatch handle 完成后释放通信域；失败时由 Simpler 负责清理。
+PyPTO 不再修改私有的通信域 registry 或 run-resource journal。
+
+## Worker 持有的外部通信域
+
+已准备好的 worker 可以通过 `create_comm_domain` 建域，将命名窗口传给独立编译的
+HOST 入口。每个入口以静态、连续 ND 的 `pld.DistributedTensor` 声明窗口。
+每次调用传入的 `DomainTensor` 决定域和槽位。内部持久化窗口的 reset 仅作用于程序内分配。
+
+schema 4 的分布式 metadata 按声明顺序记录形参，用 `is_distributed` 标记外部窗口。
+冷加载时按这个顺序恢复 scalar 后缀。每个窗口占一个 scalar 槽，存放
+buffer index。配对的隐藏 ctx 位于后缀，占三个 uint64 槽，依次为按小端编码的
+8 字节 owner ID、domain ID 和 generation。这些 scalar 由 HOST 回调原有的 `TaskArgs` 传递。普通 tensor 和保留 Python 类型的 scalar 仍按名称供 HOST 切片和控制流使用。
+每次运行通过当前 orchestrator 查询各个不同的 ref，按成员取命名 buffer 和设备 ctx，
+每个 CHIP 派发为各个不同的域追加一个排序 buffer。HOST 编排从命名 buffer 的起点传递分布式窗口。
+共用同一域的提交会等待前一次
+使用完成。释放域和关闭 worker 也会等已接受的调用完成。冷加载时由调用方重新建立
+资源，并传入对应窗口。
+
+等待被中断时，worker 会继续持有该任务的参数和通信域。如果底层取消操作无法确认任务已经结束，worker 会保留这些资源，直到原生 worker 成功关闭。

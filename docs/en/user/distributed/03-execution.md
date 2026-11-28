@@ -1,8 +1,17 @@
 # Execution
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 A one-off compile-and-dispatch call is enough for a quick test. Production
 code instead amortizes setup — forking chip processes, assembling kernels —
 across many dispatches on a reusable `DistributedWorker`.
+
+Use `worker=` to select the logical child for a dispatch. In a HOST
+orchestrator it indexes the configured devices, and in a POD orchestrator
+it indexes HOST workers. `pld.num_workers()` returns the number of immediate
+children. HOST code can still use `device=` and `pld.world_size()`.
 
 ## DistributedWorker
 
@@ -24,7 +33,7 @@ directly via `DistributedWorker(compiled)`, importable from
 
 | Method | Description |
 | ------ | ----------- |
-| `compiled.prepare(config=None, *, extra_compiled=(), persistent=False, reset_persistent_windows=None, callbacks=None, sub_worker_overrides=None, startup_timeout_s=None)` | Create worker, fork chip processes, return `DistributedWorker`. Use as context manager. |
+| `compiled.prepare(config=None, *, extra_compiled=(), persistent=False, reset_persistent_windows=None, window_sources=None, callbacks=None, sub_worker_overrides=None, startup_timeout_s=None)` | Create worker, fork chip processes, return `DistributedWorker`. Use as context manager. |
 | `rt(x, y, z)` | Single dispatch — coerces args, calls host_orch. |
 | `rt.run(compiled, x, y, z)` | Multi-program dispatch — selects the target program. |
 | `rt.submit(compiled, x, y, z)` | Bounded asynchronous dispatch — returns a `DistributedRunHandle`. |
@@ -323,3 +332,51 @@ model state, a host-side metric collector, a result inspector.
 - [00-model](00-model.md) — Quickstart and model vocabulary
 - [04-debugging](04-debugging.md) — Common failure patterns
 - [Getting Started](../00-getting_started.md) — Runtime setup
+
+### Host window file sources
+
+Pass `window_sources={"engram_l1": shard_files}` to `compiled.prepare()` or
+`DistributedWorker` for a window declared with `memory_source="host", init="engram_l1"`.
+Open the files **after compilation**, in domain rank order. Initialization reads each
+file from offset zero, restores its position, and copies the logical window size.
+The caller owns the files. With `persistent=True`, initialization runs once; Host
+and Device windows are both zeroed before reuse by default. Set
+`reset_persistent_windows=False` to preserve the loaded table and manage the state
+of all reused communication buffers yourself. Resetting a domain does not rerun
+its initializer.
+See [Host DDR windows](../../dev/passes/50-materialize_comm_domain_scopes.md)
+for the full lifecycle and error contract.
+
+The rank list may also contain contiguous CPU `torch.Tensor` objects, for example
+`window_sources={"engram_l1": [rank0_tensor, rank1_tensor]}`, or mix files and tensors.
+Tensor sources are copied as raw bytes at domain creation, with no dtype conversion.
+They must contain at least the logical window size. Keep their storage and contents
+stable until initialization completes. Runtime capability checks run during worker
+setup rather than on each submit.
+
+## Sharing an external table between programs
+
+Prepare the ordinary inputs and outputs before constructing the worker. Both HOST entries declare a static `pld.DistributedTensor[[1, 65], pl.UINT8]` table argument. Rank sources follow the declared member order. Here each source supplies 65 bytes and each physical slot occupies 128 bytes.
+
+```python
+from pypto import DataType
+from pypto.runtime import DistributedWorker, DomainBufferSpec
+
+with DistributedWorker([prefill, decode]) as worker:
+    with worker.create_comm_domain(
+        members=[0, 1],
+        buffers=[DomainBufferSpec("weights", (1, 65), DataType.UINT8)],
+        memory_source="host",
+        window_sources={"weights": [rank0_file, rank1_file]},
+    ) as domain:
+        weights = domain.tensor("weights")
+        worker.submit(prefill, weights, prefill_output).result()
+        worker.submit(decode, weights, decode_output).result()
+```
+
+`members` lists local worker indices in domain-rank order. Bind the resulting
+windows on their creating worker. For the default `memory_source="device"`,
+omit `window_sources` and populate each window with a CHIP task. A5 Host
+asynchronous peer GET requires `workspace_engines=("urma",)` and the native
+runtime's dense member order starting at worker zero. Leaving the domain's
+`with` block waits for accepted work and releases its allocations.

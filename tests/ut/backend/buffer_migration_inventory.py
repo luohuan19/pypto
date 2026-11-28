@@ -25,7 +25,7 @@ class MigrationStatus(Enum):
     RESTRICTED = "restricted"
 
 
-_TARGETS = frozenset({backend.BackendType.Ascend910B, backend.BackendType.Ascend950})
+_TARGETS = frozenset({backend.BackendType.Ascend910, backend.BackendType.Ascend950})
 
 
 @dataclass(frozen=True)
@@ -158,6 +158,7 @@ MIGRATION_FAMILIES = (
             "tile.sel",
             "tile.sels",
         ),
+        restricted=frozenset({"tile.cmp", "tile.cmps", "tile.sel", "tile.sels"}),
     ),
     MigrationFamily(
         "G08: Vector generators",
@@ -185,6 +186,18 @@ MIGRATION_FAMILIES = (
             "tile.col_argmax",
             "tile.col_argmin",
         ),
+        restricted=frozenset(
+            {
+                "tile.row_max",
+                "tile.row_sum",
+                "tile.row_min",
+                "tile.row_prod",
+                "tile.col_max",
+                "tile.col_sum",
+                "tile.col_min",
+                "tile.col_prod",
+            }
+        ),
     ),
     MigrationFamily(
         "G10: Axis expansion and broadcast",
@@ -206,6 +219,22 @@ MIGRATION_FAMILIES = (
             "tile.row_expand_mul",
             "tile.row_expand_sub",
         ),
+        restricted=frozenset(
+            {
+                "tile.col_expand_add",
+                "tile.col_expand_sub",
+                "tile.col_expand_mul",
+                "tile.col_expand_div",
+                "tile.col_expand_max",
+                "tile.col_expand_min",
+                "tile.row_expand_add",
+                "tile.row_expand_sub",
+                "tile.row_expand_mul",
+                "tile.row_expand_div",
+                "tile.row_expand_max",
+                "tile.row_expand_min",
+            }
+        ),
     ),
     MigrationFamily(
         "G11: Padding",
@@ -224,8 +253,10 @@ MIGRATION_FAMILIES = (
             "tile.concat",
             "tile.extract",
             "tile.assemble",
+            # Direct cross-core FIXPIPE currently has a TileIR callback only.
+            "tile.tpush_to_aiv_direct",
         ),
-        restricted=frozenset({"tile.move"}),
+        restricted=frozenset({"tile.move", "tile.cast", "tile.transpose"}),
     ),
     MigrationFamily(
         "G13: Views and valid metadata",
@@ -235,6 +266,9 @@ MIGRATION_FAMILIES = (
             "tile.transpose_view",
             "tile.slice",
             "tile.set_validshape",
+            # This is an initialization-analysis annotation, not a migrated
+            # native BufferIR operation.
+            "tile.mark_remote_written",
         ),
         restricted=frozenset({"tile.reshape"}),
     ),
@@ -250,14 +284,20 @@ MIGRATION_FAMILIES = (
         ),
     ),
     MigrationFamily(
-        "G15: A5 MX and scale binding",
+        "G15: A5 quantization, MX and scale binding",
         (
             "tile.matmul_mx",
             "tile.matmul_mx_acc",
             "tile.matmul_mx_bias",
+            "tile.gemv_mx",
+            "tile.gemv_mx_acc",
+            "tile.gemv_mx_bias",
+            "tile.bind_scale_addr",
+            "tile.extract_into",
             "tile.tget_scale_addr",
             "tile.tquant_mx_raw",
             "tile.tmov_x2zz",
+            "tile.dequant",
         ),
         targets=frozenset({backend.BackendType.Ascend950}),
     ),
@@ -274,6 +314,7 @@ MIGRATION_FAMILIES = (
             "tile.mgather",
             "tile.mscatter",
         ),
+        restricted=frozenset({"tile.gather", "tile.scatter", "tile.gather_compare"}),
     ),
     MigrationFamily(
         "G17: Sorting",
@@ -304,12 +345,23 @@ MIGRATION_FAMILIES = (
         "G19: Barriers, cache and core synchronization",
         (
             "system.bar_all",
+            "system.bar_fix",
             "system.bar_m",
+            "system.bar_mte1",
+            "system.bar_mte2",
+            "system.bar_mte3",
+            "system.bar_s",
             "system.bar_v",
             "system.fence",
             "system.cacheinvalid",
             "system.sync_set",
             "system.sync_wait",
+            "system.set_intra_block",
+            "system.wait_intra_block",
+            "system.set_flag",
+            "system.wait_flag",
+            "system.get_buf",
+            "system.rls_buf",
             "system.set_ffts",
             "system.syncall",
         ),
@@ -325,6 +377,8 @@ MIGRATION_FAMILIES = (
             "system.tfree_to_aiv",
             "system.aic_initialize_pipe",
             "system.aiv_initialize_pipe",
+            "system.set_quant_scalar",
+            "system.set_quant_vector",
             "system.reserve_buffer",
             "system.import_peer_buffer",
         ),
@@ -334,6 +388,11 @@ MIGRATION_FAMILIES = (
         (
             "pld.tile.get",
             "pld.tile.put",
+            "pld.system.make_session",
+            "pld.tile.get_async",
+            "pld.system.defer_wait_event",
+            "pld.tensor.get_async",
+            "pld.tensor.put_async",
             "pld.tile.remote_load",
             "pld.tile.remote_store",
             "pld.system.notify",

@@ -36,6 +36,30 @@
 namespace pypto {
 namespace ir {
 
+RegType::RegType(int64_t shape, DataType dtype, RegKind kind) : shape_(shape), dtype_(dtype), kind_(kind) {
+  CHECK(kind != RegKind::UReg) << "Create UReg with the factory; it has no shape or dtype";
+  CHECK(shape > 0) << "RegType shape must be a positive integer";
+  CHECK(DataTypeToString(dtype) != "UnknownType") << "RegType requires a known dtype";
+  CHECK(kind == RegKind::VecReg || kind == RegKind::MaskReg) << "Unknown RegKind";
+  CHECK(kind != RegKind::MaskReg || dtype == DataType::BOOL) << "MaskReg requires BOOL dtype";
+  CHECK(kind != RegKind::VecReg || dtype != DataType::BOOL) << "VecReg forbids BOOL dtype";
+}
+
+RegTypePtr RegType::GetUReg() {
+  static const auto type = std::make_shared<const RegType>(RegType{});
+  return type;
+}
+
+int64_t RegType::GetShape() const {
+  CHECK(shape_.has_value()) << "UReg has no logical lanes";
+  return *shape_;
+}
+
+DataType RegType::GetDType() const {
+  CHECK(dtype_.has_value()) << "UReg has no element dtype";
+  return *dtype_;
+}
+
 void detail::CheckValueType(const TypePtr& type, const Span& span, const char* context) {
   CHECK_SPAN(!type || type->GetKind() != ObjectKind::VoidType, span)
       << context << " cannot use VoidType: it represents no value; execute a void call with EvalStmt";
@@ -54,16 +78,6 @@ std::optional<MemorySpace> ValidateTileMemorySpaceConsistency(const std::optiona
   CHECK(memory_space.has_value()) << "TileType with MemRef must have explicit memory_space";
 
   return memory_space;
-}
-
-void ValidatePackedFp4Shape(const DataType& dtype, const std::vector<ExprPtr>& shape) {
-  if (dtype != DataType::FP4) return;
-  CHECK(!shape.empty()) << "Packed FP4 shaped types must have rank >= 1";
-  auto packed_extent = As<ConstInt>(shape.back());
-  if (!packed_extent) return;
-  CHECK(packed_extent->value_ > 0 && packed_extent->value_ % 2 == 0)
-      << "Packed FP4 shaped types require a positive even logical last dimension, but got "
-      << packed_extent->value_;
 }
 
 std::vector<ExprPtr> MakeShapeExprs(const std::vector<int64_t>& shape) {
@@ -117,6 +131,24 @@ void CanonicalizeTileViewInPlace(std::optional<TileView>& tile_view, const std::
   if (tile_view_semantics::IsImplicitPrintedTileView(*tile_view, shape, memory_space)) {
     tile_view.reset();
   }
+}
+
+void ValidateRowPlusOneTile(const std::optional<TileView>& tile_view, const std::vector<ExprPtr>& shape,
+                            DataType dtype, const std::optional<MemorySpace>& memory_space) {
+  if (!tile_view || tile_view->compact != CompactMode::row_plus_one) return;
+
+  const auto& view = *tile_view;
+  CHECK((!memory_space || *memory_space == MemorySpace::Vec) && dtype == DataType::FP8E4M3FN &&
+        view.blayout == TileLayout::col_major && view.slayout == TileLayout::row_major && view.fractal == 512)
+      << "RowPlusOne requires an FP8E4M3FN Vec tile with standard 512-byte NZ layout";
+  CHECK(shape.size() == 2) << "RowPlusOne requires a static 2D tile shape";
+  const auto rows = As<ConstInt>(shape[0]);
+  const auto cols = As<ConstInt>(shape[1]);
+  CHECK(rows && cols && rows->value_ > 0 && cols->value_ > 0 && rows->value_ % 16 == 0 &&
+        cols->value_ % 32 == 0)
+      << "RowPlusOne requires positive static rows divisible by 16 and columns divisible by 32";
+  // The producer and split transfer must derive the same padded pitch.
+  CHECK(view.valid_shape.empty()) << "RowPlusOne requires the full logical tile to be valid";
 }
 
 }  // namespace
@@ -207,6 +239,8 @@ std::string TensorLayoutToString(TensorLayout layout) {
       return "MX_A_ZZ";
     case TensorLayout::MX_B_NN:
       return "MX_B_NN";
+    case TensorLayout::MX_A_ND:
+      return "MX_A_ND";
     default:
       throw TypeError("Unknown TensorLayout value: " + std::to_string(static_cast<int>(layout)));
   }
@@ -223,6 +257,8 @@ TensorLayout StringToTensorLayout(const std::string& str) {
     return TensorLayout::MX_A_ZZ;
   } else if (str == "MX_B_NN") {
     return TensorLayout::MX_B_NN;
+  } else if (str == "MX_A_ND") {
+    return TensorLayout::MX_A_ND;
   }
   throw TypeError("Unknown TensorLayout string: " + str);
 }
@@ -257,6 +293,8 @@ std::string CompactModeToString(CompactMode mode) {
       return "null";
     case CompactMode::normal:
       return "normal";
+    case CompactMode::row_plus_one:
+      return "row_plus_one";
     default:
       throw TypeError("Unknown CompactMode value: " + std::to_string(static_cast<int>(mode)));
   }
@@ -267,8 +305,18 @@ CompactMode StringToCompactMode(const std::string& str) {
     return CompactMode::null;
   } else if (str == "normal") {
     return CompactMode::normal;
+  } else if (str == "row_plus_one") {
+    return CompactMode::row_plus_one;
   }
   throw TypeError("Unknown CompactMode string: " + str);
+}
+
+std::optional<PadValue> TryStringToPadValue(const std::string& str) {
+  if (str == "null") return PadValue::null;
+  if (str == "zero") return PadValue::zero;
+  if (str == "max") return PadValue::max;
+  if (str == "min") return PadValue::min;
+  return std::nullopt;
 }
 
 BufferType::BufferType(std::vector<int64_t> shape, DataType dtype, MemorySpace memory_space,
@@ -304,6 +352,7 @@ BufferType::BufferType(std::vector<int64_t> shape, DataType dtype, MemorySpace m
     case MemorySpace::Bias:
     case MemorySpace::LeftScale:
     case MemorySpace::RightScale:
+    case MemorySpace::Scaling:
       break;
     default:
       CHECK(false) << "BufferType requires an on-chip tile memory space, got "
@@ -391,7 +440,6 @@ ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape, MemRefPtr mem
 ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape, std::optional<MemRefPtr> memref)
     : dtype_(dtype), shape_(std::move(shape)), memref_(std::move(memref)) {
   detail::CheckValueOperands(shape_, Span::unknown(), "ShapedType dimension");
-  ValidatePackedFp4Shape(dtype_, shape_);
 }
 
 TensorType::TensorType(std::vector<ExprPtr> shape, DataType dtype, std::optional<MemRefPtr> memref,
@@ -412,6 +460,7 @@ TileType::TileType(const std::vector<int64_t>& shape, DataType dtype, std::optio
       tile_view_(std::move(tile_view)),
       memory_space_(ValidateTileMemorySpaceConsistency(memref_, memory_space)) {
   CanonicalizeTileViewInPlace(tile_view_, shape_, memory_space_);
+  ValidateRowPlusOneTile(tile_view_, shape_, dtype_, memory_space_);
 }
 
 TileType::TileType(std::vector<ExprPtr> shape, DataType dtype, std::optional<MemRefPtr> memref,
@@ -420,6 +469,7 @@ TileType::TileType(std::vector<ExprPtr> shape, DataType dtype, std::optional<Mem
       tile_view_(std::move(tile_view)),
       memory_space_(ValidateTileMemorySpaceConsistency(memref_, memory_space)) {
   CanonicalizeTileViewInPlace(tile_view_, shape_, memory_space_);
+  ValidateRowPlusOneTile(tile_view_, shape_, dtype_, memory_space_);
 }
 
 std::optional<MemorySpace> TileType::GetMemorySpace() const { return memory_space_; }

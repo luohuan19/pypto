@@ -65,12 +65,14 @@ remain live until the `Worker.run()` fence returns, so peak staging memory is
 the sum of those distinct sizes. The reset copies are part of each repeated
 request's host overhead.
 
-This whole-buffer staging is required by the current Simpler Buffer API: `copy_to`
-derives the transfer length from the source `Buffer` and exposes neither a
-destination offset nor a public Buffer subview. Generated PyPTO domains cover
-their windows exactly with named buffers. Reset rejects artifacts with unnamed
-window slack because the Buffer API cannot restore that slack to fresh-window
-state.
+PyPTO resets each named buffer with `copy_to(dst, src)`, whose default transfer
+length is the source `Buffer` size. Generated domains cover the requested
+window exactly with named buffers. Reset rejects artifacts with unnamed slack
+inside that requested extent because it has no named buffer to restore there.
+The runtime's physical mapping may be larger due to allocation alignment, as
+on A5. Reset accepts this extra capacity and copies only the named buffers;
+it does not expose or reset the mapping's trailing padding. A physical mapping
+smaller than the requested window is rejected before copying that domain's buffers.
 
 ## Multiple compiled programs
 
@@ -98,9 +100,33 @@ runs can actually overlap.
 
 This implementation does not modify Simpler. Each request uses the public
 `Worker.submit()` boundary, and its native handle remains attached to PyPTO's
-bounded dispatch handle until completion. PyPTO detaches retained CommDomains
-from Simpler's per-run release set and releases them when the prepared worker
-closes. That retention currently depends on Simpler's private Worker-level
-live-domain registry and active run-resource journal (`_live_domains` and
-`_building_run_resources.live_domains`); a future public retention API should
-encapsulate this lifecycle.
+bounded dispatch handle until completion. Each request acquires its domains
+through `Orchestrator.get_or_allocate_domain(..., retain_after_run=True)`.
+Simpler validates the configuration on reuse, registers the domain with the
+current run's completion fence, and retains its allocation across successful
+runs. PyPTO releases the domains after draining all dispatch handles when the
+prepared worker closes; Simpler owns cleanup on failure. No private domain
+registry or run-resource journal is modified by PyPTO.
+
+## Worker-owned external domains
+
+A prepared worker can create a retained domain with `create_comm_domain` and pass
+its named windows to independently compiled HOST entries. Each entry declares a
+static, contiguous ND `pld.DistributedTensor` for each window. Each invocation
+selects the owner and slot through its actual `DomainTensor` arguments.
+Internal persistent-window reset applies only to program-owned allocations.
+
+The schema 4 sidecar marks external parameters with `is_distributed` in declaration order.
+Reload uses these parameters to reconstruct the scalar suffix. Each window
+occupies one scalar slot holding its buffer index. The paired hidden context at
+the end occupies three uint64 slots for the eight-byte little-endian owner ID,
+domain ID and generation. The runner passes these scalars through the native HOST callback’s `TaskArgs`. Ordinary tensors and typed Python scalars remain available by name for HOST slicing and control flow. At each
+invocation the HOST entry resolves each distinct ref through the active
+orchestrator, materializes each member's named buffer and device context, and
+attaches one ordering buffer per distinct domain to a CHIP dispatch.
+HOST orchestration passes distributed windows from the start of their named buffer.
+Submissions sharing a domain wait for the previous use to complete. Release
+and worker close also drain accepted uses. Cold reload requires callers to
+create the runtime resources and supply the windows again.
+
+An interrupted wait keeps the dispatch arguments and its domain alive. If native cancellation cannot confirm completion, the worker retains them until native teardown succeeds.

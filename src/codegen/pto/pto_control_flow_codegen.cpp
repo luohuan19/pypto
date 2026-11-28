@@ -23,6 +23,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -70,6 +71,14 @@ static std::string JoinPairs(const std::vector<std::string>& lhs, const std::str
 void PTOCodegen::VisitStmt_(const EvalStmtPtr& op) {
   INTERNAL_CHECK(op != nullptr) << "Internal error: null EvalStmt";
   INTERNAL_CHECK_SPAN(op->expr_ != nullptr, op->span_) << "Internal error: EvalStmt has null expression";
+  if (auto call = As<ir::Call>(op->expr_); call && ir::IsOp(call, "reg.mem_bar")) {
+    INTERNAL_CHECK_SPAN(inside_reg_scope_, op->span_) << "reg.mem_bar requires RegScope";
+    // Validate raw/deserialized calls too; barriers have no SSA result.
+    const auto validated =
+        ir::OpRegistry::GetInstance().Create(call->op_->name_, call->args_, call->kwargs_, call->span_);
+    Emit("pto.mem_bar \"" + validated->GetKwarg<std::string>("kind") + "\"");
+    return;
+  }
   VisitExpr(op->expr_);
 }
 
@@ -116,6 +125,25 @@ void PTOCodegen::VisitStmt_(const YieldStmtPtr& op) {
     fs_.current_expr_value = "";
   }
   fs_.yield_buffer = yielded_values;
+}
+
+// Tensor loop carries are lowered as in-place references bound to the loop
+// initializer. Reject a rebind to a different GM window before discarding
+// tensor yields; otherwise the next iteration would silently use the old origin.
+void PTOCodegen::CheckLoopTensorYields(const std::vector<ir::IterArgPtr>& iter_args,
+                                       const ir::Span& span) const {
+  if (fs_.window_origins.empty()) return;
+  for (size_t i = 0; i < iter_args.size() && i < fs_.yield_buffer.size(); ++i) {
+    if (!ir::AsTensorTypeLike(iter_args[i]->GetType())) continue;
+    const auto yielded = fs_.view_ssa_to_base_ptr.find(fs_.yield_buffer[i]);
+    if (yielded != fs_.view_ssa_to_base_ptr.end()) {
+      const auto init = GetTensorBasePtr(iter_args[i]);
+      if (!fs_.window_origins.count(init) && !fs_.window_origins.count(yielded->second)) continue;
+      CHECK_SPAN(yielded->second == init, span)
+          << "An InCore loop-carried tensor must keep its GM origin; construct the window inside each "
+             "iteration";
+    }
+  }
 }
 
 std::string PTOCodegen::GetScalarIterArgTypeString(
@@ -211,6 +239,11 @@ bool IsDefinedInBranch(const ir::Var* var, const StmtPtr& body) {
 }
 }  // namespace
 
+std::string PTOCodegen::GetValueCarryTypeString(const ir::TypePtr& type) const {
+  if (auto reg = As<ir::RegType>(type)) return GetRegTypeString(reg);
+  return GetScalarIterArgTypeString(As<ScalarType>(type));
+}
+
 void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
   INTERNAL_CHECK(op != nullptr) << "Internal error: null IfStmt";
   INTERNAL_CHECK_SPAN(op->condition_ != nullptr, op->span_) << "Internal error: IfStmt has null condition";
@@ -224,40 +257,79 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
   if (op->return_vars_.empty()) {
     // Simple scf.if (no return values)
     EmitStructural("scf.if " + condition + " {");
-    indent_level_++;
+    IncreaseIndent();
     VisitStmt(op->then_body_);
-    indent_level_--;
+    DecreaseIndent();
 
     const auto& else_body = op->else_body_;
     if (else_body) {
       EmitStructural("} else {");
-      indent_level_++;
+      IncreaseIndent();
       VisitStmt(*else_body);
-      indent_level_--;
+      DecreaseIndent();
     }
     EmitStructural("}");
   } else {
-    // Like loops, keep tile return values out of scf.if results. Pre-declare
+    // Like loops, keep allocated tile return values out of scf.if results. Pre-declare
     // tile buffers for return_vars using the canonical MemRef address (assigned
-    // by MemoryReuse), and only use scf.if results for scalar-like SSA values.
+    // by MemoryReuse). Scalars, registers and borrowed tile handles use SSA
+    // results instead of allocating a destination.
     // MemoryReuse's YieldFixupMutator ensures all branch yields already share
     // the return_var's canonical MemRef, so no codegen-level tmov is needed.
     std::vector<bool> returns_via_scf(op->return_vars_.size(), false);
     std::vector<std::string> scf_return_names;
     std::vector<std::string> scf_return_types;
     std::vector<std::pair<std::string, AllocTileFields>> deferred_tile_valid_shapes;
+    const auto then_yield = FindBranchYield(op->then_body_);
+    const auto else_yield = op->else_body_ ? FindBranchYield(*op->else_body_) : nullptr;
 
     for (size_t i = 0; i < op->return_vars_.size(); ++i) {
       const auto& return_var = op->return_vars_[i];
-      if (auto scalar_type = As<ScalarType>(return_var->GetType())) {
+      if (As<ScalarType>(return_var->GetType()) || As<ir::RegType>(return_var->GetType())) {
         std::string ret_name = NewNamedTemp(return_var->name_hint_);
         BindVarToMlir(return_var, ret_name);
         scf_return_names.push_back(ret_name);
-        scf_return_types.push_back(GetScalarIterArgTypeString(scalar_type));
+        scf_return_types.push_back(GetValueCarryTypeString(return_var->GetType()));
         returns_via_scf[i] = true;
       } else if (auto tile_type = As<TileType>(return_var->GetType())) {
-        INTERNAL_CHECK_SPAN(tile_type->memref_.has_value(), op->span_)
-            << "TileType return_var must have a MemRef at codegen stage for var: " << return_var->name_hint_;
+        if (inside_reg_scope_) {
+          // The RegScope pre-scan proved both arms alias one external view and
+          // bound this result to its dominating handle. Keep that alias rather
+          // than creating a phi buffer and copying Tiles inside vecscope.
+          INTERNAL_CHECK_SPAN(fs_.var_to_mlir.count(GetVarKey(return_var)), op->span_)
+              << "Register Tile branch result lacks a prepared external handle";
+          continue;
+        }
+        const auto then_value =
+            then_yield && i < then_yield->value_.size() ? ir::AsVarLike(then_yield->value_[i]) : nullptr;
+        const auto else_value =
+            else_yield && i < else_yield->value_.size() ? ir::AsVarLike(else_yield->value_[i]) : nullptr;
+        if (!tile_type->memref_) {
+          // If both arms yield the same already-bound descriptor, it dominates
+          // the join. Keep its TPOP provenance and runtime valid shape so a
+          // subsequent dynamic view can replay directly from that descriptor.
+          if (then_value && else_value) {
+            const auto then_it = fs_.var_to_mlir.find(GetVarKey(then_value));
+            const auto else_it = fs_.var_to_mlir.find(GetVarKey(else_value));
+            if (then_it != fs_.var_to_mlir.end() && else_it != fs_.var_to_mlir.end() &&
+                then_it->second == else_it->second && IsLocallyBoundTileName(then_it->second)) {
+              BindVarToMlir(return_var, then_it->second);
+              continue;
+            }
+          }
+          // A borrowed FIFO value has no address for a phi allocation. Carry
+          // its tile handle through the branch instead of allocating storage
+          // disconnected from the receive. Normalize the yielded view types
+          // below, since tpop handles and zero-copy views differ in validity.
+          const auto ret_name = NewNamedTemp(return_var->name_hint_);
+          const auto ret_type = GetViewTileBufTypeStringFromTileType(tile_type);
+          BindVarToMlir(return_var, ret_name);
+          RegisterTileBufType(ret_name, ret_type, tile_type);
+          scf_return_names.push_back(ret_name);
+          scf_return_types.push_back(ret_type);
+          returns_via_scf[i] = true;
+          continue;
+        }
         // A tile phi handle is declared in the function head so it dominates
         // both branches and every post-if read. A dynamic valid_shape may be
         // computed only in the surrounding loop/body, however, and therefore
@@ -285,7 +357,8 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
         // branch producers write the phi handle (they are re-bound to it below,
         // fix #1956) while the loop result and every post-if read still resolve
         // to the shared one, which no branch ever wrote.
-        std::string ret_name = TryGetSharedTileBufHandle(ir::GetDefinedMemRef(tile_type));
+        std::string ret_name =
+            TryGetSharedTileBufHandle(tile_type, alloc_fields.type_str, then_value, else_value);
         if (!ret_name.empty()) {
           // The shared handle must dominate both branches and the post-if read.
           // Hoist its declaration to the function head unless the body already
@@ -294,13 +367,22 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
         } else {
           ret_name = AllocNewTileBuf(alloc_fields.type_str, return_var->name_hint_, alloc_fields.addr_ssa,
                                      alloc_fields.valid_row_ssa, alloc_fields.valid_col_ssa);
+          RegisterTileBufType(ret_name, alloc_fields.type_str, tile_type);
           // This head-declared handle is the phi buffer. Under PTOAS the branch
           // producers are re-bound to it (see emit_branch, fix #1956); mark it
           // emitted so their EmitAllocTileForVar dedups instead of re-declaring it.
           if (!emit_tile_addr_) fs_.emitted_tile_alloc_names.insert(ret_name);
         }
+        // Prepare before entering either branch: a phi destination view must
+        // dominate branch writes as well as reads after this scf.if. Branch
+        // producers and the synthetic tmov below share this exact target.
+        ret_name = PrepareTileDestination(return_var, ret_name, "if result").name;
         BindVarToMlir(return_var, ret_name);
         if (has_dynamic_valid_shape) {
+          // The PTOAS planner can reuse an existing descriptor for this phi.
+          // Its validity reset must participate in NZ insertion alignment too.
+          const auto valid_shape = ir::tile_view_semantics::GetEffectiveTileView(*tile_type).valid_shape;
+          RecordTileValidColumnUpdate(ret_name, valid_shape.back());
           deferred_tile_valid_shapes.emplace_back(ret_name, std::move(logical_fields));
         }
       } else if (ir::AsTensorTypeLike(return_var->GetType()) || As<ir::ArrayType>(return_var->GetType())) {
@@ -334,7 +416,7 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
     } else {
       EmitStructural("scf.if " + condition + " {");
     }
-    indent_level_++;
+    IncreaseIndent();
 
     // For in-place return vars (ArrayType and TensorType, both kept out of
     // scf.if results), capture the backing SSA that the branches yield so it can
@@ -357,9 +439,12 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
       if (!emit_tile_addr_ && yield) {
         for (size_t i = 0; i < op->return_vars_.size(); ++i) {
           if (i >= yield->value_.size()) continue;
+          if (returns_via_scf[i]) continue;
           if (!As<TileType>(op->return_vars_[i]->GetType())) continue;
           auto src = ir::AsVarLike(yield->value_[i]);
           if (!src) continue;
+          auto src_tile = As<TileType>(src->GetType());
+          if (src_tile && !src_tile->memref_) continue;
           // Only re-point a branch-local producer; an outer var yielded through
           // the branch is read elsewhere and must keep its own handle.
           if (!IsDefinedInBranch(src.get(), body)) continue;
@@ -374,11 +459,32 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
           << "IfStmt " << branch_name << "-branch yield count (" << branch_yields.size()
           << ") must match return_vars (" << op->return_vars_.size() << ")";
 
-      std::vector<std::string> scalar_yields;
-      scalar_yields.reserve(scf_return_types.size());
+      std::vector<std::string> ssa_yields;
+      ssa_yields.reserve(scf_return_types.size());
       for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+        auto yielded_tile =
+            yield && i < yield->value_.size() ? As<TileType>(yield->value_[i]->GetType()) : nullptr;
         if (returns_via_scf[i]) {
-          scalar_yields.push_back(branch_yields[i]);
+          auto value = branch_yields[i];
+          if (auto tile_type = As<TileType>(op->return_vars_[i]->GetType())) {
+            value = EnsureTileView(value, GetSSATileBufType(value), tile_type, "if_borrow_view");
+          }
+          if (As<TileType>(op->return_vars_[i]->GetType())) {
+            // Both branch values must describe the same dominating receive and
+            // physical window before a later VF can reconstruct its address.
+            const auto name = GetVarName(op->return_vars_[i]);
+            const auto candidate = fs_.c2v_views.find(value);
+            if (body == op->then_body_ && candidate != fs_.c2v_views.end()) {
+              fs_.c2v_views[name] = candidate->second;
+            } else if (auto prior = fs_.c2v_views.find(name);
+                       prior != fs_.c2v_views.end() &&
+                       (candidate == fs_.c2v_views.end() ||
+                        prior->second.received != candidate->second.received ||
+                        prior->second.byte_offset != candidate->second.byte_offset)) {
+              fs_.c2v_views.erase(prior);
+            }
+          }
+          ssa_yields.push_back(std::move(value));
         } else if (As<ir::ArrayType>(op->return_vars_[i]->GetType()) ||
                    ir::AsTensorTypeLike(op->return_vars_[i]->GetType())) {
           if (As<ir::DistributedTensorType>(op->return_vars_[i]->GetType())) {
@@ -423,17 +529,29 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
                 << "' yields different backing SSAs across branches: " << inplace_return_ssa[i] << " vs "
                 << branch_yields[i];
           }
-        } else if (!emit_tile_addr_ && As<TileType>(op->return_vars_[i]->GetType())) {
+        } else if (As<TileType>(op->return_vars_[i]->GetType()) &&
+                   (!emit_tile_addr_ || (yielded_tile && !yielded_tile->memref_))) {
           // Tile phi under PTOAS (fix #1956). A branch-local producer was already
           // re-pointed at the phi handle above, so its yield resolves to the phi
           // handle and needs nothing. Any other yield — an outer tile threaded
           // through the branch, or one the re-point conservatively skipped — has
           // NOT written the phi buffer, so copy it in: without MemoryReuse's
           // YieldFixupMutator (skipped under PTOAS) the post-if read would
-          // otherwise see an uninitialised phi buffer.
+          // otherwise see an uninitialised phi buffer. Borrowed sources need
+          // the same copy under PYPTO: YieldFixup cannot compare their absent
+          // MemRefs with the allocated phi's address.
           auto phi_it = fs_.var_to_mlir.find(GetVarKey(op->return_vars_[i]));
           if (phi_it != fs_.var_to_mlir.end() && !branch_yields[i].empty() &&
               branch_yields[i] != phi_it->second) {
+            if (yielded_tile && !yielded_tile->memref_) {
+              // Receives defined outside the branch bypass the finalizer's
+              // branch-local yield check. Copying them into a phi buffer is
+              // supported only in Vec: Mat-to-Mat tmov is not legal. Check at
+              // the copy site so same-slot borrowed handle yields remain valid.
+              CHECK_SPAN(yielded_tile->memory_space_ == ir::MemorySpace::Vec, op->span_)
+                  << "Merging a FIFO-backed Tile into an allocated if-result is only supported in Vec "
+                     "memory; consume each Mat receive inside its branch instead of yielding it";
+            }
             const std::string& phi = phi_it->second;
             // Annotate each operand with the type its own SSA value was defined
             // with. They can differ: a `pto.treshape` view carries static valid
@@ -456,30 +574,30 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
             Emit(mov.str());
           }
         }
-        // Tile return_vars under PYPTO: MemoryReuse ensures branch yields share the
+        // Allocated Tile yields under PYPTO: MemoryReuse ensures they share the
         // return_var's canonical MemRef (same physical address), so no codegen-level
         // tmov is needed — the IR-level tile.move (from YieldFixupMutator) handles it.
       }
 
       if (!scf_return_types.empty()) {
-        Emit("scf.yield " + JoinCommaSep(scalar_yields) + " : " + JoinCommaSep(scf_return_types));
+        Emit("scf.yield " + JoinCommaSep(ssa_yields) + " : " + JoinCommaSep(scf_return_types));
       }
-      CHECK(scalar_yields.size() == scf_return_types.size())
-          << "IfStmt " << branch_name << "-branch scalar yield count (" << scalar_yields.size()
-          << ") must match scalar return_vars (" << scf_return_types.size() << ")";
+      CHECK(ssa_yields.size() == scf_return_types.size())
+          << "IfStmt " << branch_name << "-branch SSA yield count (" << ssa_yields.size()
+          << ") must match SSA return_vars (" << scf_return_types.size() << ")";
       fs_.yield_buffer.clear();
     };
 
     emit_branch(op->then_body_, "then");
-    indent_level_--;
+    DecreaseIndent();
 
     EmitStructural("} else {");
-    indent_level_++;
+    IncreaseIndent();
     const auto& else_body = op->else_body_;
     INTERNAL_CHECK_SPAN(else_body.has_value(), op->span_)
         << "Internal error: IfStmt with return_vars has no else_body";
     emit_branch(*else_body, "else");
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
 
     // Bind in-place return vars (array / tensor) to the shared backing SSA both
@@ -589,22 +707,22 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
   std::string loop_var_name = NewNamedTemp(op->loop_var_->name_hint_);
   BindVarToMlir(op->loop_var_, loop_var_name);
 
-  // In PTO, only scalar types (index, f32, bool, etc.) need iter_args/yield
-  // for loop-carried value semantics. Non-scalar types (TileType, TensorType)
+  // Scalars and registers (including masks) are immutable SSA values and need
+  // iter_args/yield to carry each iteration's result. TileType and TensorType
   // are mutable references written in-place via outs(), so they are mapped
   // directly to their init values and excluded from iter_args/yield.
-  std::vector<bool> is_scalar(op->iter_args_.size(), false);
-  bool has_scalar_iter_args = false;
+  std::vector<bool> is_ssa(op->iter_args_.size(), false);
+  bool has_ssa_iter_args = false;
   for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-    if (As<ScalarType>(op->iter_args_[i]->GetType())) {
-      is_scalar[i] = true;
-      has_scalar_iter_args = true;
+    if (As<ScalarType>(op->iter_args_[i]->GetType()) || As<ir::RegType>(op->iter_args_[i]->GetType())) {
+      is_ssa[i] = true;
+      has_ssa_iter_args = true;
     }
   }
 
   // Map non-scalar iter_args/return_vars directly to their init values
   for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-    if (is_scalar[i]) continue;
+    if (is_ssa[i]) continue;
 
     const auto& iter_arg = op->iter_args_[i];
     const auto& return_var = op->return_vars_[i];
@@ -645,25 +763,26 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
     }
   }
 
-  if (!has_scalar_iter_args) {
+  if (!has_ssa_iter_args) {
     // Simple scf.for (no iter_args, or all iter_args are non-scalar)
     EmitStructural("scf.for " + loop_var_name + " = " + start + " to " + stop + " step " + step + " {");
-    indent_level_++;
+    IncreaseIndent();
 
     fs_.yield_buffer.clear();
     VisitStmt(op->body_);
+    CheckLoopTensorYields(op->iter_args_, op->span_);
     fs_.yield_buffer.clear();
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
   } else {
-    // scf.for with scalar iter_args only
+    // scf.for with SSA value iter_args only
     std::vector<std::string> init_values;
     std::vector<std::string> iter_arg_names;
     std::vector<std::string> iter_arg_types;
 
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      if (!is_scalar[i]) continue;
+      if (!is_ssa[i]) continue;
 
       const auto& iter_arg = op->iter_args_[i];
 
@@ -675,13 +794,13 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
       BindVarToMlir(iter_arg, iter_name);
       iter_arg_names.push_back(iter_name);
 
-      iter_arg_types.push_back(GetScalarIterArgTypeString(As<ScalarType>(iter_arg->GetType())));
+      iter_arg_types.push_back(GetValueCarryTypeString(iter_arg->GetType()));
     }
 
-    // Register return_vars SSA names (scalar only)
+    // Register return_vars SSA names (SSA values only)
     std::vector<std::string> return_var_names;
     for (size_t i = 0; i < op->return_vars_.size(); ++i) {
-      if (!is_scalar[i]) continue;
+      if (!is_ssa[i]) continue;
       std::string ret_name = NewNamedTemp(op->return_vars_[i]->name_hint_);
       BindVarToMlir(op->return_vars_[i], ret_name);
       return_var_names.push_back(ret_name);
@@ -692,26 +811,27 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
     EmitStructural(JoinCommaSep(return_var_names) + " = scf.for " + loop_var_name + " = " + start + " to " +
                    stop + " step " + step + " iter_args(" + JoinPairs(iter_arg_names, " = ", init_values) +
                    ") -> (" + JoinCommaSep(iter_arg_types) + ") {");
-    indent_level_++;
+    IncreaseIndent();
 
     fs_.yield_buffer.clear();
     VisitStmt(op->body_);
+    CheckLoopTensorYields(op->iter_args_, op->span_);
 
-    // Filter yield_buffer to keep only scalar iter_arg entries
-    std::vector<std::string> scalar_yields;
+    // Filter yield_buffer to keep only SSA value iter_arg entries
+    std::vector<std::string> ssa_yields;
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      if (is_scalar[i] && i < fs_.yield_buffer.size()) {
-        scalar_yields.push_back(fs_.yield_buffer[i]);
+      if (is_ssa[i] && i < fs_.yield_buffer.size()) {
+        ssa_yields.push_back(fs_.yield_buffer[i]);
       }
     }
 
     // Emit scf.yield from filtered yield values
-    if (!scalar_yields.empty()) {
+    if (!ssa_yields.empty()) {
       std::ostringstream yield_oss;
       yield_oss << "scf.yield ";
-      for (size_t i = 0; i < scalar_yields.size(); ++i) {
+      for (size_t i = 0; i < ssa_yields.size(); ++i) {
         if (i > 0) yield_oss << ", ";
-        yield_oss << scalar_yields[i];
+        yield_oss << ssa_yields[i];
       }
       yield_oss << " : ";
       for (size_t i = 0; i < iter_arg_types.size(); ++i) {
@@ -720,12 +840,12 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
       }
       Emit(yield_oss.str());
     }
-    CHECK(scalar_yields.size() == iter_arg_types.size())
-        << "ForStmt scalar yield count (" << scalar_yields.size() << ") must match scalar iter_args ("
+    CHECK(ssa_yields.size() == iter_arg_types.size())
+        << "ForStmt scalar yield count (" << ssa_yields.size() << ") must match scalar iter_args ("
         << iter_arg_types.size() << ")";
     fs_.yield_buffer.clear();
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
   }
 }
@@ -739,22 +859,22 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
       << "WhileStmt iter_args size (" << op->iter_args_.size() << ") must equal return_vars size ("
       << op->return_vars_.size() << ")";
 
-  // In PTO, only scalar types (index, f32, bool, etc.) need iter_args/yield
-  // for loop-carried value semantics. Non-scalar types (TileType, TensorType)
+  // Scalars and registers (including masks) are immutable SSA values and need
+  // iter_args/yield to carry each iteration's result. TileType and TensorType
   // are mutable references written in-place via outs(), so they are mapped
   // directly to their init values and excluded from iter_args/yield.
-  std::vector<bool> is_scalar(op->iter_args_.size(), false);
-  bool has_scalar_iter_args = false;
+  std::vector<bool> is_ssa(op->iter_args_.size(), false);
+  bool has_ssa_iter_args = false;
   for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-    if (As<ScalarType>(op->iter_args_[i]->GetType())) {
-      is_scalar[i] = true;
-      has_scalar_iter_args = true;
+    if (As<ScalarType>(op->iter_args_[i]->GetType()) || As<ir::RegType>(op->iter_args_[i]->GetType())) {
+      is_ssa[i] = true;
+      has_ssa_iter_args = true;
     }
   }
 
   // Map non-scalar iter_args/return_vars directly to their init values
   for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-    if (is_scalar[i]) continue;
+    if (is_ssa[i]) continue;
 
     const auto& iter_arg = op->iter_args_[i];
     const auto& return_var = op->return_vars_[i];
@@ -795,37 +915,38 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     }
   }
 
-  if (!has_scalar_iter_args) {
+  if (!has_ssa_iter_args) {
     // Simple scf.while (no iter_args, or all iter_args are non-scalar)
     EmitStructural("scf.while : () -> () {");
-    indent_level_++;
+    IncreaseIndent();
 
     VisitExpr(op->condition_);
     std::string cond = fs_.current_expr_value;
     fs_.current_expr_value = "";
     Emit("scf.condition(" + cond + ")");
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("} do {");
-    indent_level_++;
+    IncreaseIndent();
 
     fs_.yield_buffer.clear();
     VisitStmt(op->body_);
+    CheckLoopTensorYields(op->iter_args_, op->span_);
 
     Emit("scf.yield");
     fs_.yield_buffer.clear();
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
   } else {
-    // scf.while with scalar iter_args only
+    // scf.while with SSA value iter_args only
     std::vector<std::string> init_values;
     std::vector<std::string> before_arg_names;
     std::vector<std::string> after_arg_names;
     std::vector<std::string> iter_arg_types;
 
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      if (!is_scalar[i]) continue;
+      if (!is_ssa[i]) continue;
 
       const auto& iter_arg = op->iter_args_[i];
 
@@ -836,26 +957,26 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
       before_arg_names.push_back(NewTemp());
       after_arg_names.push_back(NewTemp());
 
-      iter_arg_types.push_back(GetScalarIterArgTypeString(As<ScalarType>(iter_arg->GetType())));
+      iter_arg_types.push_back(GetValueCarryTypeString(iter_arg->GetType()));
     }
 
-    // Register return_vars SSA names (scalar only)
+    // Register return_vars SSA names (SSA values only)
     std::vector<std::string> return_var_names;
     for (size_t i = 0; i < op->return_vars_.size(); ++i) {
-      if (!is_scalar[i]) continue;
+      if (!is_ssa[i]) continue;
 
       std::string ret_name = NewTemp();
       BindVarToMlir(op->return_vars_[i], ret_name);
       return_var_names.push_back(ret_name);
     }
 
-    // Lambda to register scalar iter_args in fs_.var_to_mlir
-    auto register_scalar_iter_args = [&](const std::vector<std::string>& ssa_names) {
-      size_t scalar_idx = 0;
+    // Lambda to register SSA value iter_args in fs_.var_to_mlir
+    auto register_ssa_iter_args = [&](const std::vector<std::string>& ssa_names) {
+      size_t ssa_idx = 0;
       for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-        if (!is_scalar[i]) continue;
-        BindVarToMlir(op->iter_args_[i], ssa_names[scalar_idx]);
-        scalar_idx++;
+        if (!is_ssa[i]) continue;
+        BindVarToMlir(op->iter_args_[i], ssa_names[ssa_idx]);
+        ssa_idx++;
       }
     };
 
@@ -865,10 +986,10 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     EmitStructural(JoinCommaSep(return_var_names) + " = scf.while (" +
                    JoinPairs(before_arg_names, " = ", init_values) + ") : " + types_str + " -> " + types_str +
                    " {");
-    indent_level_++;
+    IncreaseIndent();
 
     // Before region: register before-region args, evaluate condition
-    register_scalar_iter_args(before_arg_names);
+    register_ssa_iter_args(before_arg_names);
 
     VisitExpr(op->condition_);
     std::string cond = fs_.current_expr_value;
@@ -878,38 +999,39 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     Emit("scf.condition(" + cond + ") " + JoinCommaSep(before_arg_names) + " : " +
          JoinCommaSep(iter_arg_types));
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("} do {");
 
     // After region: emit ^bb0 block header with typed arguments
     EmitStructural("^bb0(" + JoinPairs(after_arg_names, " : ", iter_arg_types) + "):");
-    indent_level_++;
+    IncreaseIndent();
 
     // Re-register iter_args with after-region SSA names
-    register_scalar_iter_args(after_arg_names);
+    register_ssa_iter_args(after_arg_names);
 
     // Visit body
     fs_.yield_buffer.clear();
     VisitStmt(op->body_);
+    CheckLoopTensorYields(op->iter_args_, op->span_);
 
-    // Filter yield_buffer to keep only scalar iter_arg entries
-    std::vector<std::string> scalar_yields;
+    // Filter yield_buffer to keep only SSA value iter_arg entries
+    std::vector<std::string> ssa_yields;
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      if (is_scalar[i] && i < fs_.yield_buffer.size()) {
-        scalar_yields.push_back(fs_.yield_buffer[i]);
+      if (is_ssa[i] && i < fs_.yield_buffer.size()) {
+        ssa_yields.push_back(fs_.yield_buffer[i]);
       }
     }
 
     // Emit scf.yield from filtered yield values
-    if (!scalar_yields.empty()) {
-      Emit("scf.yield " + JoinCommaSep(scalar_yields) + " : " + JoinCommaSep(iter_arg_types));
+    if (!ssa_yields.empty()) {
+      Emit("scf.yield " + JoinCommaSep(ssa_yields) + " : " + JoinCommaSep(iter_arg_types));
     }
-    CHECK(scalar_yields.size() == iter_arg_types.size())
-        << "WhileStmt scalar yield count (" << scalar_yields.size() << ") must match scalar iter_args ("
+    CHECK(ssa_yields.size() == iter_arg_types.size())
+        << "WhileStmt scalar yield count (" << ssa_yields.size() << ") must match scalar iter_args ("
         << iter_arg_types.size() << ")";
     fs_.yield_buffer.clear();
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
   }
 }

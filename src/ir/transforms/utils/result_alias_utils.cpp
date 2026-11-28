@@ -12,9 +12,13 @@
 
 #include <cstddef>
 #include <optional>
+#include <vector>
 
 #include "pypto/core/logging.h"
+#include "pypto/ir/expr.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/type.h"
 
 namespace pypto {
 namespace ir {
@@ -58,7 +62,7 @@ std::optional<size_t> ResultAliasedArgIndex(const CallPtr& call) {
   // allgather / all_to_all / all_to_all_v take a read-only local operand first,
   // so their result window is argument 1; the rest reduce argument 0 in place.
   if (IsOp(call, "pld.tensor.allgather") || IsOp(call, "pld.tensor.all_to_all") ||
-      IsOp(call, "pld.tensor.all_to_all_v")) {
+      (IsOp(call, "pld.tensor.all_to_all_v") || IsOp(call, "pld.tensor.indexed_all_to_all_v"))) {
     return aliased(1);
   }
   if (IsOp(call, "pld.tensor.allreduce") || IsOp(call, "pld.tensor.reduce_scatter") ||
@@ -80,6 +84,21 @@ std::optional<size_t> ResultAliasedArgIndex(const CallPtr& call) {
     return aliased(0);
   }
   return std::nullopt;
+}
+
+std::vector<ExprPtr> TupleResultAliasOperands(const CallPtr& call) {
+  auto tuple = As<TupleType>(call->GetType());
+  if (!tuple) return {};
+  const auto* entry = LookupOpEntry(call->op_);
+  if (!entry || entry->GetTupleResultAliases().empty()) return {};
+
+  std::vector<ExprPtr> aliases(tuple->types_.size());
+  for (const auto& [field, arg] : entry->GetTupleResultAliases()) {
+    INTERNAL_CHECK_SPAN(field < aliases.size() && arg < call->args_.size(), call->span_)
+        << call->op_->name_ << " tuple result alias is out of bounds";
+    aliases[field] = call->args_[arg];
+  }
+  return aliases;
 }
 
 }  // namespace ir

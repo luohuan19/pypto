@@ -12,8 +12,10 @@
 #ifndef PYPTO_CODEGEN_DISTRIBUTED_DISTRIBUTED_CODEGEN_H_
 #define PYPTO_CODEGEN_DISTRIBUTED_DISTRIBUTED_CODEGEN_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -75,13 +77,6 @@ class DistributedCodegen : public CodegenBase {
   int64_t GetConstIntValue(const ir::ExprPtr& expr) const override;
   std::string GetVarName(const ir::VarPtr& var) const override;
 
-  /// Public hook for op codegen functions registered via
-  /// :c:macro:`REGISTER_DISTRIBUTED_OP`. Marks @p var_name as emitted so the
-  /// surrounding ``AssignStmt`` visitor does not re-emit ``var = ...`` on
-  /// the fall-through path. Mirrors the manual ``declared_vars_.insert(...)``
-  /// performed by in-class emitters such as :func:`EmitTensorCreate`.
-  void MarkDeclared(const std::string& var_name) { declared_vars_.insert(var_name); }
-
   /// Return builtin chip-callable variants requested while emitting the HOST
   /// orchestrator. Python's backend materializes these specs under
   /// ``next_levels/<variant>/`` so runtime assembly can keep scanning the
@@ -107,10 +102,10 @@ class DistributedCodegen : public CodegenBase {
   [[nodiscard]] std::string ResolveRankExpr(const ir::CallPtr& call) const;
 
   /// Lower a ``CommCtxType`` call argument. get_comm_ctx-derived locals map to
-  /// the runtime device_ctx expression for the current dispatch rank; explicit
-  /// CommCtx params are forwarded as scalar names.
+  /// the runtime device_ctx expression for the current dispatch rank.
+  /// External HOST contexts contribute their domain to the ordering-token list.
   [[nodiscard]] std::string ResolveCommCtxArg(const ir::ExprPtr& arg, const std::string& rank_expr,
-                                              const ir::Span& span) const;
+                                              const ir::Span& span, std::vector<size_t>& external_args) const;
 
   /// Return the emitted Python handle variable for the comm domain that owns
   /// ``wb``.
@@ -118,6 +113,13 @@ class DistributedCodegen : public CodegenBase {
 
   /// Format a DistributedTensor's shape as a Python tuple literal.
   [[nodiscard]] std::string FormatShapeTuple(const std::vector<ir::ExprPtr>& shape);
+
+  /// Emit a dynamic capacity check at a window declaration. Statically fitting
+  /// windows need no runtime check; Tensor construction stays at dispatch sites.
+  void EmitWindowCapacityCheck(const ir::CallPtr& call);
+  /// Same check for a window-bound type that does not go through the window
+  /// handler (e.g. a shape-changing alias of an existing window view).
+  void EmitWindowCapacityCheck(const ir::TypePtr& type, const ir::Span& span);
 
   /// Return a Python-safe identifier derived from an IR/runtime name hint.
   [[nodiscard]] std::string SanitizeName(const std::string& name) const;
@@ -185,6 +187,8 @@ class DistributedCodegen : public CodegenBase {
  private:
   // Code structure emission
   void EmitImports();
+  void EmitExternalWindowArgs(const ir::FunctionPtr& func);
+  void EmitExternalWindowCapacityCheck(size_t index, const ir::DistributedTensorTypePtr& type);
   void EmitFunction(const ir::FunctionPtr& func);
   void EmitEntryFunction();
   // Tag the emitted orchestrator/entry with a sentinel attribute so the runtime
@@ -264,6 +268,12 @@ class DistributedCodegen : public CodegenBase {
   [[nodiscard]] bool IsSubWorker(const ir::FunctionPtr& func) const;
   [[nodiscard]] static std::string DataTypeToPythonDType(const DataType& dtype);
 
+  /// Build the ``torch.zeros(...)`` expression for a host-side allocation of
+  /// ``shape`` (already formatted as a Python tuple literal) and ``dtype``.
+  /// Not every torch dtype can be filled on CPU, so this is the single place
+  /// that knows how to produce a zeroed host buffer for each of them.
+  [[nodiscard]] static std::string HostZerosExpr(const std::string& shape, const DataType& dtype);
+
   /// Look up the innermost open CommDomainScopeStmt whose ``slots_`` contain
   /// ``wb`` (by shared_ptr identity — ``MaterializeCommDomainScopes`` shares
   /// the same ``shared_ptr<const WindowBuffer>`` between the scope's slots
@@ -298,7 +308,8 @@ class DistributedCodegen : public CodegenBase {
   ir::FunctionPtr current_func_;
   std::string current_target_var_;
   std::string current_expr_value_;
-  std::set<std::string> declared_vars_;
+  std::set<std::string> window_source_keys_;
+  bool requires_host_domain_ = false;
   bool is_worker_context_{false};
   int task_args_counter_{0};  // Counter for generating unique TaskArgs variable names
 
@@ -315,10 +326,17 @@ class DistributedCodegen : public CodegenBase {
   // VisitStmt_(AssignStmt) when it encounters TupleGetItemExpr unpacking.
   std::map<std::pair<std::string, int>, std::string> tuple_element_tensors_;
 
+  // Exact return-position -> parameter mapping, local to one Generate call.
+  // Out/InOut parameters not named by ReturnStmt do not occupy result slots.
+  std::unordered_map<const ir::Function*, std::vector<std::optional<size_t>>> returned_param_indices_;
+
   // A distributed ``pl.submit`` returns the runtime TaskHandle as its final
   // tuple element. Keep it separate from tensor aliases so a later
   // ``deps=[tid]`` can lower to ``TaskArgs.add_dep_wait(tid)``.
   std::map<std::pair<std::string, int>, std::string> tuple_element_task_handles_;
+
+  // External window values and their contexts map to the originating HOST parameter.
+  std::unordered_map<const ir::Var*, size_t> external_windows_;
 
   // HOST orchestrator AssignStmt defs, populated before comm-domain emission.
   std::unordered_map<const ir::Var*, ir::ExprPtr> host_orch_var_defs_;

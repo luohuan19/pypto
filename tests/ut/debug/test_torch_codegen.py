@@ -15,7 +15,7 @@ from typing import Any
 import pypto.language as pl
 import pytest
 import torch
-from pypto import DataType, ir
+from pypto import DataType, backend, ir
 from pypto.debug import torch_codegen
 from pypto.debug.torch_codegen import TorchCodegen
 
@@ -170,6 +170,29 @@ def test_tensor_view_explicit_valid_shape_codegen_and_execution():
     assert actual._pypto_full_shape == (32, 128)
 
 
+def test_window_view_preserves_parent_origin_and_disjoint_columns():
+    src = _tensor_var("src", [8, 16])
+    row = _scalar("row", DataType.INDEX)
+    window = ir.op.tensor.view(src, [2, 4], offsets=[row, 1], steps=[3, 2])
+    v = ir.Var("v", window.type, _span())
+    inner = ir.op.tensor.view(v, [1, 2], offsets=[1, 1], steps=[1, 2])
+    w = ir.Var("w", inner.type, _span())
+    body = ir.SeqStmts(
+        [ir.AssignStmt(v, window, _span()), ir.AssignStmt(w, inner, _span()), ir.ReturnStmt([w], _span())],
+        _span(),
+    )
+    func = _simple_function("nested_window", [src, row], body, [w.type])
+    ns: dict = {}
+    exec(torch_codegen(func), ns)  # noqa: S102
+    x = torch.arange(128, dtype=torch.float32).reshape(8, 16)
+    expected = x.clone()
+    result = ns["nested_window"](x, 2)
+    assert torch.equal(result, x[5:6, 3:8:4])
+    result.fill_(-1)
+    expected[5:6, 3:8:4] = -1
+    assert torch.equal(x, expected)
+
+
 def test_tensor_view_same_layout_is_identity():
     """A layout-only view targeting the current layout should be an identity."""
     src = _tensor_var("src", [2, 4])
@@ -223,7 +246,9 @@ def test_tensor_matmul_with_transpose():
     func = _simple_function("f", [a, b], assign)
     code = torch_codegen(func)
     assert "a.mT" in code
-    assert "torch.matmul" in code
+    # Matmul emission routes through the `_cube_matmul` preamble helper, which
+    # widens 1-byte / mixed float operand pairs before calling torch.
+    assert "_cube_matmul" in code
 
 
 def test_tensor_matmul_respects_out_dtype():
@@ -235,7 +260,92 @@ def test_tensor_matmul_respects_out_dtype():
     assign = ir.AssignStmt(out, call, _span())
     func = _simple_function("f", [a, b], assign)
     code = torch_codegen(func)
-    assert "torch.matmul(a, b).to(torch.float32)" in code
+    assert "_cube_matmul(a, b).to(torch.float32)" in code
+
+
+@pytest.mark.parametrize("mode", ["round_even", "round_away"])
+@pytest.mark.parametrize(
+    "op_name", ["tensor.matmul", "tensor.matmul_acc", "tile.matmul", "tile.matmul_acc", "tile.matmul_bias"]
+)
+def test_hf32_matmul_reference_rounds_inputs_per_operation(mode, op_name):
+    """HF32 must round both inputs, while bias/accumulator and later FP32 ops stay exact."""
+    tensor_op = op_name.startswith("tensor.")
+    var = _tensor_var if tensor_op else _tile_var
+    a, b = var("a", [2, 2]), var("b", [2, 2])
+    seed = var("seed", [1, 2] if op_name.endswith("bias") else [2, 2])
+    init = _scalar("init", DataType.BOOL)
+    params = [a, b]
+    args: list[ir.Expr] = [a, b]
+    if op_name.endswith("acc"):
+        args = [seed, a, b, init]
+        params += [seed, init]
+    elif op_name.endswith("bias"):
+        args += [seed]
+        params += [seed]
+    # Exercise transposed, noncontiguous Tensor inputs as well as Tile handlers.
+    kwargs = {"a_trans": True, "b_trans": True} if tensor_op else {}
+    call = _op_call(op_name, args, {**kwargs, "tf32_mode": mode})
+    result, plain = var("result", [2, 2]), var("plain", [2, 2])
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(result, call, _span()),
+            ir.AssignStmt(plain, _op_call(op_name.split(".")[0] + ".matmul", [a, b], kwargs), _span()),
+            ir.ReturnStmt([result, plain], _span()),
+        ],
+        _span(),
+    )
+    namespace = {}
+    exec(torch_codegen(_simple_function("hf32", params, body, [result.type, plain.type])), namespace)  # noqa: S102
+    lhs = torch.tensor([[1 + 2**-11, -1], [-1 - 3 * 2**-11, 1]], dtype=torch.float32)
+    rhs = torch.tensor([[1024, 1 + 2**-11], [1024, 1 + 3 * 2**-11]], dtype=torch.float32)
+    # Hand-rounded ties include positive/negative values and even/odd retained LSBs.
+    rounded_one = 1 if mode == "round_even" else 1 + 2**-10
+    rounded_lhs = torch.tensor([[rounded_one, -1], [-1 - 2**-9, 1]])
+    rounded_rhs = torch.tensor([[1024, rounded_one], [1024, 1 + 2**-9]])
+    product = rounded_lhs @ rounded_rhs
+    plain_expected = lhs @ rhs
+    seed_data = torch.full((1, 2) if op_name.endswith("bias") else (2, 2), 3 + 2**-11)
+    for initialize in (False, True):
+        inputs: list[Any] = [lhs.T, rhs.T] if tensor_op else [lhs, rhs]
+        expected = product
+        if op_name.endswith("acc"):
+            inputs += [seed_data, initialize]
+            expected = product if initialize else seed_data + product
+        elif op_name.endswith("bias"):
+            inputs += [seed_data]
+            expected = product + seed_data
+        actual, plain_actual = namespace["hf32"](*inputs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(plain_actual, plain_expected, rtol=0, atol=0)
+        assert actual.dtype == torch.float32
+
+
+@pytest.mark.parametrize("mode", ["round_even", "round_away"])
+def test_hf32_rounding_boundaries(mode):
+    """Rounding must preserve special values and carry across fraction/exponent boundaries."""
+    namespace = {}
+    exec(torch_codegen_module._PREAMBLE, namespace)  # noqa: S102
+    values = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            float("inf"),
+            -float("inf"),
+            float("nan"),
+            2 - 2**-11,
+            1 + 2**-12,
+            1 + 3 * 2**-12,
+            -1 - 2**-11,
+            -1 - 3 * 2**-11,
+        ]
+    )
+    negative_tie = -1 if mode == "round_even" else -1 - 2**-10
+    expected = torch.tensor(
+        [0.0, -0.0, float("inf"), -float("inf"), float("nan"), 2, 1, 1 + 2**-10, negative_tie, -1 - 2**-9]
+    )
+    actual = namespace["_hf32_round"](values, mode)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(torch.signbit(actual[:2]), torch.signbit(values[:2]))
 
 
 def test_tensor_cast():
@@ -481,7 +591,7 @@ def test_tile_sels_and_prelu():
 
 
 def test_tile_matmul_acc():
-    """tile.matmul_acc should emit (acc + torch.matmul(lhs, rhs))."""
+    """tile.matmul_acc should emit (acc + _cube_matmul(lhs, rhs))."""
     acc = _tile_var("acc", [64, 64])
     a = _tile_var("a", [64, 128])
     b = _tile_var("b", [128, 64])
@@ -491,7 +601,7 @@ def test_tile_matmul_acc():
     assign = ir.AssignStmt(out, call, _span())
     func = _simple_function("f", [acc, a, b], assign)
     code = torch_codegen(func)
-    assert "acc + torch.matmul(a, b).float()" in code
+    assert "acc + _cube_matmul(a, b).float()" in code
 
 
 def test_tile_matmul_acc_runtime_init_cond_overwrites():
@@ -529,7 +639,7 @@ def test_tile_matmul_acc_runtime_init_cond_overwrites():
             return pl.store(acc_tile, [0, 0], output)
 
     code = torch_codegen(SplitKFromNonZeroAcc)
-    assert "_acc_init(acc_tile, torch.matmul(a, b).float(), (k0 == 0))" in code
+    assert "_acc_init(acc_tile, _cube_matmul(a, b).float(), (k0 == 0))" in code
 
     ns: dict = {}
     exec(code, ns)  # noqa: S102
@@ -580,9 +690,9 @@ def test_tile_matmul_acc_literal_init_cond_folds():
             return pl.store(out_tile, [0, 0], output)
 
     # True selects the overwrite arm outright -- the accumulator drops out.
-    assert "out_tile = torch.matmul(a, b).float()" in torch_codegen(MatmulAccInitTrue)
+    assert "out_tile = _cube_matmul(a, b).float()" in torch_codegen(MatmulAccInitTrue)
     # False selects the accumulating arm, identical to carrying no predicate.
-    assert "out_tile = (acc + torch.matmul(a, b).float())" in torch_codegen(MatmulAccInitFalse)
+    assert "out_tile = (acc + _cube_matmul(a, b).float())" in torch_codegen(MatmulAccInitFalse)
 
 
 def test_tile_gemv_acc_runtime_init_cond_overwrites():
@@ -617,7 +727,7 @@ def test_tile_gemv_acc_runtime_init_cond_overwrites():
             return pl.store(acc_tile, [0, 0], output)
 
     code = torch_codegen(GemvSplitKFromNonZeroAcc)
-    assert "_acc_init(acc_tile, torch.matmul(a, b).float(), (k0 == 0))" in code
+    assert "_acc_init(acc_tile, _cube_matmul(a, b).float(), (k0 == 0))" in code
 
     ns: dict = {}
     exec(code, ns)  # noqa: S102
@@ -655,7 +765,7 @@ def test_tensor_matmul_acc_init_cond_with_transpose():
             return pl.assemble(output, result, [0, 0])
 
     code = torch_codegen(TensorSplitK)
-    assert "_acc_init(result, torch.matmul(lhs.mT, rhs), (k0 == 0))" in code
+    assert "_acc_init(result, _cube_matmul(lhs.mT, rhs), (k0 == 0))" in code
 
 
 def test_tile_cmp():
@@ -787,7 +897,14 @@ def test_if_else_with_return_vars():
 
 @pytest.mark.parametrize(
     "op_name",
-    ["system.sync_src", "system.sync_set", "system.sync_wait", "system.set_ffts"],
+    [
+        "system.sync_src",
+        "system.sync_set",
+        "system.sync_wait",
+        "system.set_flag",
+        "system.wait_flag",
+        "system.set_ffts",
+    ],
 )
 def test_system_ops_are_noops(op_name):
     """System ops should emit no-op comments."""
@@ -796,6 +913,12 @@ def test_system_ops_are_noops(op_name):
         call = _op_call(op_name, [], {"set_pipe": 4, "wait_pipe": 5, "event_id": 0})
     elif op_name in ("system.sync_set", "system.sync_wait"):
         call = _op_call(op_name, [], {"pipe": ir.PipeType.MTE2, "event_id": 0})
+    elif op_name in ("system.set_flag", "system.wait_flag"):
+        call = _op_call(
+            op_name,
+            [],
+            {"src_pipe": ir.PipeType.MTE2, "dst_pipe": ir.PipeType.V, "event_id": 0},
+        )
     else:
         workspace = _tensor_var("workspace", [256], DataType.INT64)
         params = [workspace]
@@ -948,7 +1071,8 @@ def test_group_cross_core_left_right_c2v_runs_with_runtime_scheduler():
     assert torch.allclose(out, src)
 
 
-def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler():
+@pytest.mark.parametrize("pipe_id", [0, 7])
+def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler(pipe_id):
     """No-split bidirectional path should run concurrently without deadlock."""
 
     @pl.program
@@ -960,10 +1084,10 @@ def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler():
             out: pl.Out[pl.Tensor[[4, 2], pl.FP32]],
         ):
             recv: pl.Tile[[4, 2], pl.FP32, pl.MemorySpace.Mat] = pl.tpop_from_aiv(
-                shape=[4, 2], dtype=pl.FP32, split=0
+                shape=[4, 2], dtype=pl.FP32, split=0, id=pipe_id
             )
             twice: pl.Tile[[4, 2], pl.FP32, pl.MemorySpace.Mat] = pl.add(recv, recv)
-            pl.tpush_to_aiv(twice, split=0)
+            pl.tpush_to_aiv(twice, split=0, id=pipe_id)
 
         @pl.function(type=pl.FunctionType.AIV)
         def cross_aiv(
@@ -972,9 +1096,9 @@ def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler():
             out: pl.Out[pl.Tensor[[4, 2], pl.FP32]],
         ) -> pl.Tensor[[4, 2], pl.FP32]:
             tile: pl.Tile[[4, 2], pl.FP32, pl.MemorySpace.Vec] = pl.load(inp, [0, 0], [4, 2])
-            pl.tpush_to_aic(tile, split=0)
+            pl.tpush_to_aic(tile, split=0, id=pipe_id)
             recv: pl.Tile[[4, 2], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(
-                shape=[4, 2], dtype=pl.FP32, split=0
+                shape=[4, 2], dtype=pl.FP32, split=0, id=pipe_id
             )
             out = pl.store(recv, [0, 0], out)
             return out
@@ -999,6 +1123,8 @@ def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler():
 
     code = torch_codegen(NoSplitBidirectProgram)
     assert "_run_group_call('cross'" in code
+    if pipe_id:
+        assert code.count(f"pipe_id={pipe_id})") == 4
     ns: dict = {}
     exec(code, ns)  # noqa: S102
     src = torch.arange(8, dtype=torch.float32).reshape(4, 2)
@@ -1007,10 +1133,235 @@ def test_group_cross_core_no_split_bidirect_runs_with_runtime_scheduler():
     assert torch.allclose(out, src * 2)
 
 
+@pytest.mark.parametrize("pipe_id", [0, 7])
+@pytest.mark.parametrize("explicit_fp32", [False, True])
+@pytest.mark.parametrize("check_shapes", [False, True])
+def test_ordinary_groups_reset_c2v_epilogue(pipe_id, explicit_fp32, check_shapes):
+    """A default pipe after BF16/ReLU preserves FP32 values across ordinary groups."""
+    plain_options = ", c2v_dtype=pl.FP32" if explicit_fp32 else ""
+    source = f"""@pl.program
+class SequentialGroups:
+    @pl.function(type=pl.FunctionType.AIC)
+    def producer(self, a: pl.Tensor[[64, 128], pl.FP32],
+                 b: pl.Tensor[[128, 128], pl.FP32],
+                 out: pl.Out[pl.Tensor[[64, 128], pl.BF16]],
+                 raw: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        peer = pl.import_peer_buffer(name="rounded", peer_func="consumer")
+        pl.aic_initialize_pipe(c2v_consumer_buf=peer, dir_mask=1,
+            slot_size=16384, slot_num=2, id={pipe_id}, c2v_dtype=pl.BF16, pre_relu=True)
+        a_mat = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        left = pl.move(a_mat, target_memory=pl.Mem.Left)
+        right = pl.move(b_mat, target_memory=pl.Mem.Right)
+        acc = pl.matmul(left, right)
+        pl.tpush_to_aiv(acc, split=0, id={pipe_id})
+        pl.store(acc, [0, 0], raw)
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def consumer(self, a: pl.Tensor[[64, 128], pl.FP32],
+                 b: pl.Tensor[[128, 128], pl.FP32],
+                 out: pl.Out[pl.Tensor[[64, 128], pl.BF16]],
+                 raw: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        buf = pl.reserve_buffer(name="rounded", size=32768)
+        pl.aiv_initialize_pipe(c2v_consumer_buf=buf, dir_mask=1,
+            slot_size=16384, slot_num=2, id={pipe_id}, c2v_dtype=pl.BF16, pre_relu=True)
+        value = pl.tpop_from_aic(shape=[64, 128], dtype=pl.BF16, split=0, id={pipe_id})
+        pl.store(value, [0, 0], out)
+        pl.tfree_to_aic(value, id={pipe_id})
+
+    @pl.function(type=pl.FunctionType.Group)
+    def rounded(self, a: pl.Tensor[[64, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 128], pl.BF16]],
+                raw: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        self.producer(a, b, out, raw)
+        self.consumer(a, b, out, raw)
+
+    @pl.function(type=pl.FunctionType.AIC)
+    def plain_producer(self, a: pl.Tensor[[64, 128], pl.FP32],
+                       b: pl.Tensor[[128, 128], pl.FP32],
+                       out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        peer = pl.import_peer_buffer(name="plain", peer_func="plain_consumer")
+        pl.aic_initialize_pipe(c2v_consumer_buf=peer, dir_mask=1,
+            slot_size=32768, slot_num=2, id={pipe_id}{plain_options})
+        a_mat = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        left = pl.move(a_mat, target_memory=pl.Mem.Left)
+        right = pl.move(b_mat, target_memory=pl.Mem.Right)
+        acc = pl.matmul(left, right)
+        pl.tpush_to_aiv(acc, split=0, id={pipe_id})
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def plain_consumer(self, a: pl.Tensor[[64, 128], pl.FP32],
+                       b: pl.Tensor[[128, 128], pl.FP32],
+                       out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        buf = pl.reserve_buffer(name="plain", size=65536)
+        pl.aiv_initialize_pipe(c2v_consumer_buf=buf, dir_mask=1,
+            slot_size=32768, slot_num=2, id={pipe_id}{plain_options})
+        value = pl.tpop_from_aic(shape=[64, 128], dtype=pl.FP32, split=0, id={pipe_id})
+        pl.store(value, [0, 0], out)
+        pl.tfree_to_aic(value, id={pipe_id})
+
+    @pl.function(type=pl.FunctionType.Group)
+    def plain(self, a: pl.Tensor[[64, 128], pl.FP32],
+              b: pl.Tensor[[128, 128], pl.FP32],
+              out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        self.plain_producer(a, b, out)
+        self.plain_consumer(a, b, out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, a: pl.Tensor[[64, 128], pl.FP32],
+             b: pl.Tensor[[128, 128], pl.FP32],
+             rounded_out: pl.Out[pl.Tensor[[64, 128], pl.BF16]],
+             plain_out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+             raw: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        self.rounded(a, b, rounded_out, raw)
+        self.plain(a, b, plain_out)
+"""
+    namespace: dict[str, Any] = {}
+    exec(torch_codegen(pl.parse(source), check_shapes=check_shapes), namespace)  # noqa: S102
+    assert namespace["_GROUP_META"] == {}
+    a = torch.zeros(64, 128)
+    a[:, :2] = 1
+    b = torch.zeros(128, 128)
+    b[0] = torch.tensor([1.0, 1.0078125, -1.0, -1.0078125] * 32)
+    b[1] = torch.tensor([2**-8, 2**-11, -(2**-8), -(2**-11)] * 32)
+    expected = a @ b
+    rounded = torch.empty_like(expected, dtype=torch.bfloat16)
+    plain = torch.empty_like(expected)
+    raw = torch.empty_like(expected)
+    for _ in range(3):
+        namespace["main"](a, b, rounded, plain, raw)
+        torch.testing.assert_close(rounded, expected.clamp_min(0).to(torch.bfloat16), rtol=0, atol=0)
+        torch.testing.assert_close(plain, expected, rtol=0, atol=0)
+        torch.testing.assert_close(raw, expected, rtol=0, atol=0)
+        assert namespace["_cross_core_rt"].snapshot(pipe_id)["to_aiv"] == 0
+
+
+@pytest.mark.parametrize("pipe_id", [0, 7])
+@pytest.mark.parametrize("dir_mask", [1, 3])
+def test_default_c2v_initializer_keeps_other_pipe_epilogues(pipe_id, dir_mask):
+    """Reset one payload contract without dropping queued data or another pipe's epilogue."""
+    namespace: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, namespace)  # noqa: S102
+    runtime = namespace["_cross_core_rt"]
+    other_id = 7 if pipe_id == 0 else 0
+    runtime.initialize_c2v_pipe(torch.bfloat16, True, pipe_id)
+    runtime.initialize_c2v_pipe(torch.bfloat16, True, other_id)
+    acc = torch.tensor([[-1.00390625, 1.00390625]], dtype=torch.float32)
+    original = acc.clone()
+    runtime.push_to_aiv(acc, 0, pipe_id=other_id)
+    code = torch_codegen_module._handle_aic_initialize_pipe([], {"dir_mask": dir_mask, "id": pipe_id})
+    exec(code, namespace)  # noqa: S102
+    runtime.push_to_aiv(acc, 0, pipe_id=pipe_id)
+    torch.testing.assert_close(runtime.pop_from_aic(0, pipe_id), original, rtol=0, atol=0)
+    torch.testing.assert_close(
+        runtime.pop_from_aic(0, other_id), original.clamp_min(0).to(torch.bfloat16), rtol=0, atol=0
+    )
+    torch.testing.assert_close(acc, original, rtol=0, atol=0)
+
+
+def test_v2c_only_initializer_preserves_c2v_epilogue():
+    """A V2C-only initializer does not replace the C2V contract on the same ID."""
+    namespace: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, namespace)  # noqa: S102
+    runtime = namespace["_cross_core_rt"]
+    runtime.initialize_c2v_pipe(torch.bfloat16, True, 7)
+    code = torch_codegen_module._handle_aic_initialize_pipe([], {"dir_mask": 2, "id": 7})
+    exec(code, namespace)  # noqa: S102
+    acc = torch.tensor([[-1.00390625, 1.00390625]], dtype=torch.float32)
+    runtime.push_to_aiv(acc, 0, pipe_id=7)
+    torch.testing.assert_close(
+        runtime.pop_from_aic(0, 7), acc.clamp_min(0).to(torch.bfloat16), rtol=0, atol=0
+    )
+
+
 def test_split_mode_to_int_invalid_value_raises():
     """Invalid split value should fail fast with a clear error."""
     with pytest.raises(ValueError, match="Invalid split mode"):
         torch_codegen_module._split_mode_to_int("bad_split")
+
+
+@pytest.fixture
+def _reference_fifo_namespace():
+    # Execute only the trusted helper definitions, never a generated kernel or simulator.
+    namespace: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("split", [1, 2])
+@pytest.mark.parametrize("pipe_id", [0, 7])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_v2c_fifo_frame_order_follows_physical_aiv(_reference_fifo_namespace, split, pipe_id, explicit):
+    """One producer can advance two frames without pairing with itself."""
+    namespace = _reference_fifo_namespace
+    runtime = namespace["_cross_core_rt"]
+    set_lane = namespace["_set_subblock_idx"]
+    axis = 0 if split == 1 else 1
+    frames = [torch.arange(16).reshape(4, 4).float() + frame * 100 for frame in (0, 1)]
+    other_id = 7 if pipe_id == 0 else 0
+    other = torch.arange(16).reshape(4, 4).float() + 900
+    for physical in (0, 1):
+        set_lane(physical)
+        # Physical AIV0 runs both iterations before AIV1 starts. Logical band
+        # choice changes while each producer's FIFO frame sequence stays fixed.
+        for frame in (0, 1):
+            logical = physical ^ frame if explicit else physical
+            kwargs = {"aiv_subblockid": logical} if explicit else {}
+            runtime.push_to_aic(frames[frame].narrow(axis, logical * 2, 2), split, pipe_id, **kwargs)
+        runtime.push_to_aic(other.narrow(axis, physical * 2, 2), split, other_id)
+    for expected in frames:
+        torch.testing.assert_close(runtime.pop_from_aiv(split, pipe_id), expected, rtol=0, atol=0)
+    torch.testing.assert_close(runtime.pop_from_aiv(split, other_id), other, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("split", [1, 2, 3, 4])
+@pytest.mark.parametrize("pipe_id", [0, 7])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_c2v_fifo_frame_order_follows_physical_aiv(_reference_fifo_namespace, split, pipe_id, explicit):
+    """Each physical reader consumes its next frame, then selects its logical band."""
+    namespace = _reference_fifo_namespace
+    runtime = namespace["_cross_core_rt"]
+    set_lane = namespace["_set_subblock_idx"]
+    axis = 0 if split in (1, 3) else 1
+    frames = [torch.arange(16).reshape(4, 4).float() + frame * 100 for frame in (0, 1)]
+    other_id = 7 if pipe_id == 0 else 0
+    other = torch.arange(16).reshape(4, 4).float() + 900
+    valid_shape = [4, 4]
+    if split in (3, 4):
+        valid_shape[axis] = 3
+    for tile, target_id in ((frames[0], pipe_id), (other, other_id), (frames[1], pipe_id)):
+        setattr(tile, "_pypto_valid_shape", tuple(valid_shape))
+        setattr(tile, "_pypto_full_shape", (4, 4))
+        runtime.push_to_aiv(tile, split, pipe_id=target_id)
+    for physical in (0, 1):
+        set_lane(physical)
+        for frame in (0, 1):
+            logical = physical ^ frame if explicit else physical
+            kwargs = {"aiv_subblockid": logical} if explicit else {}
+            actual = runtime.pop_from_aic(split, pipe_id, **kwargs)
+            torch.testing.assert_close(actual, frames[frame].narrow(axis, logical * 2, 2), rtol=0, atol=0)
+            expected_valid = [4, 4]
+            expected_valid[axis] = 1 if split in (3, 4) and logical == 1 else 2
+            assert getattr(actual, "_pypto_valid_shape") == tuple(expected_valid)
+        # Frame progress belongs to the pipe too, not to a global reader cursor.
+        actual = runtime.pop_from_aic(split, other_id)
+        torch.testing.assert_close(actual, other.narrow(axis, physical * 2, 2), rtol=0, atol=0)
+
+
+def test_c2v_fifo_frame_readers_have_independent_storage(_reference_fifo_namespace):
+    """A physical reader must not mutate another reader's queued GM band."""
+    namespace = _reference_fifo_namespace
+    runtime = namespace["_cross_core_rt"]
+    tile = torch.arange(16).reshape(4, 4).float()
+    runtime.push_to_aiv(tile, 1, pipe_id=7)
+    namespace["_set_subblock_idx"](0)
+    first = runtime.pop_from_aic(1, 7, aiv_subblockid=0)
+    first.add_(100)
+    namespace["_set_subblock_idx"](1)
+    second = runtime.pop_from_aic(1, 7, aiv_subblockid=0)
+    torch.testing.assert_close(second, tile[:2], rtol=0, atol=0)
 
 
 def test_cross_core_split_merge_preserves_region_attrs():
@@ -1046,6 +1397,40 @@ def test_cross_core_split_merge_preserves_region_attrs():
     assert tuple(merged.shape) == (2, 4)
     assert getattr(merged, "_pypto_valid_shape", None) == (2, 3)
     assert getattr(merged, "_pypto_full_shape", None) == (2, 4)
+
+
+@pytest.mark.parametrize("rows", [96, 160, 192])
+def test_cross_core_split_valid_rows_uses_matmul_result_type(rows):
+    """Matmul carries runtime row validity in IR even when its Torch result has no tile attribute."""
+
+    @pl.program
+    class Producer:
+        @pl.function(type=pl.FunctionType.AIC)
+        def produce(
+            self,
+            lhs: pl.Tensor[[192, 16], pl.FP32],
+            rhs: pl.Tensor[[16, 16], pl.FP32],
+            valid_rows: pl.Scalar[pl.INDEX],
+        ):
+            left = pl.move(
+                pl.load(lhs, [0, 0], [192, 16], valid_shape=[valid_rows, 16]), target_memory=pl.Mem.Left
+            )
+            right = pl.move(pl.load(rhs, [0, 0], [16, 16]), target_memory=pl.Mem.Right)
+            acc = pl.matmul(left, right)
+            pl.tpush_to_aiv(acc, split=1)
+
+    namespace: dict[str, Any] = {}
+    exec(torch_codegen(Producer, backend_type=backend.BackendType.Ascend950), namespace)  # noqa: S102
+    lhs = torch.arange(192 * 16, dtype=torch.float32).reshape(192, 16)
+    rhs = torch.eye(16)
+    namespace["produce"](lhs, rhs, rows)
+    half = rows // 2
+    for lane in (0, 1):
+        namespace["_set_subblock_idx"](lane)
+        payload = namespace["_cross_core_rt"].pop_from_aic(1)
+        assert payload.shape == (96, 16)
+        assert getattr(payload, "_pypto_valid_shape", None) == (half, 16)
+        torch.testing.assert_close(payload[:half], lhs[lane * half : (lane + 1) * half])
 
 
 def test_cross_core_rebalanced_split_slices_at_the_box_but_starts_at_the_stride():
@@ -1142,6 +1527,39 @@ def test_cross_core_no_split_dual_dispatch_runtime_pipe_pairing():
     paired = rt.pop_from_aiv(0)
     assert torch.equal(paired, lane0_tile)
     assert rt.snapshot()["to_aic_dual_nosplit"] == {0: 0, 1: 0}
+
+
+@pytest.mark.parametrize("split,dual", [(0, False), (0, True), (1, False), (2, False)])
+def test_cross_core_pipe_ids_isolate_queues_in_both_directions(split, dual):
+    """Reverse pipe order must not exchange payloads, including per-lane queues."""
+    ns: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, ns)  # noqa: S102
+    rt = ns["_cross_core_rt"]
+    set_lane = ns["_set_subblock_idx"]
+    rt.reset(no_split_dual_aiv_dispatch=dual)
+    payloads = {0: torch.full((4, 4), 1.0), 7: torch.full((4, 4), -3.0)}
+    for pipe_id, payload in payloads.items():
+        rt.push_to_aiv(payload, split, pipe_id=pipe_id)
+    for pipe_id in (7, 0):
+        for lane in range(2 if split or dual else 1):
+            set_lane(lane)
+            actual = rt.pop_from_aic(split, pipe_id=pipe_id)
+            expected = payloads[pipe_id]
+            if split:
+                expected = rt._split_tile(expected, split)[lane]
+            torch.testing.assert_close(actual, expected)
+
+    for pipe_id, payload in payloads.items():
+        parts = rt._split_tile(payload, split) if split else (payload, payload)
+        for lane in range(2 if split or dual else 1):
+            set_lane(lane)
+            rt.push_to_aic(parts[lane], split, pipe_id=pipe_id)
+    for pipe_id in (7, 0):
+        actual = rt.pop_from_aiv(split, pipe_id=pipe_id)
+        torch.testing.assert_close(actual, payloads[pipe_id])
+    rt.reset()
+    assert rt.snapshot(7)["to_aiv"] == 0
+    assert rt.snapshot(7)["to_aic"] == 0
 
 
 def test_mixed_kernel_timeout_cancels_waiters_and_runtime_recovers():
@@ -1444,6 +1862,22 @@ def test_type_error_on_invalid_input():
         torch_codegen(ir.ConstInt(42, DataType.INT64, _span()))  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("action", ["set", "wait"])
+@pytest.mark.parametrize("dtype", [None, DataType.INT32, DataType.INT64])
+def test_named_intra_block_debug_rejects_unmodeled_ordering(action, dtype):
+    """Generation must fail before a mixed-thread reference can elide a rendezvous."""
+    event = ir.Var("event", ir.ScalarType(dtype), _span()) if dtype is not None else None
+    params = [event] if event is not None else []
+    args: list[ir.Expr] = list(params)
+    kwargs = {"pipe": int(pl.PipeType.MTE2)}
+    if event is None:
+        kwargs["event_id"] = 17
+    call = _op_call(f"system.{action}_intra_block", args, kwargs)
+    function = _simple_function("named_event", params, ir.EvalStmt(call, _span()))
+    with pytest.raises(ValueError, match="cannot model named intra-block synchronization.*native PTO"):
+        torch_codegen(function)
+
+
 def test_unsupported_op_raises():
     """torch_codegen should raise ValueError for unregistered ops."""
     a = _tensor_var("a", [64])
@@ -1454,6 +1888,14 @@ def test_unsupported_op_raises():
     assign = ir.AssignStmt(out, call, _span())
     func = _simple_function("f", [a], assign)
     with pytest.raises(ValueError, match="Unsupported op 'fake.nonexistent_op'"):
+        torch_codegen(func)
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP4E2M1X2, DataType.FP4E1M2X2])
+def test_fp4_debug_reference_rejects_instead_of_emitting_float32(dtype):
+    src = _tensor_var("src", [32, 64], dtype)
+    func = _simple_function("fp4_identity", [src], ir.ReturnStmt([src], _span()), [src.type])
+    with pytest.raises(ValueError, match="does not implement packed FP4 encoding or decoding"):
         torch_codegen(func)
 
 

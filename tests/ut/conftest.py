@@ -32,6 +32,7 @@ import pytest
 from pypto import LogLevel, get_log_level, set_log_level
 from pypto import backend as _backend
 from pypto.backend import BackendType
+from pypto.backend._ptoas_locate import check_ptoas_version, find_ptoas_binary
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import _clear_thread_log_level, passes
 
@@ -39,6 +40,31 @@ from pypto.pypto_core import _clear_thread_log_level, passes
 # mutate it — so every unit test starts from whatever PYPTO_LOG_LEVEL / the
 # build-type default selected for this session. See `_reset_log_level`.
 _INITIAL_LOG_LEVEL: Final[LogLevel] = get_log_level()
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--require-ptoas",
+        action="store_true",
+        help="Fail before running tests if a supported PTOAS compiler is unavailable.",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register compilation coverage and fail CI before optional checks can skip."""
+    config.addinivalue_line(
+        "markers",
+        "ptoas_compile: invokes PTOAS compilation to check generated-code regressions",
+    )
+    if not config.getoption("--require-ptoas"):
+        return
+    binary = find_ptoas_binary()
+    if binary is None:
+        raise pytest.UsageError("--require-ptoas requires PTOAS; set PTOAS_ROOT to its installation.")
+    try:
+        check_ptoas_version(binary)
+    except RuntimeError as exc:
+        raise pytest.UsageError(str(exc)) from exc
 
 
 @pytest.fixture
@@ -165,13 +191,13 @@ def stub_device_runner():
 def ascend_backend(request):
     """Configure an Ascend backend for the duration of a test, then reset.
 
-    Use either as a plain fixture (defaults to ``Ascend910B``) or via
+    Use either as a plain fixture (defaults to ``Ascend910``) or via
     ``pytest.mark.parametrize("ascend_backend", [...], indirect=True)`` to
     cycle through multiple backends. Replaces the per-test
     ``backend.reset_for_testing()`` + ``backend.set_backend_type(...)`` pair
     that is otherwise duplicated across pass / codegen tests.
     """
-    backend_type = getattr(request, "param", BackendType.Ascend910B)
+    backend_type = getattr(request, "param", BackendType.Ascend910)
     _backend.reset_for_testing()
     _backend.set_backend_type(backend_type)
     try:
@@ -289,3 +315,437 @@ def pass_verification_context(pass_verification_instruments):
     """Enable the configured checks for all pass executions."""
     with passes.PassContext(pass_verification_instruments):
         yield
+
+
+@pytest.fixture
+def kernel_env(monkeypatch, tmp_path):
+    """Isolate the process manager and mock only the Worker/device boundary."""
+    from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities  # noqa: PLC0415
+    from pypto.ir._artifact_metadata import ArtifactMetadata  # noqa: PLC0415
+    from pypto.ir.compiled_artifact import CompiledArtifact  # noqa: PLC0415
+    from pypto.runtime import _execution_mode  # noqa: PLC0415
+    from pypto.runtime.kernel import context  # noqa: PLC0415
+    from pypto.runtime.kernel.session import KernelConfig  # noqa: PLC0415
+
+    monkeypatch.setattr(_execution_mode, "_gate", _execution_mode._ModeGate())
+    calls = SimpleNamespace(workers=[], inits=[], prepares=[], closes=[])
+
+    class FakeWorker:
+        def __init__(self, config, state):
+            calls.workers.append(self)
+
+        def init(self, config):
+            calls.inits.append(config)
+
+        def check_context(self):
+            pass
+
+        def check_eager_admission(self):
+            pass
+
+        def on_owner_thread(self):
+            return False
+
+        def prepare(self, callable_):
+            calls.prepares.append(callable_)
+            return object()  # Opaque handle; neither a slot nor convertible to int.
+
+        def wait(self, ticket):
+            ticket.wait()
+
+        def close(self):
+            calls.closes.append(self)
+
+    monkeypatch.setattr(context, "_BorrowedWorkerSession", FakeWorker)
+    state = context._ProcessKernelState()
+    monkeypatch.setattr(context, "_process", SimpleNamespace(state=state))
+
+    def artifact(key=b"kernel"):
+        meta = ArtifactMetadata(
+            (),
+            (),
+            0,
+            "a2a3",
+            BackendType.Ascend910,
+            (),
+            ExecutionCapabilities((ArtifactExecutionMode.KERNEL,)),
+        )
+        result = CompiledArtifact(tmp_path / key.hex(), "a2a3", meta)
+        monkeypatch.setattr(
+            result,
+            "_artifact_runtime",
+            SimpleNamespace(
+                load=lambda: {".": (key, "tensormap_and_ringbuffer", {})},
+                handle=SimpleNamespace(key=key),
+            ),
+        )
+        return result
+
+    return SimpleNamespace(
+        state=state,
+        config=KernelConfig("a2a3", "tensormap_and_ringbuffer", 0),
+        calls=calls,
+        worker_cls=FakeWorker,
+        artifact=artifact,
+    )
+
+
+@pytest.fixture
+def eager_env(monkeypatch):
+    """Real initialization/session/admission with public runtime and Torch queue fakes."""
+    import threading  # noqa: PLC0415
+
+    import torch  # noqa: PLC0415
+    from pypto.runtime import _execution_mode  # noqa: PLC0415
+    from pypto.runtime.kernel import arguments, context, session  # noqa: PLC0415
+    from pypto.torch import init, interop, launch, shutdown  # noqa: PLC0415
+
+    env = SimpleNamespace(
+        events=[],
+        queue=[],
+        runs=[],
+        buffers=[],
+        workers=[],
+        synchronized_streams=[],
+        capture=False,
+        models={},
+        device_sync_error=None,
+        capture_release_error=None,
+        queued=True,
+        stream_id=7,
+        rts_stream=12345,
+        device=0,
+        context=321,
+        submit_error=None,
+        register_error=None,
+        enqueue_error=None,
+        queue_error=None,
+    )
+
+    class NPUTensor(torch.Tensor):
+        def __getattribute__(self, name):
+            # Keep real CPU storage operations; only the device label is fake.
+            if name == "device":
+                return SimpleNamespace(type="npu", index=0)
+            return super().__getattribute__(name)
+
+    env.tensor = lambda shape=(16, 16), dtype=torch.float32: torch.empty(shape, dtype=dtype).as_subclass(
+        NPUTensor
+    )
+
+    def synchronize(stream_id):
+        env.events.append("synchronize")
+        env.synchronized_streams.append(stream_id)
+        run_queue()
+        if env.queue_error:
+            raise env.queue_error
+
+    def stream():
+        stream_id = env.stream_id
+        return SimpleNamespace(
+            stream_id=stream_id,
+            device=SimpleNamespace(type="npu", index=env.device),
+            synchronize=lambda: synchronize(stream_id),
+        )
+
+    def synchronize_device(device):
+        assert device == env.device
+        env.events.append("device.synchronize")
+        run_queue()
+        if env.device_sync_error:
+            raise env.device_sync_error
+        if env.queue_error:
+            raise env.queue_error
+        for run in env.runs:
+            run.complete = True
+
+    framework = SimpleNamespace(
+        __version__="2.6.0.post2",
+        npu=SimpleNamespace(
+            current_device=lambda: env.device,
+            current_stream=lambda device: stream(),
+            synchronize=synchronize_device,
+        ),
+        get_npu_format=lambda tensor: 2,
+        _C=SimpleNamespace(_npu_shutdown=lambda: None, _npu_shutdown_synchronize=lambda: None),
+    )
+
+    class CallConfig:
+        def __init__(self):
+            self.runtime_env = SimpleNamespace()
+
+        def validate(self):
+            pass
+
+    class RunHandle:
+        def __init__(self):
+            self.complete = False
+            self.retired = False
+            self.wait_error = None
+
+        @property
+        def done(self):
+            return self.complete
+
+        def wait(self):
+            env.events.append("wait")
+            if self.wait_error:
+                raise self.wait_error
+            self.complete = self.retired = True
+
+    class RunPreparationRefused(RuntimeError):
+        pass
+
+    class PreparedSubmission:
+        def __init__(self, worker, target, args, config, caller_stream, keepalive):
+            self.worker, self.target, self.args = worker, target, args
+            self.config, self.caller_stream = config, caller_stream
+            self.keepalive = keepalive
+            self.run = None
+            self.consumed = False
+            self.cancelled = False
+            self.error = None
+            self.safe = False
+            self.cancel_error = None
+            self.model_notice = None
+            self.model_released = False
+            self._native_submission = SimpleNamespace(
+                _submission=self,
+                _register_model_destroy_notice=lambda anchor=None: self._register_model_destroy_notice(
+                    anchor._submission if anchor is not None else None
+                ),
+                _model_destroyed=self._model_destroyed,
+                _release_model_resources=self._release_model_resources,
+                cancel=self._cancel_native,
+            )
+
+        def _cancel_native(self):
+            if self.consumed or self.cancelled:
+                return False
+            self.cancelled = True
+            return True
+
+        def _register_model_destroy_notice(self, anchor=None):
+            model = int(env.capture)
+            assert model
+            env.events.append(("capture.retain", model, anchor))
+            if anchor is not None:
+                assert anchor.caller_stream == self.caller_stream
+                assert anchor.model_notice is env.models[model]
+                assert not anchor._model_destroyed()
+                self.model_notice = anchor.model_notice
+            else:
+                assert model not in env.models or env.models[model].destroyed
+                self.model_notice = SimpleNamespace(destroyed=False)
+                env.models[model] = self.model_notice
+
+        def _model_destroyed(self):
+            return self.model_notice is not None and self.model_notice.destroyed
+
+        def _release_model_resources(self):
+            if self.model_notice is not None and not self._model_destroyed():
+                raise RunPreparationRefused("native resource release requires the ACL model destroy notice")
+            if env.capture_release_error:
+                raise env.capture_release_error
+            env.events.append("capture.release")
+            cancelled = not self.consumed and not self.cancelled
+            if cancelled:
+                self.cancelled = True
+                self.cancel_error = RunPreparationRefused("model release cancelled the prepared submission")
+            self.model_released = True
+            return cancelled
+
+        native_handle = property(lambda self: self)
+        safe_to_release = property(lambda self: self.safe)
+        done = property(
+            lambda self: self.cancelled or self.error is not None or bool(self.run and self.run.done)
+        )
+
+        def consume(self):
+            if self.consumed or self.cancelled:
+                return
+            self.consumed = True
+            try:
+                self.run = self.worker.submit(
+                    self.target, self.args, self.config, caller_stream=self.caller_stream
+                )
+            except BaseException as error:
+                self.error = error
+
+        def cancel(self):
+            if self.consumed or self.cancelled:
+                return False
+            self.cancelled = True
+            if self.cancel_error:
+                raise self.cancel_error
+            self.safe = self.model_notice is None
+            if self.safe:
+                self.keepalive = ()
+            return True
+
+        def wait(self, timeout=None):
+            if self.model_notice is not None and not self.model_released:
+                raise TimeoutError("model still retained")
+            if self.model_released:
+                self.safe = True
+                self.keepalive = ()
+            if self.error:
+                raise self.error
+            if self.cancelled:
+                if self.cancel_error:
+                    raise self.cancel_error
+                return
+            if self.run is None:
+                raise TimeoutError("not consumed")
+            self.run.wait()
+            self.safe = True
+            self.keepalive = ()
+
+    class Worker:
+        device_location = property(lambda self: self.location)
+
+        def __init__(self, **options):
+            self.location = object()
+            self.imports = {}
+            self.options = options
+            env.workers.append(self)
+
+        def init(self, prewarm_config=None, *, borrowed_context_generation=None):
+            env.events.append("init")
+
+        def register(self, callable_):
+            env.events.append("register")
+            if env.register_error:
+                raise env.register_error
+            return object()
+
+        def unregister(self, handle):
+            pytest.fail("no eviction")
+
+        def submit(self, target, args=None, config=None, *, caller_stream=None):
+            env.events.append(("submit", target, args, config, caller_stream, threading.get_ident()))
+            if env.submit_error:
+                raise env.submit_error
+            assert args is not None
+            self.imports.update((id(view.buffer), view.buffer) for view, _ in args.tensors)
+            run = RunHandle()
+            env.runs.append(run)
+            return run
+
+        def prepare_submission(self, target, args=None, config=None, *, caller_stream, keepalive=()):
+            env.events.append("prepare")
+            return PreparedSubmission(self, target, args, config, caller_stream, keepalive)
+
+        def flush_diagnostics(self):
+            pytest.fail("no implicit DFX flush")
+
+        def release_buffer(self, buffer):
+            buffer.close()
+            self.imports.pop(id(buffer), None)
+
+        def close(self):
+            env.events.append("close")
+
+    class Buffer:
+        def __init__(self, address, nbytes, location):
+            self.address, self.nbytes, self.location = address, nbytes, location
+            self.closed = False
+            self.close_error = None
+            env.buffers.append(self)
+
+        @classmethod
+        def wrap(cls, *, address, nbytes, location):
+            assert not any(
+                not b.closed and b.address < address + nbytes and address < b.address + b.nbytes
+                for b in env.buffers
+            ), "overlapping live Buffer.wrap"
+            return cls(address, nbytes, location)
+
+        def close(self):
+            env.events.append("source.close")
+            if self.close_error:
+                raise self.close_error
+            self.closed = True
+
+    class TaskArgs:
+        def __init__(self):
+            self.tensors, self.scalars, self.transfers = [], [], []
+
+        def add_tensor(self, tensor, tag, *, transfer):
+            assert not self.scalars and transfer == "NONE"
+            self.tensors.append((tensor, tag))
+            self.transfers.append(transfer)
+
+        def add_scalar(self, scalar):
+            self.scalars.append(scalar)
+
+    api = SimpleNamespace(
+        Worker=Worker,
+        CallConfig=CallConfig,
+        RunHandle=RunHandle,
+        PreparedSubmission=PreparedSubmission,
+        RunPreparationRefused=RunPreparationRefused,
+        Buffer=Buffer,
+        TaskArgs=TaskArgs,
+        Tensor=lambda buffer, **kw: SimpleNamespace(buffer=buffer, **kw),
+        TensorArgType=SimpleNamespace(INPUT="IN", OUTPUT_EXISTING="OUT", INOUT="INOUT"),
+        TensorTransfer=SimpleNamespace(NONE="NONE"),
+    )
+
+    def run_queue():
+        while env.queue:
+            env.queue.pop(0)()
+            if env.queue_error:
+                env.queue.clear()
+
+    def enqueue(tensors, stream_id, device, context, submission):
+        assert stream_id == env.stream_id and device == env.device and context == env.context
+        assert env.state._submissions[-1].submission is submission
+        assert env.state._submissions[-1]._owners
+        env.events.append("recordStream")
+        if env.enqueue_error:
+            raise env.enqueue_error
+
+        def consume():
+            submission.consume()
+            if submission.error:
+                env.queue_error = RuntimeError("framework submission failed")
+
+        if env.queued:
+            env.queue.append(consume)
+        else:
+            consume()
+            if env.queue_error:
+                raise env.queue_error
+
+    native = SimpleNamespace(
+        enqueue=enqueue,
+        caller_stream=lambda stream, device: env.rts_stream,
+        check_call=lambda stream, device: bool(env.capture),
+        capture_model=lambda stream, device: int(env.capture),
+        recording_on_stream=lambda stream: bool(env.capture),
+        borrow_context=lambda device: env.context,
+        bind_context=lambda context: None,
+        framework_alive=lambda: True,
+        retain_until_exit=lambda owner: None,
+    )
+    for module in ("simpler", "simpler.task_interface", "simpler.worker"):
+        monkeypatch.setitem(sys.modules, module, api)
+    monkeypatch.setattr(session, "check_runtime_pin", lambda: None)
+    monkeypatch.setattr(arguments, "check_runtime_pin", lambda: None)
+    env.tensor_dtype = arguments._tensor_dtype
+    monkeypatch.setattr(arguments, "_tensor_dtype", str)
+    for module in (interop, shutdown):
+        monkeypatch.setattr(module, "_load_torch_npu", lambda: framework)
+    for module in (launch, shutdown):
+        monkeypatch.setattr(module, "_load_native", lambda: native)
+    monkeypatch.setattr(_execution_mode, "_gate", _execution_mode._ModeGate())
+    env.state = context._ProcessKernelState()
+    monkeypatch.setattr(context, "_process", SimpleNamespace(state=env.state))
+    env.init, env.run_queue, env.api, env.native, env.framework = init, run_queue, api, native, framework
+    yield env
+    # Tests of unknown completion intentionally retain owners in production.
+    # Drop only the fake state and stop its thread, without pretending it closed.
+    owner = env.state._worker
+    if owner is not None:
+        owner._owner.stop()

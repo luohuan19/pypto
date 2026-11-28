@@ -36,7 +36,7 @@
 | ---- | ---- | ---- |
 | [`add`][pypto.language.add] [`sub`][pypto.language.sub] [`mul`][pypto.language.mul] [`div`][pypto.language.div] | `pl.` | 二元算术；右侧给 Python 数字会选中标量操作数形式。Tensor/Tensor 与 Tile/Tile 形式的 `div` 设置 `high_precision=True` 时会在 A5 上选择速度较慢、精度较高的 PTO 路径；A2/A3 接受该参数但 PTO-ISA 会忽略它并返回默认结果，编译时会给出告警 |
 | [`neg`][pypto.language.neg] [`abs`][pypto.language.abs] [`recip`][pypto.language.recip] | `pl.` | 取负、绝对值、倒数；FP16/FP32 倒数设置 `high_precision=True` 时会在 A5 上选择速度较慢、精度较高的 PTO 路径；A2/A3 接受该参数但 PTO-ISA 会忽略它并返回默认结果，编译时会给出告警 |
-| [`rem`][pypto.language.tile.rem] [`rems`][pypto.language.tile.rems] [`fmod`][pypto.language.fmod] [`fmods`][pypto.language.fmods] | `pl.` | floor 取余（`rem*`）与截断取余（`fmod*`）。Tensor 操作数的 shape 和 dtype 必须一致；tile-tile 操作数的物理 shape 与 valid shape 必须一致。A2/A3 的 `rem*` 支持 FP32/INT32，`fmod*` 仅支持 FP32；A2/A3 INT32 `rem*` 的每个 source/scalar 值必须位于 PTO-ISA 闭区间 `[-2^24, 2^24]`。A2/A3 scalar 形式的 valid extent 必须可证明为正。Tile `rem` / `rems` 的 scratch 物理容量和有效容量都必须可证明足够（分别为两行 / 一行并覆盖全部 source 列），且在 A2/A3 上不得与仍存活的 source 重叠。A5 接受更宽的前端 dtype 集合。`high_precision=True` 仅适用于 FP32 tile-tile（A5 定义；A2/A3 接受但忽略，编译时会给出告警） |
+| [`rem`][pypto.language.tile.rem] [`rems`][pypto.language.tile.rems] [`fmod`][pypto.language.fmod] [`fmods`][pypto.language.fmods] | `pl.` | floor 取余（`rem*`）与截断取余（`fmod*`）。Tensor 操作数的 shape 和 dtype 必须一致；tile-tile 操作数的物理 shape 与 valid shape 必须一致。A2/A3 的 `rem*` 支持 FP32/INT32，`fmod*` 仅支持 FP32；A2/A3 INT32 `rem*` 的每个 source/scalar 值必须位于 PTO-ISA 闭区间 `[-2^24, 2^24]`。A2/A3 scalar 形式的 valid extent 必须可证明为正。Tile `rem` / `rems` 的 scratch 物理容量和有效容量都必须可证明足够（分别为两行 / 一行并覆盖全部 source 列），且在 A2/A3 上不得与仍存活的 source 重叠。A5 接受更宽的前端 dtype 集合。`high_precision=True` 仅适用于 FP32 tile-tile：`rem` 在 A2/A3 和 A5 上均生效；`fmod` 在 A5 上生效，在 A2/A3 上被忽略并产生编译告警 |
 | [`addc`][pypto.language.tile.addc] [`subc`][pypto.language.tile.subc] [`addsc`][pypto.language.tile.addsc] [`subsc`][pypto.language.tile.subsc] | `pl.` (t) | 带进位操作数的三输入加 / 减 |
 | [`part_add`][pypto.language.part_add] [`part_mul`][pypto.language.part_mul] [`part_max`][pypto.language.part_max] [`part_min`][pypto.language.part_min] | `pl.` | 分段算术 |
 
@@ -45,7 +45,7 @@
 | 算子 | 可达 | 作用 |
 | ---- | ---- | ---- |
 | [`exp`][pypto.language.exp] [`log`][pypto.language.log] | `pl.` | 指数、自然对数。`log` 的 `high_precision=True` 在 A5 上选择更慢、更高精度的 PTO 路径；A2/A3 接受该参数但 PTO-ISA 会忽略它并返回默认结果，编译时会给出告警 |
-| [`sqrt`][pypto.language.sqrt] [`rsqrt`][pypto.language.rsqrt] | `pl.` | 平方根；倒数平方根。`high_precision=` 只作用于张量路径，传给 Tile 会**抛异常** —— tile 级的精度由是否传入 scratch tile 决定：`pl.tile.rsqrt(src, tmp)` |
+| [`sqrt`][pypto.language.sqrt] [`rsqrt`][pypto.language.rsqrt] | `pl.` | 平方根；倒数平方根。`rsqrt` 在 Tensor 和 Tile 层均默认 `high_precision=False`。Tensor 高精度由编译器分配 scratch；Tile 高精度须写 `pl.tile.rsqrt(src, tmp=tmp, high_precision=True)`（或 `pl.rsqrt(src, high_precision=True, tmp=tmp)`）。仅传 scratch 而未开启高精度会报错；A5 codegen 显式生成 `RsqrtAlgorithm::HIGH_PRECISION`。 |
 | [`sin`][pypto.language.tensor.sin] [`cos`][pypto.language.tensor.cos] | `pl.` | 三角函数 |
 
 ## 比较与选择
@@ -114,7 +114,7 @@ Tensor 的 `pl.col_sum(x, is_binary=True)` 使用编译器分配的静态二维�
 | [`assemble`][pypto.language.tensor.assemble] | `pl.` | 把子区域写回；也可写作 `dst[i:i+16] = src` |
 | [`reinterpret_view`][pypto.language.reinterpret_view] | `pl.` | 不搬数据的重新解释 |
 | [`set_validshape`][pypto.language.set_validshape] | `pl.` | 声明 tile 的有效区域 |
-| [`cast`][pypto.language.cast] | `pl.` | 转换 dtype —— 可能展开成多跳链，见 [LegalizeTileCast](../../dev/passes/17-legalize_tile_cast.md) |
+| [`cast`][pypto.language.cast] | `pl.` | 转换 dtype —— 可能展开成多跳链，见 [LegalizeTileCast](../../dev/passes/19-legalize_tile_cast.md) |
 | [`dim`][pypto.language.tensor.dim] | `pl.` | 张量的运行期维度 |
 | [`read`][pypto.language.read] [`write`][pypto.language.write] | `pl.` | 元素访问 |
 
@@ -122,30 +122,41 @@ Tensor 的 `pl.col_sum(x, is_binary=True)` 使用编译器分配的静态二维�
 
 | 算子 | 可达 | 作用 |
 | ---- | ---- | ---- |
-| `quant_mx` | `pl.` (T/t) | Ascend950 MXFP8 block-32 动态量化，生成 FP8E4M3FN 数据及 FP8E8M0 scale（`group_axis` 对齐 PTOAS `grpAxis`）。Tensor 调用物化 GM data 和 MX layout scale，tile 调用保留在片上；本版本不含 MXFP4 quant。直接的 tensor quant→matmul 链可使用 data+scale 的 V2C 传输（见 [类型](../language/00-types.md)） |
+| `quant_mx` | `pl.` (T/t) | Ascend950 block-32 动态量化，生成 FP8E4M3FN 或 packed `fp4e2m1x2` 数据及 FP8E8M0 scale。FP4 输入须为 FP16/BF16；axis1 返回 `[M,K/2]`，axis0 将 `[N,K]` 转置为 `[K,N/2]`。`quant_scale_alg="ocp"` 为默认值；`"nv"` 在 axis0 支持所有源 dtype，在 axis1 仅支持 FP32，PTOAS 不支持 axis1 的 FP16/BF16 NV。Tensor 调用物化 GM 数据和 MX layout scale，tile 调用保留在片上。经 GM 暂存的 FP8/FP4 结果可供 `tensor.matmul_mx` 使用；片上 FP4 量化结果仍需显式跨核搬运，并经受支持的 Mat→Left/Right 放置后用于 tile 矩阵乘（见 [FP4](../../dev/fp4.md)）。 |
+| `quant_mx_raw` | `pl.tile.` (t) | 直接使用 Ascend950 TQUANT，显式提供 max/scaling 工作区。返回原生 FP4E2M1X2 或 INT8 数据及原始 UINT8 指数，不进行 MX scale 分块打包。axis1 允许任意正行数和 32 的倍数 K（原生 FP4 为 64 的倍数）；源有效行数可小于物理行数。axis0 直接使用源朝向，每 32 个有效行分组；FP16/BF16 行数为 64 的倍数时，可用 `interleave=True` 交错相邻指数对。 |
+| `dequant` | `pl.tile.` (t) | Ascend950 有符号 INT8/INT16 逐行反量化为 FP32，每个有效行使用一个 FP32 scale 和 offset。 |
 | `tmov_x2zz` | `pl.` (t) | Ascend950 指数 X-to-ZZ 布局转换（UINT8）。`tmp` 为只写 workspace；axis1 需 `dst_rows`/`dst_cols` 指定 ZZ `[M,G]`（相对 TQUANT 扁平 exp）。通常由 `quant_mx` 降级使用，而非直接调用 |
 
 ## 线性代数
 
 | 算子 | 可达 | 作用 |
 | ---- | ---- | ---- |
-| [`matmul`][pypto.language.matmul] | `pl.` | 矩阵乘；`a_trans=` / `b_trans=` 用来替代 DN 注解转置操作数 |
-| [`matmul_acc`][pypto.language.matmul_acc] | `pl.` | 乘累加进已有的 `Acc` tile |
-| [`matmul_bias`][pypto.language.tile.matmul_bias] | `pl.` (t) | 带 bias 操作数的乘法 |
+| [`matmul`][pypto.language.matmul] | `pl.` | 矩阵乘；`a_trans=` / `b_trans=` 用来替代 DN 注解转置操作数。操作数类型必须成对：INT8、FP16、BF16、FP32 与自身配对，Ascend950 上还支持任意 FP8（E4M3FN / E5M2，**两种顺序**）或 HF8 配对，结果恒为 FP32 |
+| [`matmul_acc`][pypto.language.matmul_acc] | `pl.` | 乘累加进已有的 `Acc` tile。操作数配对同 `matmul`；累加器使用 FP32 / INT32 结果类型 |
+| [`matmul_bias`][pypto.language.tile.matmul_bias] | `pl.` (t) | 带 bias 操作数的乘法。操作数配对同 `matmul`；bias 与累加器类型一致 |
 | [`batch_matmul`][pypto.language.batch_matmul] | `pl.` (t) | 批量矩阵乘，**只接受 tile 操作数**。张量请调 `pl.matmul` —— rank > 2 会在降级时派发到 `tile.batch_matmul` |
-| [`gemv`][pypto.language.tile.gemv] [`gemv_acc`][pypto.language.tile.gemv_acc] [`gemv_bias`][pypto.language.tile.gemv_bias] | `pl.` (t) | 矩阵-向量形式 |
-| [`matmul_mx`][pypto.language.matmul_mx] [`matmul_mx_acc`][pypto.language.tile.matmul_mx_acc] [`matmul_mx_bias`][pypto.language.tile.matmul_mx_bias] | `pl.` (T/t) | A5 MX 块缩放矩阵乘。Tensor `matmul_mx` 使用定向的 2D data/scale tensor 并返回 FP32；`_acc` / `_bias` 仍只支持 tile。进入算子的 data 必须为 FP8E4M3FN；不支持原生 FP4×FP4 |
+| [`gemv`][pypto.language.tile.gemv] [`gemv_acc`][pypto.language.tile.gemv_acc] [`gemv_bias`][pypto.language.tile.gemv_bias] | `pl.` (t) | 矩阵-向量形式，`M == 1`。操作数配对与 `matmul` 相同（含 Ascend950 上的 FP8 / HF8 配对）；结果、累加器与 bias 为 FP32 / INT32 |
+| [`matmul_mx`][pypto.language.matmul_mx] [`matmul_mx_acc`][pypto.language.tile.matmul_mx_acc] [`matmul_mx_bias`][pypto.language.tile.matmul_mx_bias] | `pl.` (T/t) | A5 MX 块缩放矩阵乘。Tensor `matmul_mx` 使用定向的 2D data/scale tensor，返回 FP32。Tensor 支持两侧均为 FP8E4M3FN 或两侧均为打包 FP4（E2M1/E1M2，可混合）。打包 ND/DN Tensor 的形状按字节载体计，scale 和输出按逻辑维度计。Tile API 及其专有的 `_acc` 和 `_bias` 形式支持 FP8E4M3FN/FP8E5M2 的四种组合和两侧均为打包 FP4 的组合 |
+| [`gemv_mx`][pypto.language.tile.gemv_mx] [`gemv_mx_acc`][pypto.language.tile.gemv_mx_acc] [`gemv_mx_bias`][pypto.language.tile.gemv_mx_bias] | `pl.` (t) | A5 单行 MX 块缩放矩阵乘，支持 FP8 配对或打包 FP4 配对。左侧向量 scale 使用 `MX_A_ND`，物理向量宽度按 512 字节对齐，原生 FP4 的 K/N 必须全有效。FP32 累加器有 16 个物理行和 1 个有效行。MX GEMV 与 GEMM tile 形式支持 `acc_phase=pl.AccPhase.Partial` 或 `Final`；Final 结果使用 `pl.store(..., st_phase=pl.STPhase.Final)` 消费 |
 
-分阶段 GEMV 累加通过 `pl.AccPhase` 选择生产者阶段。以 `pl.AccPhase.Final`
-结束的生产者必须与使用 `pl.STPhase.Final` 的 store 配对：
+`pl.tile.matmul`、`pl.tile.matmul_acc` 和 GEMV 家族通过
+`acc_phase=pl.AccPhase` 选择生产者阶段。默认 `Unspecified` 保持现有行为；
+中间 K 分块使用 `Partial`，最后一个生产者的 `Final` 必须与使用
+`pl.STPhase.Final` 的 store 配对：
 
 其中 `lhs0`、`rhs0`、`lhs1` 和 `rhs1` 是预加载的 tile，`output` 是目标 tensor。
 
 ```python
-partial = pl.tile.gemv(lhs0, rhs0, acc_phase=pl.AccPhase.Partial)
-final = pl.tile.gemv_acc(partial, lhs1, rhs1, acc_phase=pl.AccPhase.Final)
+partial = pl.tile.matmul(lhs0, rhs0, acc_phase=pl.AccPhase.Partial)
+final = pl.tile.matmul_acc(partial, lhs1, rhs1, acc_phase=pl.AccPhase.Final)
 pl.store(final, [0, 0], output, st_phase=pl.STPhase.Final)
 ```
+
+Matmul 的 `acc_phase` 仅接受关键字传参；`matmul_acc` 保留现有 `init_cond`
+位置，两者可一起使用。final 结果必须在同一个直线控制流区域内恰好排空一次；
+在这次 store 之前，只允许普通 SSA 别名转发该结果，其他操作不得消费它。条件执行或重复执行时，应把完整配对放在同一个分支或
+循环体内。自动 K 切分只给最后一个物理 K 分块分配 `Final`。选择阶段不会删除
+编译器的其他同步，也不意味着已经获得性能提升。
 
 ## Gather、Scatter、排序
 
@@ -177,10 +188,11 @@ pl.store(final, [0, 0], output, st_phase=pl.STPhase.Final)
 | [`tpop_from_aic`][pypto.language.system.tpop_from_aic] [`tpop_from_aiv`][pypto.language.system.tpop_from_aiv] | `pl.` | 弹出对端推来的 tile |
 | [`tfree_to_aic`][pypto.language.system.tfree_to_aic] [`tfree_to_aiv`][pypto.language.system.tfree_to_aiv] | `pl.` | 把弹出的 slot 释放回生产者 |
 | [`aic_initialize_pipe`][pypto.language.system.aic_initialize_pipe] [`aiv_initialize_pipe`][pypto.language.system.aiv_initialize_pipe] | `pl.` | 建立跨核管道 |
+| `set_quant_scalar` `set_quant_vector` | `pl.` / `pl.system.` | 设置 FP32 标量或 packed 64-bit 向量 Fixpipe 控制字 |
 | [`aiv_shard`][pypto.language.tile.aiv_shard] [`aic_gather`][pypto.language.tile.aic_gather] | `pl.` | 在 AIV lane 间分片 / 在 AIC 上聚回 |
 | `AUTO` | `pl.` | 由编译器选择管道参数的哨兵值 |
 
-push 与 pop 必须**配对**，且每次 pop 都必须有对应的 `tfree`。用法见 [混合 kernel 教程](../tutorials/03-mixed-kernel.md)；机制见 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md) 与 [ExpandMixedKernel](../../dev/passes/24-expand_mixed_kernel.md)。
+push 与 pop 必须**配对**，且每次 pop 都必须有对应的 `tfree`。用法见 [混合 kernel 教程](../tutorials/03-mixed-kernel.md)；机制见 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md) 与 [ExpandMixedKernel](../../dev/passes/26-expand_mixed_kernel.md)。
 
 ## 任务与依赖
 

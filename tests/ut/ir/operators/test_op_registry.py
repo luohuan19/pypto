@@ -1311,15 +1311,15 @@ class TestArgEffects:
             ("pld.tensor.allreduce", 0, ir.ArgEffect.ReadWrite),
             ("pld.tensor.allreduce", 1, ir.ArgEffect.ReadWrite),
             # A gather/exchange destination is overwritten, not updated: the
-            # lowering only pushes into it and never loads from it. `recv_counts`
-            # is deposited with NotifyOp::Set, so it is not an accumulate either.
+            # lowering only pushes into it and never loads from it.
             ("pld.tensor.allgather", 0, ir.ArgEffect.Read),
             ("pld.tensor.allgather", 1, ir.ArgEffect.Write),
             ("pld.tensor.allgather", 2, ir.ArgEffect.ReadWrite),
             ("pld.tensor.all_to_all", 1, ir.ArgEffect.Write),
             ("pld.tensor.all_to_all_v", 1, ir.ArgEffect.Write),
             ("pld.tensor.all_to_all_v", 3, ir.ArgEffect.Read),
-            ("pld.tensor.all_to_all_v", 4, ir.ArgEffect.Write),
+            # Receiver-owned count reset reads old values before atomic updates.
+            ("pld.tensor.all_to_all_v", 4, ir.ArgEffect.ReadWrite),
             # A reduce destination *is* read — its lowering loads the running
             # value back — so the distinction is per operator, not per family.
             ("pld.tensor.allreduce", 0, ir.ArgEffect.ReadWrite),
@@ -1545,6 +1545,7 @@ _IN_PLACE_OPS = [
         "tile.scatter",
         "tile.scatter_mask",
         "tile.scatter_update",
+        "tile.set_validshape",
         "tile.store",
         "tile.tget_scale_addr",
     )
@@ -1674,18 +1675,17 @@ class TestMultiOutputOps:
                     f"scratch is hardware-written by definition"
                 )
 
-    def test_written_arguments_are_workspaces(self):
-        """A written argument is scratch the hardware needs — which must say so —
-        or a result the caller reads, which belongs in the TupleType instead."""
+    def test_written_arguments_have_a_declared_role(self):
+        """Written operands declare scratch, mutable session state, or a returned tensor."""
         for op_name in self._declared_multi_output_ops():
             for i in range(ir.get_op_argument_count(op_name)):
                 if ir.get_op_arg_effect(op_name, i) == ir.ArgEffect.Read:
                     continue
-                assert ir.op_arg_is_workspace(op_name, i), (
-                    f"{op_name} writes argument {i} without declaring it a "
-                    f"workspace; a written argument that carries a result is a "
-                    f"destination and must be a TupleType element"
-                )
+                assert (
+                    ir.op_arg_is_workspace(op_name, i)
+                    or i == ir.get_op_mutable_session_arg(op_name)
+                    or i in ir.get_op_tuple_result_aliases(op_name).values()
+                ), f"{op_name} writes argument {i} without declaring its role"
 
     def test_single_output_ops_declare_no_arity(self):
         """The default arity is what makes ``set_output_arity`` mean something."""

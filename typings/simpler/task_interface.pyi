@@ -13,7 +13,10 @@ Mirrors the real module's re-exports: the nanobind wire types from
 ``simpler.buffer``.
 """
 
+from dataclasses import dataclass
+
 from _task_interface import (
+    AddressSpace,
     ArgDirection,
     CallConfig,
     ChipCallable,
@@ -22,12 +25,16 @@ from _task_interface import (
     CoreCallable,
     DataType,
     TaskArgs,
+    TensorArgType,
     scalar_to_uint64,
 )
 
-from .buffer import Buffer, Tensor
+from .buffer import Buffer, Tensor, TensorTransfer
 
 __all__ = [
+    "MAX_TENSOR_DIMS",
+    "AddressSpace",
+    "CommBufferSpec",
     "ArgDirection",
     "Buffer",
     "CallConfig",
@@ -38,5 +45,18 @@ __all__ = [
     "DataType",
     "TaskArgs",
     "Tensor",
+    "TensorArgType",
+    "TensorTransfer",
     "scalar_to_uint64",
 ]
+
+MAX_TENSOR_DIMS: int
+
+@dataclass
+class CommBufferSpec:
+    name: str
+    dtype: str
+    count: int
+    nbytes: int
+    load_from_host: bool = False
+    store_to_host: bool = False

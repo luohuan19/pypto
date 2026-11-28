@@ -48,6 +48,8 @@ import torch
 from .device_tensor import DeviceTensor, alloc_device_tensor, default_init_prep
 
 if TYPE_CHECKING:
+    from simpler.buffer_export import BufferExport
+
     from .worker import RegistrationHandle
 
 
@@ -103,7 +105,7 @@ class Worker(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
+    def malloc(self, nbytes: int, *, worker_id: int = 0, exportable: bool = False) -> int:
         """Allocate ``nbytes`` of device memory; return an opaque pointer."""
 
     @abstractmethod
@@ -195,6 +197,12 @@ class Worker(ABC):
         Workers, freed handles, and pointer-reuse (ABA) cases before a stale
         wire descriptor can enter simpler ``Worker.run``.
 
+        A borrowed view (:meth:`view_tensor`) keeps its source's Buffer and a
+        nonzero ``byte_offset``. ``_device_buffers`` is keyed by the allocation
+        base, so the lookup subtracts ``byte_offset`` first; the view is
+        accepted only while that owning allocation is still live, and
+        :meth:`free_tensor` refuses to free the view itself.
+
         When the caller does not name the placement, the retained Buffer
         usually does: simpler stamps ``owner_worker_id`` on every allocation it
         hands out, making the owning key derivable rather than searched.  That
@@ -227,12 +235,13 @@ class Worker(ABC):
                 worker_id = int(tensor.buffer.owner_worker_id)
             except (AttributeError, TypeError, ValueError):
                 worker_id = None  # Placeless handle — fall back to the scan.
+        base_ptr = tensor.data_ptr - tensor.byte_offset
         if worker_id is None:
             owned = any(
-                ptr == tensor.data_ptr and buffer is tensor.buffer for (_wid, ptr), buffer in buffers.items()
+                ptr == base_ptr and buffer is tensor.buffer for (_wid, ptr), buffer in buffers.items()
             )
         else:
-            owned = buffers.get((worker_id, tensor.data_ptr)) is tensor.buffer
+            owned = buffers.get((worker_id, base_ptr)) is tensor.buffer
         if not owned:
             placement = "" if worker_id is None else f" on worker_id={worker_id}"
             raise ValueError(
@@ -251,6 +260,7 @@ class Worker(ABC):
         *,
         init: torch.Tensor | None = None,
         worker_id: int = 0,
+        exportable: bool = False,
     ) -> DeviceTensor:
         """Allocate a device buffer and (optionally) upload host data.
 
@@ -270,12 +280,24 @@ class Worker(ABC):
         a caller that allocates on a non-default worker MUST pass the same
         ``worker_id`` to :meth:`free_tensor`.
 
+        Args:
+            shape: Shape of the allocation.
+            dtype: Element type of the allocation.
+            init: Optional CPU data uploaded after allocation.
+            worker_id: Chip owner; use the same ID for export and free.
+            exportable: Allocate onboard VMM storage that a same-host consumer can import.
+                Keep this Worker alive until every external access, mapping and lease retires.
+
         Returns:
             A :class:`DeviceTensor` referencing the allocated buffer.
         """
         self._require_ready("alloc_tensor")
         t = alloc_device_tensor(
-            malloc=lambda nbytes: self.malloc(nbytes, worker_id=worker_id),
+            malloc=lambda nbytes: (
+                self.malloc(nbytes, worker_id=worker_id, exportable=True)
+                if exportable
+                else self.malloc(nbytes, worker_id=worker_id)
+            ),
             copy_to=lambda dst, src, nbytes: self.copy_to(dst, src, nbytes, worker_id=worker_id),
             free=lambda ptr: self.free(ptr, worker_id=worker_id),
             buffer_for_ptr=lambda ptr: self._buffer_for_ptr(ptr, worker_id=worker_id),
@@ -286,6 +308,57 @@ class Worker(ABC):
         )
         self._owned_tensors[(worker_id, t.data_ptr)] = t
         return t
+
+    def export_buffer(self, tensor: DeviceTensor, *, worker_id: int = 0) -> BufferExport:
+        """Export a live tensor's backing for one same-host external consumer.
+
+        Args:
+            tensor: A resident tensor allocated by this Worker with exportable=True.
+            worker_id: The chip owner used for the original allocation.
+
+        Returns:
+            A consumer lease with a shareable handle; it contains no consumer-local VA.
+
+        The controller keeps this Worker alive, orders access with computation, and confirms
+        release only after the consumer drains, unregisters and unmaps the backing.
+        """
+        self._require_owned_resident_tensor(tensor, "export_buffer", worker_id=worker_id)
+        assert self._tensor_arg_worker is not None
+        return self._tensor_arg_worker.export_buffer(tensor.buffer)
+
+    def release_export(self, exported: BufferExport) -> None:
+        """Release a source lease after the consumer successfully finishes and unmaps.
+
+        Args:
+            exported: The exact lease returned by export_buffer for this Worker.
+
+        A missing completion or failed unmap must retain the lease and its source allocation.
+        """
+        assert self._tensor_arg_worker is not None
+        self._tensor_arg_worker.release_export(exported)
+
+    def view_tensor(
+        self,
+        source: DeviceTensor,
+        shape: Sequence[int],
+        *,
+        byte_offset: int = 0,
+        worker_id: int = 0,
+    ) -> DeviceTensor:
+        """Borrow a contiguous subview without transferring or owning the backing."""
+        self._require_owned_resident_tensor(source, "view_tensor source", worker_id=worker_id)
+        if type(byte_offset) is not int or byte_offset < 0:
+            raise ValueError("view_tensor byte_offset must be a nonnegative int")
+        view = DeviceTensor(
+            source.data_ptr + byte_offset,
+            shape,
+            source.dtype,
+            buffer=source.buffer,
+            byte_offset=source.byte_offset + byte_offset,
+        )
+        if byte_offset + view.nbytes > source.nbytes:
+            raise ValueError("view_tensor range exceeds its source")
+        return view
 
     def free_tensor(self, t: DeviceTensor, *, worker_id: int = 0) -> None:
         """Release a buffer previously returned by :meth:`alloc_tensor`.
@@ -302,11 +375,15 @@ class Worker(ABC):
         cleanup races with auto-free.
 
         Raises:
-            ValueError: if ``t.data_ptr`` is still tracked but under a different
-                ``worker_id`` — silently no-oping there would leak the buffer
-                until ``close()`` — or if the address is now owned by a newer
-                allocation, so a stale handle cannot free the replacement.
+            ValueError: if *t* is a borrowed view (``t.byte_offset != 0``) —
+                free the owning allocation instead; if ``t.data_ptr`` is still
+                tracked but under a different ``worker_id`` — silently no-oping
+                there would leak the buffer until ``close()``; or if the address
+                is now owned by a newer allocation, so a stale handle cannot
+                free the replacement.
         """
+        if t.byte_offset:
+            raise ValueError("free_tensor requires the owning allocation, not a view")
         key = (worker_id, t.data_ptr)
         if key not in self._owned_tensors:
             # A missing exact key is only idempotent if this ptr is no longer

@@ -22,7 +22,7 @@ one config object can drive both phases::
     from pypto import ir
     from pypto.runtime import RunConfig
 
-    config = RunConfig(platform="a2a3sim")
+    config = RunConfig()
     compiled = ir.compile(MyProgram, **config.compile_kwargs())
 
     a = torch.full((128, 128), 2.0)
@@ -60,6 +60,7 @@ to the layer it belongs to.
 
 from . import log_config as _log_config
 from .bench import BenchmarkStats, TraceInvocation, TraceSpan, benchmark
+from .comm_domain import CommDomain, DomainBufferSpec, DomainTensor
 from .device_tensor import DeviceTensor, StackedDeviceTensor
 from .distributed_runner import (
     DistributedRunHandle,
@@ -112,6 +113,9 @@ __all__ = [
     "DeviceTensor",
     "StackedDeviceTensor",
     "DistributedWorker",
+    "CommDomain",
+    "DomainBufferSpec",
+    "DomainTensor",
     "DistributedRunHandle",
     "ReadOnlyHostTensor",
     "RegistrationHandle",

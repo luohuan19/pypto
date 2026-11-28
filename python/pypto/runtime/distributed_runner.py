@@ -17,28 +17,35 @@ import inspect
 import json
 import logging
 import math
+import shutil
 import sys
 import threading
 import time
 import types
+import uuid
 import warnings
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
 import numpy as np
 import torch
 
+from .comm_domain import CommDomain, DomainBufferSpec, DomainState, DomainTensor, allocate_external_domain
 from .device_tensor import DeviceTensor, StackedDeviceTensor
+from .distributed_args import entry_window_requirements, pack_window_args
 from .runtime_base import Worker
+from .window_sources import normalize_window_sources
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from simpler.task_interface import TaskArgs
+
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram, DistributedConfig
 
     from .runner import RunConfig
@@ -58,7 +65,28 @@ _DTYPE_MAP: dict[str, tuple[type[ctypes._CData], torch.dtype]] = {
     "INT32": (ctypes.c_int32, torch.int32),
     "INT64": (ctypes.c_int64, torch.int64),
     "UINT8": (ctypes.c_uint8, torch.uint8),
+    # Simpler's FP4E2M1 element is one packed x2 byte; shapes/strides use carriers.
+    "FP4E2M1": (ctypes.c_uint8, torch.uint8),
 }
+
+
+def validate_host_domain_runtime(orch: Any, *, initialized: bool = False) -> None:
+    """Check Host APIs once while loading an artifact, before constructing a worker.
+
+    Generated entries carry capability metadata; dispatch only binds sources and
+    requests domains. Accepting an instance also supports older generated entries.
+    """
+    required = {"memory_source", "workspace_engines"}
+    if initialized:
+        required.add("initializer")
+    for method in ("allocate_domain", "get_or_allocate_domain"):
+        api = getattr(orch, method, None)
+        if api is None or not required.issubset(inspect.signature(api).parameters):
+            version = "#2939" if initialized else "#2913"
+            raise RuntimeError(
+                f"memory_source='host' requires Simpler Host-source communication domains "
+                f"(simpler PR {version} or later); {method} must accept {sorted(required)}"
+            )
 
 
 def _resolve_persistent_window_reset(persistent: bool, reset_persistent_windows: bool | None) -> bool:
@@ -87,11 +115,22 @@ class _DispatchFrame:
     """One of two reusable, pre-fork dispatch metadata frames."""
 
     slot_id: int
+    external_domains: tuple[CommDomain, ...] = ()
     in_use: bool = False
     tensors: dict[str, Any] = field(default_factory=dict[str, Any])
     keepalive: list[Any] = field(default_factory=list[Any])
     cleanup: list[Callable[[], None]] = field(default_factory=list[Callable[[], None]])
     handle: DistributedRunHandle | None = None
+    abandoned: bool = False
+
+    def clear(self) -> None:
+        self.external_domains = ()
+        self.tensors.clear()
+        self.keepalive.clear()
+        self.cleanup.clear()
+        self.handle = None
+        self.in_use = False
+        self.abandoned = False
 
 
 class DistributedRunHandle:
@@ -110,12 +149,15 @@ class DistributedRunHandle:
         frame: _DispatchFrame,
         dispatch_id: int,
         postprocess: Callable[[], None] | None = None,
+        *,
+        capture_directory: Path | None = None,
     ) -> None:
         self._worker: DistributedWorker | None = worker
         self._native_handle = native_handle
         self._frame: _DispatchFrame | None = frame
         self._dispatch_id = dispatch_id
         self._postprocess = postprocess
+        self._capture_directory = capture_directory
         self._cv = threading.Condition()
         self._wait_in_progress = False
         self._terminal = False
@@ -135,6 +177,8 @@ class DistributedRunHandle:
         cls,
         worker: DistributedWorker,
         error: BaseException | None = None,
+        *,
+        capture_directory: Path,
     ) -> DistributedRunHandle:
         handle = cls.__new__(cls)
         handle._worker = worker
@@ -142,11 +186,21 @@ class DistributedRunHandle:
         handle._frame = None
         handle._dispatch_id = 0
         handle._postprocess = None
+        handle._capture_directory = capture_directory
         handle._cv = threading.Condition()
         handle._wait_in_progress = False
         handle._terminal = True
         handle._error = error
         return handle
+
+    @property
+    def capture_directory(self) -> Path | None:
+        """Root of this submission's chip-swimlane capture, or None when disabled.
+
+        Read the artifacts after ``result()``. They survive worker close until a
+        new worker starts a profiling session in the same output root.
+        """
+        return self._capture_directory
 
     @property
     def done(self) -> bool:
@@ -160,8 +214,11 @@ class DistributedRunHandle:
             self.result(timeout=0.0)
         except TimeoutError:
             return False
-        except BaseException:  # noqa: BLE001 - a failed dispatch is terminal
-            return True
+        except BaseException:
+            with self._cv:
+                if self._terminal:
+                    return True
+            raise
         return True
 
     def result(self, timeout: float | None = None) -> None:
@@ -189,23 +246,40 @@ class DistributedRunHandle:
             self._wait_in_progress = True
 
         error: BaseException | None = None
+        native_handle = self._native_handle
         try:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            native_handle = self._native_handle
             if native_handle is None:
                 raise RuntimeError("DistributedRunHandle lost its native handle before completion")
             native_handle.result(timeout=remaining)
-        except TimeoutError:
-            with self._cv:
-                self._wait_in_progress = False
-                self._cv.notify_all()
-            raise
-        except BaseException as exc:  # noqa: BLE001 - cached for every waiter
+        except BaseException as exc:
+            # Simpler.done can report device completion before native finalization. An
+            # interrupted waiter may still owe finalization even when that flag is true.
+            native_terminal = getattr(native_handle, "_terminal", None)
+            if (
+                isinstance(exc, TimeoutError)
+                or native_terminal is False
+                or (
+                    isinstance(exc, (KeyboardInterrupt, SystemExit))
+                    and native_handle is not None
+                    and native_terminal is not True
+                    and not native_handle.done
+                )
+            ):
+                # Waiting can be interrupted before the native fence. Retain the frame
+                # and its resources for the next waiter, including release or close.
+                with self._cv:
+                    self._wait_in_progress = False
+                    self._cv.notify_all()
+                raise
             error = exc
 
         worker = self._worker
         frame = self._frame
-        if worker is not None and frame is not None:
+        # Simpler can publish a terminal error without confirming cancellation.
+        # Its whole-worker close then owns physical reclamation, including reset buffers.
+        abandoned = getattr(native_handle, "_finalization_abandoned", False) is True
+        if worker is not None and frame is not None and not abandoned:
             try:
                 worker._run_dispatch_cleanup(frame.cleanup)
             except BaseException as exc:  # noqa: BLE001 - cleanup is part of terminal publication
@@ -219,6 +293,9 @@ class DistributedRunHandle:
             except BaseException as exc:  # noqa: BLE001 - terminal post-processing outcome
                 error = exc
 
+        # A domain-release waiter must see the retired (or abandoned) frame as soon as it sees the error.
+        if worker is not None and frame is not None:
+            worker._retire_dispatch_handle(self, frame, error, abandoned=abandoned)
         with self._cv:
             self._error = error
             self._terminal = True
@@ -228,8 +305,6 @@ class DistributedRunHandle:
             self._frame = None
             self._worker = None
             self._cv.notify_all()
-        if worker is not None and frame is not None:
-            worker._retire_dispatch_handle(self, frame, error)
         if error is not None:
             raise error
 
@@ -357,15 +432,16 @@ def _run_directory(compiled: Any) -> Path:
     return runtime_output_directory(compiled)
 
 
-def _collect_program_swimlane(compiled: Any) -> None:
+def _collect_program_swimlane(compiled: Any, dfx_base: Path) -> None:
     artifact_fields = cast("dict[str, Any]", vars(compiled))
     if artifact_fields.get("_artifact_runtime") is None:
-        _collect_l3_swimlane(compiled.output_dir, compiled.platform)
+        _collect_l3_swimlane(compiled.output_dir, compiled.platform, dfx_base=dfx_base)
     else:
         _collect_l3_swimlane(
             artifact_fields["_artifact_runtime"].directory,
             compiled.platform,
             run_directory=_run_directory(compiled),
+            dfx_base=dfx_base,
         )
 
 
@@ -375,6 +451,48 @@ def _collect_program_swimlane(compiled: Any) -> None:
 # both paths run identical, expensive setup (_compile_and_assemble, module load,
 # Worker construction + registration) without duplicating it.
 # ---------------------------------------------------------------------------
+
+
+class _ChipCallables(dict[str, Any]):
+    """Chip callables (or registered handles) with their tensor transfer contracts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.host_tensor_indices: dict[str, frozenset[int]] = {}
+
+    def add(self, name: str, value: Any, config: dict[str, Any]) -> None:
+        self[name] = value
+        self.host_tensor_indices[name] = frozenset(config.get("host_tensor_indices", ()))
+
+
+def add_chip_tensor_arg(
+    args: Any,
+    worker: Any,
+    tensor: Any,
+    tag: Any,
+    callables: dict[str, Any],
+    name: str,
+    index: int,
+) -> None:
+    """Pack a chip argument using the callee's emitted host-control contract."""
+    from .tensor_arg import make_tensor_arg  # noqa: PLC0415
+
+    host_slots = callables.host_tensor_indices.get(name, ()) if isinstance(callables, _ChipCallables) else ()
+    if index in host_slots:
+        from simpler.buffer import TensorTransfer  # noqa: PLC0415
+
+        is_host = isinstance(tensor, torch.Tensor) and tensor.device.type == "cpu"
+        if not is_host and _is_simpler_tensor(tensor):
+            from simpler.buffer import AddressSpace, Tensor  # noqa: PLC0415
+
+            is_host = isinstance(tensor, Tensor) and tensor.buffer.address_space == AddressSpace.HOST
+        if not is_host:
+            raise ValueError(
+                f"Chip {name!r} host control tensor slot {index} requires a CPU tensor or a HOST Tensor"
+            )
+        args.add_tensor(make_tensor_arg(worker, tensor), tag, transfer=TensorTransfer.NONE)
+    else:
+        args.add_tensor(make_tensor_arg(worker, tensor), tag)
 
 
 def _assemble_chip_callables(
@@ -389,14 +507,27 @@ def _assemble_chip_callables(
     :meth:`DistributedCompiledProgram.from_dir` (the ``runtime_dir`` replay path).
     """
     artifact_runtime = vars(compiled).get("_artifact_runtime")
-    if artifact_runtime is not None:
-        chips = artifact_runtime.load()
+    from ._prebuilt import BINARY_MANIFEST, BuildKind, load_prebuilt  # noqa: PLC0415
+
+    ready_entry = (
+        any(p.is_distributed for p in (vars(compiled).get("_param_infos") or ()))
+        and (compiled.output_dir / BINARY_MANIFEST).is_file()
+    )
+    if artifact_runtime is not None or ready_entry:
+        chips = (
+            artifact_runtime.load()
+            if artifact_runtime is not None
+            else load_prebuilt(compiled.output_dir, compiled.platform, BuildKind.DISTRIBUTED)
+        )
+        callables = _ChipCallables()
+        for name, (chip_callable, _, config) in chips.items():
+            callables.add(name, chip_callable, config)
         return (
-            {name: value[0] for name, value in chips.items()},
+            callables,
             next(iter(chips.values()))[1],
             any(bool(value[2].get("enable_sdma", False)) for value in chips.values()),
         )
-    chip_callables: dict[str, Any] = {}
+    chip_callables = _ChipCallables()
     runtime_name: str | None = None
     enable_sdma = False
     next_levels_dir = compiled.output_dir / "next_levels"
@@ -412,7 +543,7 @@ def _assemble_chip_callables(
             chip_callable, chip_runtime, chip_runtime_config = _compile_and_assemble(
                 chip_dir, compiled.platform
             )
-            chip_callables[chip_dir.name] = chip_callable
+            chip_callables.add(chip_dir.name, chip_callable, chip_runtime_config)
             enable_sdma = enable_sdma or bool(chip_runtime_config.get("enable_sdma", False))
             if runtime_name is None:
                 runtime_name = chip_runtime
@@ -473,6 +604,12 @@ def _load_orch_entry(output_dir: Path) -> tuple[Any, Any]:
             f"orchestration module is malformed — regenerate via distributed codegen."
         )
     entry_fn = entry_candidates[0]
+    if getattr(entry_fn, "_requires_host_domain", False):
+        from simpler.orchestrator import Orchestrator  # noqa: PLC0415
+
+        validate_host_domain_runtime(
+            Orchestrator, initialized=bool(getattr(entry_fn, "_window_source_keys", ()))
+        )
 
     alloc_fn = getattr(orch_module, "_alloc_intermediates", None)
     return entry_fn, alloc_fn
@@ -605,7 +742,11 @@ def _register_callables(
     # ``Any`` here and threaded straight back into ``submit_sub`` /
     # ``submit_next_level``, which accept the handle.
     sub_ids: dict[str, Any] = {name: w.register(fn) for name, fn in sub_worker_fns.items()}
-    chip_cids: dict[str, Any] = {name: w.register(cc) for name, cc in chip_callables.items()}
+    chip_cids = _ChipCallables()
+    for name, cc in chip_callables.items():
+        chip_cids[name] = w.register(cc)
+    if isinstance(chip_callables, _ChipCallables):
+        chip_cids.host_tensor_indices = chip_callables.host_tensor_indices.copy()
     return sub_ids, chip_cids
 
 
@@ -785,10 +926,12 @@ def _run_l3_swimlane_two_pass(
 
     The two passes are two runs, and the ChipWorker child numbers its capture
     directories per process — so the graph pass's ``deps.json`` and the timing
-    pass's records land in *different* ``rank{r}/d{k}`` directories.
-    :func:`_collect_l3_swimlane` pairs them back up from the child's identity
-    sidecars; without that pairing the converter sees no task graph and renders
-    a swimlane with no dependency edges.
+    pass's records land in *different* ``rank{r}/d{k}`` directories. The DFX
+    marker counter mirrors that process-scoped numbering
+    (:func:`_reset_dfx_dispatch_state`), so each pass is marked where it lands.
+    :func:`_collect_l3_swimlane` still pairs the two captures from the child's
+    identity sidecars; without that pairing the converter sees no task graph and
+    renders a swimlane with no dependency edges.
 
     Both calls execute the program. As with the existing one-shot L3 protocol,
     mutable arguments are not snapshotted or restored between passes.
@@ -845,6 +988,7 @@ _DISPATCH_DIR_GLOB = "d[0-9]*"
 # ``next_levels/<program>`` — so naming a dispatch's tasks needs this marker
 # (issue #2169).
 _DISPATCH_PROGRAM_FILE = "dispatch_program.json"
+_CLOSED_SWIMLANE_SESSION = ".pypto-swimlane-closed"
 
 # Written by the ChipWorker child into every capture directory it creates. The
 # child numbers captures per *process* (``local_capture_index``), not per run, so
@@ -895,11 +1039,20 @@ def _resolve_chip_worker(orch: Any, worker: int | None) -> int:
     return seq % chip_count
 
 
-def _reset_dfx_dispatch_state(orch: Any, chip_cids: dict[str, Any]) -> None:
-    """Reset the per-run dispatch state :func:`_submit_chip` reads off ``orch``.
+def _reset_dfx_dispatch_state(
+    orch: Any,
+    chip_cids: dict[str, Any],
+    *,
+    dispatch_idx: dict[str, int] | None = None,
+) -> None:
+    """Install the dispatch state :func:`_submit_chip` reads off ``orch``.
 
-    ``_dfx_dispatch_idx`` numbers each card's dispatches ``d0, d1, ...`` fresh per
-    run, so the swimlane two-pass files one dispatch under one directory.
+    ``_dfx_dispatch_idx`` numbers each card's dispatches ``d0, d1, ...`` and must
+    mirror the ChipWorker child's ``local_capture_index``, which spans the
+    *process*. Callers on a long-lived child (prepared and persistent workers)
+    therefore pass the worker-owned dict here so the numbering continues across
+    runs; the one-shot path, which forks a fresh child per pass, passes nothing
+    and gets a fresh counter. Reset when the child resets.
 
     ``_dfx_chip_names`` reverses the registered ``callables`` mapping so
     ``_submit_chip`` can name the L2 program behind an otherwise opaque
@@ -907,7 +1060,7 @@ def _reset_dfx_dispatch_state(orch: Any, chip_cids: dict[str, Any]) -> None:
     hashable, and ``chip_cids`` holds every one alive for the whole run, so the
     ids are stable and unique.
     """
-    orch._dfx_dispatch_idx = {}
+    orch._dfx_dispatch_idx = {} if dispatch_idx is None else dispatch_idx
     orch._dfx_chip_names = {id(cid): name for name, cid in chip_cids.items()}
 
 
@@ -960,14 +1113,14 @@ def _submit_chip(  # pyright: ignore[reportUnusedFunction]
     this wrapper only derives the same directory — for the marker below and the
     offline post-pass — and forwards ``config`` untouched.
 
-    ``k`` comes from a per-card counter on ``orch`` reset at the top of every
-    run (see :func:`_reset_dfx_dispatch_state`), so it is this run's dispatch
-    ordinal. The child's own counter spans the whole process, so the two
-    numberings agree only on a worker's first run: the marker
-    :func:`_record_dispatch_program` stamps here therefore lands on the first
-    run's capture directory — the graph pass of a swimlane two-pass — and
-    :func:`_collect_l3_swimlane` reads it back through the capture pairing
-    rather than expecting it beside the records.
+    ``k`` comes from a per-card counter on ``orch`` that mirrors the child's own
+    ``local_capture_index``. Both are process-scoped: a prepared or persistent
+    worker carries the counter across runs, while a one-shot worker — which
+    forks a fresh child for each pass — starts it over. The marker
+    :func:`_record_dispatch_program` stamps therefore lands in the same
+    ``rank{w}/d{k}`` the child files that capture under, on the graph pass of a
+    swimlane two-pass; :func:`_collect_l3_swimlane` still resolves it through the
+    capture pairing.
 
     When DFX is off (``output_prefix`` unset) the call is forwarded unchanged.
 
@@ -987,27 +1140,21 @@ def _submit_chip(  # pyright: ignore[reportUnusedFunction]
         idx_map = orch._dfx_dispatch_idx = cast("dict[str, int]", {})
     rank_label = _dfx_rank_label(worker)
     k = idx_map.get(rank_label, 0)
-    idx_map[rank_label] = k + 1
     _record_dispatch_program(orch, callable_id, Path(f"{base}/{rank_label}/d{k}"))
-    return orch.submit_next_level(callable_id, task_args, config, worker=worker)
+    handle = orch.submit_next_level(callable_id, task_args, config, worker=worker)
+    # Advance only once the submit is accepted. A synchronous rejection creates
+    # no capture, so counting it would leave every later marker one directory
+    # ahead of the child's own numbering -- self-correcting when the counter was
+    # reset per run, permanent now that a prepared worker carries it across
+    # runs. The marker already at ``d{k}`` is overwritten by the next submit.
+    idx_map[rank_label] = k + 1
+    return handle
 
 
 def _clear_dfx_dispatch_dirs(dfx_base: Path) -> None:
-    """Remove stale ``rank*/d{k}`` dispatch dirs before a fresh DFX run.
-
-    A prepared :class:`DistributedWorker` reusing one ``output_dir`` across runs
-    would otherwise leave ``d{k}`` dirs from an earlier, larger run on disk,
-    whether the child restarted its capture numbering or carried it forward.
-    ``_collect_l3_swimlane`` globs ``d[0-9]*``, so
-    those stale dirs would be re-converted as if they belonged to the current
-    run. Clearing them once, before the first dispatch of a DFX run, scopes the
-    artifacts (and their post-processing) to exactly this run. Called only when
-    DFX is enabled; best-effort (a removal failure must not abort the dispatch).
-    """
+    """Remove stale dispatch directories for DFX calls that reuse a flat output prefix."""
     if not dfx_base.is_dir():
         return
-    import shutil  # noqa: PLC0415
-
     for rank_dir in dfx_base.glob(_RANK_DIR_GLOB):
         if not rank_dir.is_dir():
             continue
@@ -1163,12 +1310,11 @@ def _consolidate_two_pass_captures(rank_dir: Path, pairs: dict[Path, Path]) -> N
     merged trace: a tool that selects directories by "has ``deps.json`` and a
     name map" matches neither half.
 
-    Fold forward, into the graph capture. The graph pass runs first, so its
-    captures carry the lower indices — for a card dispatching ``N`` times they
-    are ``d0..d(N-1)``, the dispatch ordinals themselves, while the timing pass's
-    ``dN..d(2N-1)`` are only that offset repeated. Keeping the first of each pair
-    therefore restores both halves of the layout every consumer expects: one
-    directory per dispatch, named by the dispatch.
+    Fold forward, into the graph capture. The graph pass runs first, so within a
+    dispatch its captures carry the lower indices; the timing pass's follow. The
+    counter spans the child process, so the absolute numbers need not start at
+    zero — only the graph-before-timing order matters. Keeping the first of each
+    pair restores the layout every consumer expects: one directory per dispatch.
 
     Only paired captures are touched (see :func:`_pair_rank_captures`), only
     after both passes have finished, and only where the pairing is one-to-one.
@@ -1178,7 +1324,6 @@ def _consolidate_two_pass_captures(rank_dir: Path, pairs: dict[Path, Path]) -> N
     left exactly as it was, and its records are still converted where they lie.
     """
     import collections  # noqa: PLC0415
-    import shutil  # noqa: PLC0415
 
     # Several timed captures can share one graph pass — a benchmark loop repeats
     # the timing run against the graph it captured once. Folding them all into
@@ -1193,6 +1338,18 @@ def _consolidate_two_pass_captures(rank_dir: Path, pairs: dict[Path, Path]) -> N
             for artifact in sorted(timing_dir.iterdir()):
                 if artifact.name == _DISPATCH_IDENTITY_FILE:
                     target = graph_dir / "dispatch_identity.timing.json"
+                elif artifact.name == _DISPATCH_PROGRAM_FILE:
+                    # Both passes are marked now that the counter spans the child
+                    # process. Keep the timing pass's marker beside the graph
+                    # pass's rather than colliding with it -- unless the graph
+                    # pass left none (that write is best-effort), in which case
+                    # this is the only program name the capture has and it must
+                    # land where :func:`_read_dispatch_program` looks for it.
+                    target = (
+                        graph_dir / "dispatch_program.timing.json"
+                        if (graph_dir / _DISPATCH_PROGRAM_FILE).exists()
+                        else graph_dir / _DISPATCH_PROGRAM_FILE
+                    )
                 else:
                     target = graph_dir / artifact.name
                 if target.exists():
@@ -1281,7 +1438,9 @@ def _write_dispatch_name_map(
     return name_map_path
 
 
-def _collect_l3_swimlane(output_dir: Path, platform: str, *, run_directory: Path | None = None) -> None:
+def _collect_l3_swimlane(
+    output_dir: Path, platform: str, *, dfx_base: Path | None = None, run_directory: Path | None = None
+) -> None:
     """Convert each dispatch's swimlane records into a ``merged_swimlane_*.json``.
 
     The runtime writes ``rank{r}/d{k}/deps.json`` in the graph pass and
@@ -1335,7 +1494,8 @@ def _collect_l3_swimlane(output_dir: Path, platform: str, *, run_directory: Path
     # ``_write_dispatch_name_map`` so each config is loaded once per run.
     name_map_cache: dict[str, dict[str, str]] = {}
 
-    dfx_base = (output_dir if run_directory is None else run_directory) / "dfx_outputs"
+    if dfx_base is None:
+        dfx_base = (output_dir if run_directory is None else run_directory) / "dfx_outputs"
     # See the docstring for why we glob rather than iterate a rank count.
     # 3.10-safe dir filter (``glob`` directory filtering is only reliable on 3.11+).
     rank_dirs = sorted(d for d in dfx_base.glob(_RANK_DIR_GLOB) if d.is_dir())
@@ -1433,21 +1593,24 @@ def _make_dispatch_orchestration(
     call_config: Any,
     device_nums: int,
     keepalive: list[Any],
+    *,
+    dfx_dispatch_idx: dict[str, int] | None = None,
+    window_sources: Mapping[str, Sequence[BinaryIO | torch.Tensor]] | None = None,
 ) -> Callable[..., None]:
     """Build one orchestration closure over a handle-owned metadata frame."""
     # ``world_size`` is the only worker-level scalar the entry needs; codegen
     # binds ``pld.system.world_size()`` to this kwarg uniformly across comm
     # and comm-less paths.
 
-    def orch_fn(orch: Any, _unused_args: Any, _unused_cfg: Any) -> None:
-        # Reset the per-card DFX dispatch counter at the start of every run so
-        # a card's dispatches are numbered ``d0, d1, ...`` fresh each pass.
-        # Two-pass swimlane reissues the same dispatch order, so pass 1
-        # (deps.json) and pass 2 (records) land the same dispatch in the same
-        # ``rank{w}/d{k}`` dir — letting the converter join them. The same call
-        # publishes the callable -> L2 program names ``_submit_chip`` stamps into
-        # each dispatch dir.
-        _reset_dfx_dispatch_state(orch, chip_cids)
+    def orch_fn(orch: Any, args: Any, _unused_cfg: Any) -> None:
+        # Install the per-card DFX dispatch counter. On a prepared or persistent
+        # worker the child survives across runs, so ``dfx_dispatch_idx`` is the
+        # worker-owned dict and its numbering continues (the child's
+        # ``local_capture_index`` does the same); a one-shot call passes nothing
+        # and gets a fresh counter, because its child is forked per pass. The
+        # same call publishes the callable -> L2 program names ``_submit_chip``
+        # stamps into each dispatch dir.
+        _reset_dfx_dispatch_state(orch, chip_cids, dispatch_idx=dfx_dispatch_idx)
         # Comm-less dispatches carry no rank, so ``_resolve_chip_worker`` hands
         # them out round-robin over the program's chips; both the count and the
         # sequence live on ``orch`` so the wrapper stays a pure function of the
@@ -1457,19 +1620,20 @@ def _make_dispatch_orchestration(
         orch._pypto_commless_seq = 0
         entry_fn(
             orch,
-            _unused_args,
+            args,
             call_config,
             tensors=tensors,
             callables=chip_cids,
             sub_ids=sub_ids,
             _keep=keepalive,
             world_size=device_nums,
+            **({"_window_sources": window_sources} if window_sources else {}),
         )
 
     return orch_fn
 
 
-def _submit_dispatch(
+def _submit_dispatch(  # noqa: PLR0913 - compatibility wrapper for prepared and one-shot callers
     w: Any,
     entry_fn: Any,
     tensors: dict[str, Any],
@@ -1478,6 +1642,10 @@ def _submit_dispatch(
     call_config: Any,
     device_nums: int,
     keepalive: list[Any],
+    *,
+    entry_args: TaskArgs | None = None,
+    dfx_dispatch_idx: dict[str, int] | None = None,
+    window_sources: Mapping[str, Sequence[BinaryIO | torch.Tensor]] | None = None,
 ) -> Any:
     """Submit one orchestration closure and return Simpler's run handle."""
     orch_fn = _make_dispatch_orchestration(
@@ -1488,8 +1656,10 @@ def _submit_dispatch(
         call_config,
         device_nums,
         keepalive,
+        dfx_dispatch_idx=dfx_dispatch_idx,
+        window_sources=window_sources,
     )
-    return w.submit(orch_fn)
+    return w.submit(orch_fn, entry_args) if entry_args is not None else w.submit(orch_fn)
 
 
 def _dispatch(
@@ -1568,6 +1738,12 @@ def _execute_distributed(  # pyright: ignore[reportUnusedFunction]
                 "`worker.alloc_tensor()` / `worker.alloc_stacked_tensor()`, then call `worker.run(...)`."
             )
         host_args.append(arg)
+
+    from ._execution_mode import claim_program_mode  # noqa: PLC0415
+
+    # Reject a kernel-mode process before setup can change caller storage or
+    # remove diagnostics from an earlier run.
+    claim_program_mode()
 
     dc = compiled._distributed_config
     output_dir = compiled.output_dir
@@ -1653,13 +1829,13 @@ def _execute_distributed(  # pyright: ignore[reportUnusedFunction]
 
     # Offline post-pass (reads the per-dispatch deps.json + records on disk).
     if swimlane:
-        _collect_program_swimlane(compiled)
+        _collect_program_swimlane(compiled, dfx_base)
 
 
 _EXECUTE_DISTRIBUTED_COMPILED_DEPRECATION = (
     "pypto.runtime.execute_distributed_compiled is deprecated; reconstruct the "
     "artifact and call it: ir.DistributedCompiledProgram.from_dir(output_dir, "
-    "platform=...)(*args, config=...). The directory-driven function will be "
+    "backend_type=..., execution_mode=...)(*args, config=...). The directory-driven function will be "
     "removed in a future release."
 )
 
@@ -1690,7 +1866,12 @@ def execute_distributed_compiled(
         execute_distributed_compiled(work_dir, args, config=cfg, platform="a2a3")
 
         # after
-        ir.DistributedCompiledProgram.from_dir(work_dir, platform="a2a3")(*args, config=cfg)
+        from pypto.backend import BackendType
+        from pypto.runtime import ExecutionMode
+
+        ir.DistributedCompiledProgram.from_dir(
+            work_dir, backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD,
+        )(*args, config=cfg)
 
     Emits a :class:`DeprecationWarning`; behaviour is unchanged.
 
@@ -1776,6 +1957,13 @@ class DistributedWorker(Worker):
     runtime-owned POSIX-shm Buffers, so their CPU-contiguous host endpoints may
     be ordinary tensors created after ``prepare``.
 
+    ``window_sources`` maps compiled Host-window ``init`` keys to open binary
+    files or contiguous CPU tensors in domain rank order. Sources are copied only
+    when creating a domain. Host and Device windows both follow ``persistent``
+    and ``reset_persistent_windows``. Disable reset explicitly to retain loaded
+    table contents across dispatches. The caller owns
+    the files and must keep them open until initialization completes.
+
     ``inherited_host_tensors`` keeps such a host range alive for the worker's
     lifetime *and* is a caller guarantee about it: listing a tensor asserts that
     its backing is visible across processes — a ``MAP_SHARED`` mapping, whether
@@ -1842,6 +2030,7 @@ class DistributedWorker(Worker):
         *,
         persistent: bool = False,
         reset_persistent_windows: bool | None = None,
+        window_sources: Mapping[str, Sequence[BinaryIO | torch.Tensor]] | None = None,
         callbacks: dict[str, Callable[..., Any]] | None = None,
         sub_worker_overrides: dict[str, Callable[..., Any]] | None = None,
         inherited_host_tensors: Sequence[torch.Tensor | ReadOnlyHostTensor] | None = None,
@@ -1854,6 +2043,7 @@ class DistributedWorker(Worker):
         # attached to DeviceTensor for address-free wire TaskArgs.
         self._device_buffers: dict[tuple[int, int], Any] = {}
         callbacks = _coalesce_callbacks(callbacks, sub_worker_overrides)
+        window_sources = normalize_window_sources(window_sources)
         reset_persistent_windows = _resolve_persistent_window_reset(persistent, reset_persistent_windows)
         inherited, self._inherited_host_spans = self._resolve_inherited_host_tensors(inherited_host_tensors)
         self._inherited_host_tensors = inherited
@@ -1881,11 +2071,19 @@ class DistributedWorker(Worker):
         # per chip through this path, so the cache, owner, and counter are guarded together.
         self._named_host_buffer_mu = threading.Lock()
         self._persistent = bool(persistent)
+        # DFX dispatch counter, scoped to this worker's child process. A prepared
+        # worker reuses one child across runs, so the counter must continue like
+        # the child's ``local_capture_index``; a new Worker (new child) starts
+        # fresh. See ``_reset_dfx_dispatch_state`` / ``_submit_chip``.
+        self._dfx_dispatch_idx: dict[str, int] = {}
+        # Dispatch IDs restart on a new worker, even if it shares an output directory.
+        self._swimlane_session = f"session-{uuid.uuid4().hex}"
+        self._swimlane_session_dirs: set[Path] = set()
         self._reset_persistent_windows = reset_persistent_windows
         self._persistent_error: BaseException | None = None
         self._persistent_error_reported = False
         self._persistent_domains_by_program: dict[str, dict[str, tuple[tuple[Any, ...], Any]]] = {}
-        self._dispatch_submit_mu = threading.Lock()
+        self._init_external_domains()
         self._dispatch_cv = threading.Condition()
         self._dispatch_frames = [_DispatchFrame(slot_id) for slot_id in range(2)]
         self._active_dispatch_handles: set[DistributedRunHandle] = set()
@@ -1932,12 +2130,18 @@ class DistributedWorker(Worker):
             # required-callback manifest is enforced per program.
             callbacks = callbacks or {}
             consumed: set[str] = set()
+            consumed_sources: set[str] = set()
             for program_index, prog in enumerate(programs):
                 self._check_compatible(prog, primary)
                 chip_callables, prog_runtime, prog_enable_sdma = _assemble_chip_callables(prog)
                 runtime_name = self._unify_runtime(runtime_name, prog_runtime)
                 enable_sdma = enable_sdma or prog_enable_sdma
                 entry_fn, alloc_fn = _load_orch_entry(prog.output_dir)
+                source_keys = set(getattr(entry_fn, "_window_source_keys", ()))
+                missing_sources = sorted(source_keys - window_sources.keys())
+                if missing_sources:
+                    raise ValueError(f"Missing window_sources for Host window init keys: {missing_sources}")
+                consumed_sources |= source_keys
                 loaded_subs = _load_sub_worker_fns(prog.output_dir)
                 prog_callbacks = {name: fn for name, fn in callbacks.items() if name in loaded_subs}
                 consumed |= set(prog_callbacks)
@@ -1953,11 +2157,14 @@ class DistributedWorker(Worker):
                             alloc_fn, base_tensors, len(prog._distributed_config.device_ids)
                         )
                     base_tensor_frames.append(base_tensors)
+                infos = prog._get_metadata()[0]
                 self._states[prog] = {
+                    "window_requirements": entry_window_requirements(entry_fn, infos),
                     "entry_fn": entry_fn,
+                    "window_sources": {key: window_sources[key] for key in source_keys},
                     "base_tensor_frames": tuple(base_tensor_frames),
                     "call_config": _make_call_config(prog._distributed_config),
-                    "param_infos": tuple(prog._get_metadata()[0]),
+                    "param_infos": tuple(infos),
                     "device_nums": len(prog._distributed_config.device_ids),
                     "persistent_id": f"p{program_index}",
                 }
@@ -1968,6 +2175,11 @@ class DistributedWorker(Worker):
                     )
                 loaded.append((prog, chip_callables, sub_worker_fns))
 
+            unused_sources = sorted(window_sources.keys() - consumed_sources)
+            if unused_sources:
+                raise ValueError(
+                    f"window_sources keys are not used by any prepared program: {unused_sources}"
+                )
             unconsumed = sorted(set(callbacks) - consumed)
             if unconsumed:
                 raise ValueError(f"callbacks names {unconsumed} are not sub-workers of any prepared program.")
@@ -1989,7 +2201,6 @@ class DistributedWorker(Worker):
             from .tensor_arg import bind_tensor_arg_owner  # noqa: PLC0415
 
             bind_tensor_arg_owner(self._w, self)
-            self._validate_persistent_runtime_hooks()
             for prog, chip_callables, sub_worker_fns in loaded:
                 sub_ids, chip_cids = _register_callables(self._w, sub_worker_fns, chip_callables)
                 self._states[prog]["sub_ids"] = sub_ids
@@ -2005,6 +2216,9 @@ class DistributedWorker(Worker):
                 prewarm_cc = _make_call_config(
                     primary._distributed_config, config, dfx_base=_run_directory(primary) / "dfx_outputs"
                 )
+            from ._execution_mode import claim_program_mode  # noqa: PLC0415
+
+            claim_program_mode()
             self._w.init(prewarm_config=prewarm_cc)
 
             # ``Worker.init()`` eagerly starts the chip/sub-worker hierarchy, so
@@ -2049,19 +2263,20 @@ class DistributedWorker(Worker):
             )
         return runtime_name
 
-    def _acquire_dispatch_frame(self) -> tuple[_DispatchFrame, int]:
-        """Reserve one of two metadata frames, draining the oldest on pressure."""
+    def _next_dispatch_frame(self) -> tuple[_DispatchFrame, int]:
+        """Select an idle frame under the caller's submit lock, draining the oldest on pressure."""
         while True:
             with self._dispatch_cv:
                 if not self._accepting_dispatches:
                     raise RuntimeError("DistributedWorker.submit() called while the worker is closing")
+                if any(frame.abandoned for frame in self._dispatch_frames):
+                    raise RuntimeError("DistributedWorker has an abandoned native run; close the worker")
                 frame = next((candidate for candidate in self._dispatch_frames if not candidate.in_use), None)
                 if frame is not None:
                     if frame.cleanup:
                         raise RuntimeError(
                             "DistributedWorker dispatch frame retained stale cleanup callbacks"
                         )
-                    frame.in_use = True
                     dispatch_id = self._next_dispatch_id
                     self._next_dispatch_id += 1
                     return frame, dispatch_id
@@ -2095,10 +2310,7 @@ class DistributedWorker(Worker):
             self._run_dispatch_cleanup(frame.cleanup)
         finally:
             with self._dispatch_cv:
-                frame.tensors.clear()
-                frame.keepalive.clear()
-                frame.handle = None
-                frame.in_use = False
+                frame.clear()
                 self._dispatch_cv.notify_all()
 
     def _discard_unsubmitted_dispatch_handle(
@@ -2114,13 +2326,14 @@ class DistributedWorker(Worker):
         self._release_unpublished_dispatch_frame(frame)
 
     def _accepted_native_handles(self) -> set[Any] | None:
-        """Snapshot Simpler's accepted set for interruption recovery."""
+        """Snapshot all accepted runs, including those retained for whole-worker teardown."""
         handles: Any = getattr(self._w, "_accepted_run_handles", None)
         lifecycle_cv = getattr(self._w, "_hierarchical_start_cv", None)
         if not isinstance(handles, set) or lifecycle_cv is None:
             return None
         with lifecycle_cv:
-            return set(cast("set[Any]", handles))
+            abandoned = getattr(self._w, "_abandoned_run_handles", ())
+            return set(cast("set[Any]", handles)).union(abandoned)
 
     def _recover_accepted_native_handle(self, before: set[Any] | None) -> Any | None:
         """Recover the sole handle accepted while one serialized submit ran."""
@@ -2139,19 +2352,24 @@ class DistributedWorker(Worker):
         handle: DistributedRunHandle,
         frame: _DispatchFrame,
         error: BaseException | None,
+        *,
+        abandoned: bool,
     ) -> None:
-        """Release one terminal handle's frame and publish persistent failure."""
+        """Retire the handle and retain an unfenced frame until native teardown."""
         if error is not None and self._persistent and self._persistent_error is None:
             self._persistent_error = error
             self._persistent_error_reported = True
         with self._dispatch_cv:
             self._active_dispatch_handles.discard(handle)
             if frame.handle is handle:
-                frame.tensors.clear()
-                frame.keepalive.clear()
-                frame.cleanup.clear()
-                frame.handle = None
-                frame.in_use = False
+                if error is not None:
+                    for domain in frame.external_domains:
+                        if domain._state is DomainState.LIVE:
+                            domain._state = DomainState.INVALID
+                if abandoned:
+                    frame.abandoned = True
+                else:
+                    frame.clear()
             self._dispatch_cv.notify_all()
 
     @staticmethod
@@ -2177,23 +2395,12 @@ class DistributedWorker(Worker):
             tuple(int(worker) for worker in kwargs["workers"]),
             int(kwargs["window_size"]),
             buffers,
+            str(
+                getattr(kwargs.get("memory_source", "device"), "name", kwargs.get("memory_source", "device"))
+            ).lower(),
+            tuple(sorted(kwargs.get("workspace_engines", ()))),
+            tuple(getattr(kwargs.get("initializer"), "bindings", ())),
         )
-
-    def _validate_persistent_runtime_hooks(self) -> None:
-        """Fail before worker initialization when Simpler cannot retain domains."""
-        if not self._persistent:
-            return
-        live_domains = getattr(self._w, "_live_domains", None)
-        missing: list[str] = []
-        if not isinstance(live_domains, dict):
-            missing.append("_live_domains")
-        if not hasattr(self._w, "_building_run_resources"):
-            missing.append("_building_run_resources")
-        if missing:
-            raise RuntimeError(
-                "persistent distributed execution requires Simpler's private retention hooks: "
-                + ", ".join(missing)
-            )
 
     def _reset_persistent_domains(
         self,
@@ -2201,23 +2408,24 @@ class DistributedWorker(Worker):
         domains: dict[str, tuple[tuple[Any, ...], Any]],
         reset_buffers: dict[int, Any],
     ) -> None:
-        """Restore every named buffer in retained domains to its initial zero state.
+        """Restore all retained communication buffers to zero, regardless of backing.
 
-        The host Buffers are created before ``Worker.run`` and released after it;
-        this callback only issues copies while Simpler holds its submit lock.
+        Device windows use staged zero buffers; Host windows are zeroed through
+        their CPU mappings while Simpler holds its submit lock.
         """
         for domain_name, (spec, handle) in domains.items():
-            _workers, window_nbytes, buffer_specs = spec
+            _workers, window_nbytes, buffer_specs, memory_source, *_resource_spec = spec
             for worker_id in handle.workers:
                 actual_window_size = int(handle[worker_id].actual_window_size)
-                if actual_window_size != int(window_nbytes):
+                # Physical mappings can be rounded up to the platform's allocation
+                # granularity. Named buffers cover only the requested extent.
+                if actual_window_size < int(window_nbytes):
                     raise RuntimeError(
-                        f"persistent CommDomain {domain_name!r} changed window size on worker {worker_id}: "
-                        f"{actual_window_size} != {window_nbytes}"
+                        f"persistent CommDomain {domain_name!r} window on worker {worker_id} is too small: "
+                        f"{actual_window_size} < {window_nbytes}"
                     )
             for buffer_name, _dtype, _count, buffer_nbytes in buffer_specs:
                 nbytes = int(buffer_nbytes)
-                zero_buffer = reset_buffers[nbytes]
                 for worker_id in handle.workers:
                     dst_buffer = handle[worker_id].buffers[buffer_name]
                     if int(dst_buffer.nbytes) != nbytes:
@@ -2225,16 +2433,29 @@ class DistributedWorker(Worker):
                             f"persistent CommDomain buffer {buffer_name!r} changed size: "
                             f"{dst_buffer.nbytes} != {nbytes}"
                         )
-                    orch.copy_to(dst_buffer, zero_buffer)
+                    if memory_source == "host":
+                        # Each named buffer's shm covers the whole rank window.
+                        # Apply its offset and leave physical padding untouched.
+                        offset, _ = handle.buffer_range(buffer_name)
+                        with dst_buffer.shm.buf[offset : offset + nbytes] as target:
+                            if len(target) != nbytes:
+                                raise RuntimeError(
+                                    f"persistent Host buffer {buffer_name!r} mapping is too small: "
+                                    f"{len(target)} < {nbytes}"
+                                )
+                            if nbytes:
+                                ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(target)), 0, nbytes)
+                    else:
+                        orch.copy_to(dst_buffer, reset_buffers[nbytes])
 
     def _prepare_persistent_reset_buffers(
         self,
         domains: dict[str, tuple[tuple[Any, ...], Any]],
         reset_buffers: dict[int, Any],
     ) -> None:
-        """Create zero-filled host Buffers, shared by every named buffer of the same size."""
+        """Stage zeros for Device windows; Host windows need no staging allocation."""
         for domain_name, (spec, _handle) in domains.items():
-            _workers, window_nbytes, buffer_specs = spec
+            _workers, window_nbytes, buffer_specs, memory_source, *_resource_spec = spec
             named_nbytes = sum(int(buffer_spec[3]) for buffer_spec in buffer_specs)
             if named_nbytes != int(window_nbytes):
                 raise RuntimeError(
@@ -2242,6 +2463,8 @@ class DistributedWorker(Worker):
                     "to cover its window: "
                     f"named bytes {named_nbytes} != window size {window_nbytes}"
                 )
+            if memory_source == "host":
+                continue
             for _name, _dtype, _count, buffer_nbytes in buffer_specs:
                 nbytes = int(buffer_nbytes)
                 if nbytes in reset_buffers:
@@ -2262,38 +2485,6 @@ class DistributedWorker(Worker):
         reset_buffers.clear()
         if first_error is not None:
             raise first_error
-
-    def _detach_persistent_domain(self, handle: Any) -> None:
-        """Transfer one CommDomain from the current run to Worker ownership.
-
-        Simpler records a newly allocated domain in both the current
-        ``_RunResources.live_domains`` journal and ``Worker._live_domains``.
-        Remove only the run-local claim: the global entry must remain reachable
-        so ``Worker.close()`` can reclaim it if request finalization is
-        interrupted before the run is retired.
-        """
-        live_domains = getattr(self._w, "_live_domains", None)
-        resources = getattr(self._w, "_building_run_resources", None)
-        run_live_domains = getattr(resources, "live_domains", None)
-        domain_lock = getattr(resources, "domain_lock", None)
-        if (
-            not isinstance(live_domains, dict)
-            or not isinstance(run_live_domains, dict)
-            or domain_lock is None
-        ):
-            raise RuntimeError(
-                "persistent distributed execution requires Simpler's active per-run CommDomain journal"
-            )
-        live_domains = cast("dict[str, Any]", live_domains)
-        run_live_domains = cast("dict[str, Any]", run_live_domains)
-        with domain_lock:
-            if bool(getattr(resources, "retired", False)):
-                raise RuntimeError("persistent CommDomain cannot be retained from an already-retired run")
-            if live_domains.get(handle.name) is not handle or run_live_domains.get(handle.name) is not handle:
-                raise RuntimeError(
-                    "persistent distributed execution could not transfer the CommDomain's run-local ownership"
-                )
-            del run_live_domains[handle.name]
 
     def _release_persistent_domains(
         self,
@@ -2348,28 +2539,29 @@ class DistributedWorker(Worker):
                 program_domains = domains_by_program.setdefault(program_id, {})
                 spec = self._persistent_domain_spec(kwargs)
                 existing = program_domains.get(generated_name)
-                if existing is None:
-                    runtime_kwargs = dict(kwargs)
-                    runtime_kwargs["name"] = f"{program_id}:{generated_name}"
-                    handle = orch.allocate_domain(**runtime_kwargs)
-                    self._detach_persistent_domain(handle)
-                    program_domains[generated_name] = (spec, handle)
-                else:
-                    prior_spec, handle = existing
-                    if spec != prior_spec:
-                        raise ValueError(
-                            f"persistent CommDomain {generated_name!r} changed specification "
-                            f"for program {program_id}"
-                        )
+                if existing is not None and spec != existing[0]:
+                    raise ValueError(
+                        f"persistent CommDomain {generated_name!r} changed specification "
+                        f"for program {program_id}"
+                    )
+                # Reuse through the public API on every request: Simpler must
+                # attach the retained domain to this run's completion fence,
+                # including when its physical allocation already exists.
+                runtime_kwargs = dict(kwargs)
+                runtime_kwargs["name"] = f"{program_id}:{generated_name}"
+                runtime_kwargs["members"] = runtime_kwargs.pop("workers")
+                runtime_kwargs["retain_after_run"] = True
+                handle = orch.get_or_allocate_domain(**runtime_kwargs)
+                program_domains[generated_name] = (spec, handle)
                 return _RetainedDomainLease(handle)
 
             program_domains = domains_by_program.get(program_id)
             if program_domains and self._reset_persistent_windows:
                 self._reset_persistent_domains(orch, program_domains, reset_buffers)
-            _reset_dfx_dispatch_state(orch, state["chip_cids"])
+            _reset_dfx_dispatch_state(orch, state["chip_cids"], dispatch_idx=self._dfx_dispatch_idx)
             state["entry_fn"](
                 orch,
-                None,
+                _args,
                 call_config,
                 tensors=tensors,
                 callables=state["chip_cids"],
@@ -2377,9 +2569,12 @@ class DistributedWorker(Worker):
                 _keep=keepalive,
                 world_size=state["device_nums"],
                 _domain_provider=domain_provider,
+                **({"_window_sources": state["window_sources"]} if state["window_sources"] else {}),
             )
 
         try:
+            if "entry_args" in state:
+                return self._w.submit(run_request, state["entry_args"])
             return self._w.submit(run_request)
         except Exception as exc:
             self._persistent_error = exc
@@ -2403,6 +2598,9 @@ class DistributedWorker(Worker):
         """Submit through either the ordinary or persistent prepared path."""
         if self._persistent:
             return self._submit_persistent(state, tensors, call_config, keepalive, cleanup)
+        # The prepared worker reuses one child across submits, so the DFX
+        # dispatch counter must continue across runs like the child's own
+        # capture counter does.
         return _submit_dispatch(
             self._w,
             state["entry_fn"],
@@ -2412,6 +2610,9 @@ class DistributedWorker(Worker):
             call_config,
             state["device_nums"],
             keepalive,
+            dfx_dispatch_idx=self._dfx_dispatch_idx,
+            window_sources=state["window_sources"],
+            **({"entry_args": state["entry_args"]} if "entry_args" in state else {}),
         )
 
     def _submit_native_dispatch(
@@ -2424,58 +2625,19 @@ class DistributedWorker(Worker):
     ) -> None:
         """Install or recover the native handle for one published frame."""
         accepted_before = self._accepted_native_handles()
-        native_handle: Any | None = None
         try:
-            native_handle = self._submit_prepared_native(
-                state,
-                tensors,
-                call_config,
-                frame.keepalive,
-                frame.cleanup,
+            handle._native_handle = self._submit_prepared_native(
+                state, tensors, call_config, frame.keepalive, frame.cleanup
             )
         except BaseException as exc:
-            if native_handle is None:
-                native_handle = self._recover_accepted_native_handle(accepted_before)
-            if native_handle is None:
+            if handle._native_handle is None:
+                handle._native_handle = self._recover_accepted_native_handle(accepted_before)
+            if handle._native_handle is None:
                 if self._persistent and self._persistent_error is None:
                     self._persistent_error = exc
                     self._persistent_error_reported = True
                 self._discard_unsubmitted_dispatch_handle(handle, frame)
-            else:
-                handle._native_handle = native_handle
             raise
-        handle._native_handle = native_handle
-
-    def _dispatch_prepared(
-        self,
-        state: dict[str, Any],
-        tensors: dict[str, Any],
-        call_config: Any,
-        keepalive: list[Any] | None = None,
-    ) -> None:
-        """Blocking compatibility composition used by diagnostic two-pass runs."""
-        cleanup: list[Callable[[], None]] = []
-        error: BaseException | None = None
-        try:
-            native_handle = self._submit_prepared_native(
-                state,
-                tensors,
-                call_config,
-                [] if keepalive is None else keepalive,
-                cleanup,
-            )
-            native_handle.result()
-        except BaseException as exc:  # noqa: BLE001 - preserve the dispatch failure across cleanup
-            error = exc
-        try:
-            self._run_dispatch_cleanup(cleanup)
-        except BaseException as exc:  # noqa: BLE001 - cleanup remains mandatory on failure
-            if error is None:
-                error = exc
-            elif error.__context__ is None:
-                error.__context__ = exc
-        if error is not None:
-            raise error
 
     # ------------------------------------------------------------------
     # Device memory primitives
@@ -2486,14 +2648,21 @@ class DistributedWorker(Worker):
     # the private Orchestrator facade.
     # ------------------------------------------------------------------
 
-    def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
-        """Allocate ``nbytes`` on chip *worker_id*; returns a device pointer."""
+    def malloc(self, nbytes: int, *, worker_id: int = 0, exportable: bool = False) -> int:
+        """Allocate ``nbytes`` on chip *worker_id*; return its owner-local device pointer.
+
+        exportable=True requests onboard VMM storage for a same-host external consumer.
+        The returned pointer belongs to the chip owner; consumers import their own VA.
+        """
         self._require_open("malloc")
         if type(nbytes) is not int or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
         from simpler.task_interface import DataType  # noqa: PLC0415
 
-        handle = self._w.alloc_child_tensor(worker_id, (nbytes,), DataType.UINT8)
+        if exportable:
+            handle = self._w.alloc_child_tensor(worker_id, (nbytes,), DataType.UINT8, exportable=True)
+        else:
+            handle = self._w.alloc_child_tensor(worker_id, (nbytes,), DataType.UINT8)
         try:
             ptr = int(handle.base)
         except (AttributeError, TypeError, ValueError) as e:
@@ -3000,9 +3169,17 @@ class DistributedWorker(Worker):
             raise ValueError(f"host dtype {host.dtype} does not match stacked dtype {stacked.dtype}")
         self._require_copy_host_tensor(host, "copy_stacked_from(host=...)")
         for i, (shard, w) in enumerate(zip(stacked.shards, stacked.worker_ids, strict=True)):
-            # The public raw-pointer API targets the parent view; copy_from
-            # handles the child-visible POSIX-shm staging internally.
-            self.copy_from(host[i].data_ptr(), shard.data_ptr, shard.nbytes, worker_id=w)
+            # `_device_buffer` accepts the allocation base only, not an interior
+            # view pointer, so pass the base and let copy_from apply the view's
+            # byte offset on the device side. copy_from still owns the
+            # child-visible POSIX-shm staging internally.
+            self.copy_from(
+                host[i].data_ptr(),
+                shard.data_ptr - shard.byte_offset,
+                shard.nbytes,
+                src_offset=shard.byte_offset,
+                worker_id=w,
+            )
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -3112,91 +3289,123 @@ class DistributedWorker(Worker):
                 f"got {len(args)}. Parameters: {[p.name for p in param_infos]}"
             )
 
-        frame, dispatch_id = self._acquire_dispatch_frame()
-        try:
-            call_config, dfx_base, two_pass_swimlane = self._prepare_dispatch_config(
-                compiled,
-                config,
-            )
+        frame, dispatch_id = self._next_dispatch_frame()
+        call_config, capture_directory, two_pass_swimlane = self._prepare_dispatch_config(
+            compiled, config, dispatch_id
+        )
 
-            tensors = frame.tensors
-            tensors.clear()
-            tensors.update(state["base_tensor_frames"][frame.slot_id])
-            frame.keepalive.clear()
-            frame.keepalive.extend((compiled, call_config, config, *args))
-            for info, arg in zip(param_infos, args, strict=True):
-                if info.shape is None:
-                    # Scalar parameter (e.g. seq_len): forwarded as-is to the entry.
-                    tensors[info.name] = arg
-                    continue
-                self._validate_prepared_dispatch_arg(info, arg)
-                tensors[info.name] = arg
-
-            if two_pass_swimlane:
-                assert config is not None
-                assert dfx_base is not None
-                _run_l3_swimlane_two_pass(
-                    compiled._distributed_config,
-                    config,
-                    dfx_base,
-                    lambda pass_config: self._dispatch_prepared(
-                        state,
-                        tensors,
-                        pass_config,
-                        frame.keepalive,
-                    ),
-                )
-                _collect_program_swimlane(compiled)
-                self._release_unpublished_dispatch_frame(frame)
-                return DistributedRunHandle._completed(self)
-
-            postprocess: Callable[[], None] | None = None
-            if config is not None and config.enable_chip_swimlane > 0:
-
-                def collect_swimlane() -> None:
-                    _collect_program_swimlane(compiled)
-
-                postprocess = collect_swimlane
-            handle = DistributedRunHandle(self, None, frame, dispatch_id, postprocess)
+        def submit_pass(
+            pass_config: Any, postprocess: Callable[[], None] | None = None
+        ) -> DistributedRunHandle:
+            # submit() holds the admission lock across both diagnostic passes. Rebind the arguments
+            # after the previous pass retires; an interrupted pass keeps this frame and its public handle.
+            frame.in_use = True
             try:
-                frame.handle = handle
-                with self._dispatch_cv:
-                    self._active_dispatch_handles.add(handle)
+                tensors = frame.tensors
+                tensors.clear()
+                tensors.update(state["base_tensor_frames"][frame.slot_id])
+                frame.keepalive.extend((compiled, pass_config, config, *args))
+                pass_state = state
+                if state["window_requirements"]:
+                    entry_args, domains = pack_window_args(
+                        param_infos, args, self, state["window_requirements"]
+                    )
+                    frame.external_domains = domains
+                    # Frame-local ordering buffers, distinct from the user-named tensors.
+                    tensors[".domain_tokens"] = {domain.ref: domain._tokens for domain in domains}
+                    pass_state = {**state, "entry_args": entry_args}
+                for info, arg in zip(param_infos, args, strict=True):
+                    if isinstance(arg, DomainTensor):
+                        if not state["window_requirements"]:
+                            raise TypeError(f"Parameter {info.name!r} does not accept a DomainTensor")
+                        continue
+                    if info.shape is None:
+                        # Scalar parameter (e.g. seq_len): forwarded as-is to the entry.
+                        tensors[info.name] = arg
+                        continue
+                    self._validate_prepared_dispatch_arg(info, arg)
+                    tensors[info.name] = arg
+
+                handle = DistributedRunHandle(
+                    self, None, frame, dispatch_id, postprocess, capture_directory=capture_directory
+                )
+                try:
+                    frame.handle = handle
+                    with self._dispatch_cv:
+                        self._active_dispatch_handles.add(handle)
+                except BaseException:
+                    self._discard_unsubmitted_dispatch_handle(handle, frame)
+                    raise
+
+                self._submit_native_dispatch(handle, frame, pass_state, tensors, pass_config)
+                return handle
             except BaseException:
-                self._discard_unsubmitted_dispatch_handle(handle, frame)
+                if frame.handle is None and frame.in_use:
+                    self._release_unpublished_dispatch_frame(frame)
                 raise
 
-            self._submit_native_dispatch(handle, frame, state, tensors, call_config)
-            return handle
-        except BaseException:
-            if frame.handle is None and frame.in_use:
-                self._release_unpublished_dispatch_frame(frame)
-            raise
+        if two_pass_swimlane:
+            assert config is not None
+            assert capture_directory is not None
+            _run_l3_swimlane_two_pass(
+                compiled._distributed_config,
+                config,
+                capture_directory,
+                lambda pass_config: submit_pass(pass_config).result(),
+            )
+            _collect_program_swimlane(compiled, capture_directory)
+            return DistributedRunHandle._completed(self, capture_directory=capture_directory)
+
+        if capture_directory is None:
+            return submit_pass(call_config)
+        return submit_pass(call_config, lambda: _collect_program_swimlane(compiled, capture_directory))
+
+    def _swimlane_capture_directory(self, dfx_base: Path, dispatch_id: int) -> Path:
+        """Start a session per output root and allocate one prefix for both passes."""
+        session_dir = dfx_base.resolve() / self._swimlane_session
+        if session_dir not in self._swimlane_session_dirs:
+            session_dir.mkdir(parents=True)
+            self._swimlane_session_dirs.add(session_dir)
+            # Other workers can profile into the same root. Only a worker that
+            # finished closing has released its captures for cleanup.
+            for marker in session_dir.parent.glob(f"session-*/{_CLOSED_SWIMLANE_SESSION}"):
+                if marker.is_file():
+                    shutil.rmtree(marker.parent, ignore_errors=True)
+        return session_dir / f"run-{dispatch_id:06d}"
+
+    def _close_swimlane_session(self) -> None:
+        for session_dir in self._swimlane_session_dirs:
+            try:
+                (session_dir / _CLOSED_SWIMLANE_SESSION).touch()
+            except OSError as exc:
+                logger.warning("Could not mark swimlane session %s for cleanup: %s", session_dir, exc)
 
     def _prepare_dispatch_config(
         self,
         compiled: DistributedCompiledProgram,
         config: RunConfig | None,
+        dispatch_id: int,
     ) -> tuple[Any, Path | None, bool]:
         """Snapshot one dispatch's runtime config after capacity admission."""
         if config is None:
             return _make_call_config(compiled._distributed_config), None, False
 
         dfx_base = _run_directory(compiled) / "dfx_outputs"
-        two_pass_swimlane = config.enable_chip_swimlane > 0 and not compiled.platform.endswith("sim")
+        capture_directory = None
+        if config.enable_chip_swimlane > 0:
+            capture_directory = self._swimlane_capture_directory(dfx_base, dispatch_id)
+        two_pass_swimlane = capture_directory is not None and not compiled.platform.endswith("sim")
         call_config = None
         if not two_pass_swimlane:
-            call_config = _make_call_config(compiled._distributed_config, config, dfx_base=dfx_base)
+            call_config = _make_call_config(
+                compiled._distributed_config, config, dfx_base=capture_directory or dfx_base
+            )
 
-        # This worker reuses one output_dir across dispatches, so stale
-        # ``rank*/d{k}`` dirs from an earlier, larger run must be cleared before
-        # this run rewrites ``d0, d1, ...``.
         if config.dfx_options().any():
-            # Every dispatch writes below the same output directory. Finish
-            # earlier work before clearing or repopulating those paths.
             self._drain_dispatch_handles()
-            _clear_dfx_dispatch_dirs(dfx_base)
-        return call_config, dfx_base, two_pass_swimlane
+            if capture_directory is None:
+                _clear_dfx_dispatch_dirs(dfx_base)
+        return call_config, capture_directory, two_pass_swimlane
 
     def _run_compiled(
         self, compiled: DistributedCompiledProgram, *args: Any, config: RunConfig | None = None
@@ -3227,12 +3436,13 @@ class DistributedWorker(Worker):
                     first_error = exc
 
     def close(self) -> None:
-        """Release runtime resources, retrying incomplete Worker cleanup."""
+        """Drain registered runs and release all worker-owned resources."""
         # Serialize the admission transition with submit() and prevent two
         # callers from running teardown concurrently.
-        with self._dispatch_submit_mu:
+        with self._domain_gate, self._dispatch_submit_mu:
             if self._close_complete or self._closing:
                 return
+            self._w.check_exports_retired()
             self._closing = True
             first_attempt = not self._closed
             if first_attempt:
@@ -3262,7 +3472,8 @@ class DistributedWorker(Worker):
 
                 # DeviceTensor frees use the still-live simpler control path.
                 try:
-                    self._close_owned_tensors()
+                    if not any(frame.abandoned for frame in self._dispatch_frames):
+                        self._close_owned_tensors()
                 except BaseException as exc:  # noqa: BLE001 - underlying worker still must close
                     first_error = self._remember_close_error(first_error, exc)
 
@@ -3270,25 +3481,43 @@ class DistributedWorker(Worker):
                 for handle in list(self._handles):
                     handle._mark_closed()
                 self._handles.clear()
-            try:
-                self._w.close()
-            except BaseException as exc:  # noqa: BLE001 - report after local teardown
-                first_error = self._remember_close_error(first_error, exc)
-            else:
-                self._close_complete = True
-            finally:
-                self._inherited_host_tensors = ()
-                self._inherited_host_spans = ()
-                with self._named_host_buffer_mu:
-                    self._named_host_buffers.clear()
-                self._persistent_domains_by_program.clear()
-                if self._close_complete:
-                    self._device_buffers.clear()
+            with self._domain_gate:
+                if not any(frame.abandoned for frame in self._dispatch_frames):
+                    first_error = self._free_external_domains(first_error)
+            first_error = self._close_native_worker(first_error)
             if first_error is not None:
                 raise first_error
         finally:
             with self._dispatch_submit_mu:
                 self._closing = False
+
+    def _close_native_worker(self, first_error: BaseException | None) -> BaseException | None:
+        """Confirm teardown before dropping resources of an unfenced run."""
+        try:
+            self._w.close()
+        except BaseException as exc:  # noqa: BLE001 - keep the first dispatch or teardown error
+            first_error = self._remember_close_error(first_error, exc)
+            if any(frame.abandoned for frame in self._dispatch_frames):
+                return first_error
+        else:
+            with self._domain_gate:
+                # Native teardown reclaimed abandoned run buffers. Drop their Python references
+                # without issuing per-run cleanup commands to a closed worker.
+                for frame in self._dispatch_frames:
+                    if frame.abandoned:
+                        frame.clear()
+                self._owned_tensors.clear()
+                first_error = self._free_external_domains(first_error, worker_closed=True)
+                self._close_complete = not (self._external_domains or self._external_cleanup)
+            self._close_swimlane_session()
+        self._inherited_host_tensors = ()
+        self._inherited_host_spans = ()
+        with self._named_host_buffer_mu:
+            self._named_host_buffers.clear()
+        self._persistent_domains_by_program.clear()
+        if self._close_complete:
+            self._device_buffers.clear()
+        return first_error
 
     def __enter__(self) -> DistributedWorker:
         return self
@@ -3323,8 +3552,87 @@ class DistributedWorker(Worker):
         Returns:
             A handle that owns the dispatch lifetime and cached outcome.
         """
-        with self._dispatch_submit_mu:
-            return self._submit_compiled(compiled, *args, config=config)
+        with self._domain_gate:
+            owners = {value._owner for value in args if isinstance(value, DomainTensor)}
+            self._wait_domain_uses(owners)
+            with self._dispatch_submit_mu:
+                return self._submit_compiled(compiled, *args, config=config)
+
+    def _wait_domain_uses(self, owners: set[CommDomain]) -> None:
+        if not owners:
+            return
+        for handle in self._domain_handles(owners):
+            handle.result()
+
+    def _domain_handles(self, owners: set[CommDomain]) -> list[DistributedRunHandle]:
+        with self._dispatch_cv:
+            return [
+                frame.handle
+                for frame in self._dispatch_frames
+                if frame.handle is not None and owners.intersection(frame.external_domains)
+            ]
+
+    def create_comm_domain(
+        self,
+        *,
+        members: Sequence[int],
+        buffers: Sequence[DomainBufferSpec],
+        memory_source: str = "device",
+        workspace_engines: Sequence[str] = (),
+        window_sources: Mapping[str, Sequence[BinaryIO | torch.Tensor]] | None = None,
+    ) -> CommDomain:
+        """Create and synchronously initialize a retained, worker-owned communication domain."""
+        with self._domain_gate:
+            self._require_open("create_comm_domain")
+            if self._closing:
+                raise RuntimeError("cannot create a communication domain while worker is closing")
+            error = self._drain_dispatch_handles()
+            if error is not None:
+                raise error
+            return allocate_external_domain(
+                self, members, buffers, memory_source, workspace_engines, window_sources
+            )
+
+    def _init_external_domains(self) -> None:
+        # This gate serializes control operations and submission admission. Completion
+        # callbacks use only _dispatch_cv and never need the control gate.
+        self._dispatch_submit_mu = threading.Lock()
+        self._domain_gate = threading.RLock()
+        self._external_domains: dict[Any, CommDomain] = {}
+        self._external_cleanup: set[CommDomain] = set()
+        self._next_external_domain = 0
+
+    def _free_external_domains(
+        self, first_error: BaseException | None, *, worker_closed: bool = False
+    ) -> BaseException | None:
+        for domain in set(self._external_domains.values()) | self._external_cleanup:
+            try:
+                if worker_closed:
+                    domain._after_worker_close()
+                else:
+                    domain._free()
+            except BaseException as exc:
+                first_error = self._remember_close_error(first_error, exc)
+            else:
+                if domain._ref is not None:
+                    self._external_domains.pop(domain._ref, None)
+                self._external_cleanup.discard(domain)
+        return first_error
+
+    def _release_external_domain(self, domain: CommDomain) -> None:
+        with self._domain_gate:
+            if domain._state is DomainState.RELEASED:
+                return
+            domain._state = DomainState.CLOSING
+            try:
+                self._wait_domain_uses({domain})
+            except BaseException:
+                if not self._domain_handles({domain}):
+                    domain._free()
+                    self._external_domains.pop(domain.ref, None)
+                raise
+            domain._free()
+            self._external_domains.pop(domain.ref, None)
 
     def run(
         self,

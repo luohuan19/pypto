@@ -1,5 +1,9 @@
 # Running on Device
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../dev/08-entry-points.md#legacy-platform-examples).
+
 Keeping data resident on a worker, dispatching explicitly, measuring, and running
 distributed programs.
 
@@ -192,6 +196,7 @@ def kernel(
         pl.store(pl.add(pl.load(x, [0, 0], [BLOCK, BLOCK]), scale), [0, 0], out)
     return out
 
+# Eager calls require pypto.torch.init() and NPU tensors x/out.
 kernel(x, out, scale=1.0, BLOCK=16)
 kernel(x, out, scale=2.0, BLOCK=16)   # same artifact — only the scalar changed
 kernel(x, out, scale=2.0, BLOCK=32)   # a second artifact
@@ -223,6 +228,7 @@ fixed configuration, and a closure factory still works for several. `constexpr`
 is for when the configuration belongs in the call:
 
 ```python
+# Eager calls require pypto.torch.init() and NPU tensors x/out.
 # Before: a factory per configuration, and callers juggle the kernel objects.
 def build(block: int):
     BLOCK = block
@@ -309,6 +315,14 @@ wall-clock window, *not* a partition: children may overlap (e.g. `orch`/`sched`
 run concurrently) or sit in a different clock domain (`runner_run` host wall vs
 `device_wall` on-NPU), so child durations need not sum to the parent. Drill into
 raw spans via `stats.invocations[i].by_name()[<name>].dur_us`.
+
+Legacy `chip.run.runner_run.device_boundaries` records use host-clock timestamps
+even when their attributes include `clk=dev`; they remain untagged in the tree.
+Setup-only trace groups, such as `chip.prewarm.build`, are excluded before
+discarding warmup launches, even when they share a callable hash with dispatches.
+L2 captures must then contain exactly `warmup + rounds` dispatches for the selected
+callable; otherwise `benchmark` raises `RuntimeError` before removing warmup,
+rather than returning partial or misaligned samples.
 
 `benchmark` also accepts an L3 `DistributedCompiledProgram` and opens its own
 prepared worker. Pass shared-memory host tensors; an externally allocated

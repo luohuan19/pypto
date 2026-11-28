@@ -37,7 +37,7 @@ Python::
     replay(
         "build_output/_jit_xxx/",
         a, b, c,
-        config=RunConfig(platform="a2a3sim", enable_pmu=2, enable_chip_swimlane=4),
+        config=RunConfig(enable_pmu=2, enable_chip_swimlane=4),
     )
 """
 
@@ -53,6 +53,7 @@ from typing import Any, cast
 
 import torch
 
+from pypto._target import _parse_platform
 from pypto.runtime._binary_cache import binary_context_lock, invalidate_binary_context
 from pypto.runtime.debug.pto_rebuild import rebuild_kernel_cpp_from_pto
 from pypto.runtime.device_tensor import DeviceTensor
@@ -117,8 +118,9 @@ def replay(
             contains ``kernel_config.py``, ``orchestration/`` and ``kernels/``.
             An L3 distributed build (``orchestration/host_orch.py`` +
             ``next_levels/{rank}/`` + ``distributed_meta.json``) is detected
-            automatically and dispatched via
-            :meth:`~pypto.ir.DistributedCompiledProgram.from_dir`.
+            automatically. ``replay()`` rejects builds that declare external communication
+            windows. Load those builds with :meth:`~pypto.ir.DistributedCompiledProgram.from_dir`,
+            recreate the domains on a prepared DistributedWorker, and pass ``domain.tensor(name)``.
         *tensors: Positional ``torch.Tensor`` (host), :class:`DeviceTensor`,
             or ctypes scalar arguments matching the orchestration entry's
             parameter order. Outputs are written in-place into the
@@ -170,6 +172,25 @@ def replay(
             f"(missing kernel_config.py and orchestration/host_orch.py)"
         )
 
+    compiled = None
+    if is_l3:
+        # L3: reconstruct the distributed program from the build dir and dispatch
+        # via simpler Worker(level=3); per-dispatch ring and DFX settings are
+        # forwarded through its CallConfig.
+        from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+            DistributedCompiledProgram,
+        )
+
+        compiled = DistributedCompiledProgram.from_dir(
+            work_dir, backend_type=config.backend_type, execution_mode=config.execution_mode
+        )
+        if any(p.is_distributed for p in compiled._get_metadata()[0]):
+            raise ValueError(
+                "replay() cannot bind external communication windows. Load the program with from_dir(), "
+                "recreate their domains and sources on a prepared DistributedWorker, "
+                "and pass domain.tensor(name)."
+            )
+
     named_tensors: list[tuple[str, torch.Tensor]] | None = None
     golden_module = None
     if validate:
@@ -203,15 +224,7 @@ def replay(
         print("[cpp->.so] skipped forced invalidation; compatibility checks still apply (recompile=False)")
 
     print("[execute] running on device...")
-    if is_l3:
-        # L3: reconstruct the distributed program from the build dir and dispatch
-        # via simpler Worker(level=3); per-dispatch ring and DFX settings are
-        # forwarded through its CallConfig.
-        from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
-            DistributedCompiledProgram,
-        )
-
-        compiled = DistributedCompiledProgram.from_dir(work_dir, platform=config.platform)
+    if compiled is not None:
         compiled(*tensors, config=config)
     else:
         _execute_compiled(
@@ -411,9 +424,10 @@ def _main(
         tensors = [v for _, v in _load_named_inputs_from_golden(args.work_dir)]
         do_validate = args.validate
 
+    backend_type, execution_mode = _parse_platform(args.platform)
     config = RunConfig(
-        # InitVar cannot coexist with the same-named read property; see RunConfig.
-        platform=args.platform,
+        backend_type=backend_type,
+        execution_mode=execution_mode,
         device_id=args.device_id,
         enable_pmu=args.pmu,
         enable_chip_swimlane=(args.swimlane_level if args.swimlane_level is not None else args.swimlane),

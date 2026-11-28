@@ -1,0 +1,41 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+/**
+ * @file backend_910_ops.cpp
+ * @brief Backend op registration for Backend910
+ *
+ * Registers all standard PTO ops to the 910 backend by delegating
+ * to the shared RegisterPTOOps() function. To override specific ops for
+ * this backend, register them before calling RegisterPTOOps() and pass
+ * the op names in the exclude_ops set.
+ */
+
+#include "pypto/backend/910/backend_910.h"
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/pto_ops_common.h"
+
+namespace pypto {
+namespace backend {
+
+static const bool kOpsRegistered = [] {
+  RegisterSelectOps(Backend910::Instance(), BackendType::Ascend910);
+  RegisterCastOps(Backend910::Instance(), BackendType::Ascend910);
+  // Only the A5 backend exposes these MX operations and row-wise dequantization.
+  RegisterPTOOps(Backend910::Instance(),
+                 {"tile.matmul_mx", "tile.matmul_mx_acc", "tile.matmul_mx_bias", "tile.gemv_mx",
+                  "tile.gemv_mx_acc", "tile.gemv_mx_bias", "tile.bind_scale_addr", "tile.extract_into",
+                  "tile.tget_scale_addr", "tile.tquant_mx_raw", "tile.tmov_x2zz", "tile.dequant"});
+  return true;
+}();
+
+}  // namespace backend
+}  // namespace pypto

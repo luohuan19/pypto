@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import pypto.language as pl
 import pytest
-from pypto import DataType, ir
+from pypto import DataType, codegen, ir
 from pypto.language.parser.diagnostics import ParserTypeError
 from pypto.language.parser.expr_evaluator import ExprEvaluator
 from pypto.language.parser.type_resolver import TypeResolver
@@ -161,6 +161,12 @@ class TestTypeResolver:
             result = resolver.resolve_dtype(node)
             assert result == expected
 
+    @pytest.mark.parametrize("annotation", ["pl.fp4", "pl.FP4", "DataType.FP4", "fp4", "FP4"])
+    def test_removed_fp4_dtype_is_rejected(self, annotation):
+        resolver = _make_resolver()
+        with pytest.raises(ParserTypeError, match="Unknown (dtype|DataType)"):
+            resolver.resolve_dtype(ast.parse(annotation, mode="eval").body)
+
     def test_resolve_invalid_dtype(self):
         """Test error on invalid dtype."""
         resolver = _make_resolver()
@@ -287,6 +293,105 @@ class TestTypeResolver:
             enable_auto_mapping=True,
         )
 
+    def test_compact_metadata_survives_syntax_normalization(self):
+        """A non-default compact mode is semantic, not elidable metadata.
+
+        ``_normalize_type_for_syntax_match`` drops a TileView only when every
+        field equals the implicit default. ``compact`` participates in that
+        decision: dropping it would make a compact tile compare equal to an
+        ordinary one, silently accepting a rebind between different layouts.
+        """
+        from pypto.language.typing.type_utils import (  # noqa: PLC0415 - regression seam
+            _normalize_type_for_syntax_match,
+            _types_match,
+        )
+
+        compact = ir.TileType(
+            [32, 32],
+            DataType.INT8,
+            tile_view=ir.TileView(valid_shape=[32, 16], compact=ir.CompactMode.normal),
+            memory_space=ir.MemorySpace.Right,
+        )
+        ordinary = ir.TileType(
+            [32, 32],
+            DataType.INT8,
+            tile_view=ir.TileView(valid_shape=[32, 16]),
+            memory_space=ir.MemorySpace.Right,
+        )
+
+        normalized = _normalize_type_for_syntax_match(compact)
+        assert isinstance(normalized, ir.TileType)
+        assert normalized.tile_view is not None
+        assert normalized.tile_view.compact == ir.CompactMode.normal
+        assert not _types_match(compact, ordinary)
+
+    def test_scale_memory_spaces_use_the_single_default_table(self):
+        """Every memory space resolves its implicit defaults through one table.
+
+        The TileView elision check used a private copy of the space→layout
+        table that omitted the MX scale spaces, so an omitted layout in
+        ``pl.Mem.LeftScale`` / ``pl.Mem.RightScale`` compared against the bare
+        defaults instead of the scale defaults.
+        """
+        from pypto.language.typing.type_utils import (  # noqa: PLC0415 - regression seam
+            _has_printable_tile_view,
+            implicit_tile_view_defaults,
+        )
+
+        shape = [ir.ConstInt(32, DataType.INDEX, ir.Span.unknown())] * 2
+        for space in (ir.MemorySpace.LeftScale, ir.MemorySpace.RightScale):
+            blayout, slayout, fractal = implicit_tile_view_defaults(shape, space)
+            assert fractal == 32
+            default_view = ir.TileView(blayout=blayout, slayout=slayout, fractal=fractal)
+            assert not _has_printable_tile_view(default_view, shape, space)
+            assert _has_printable_tile_view(ir.TileView(fractal=0), shape, space)
+
+    @pytest.mark.parametrize("shape", [(1, 32), (32, 1)])
+    def test_scaling_layout_defaults_round_trip(self, shape):
+        """Check Scaling defaults for both singleton axes. Partial valid_shape keeps the view printable."""
+        valid = [max(1, extent // 2) for extent in shape]
+        annotation = f"pl.Tile[{list(shape)}, pl.UINT64, pl.Mem.Scaling, pl.TileView(valid_shape={valid})]"
+        resolved = _make_resolver().resolve_type(ast.parse(annotation, mode="eval").body)
+        assert isinstance(resolved, ir.TileType) and resolved.tile_view is not None
+        view = resolved.tile_view
+        assert (view.blayout, view.slayout) == (ir.TileLayout.row_major, ir.TileLayout.none_box)
+        printed = ir.python_print_type(resolved)
+        assert "valid_shape=" in printed and "blayout=" not in printed and "slayout=" not in printed
+        reparsed = _make_resolver().resolve_type(ast.parse(printed, mode="eval").body)
+        assert isinstance(reparsed, ir.TileType)
+        ir.assert_structural_equal(resolved, reparsed)
+
+    def test_types_match_ignores_memref_identity_through_one_seam(self):
+        """The shared type comparison keeps the parser's memref exclusion.
+
+        The parser's historical semantics stripped ``memref`` metadata before
+        comparing (the Var, not the Call, carries the authoritative memref via
+        ``override_type``); the tracing lane must not diverge, so both
+        frontends compare through the one shared seam, which strips it.
+        """
+        from pypto.language.parser.type_semantics import types_match  # noqa: PLC0415 - regression seam
+        from pypto.language.typing.type_utils import _types_match  # noqa: PLC0415 - regression seam
+
+        assert types_match is _types_match  # one implementation, two spellings
+
+        left_alloc = ir.MemRef("a", 0, 1024)
+        right_alloc = ir.MemRef("b", 0, 1024)
+        tensor_lhs = ir.TensorType([32, 32], DataType.FP16, left_alloc)
+        tensor_rhs = ir.TensorType([32, 32], DataType.FP16, right_alloc)
+        assert _types_match(tensor_lhs, tensor_rhs)
+        assert types_match(tensor_lhs, tensor_rhs)
+
+        tile_lhs = ir.TileType([32, 32], DataType.FP16, left_alloc, None, ir.MemorySpace.Vec)
+        tile_rhs = ir.TileType([32, 32], DataType.FP16, right_alloc, None, ir.MemorySpace.Vec)
+        assert _types_match(tile_lhs, tile_rhs)
+        assert types_match(tile_lhs, tile_rhs)
+
+        # The exclusion is memref-only: a real value difference still differs.
+        other_shape = ir.TensorType([32, 16], DataType.FP16, left_alloc)
+        other_dtype = ir.TileType([32, 32], DataType.FP32, left_alloc, None, ir.MemorySpace.Vec)
+        assert not _types_match(tensor_lhs, other_shape)
+        assert not _types_match(tile_lhs, other_dtype)
+
     @pytest.mark.parametrize("annotation", _DEFAULT_TILEVIEW_ANNOTATIONS)
     def test_tile_type_text_roundtrip_is_stable_after_canonicalization(self, annotation: str):
         """Once canonicalized, the printed tile type should parse and print stably."""
@@ -384,6 +489,30 @@ class TestTypeResolver:
         )
         with pytest.raises(ParserTypeError, match="must be an index expression"):
             resolver.resolve_type(ast.parse(annotation, mode="eval").body)
+
+
+@pytest.mark.parametrize("composite", [False, True])
+@pytest.mark.parametrize(
+    "result_type",
+    [
+        "pl.Scalar[pl.FP32]",
+        "pl.Scalar[pl.BOOL]",
+        "pl.Tensor[[1], pl.FP32]",
+        "pl.Tile[[1], pl.FP32, pl.Mem.Vec]",
+        "pl.Tuple[pl.Scalar[pl.INDEX]]",
+    ],
+)
+def test_shape_recorded_call_rejects_non_integer_result(result_type, composite):
+    """A restored Call is admissible as a shape only with an integer scalar type."""
+    call = f'pl._dump.call("tensor.dim", [x, pl.const(0, pl.INDEX)], {result_type})'
+    dim = f"{call} * pl.const(2, pl.INDEX)" if composite else call
+    source = f"""
+@pl.function
+def kernel(x: pl.Tensor[[8, 32], pl.FP32], y: pl.Tensor[[{dim}, 16], pl.FP32]):
+    return y
+"""
+    with pytest.raises(ParserTypeError, match="Shape dimension must be an integer scalar"):
+        pl.parse(source)
 
 
 class TestTupleTypeResolver:
@@ -2255,6 +2384,320 @@ class TestTensorViewIntegration:
         assert tv.valid_shape[0].value == 8
         assert isinstance(tv.valid_shape[1], ir.Var)
         assert tv.valid_shape[1].name_hint == "valid_n"
+
+
+@pytest.mark.parametrize(
+    "annotation,dtype,kind",
+    [
+        ("pl.Reg[64, pl.FP32]", DataType.FP32, "VecReg"),
+        ("pl.Reg[64, pl.INT32, pl.RegKind.VecReg]", DataType.INT32, "VecReg"),
+        ("pl.Reg[64, pl.BOOL, pl.RegKind.MaskReg]", DataType.BOOL, "MaskReg"),
+    ],
+)
+def test_reg_annotation(annotation, dtype, kind):
+    resolver = _make_resolver({"pl": pl})
+    result = resolver.resolve_type(ast.parse(annotation, mode="eval").body)
+    assert isinstance(result, ir.RegType)
+    assert result.shape == 64
+    assert result.dtype == dtype
+    assert result.kind == getattr(ir.RegKind, kind)
+    runtime = pl.Reg.__class_getitem__((64, dtype, getattr(pl.RegKind, kind)))
+    ir.assert_structural_equal(result, runtime)
+
+
+@pytest.mark.parametrize("shape", ["[64]", "True", "0", "-1", "1.5"])
+def test_reg_annotation_rejects_invalid_shape(shape):
+    resolver = _make_resolver({"pl": pl})
+    with pytest.raises((ParserTypeError, TypeError, ValueError)):
+        resolver.resolve_type(ast.parse(f"pl.Reg[{shape}, pl.FP32]", mode="eval").body)
+
+
+def test_reg_runtime_annotation_defaults_to_vector():
+    assert isinstance(pl.Reg[64, pl.FP32], ir.RegType)
+    with pytest.raises(TypeError, match="static positive integer"):
+        pl.Reg[True, pl.FP32]
+
+
+def test_canonical_reg_annotation_resolves_without_captured_module():
+    annotation = ast.parse("pl.Reg[64, pl.BOOL, pl.RegKind.MaskReg]", mode="eval").body
+    result = _make_resolver().resolve_type(annotation)
+    assert isinstance(result, ir.RegType)
+    assert result.kind == ir.RegKind.MaskReg
+
+
+@pytest.mark.parametrize("text", ["pl._dump.UReg", "pl._dump.SqueezeStore", "pl.SqueezeStoreType"])
+def test_ureg_annotation_resolves_from_current_and_legacy_dumps(text):
+    annotation = ast.parse(text, mode="eval").body
+    resolved = _make_resolver().resolve_type(annotation)
+    assert isinstance(resolved, ir.RegType)
+    ir.assert_structural_equal(resolved, ir.RegType.ureg())
+
+
+def test_ureg_annotation_rejects_lanes_and_dtype():
+    annotation = ast.parse("pl.Reg[64, pl.FP32, pl.RegKind.UReg]", mode="eval").body
+    with pytest.raises(ParserTypeError, match="no lanes or dtype"):
+        _make_resolver().resolve_type(annotation)
+
+
+@pytest.mark.parametrize("shape_expr", ["SHAPE", "[SHAPE[0], 16]"])
+@pytest.mark.parametrize("initialized", [False, True])
+def test_shape_alias_uses_local_dynamic_binding(shape_expr, initialized):
+    """A captured container must not retain another function's dimension Var."""
+    B = pl.dynamic("B")
+    original = ir.Var("B", ir.ScalarType(DataType.INDEX), ir.Span.unknown()) if initialized else None
+    B._ir_var = original
+    resolver = _make_resolver({"SHAPE": [B, 16]})
+    local = ir.Var("B", ir.ScalarType(DataType.INDEX), ir.Span.unknown())
+    resolver.bind_local_dynamic_symbol("B", local)
+    ty = resolver.resolve_type(ast.parse(f"pl.Tensor[{shape_expr}, pl.FP32]", mode="eval").body)
+    assert isinstance(ty, ir.TensorType)
+    assert ty.shape[0].same_as(local)
+    assert B._ir_var is original
+
+
+@pytest.mark.parametrize("symbol_name", ["B", "rows"])
+def test_shape_alias_shadowing_is_local_to_each_function(symbol_name):
+    # The Python alias and DynVar name need not match. An earlier function
+    # populates the shared cache before the scalar parameter shadows the alias.
+    B = pl.dynamic(symbol_name)
+    SHAPE = [B, 16]
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def first(self, x: pl.Tensor[SHAPE, pl.FP32]) -> pl.Tensor[SHAPE, pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def second(self, B: pl.Scalar[pl.INDEX], x: pl.Tensor[SHAPE, pl.FP32]) -> pl.Tensor[SHAPE, pl.FP32]:
+            return x
+
+    first = Program.get_function("first")
+    second = Program.get_function("second")
+    assert first is not None and second is not None
+    first_type = first.params[0].type
+    second_type = second.params[1].type
+    return_type = second.return_types[0]
+    assert isinstance(first_type, ir.TensorType)
+    assert isinstance(second_type, ir.TensorType)
+    assert isinstance(return_type, ir.TensorType)
+    assert B._ir_var is not None
+    assert second_type.shape[0].same_as(second.params[0])
+    assert return_type.shape[0].same_as(second.params[0])
+    assert first_type.shape[0].same_as(B._ir_var)
+    assert not B._ir_var.same_as(second.params[0])
+    assert codegen.collect_tensor_shape_dyn_vars(second) == []
+
+
+@pytest.mark.parametrize("symbol_name", ["D", "B"])
+def test_dynamic_alias_shadow_matches_body_tensor_shape(symbol_name):
+    """Direct annotations and tensor construction must share the local scalar."""
+    D = pl.dynamic(symbol_name)
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.Opaque)
+        def first(self, x: pl.Tensor[[D, 16], pl.FP32]) -> pl.Tensor[[D, 16], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Opaque)
+        def second(
+            self, D: pl.Scalar[pl.INDEX], x: pl.Tensor[[D, 16], pl.FP32]
+        ) -> pl.Tensor[[D, 16], pl.FP32]:
+            other = pl.create_tensor([D, 16], dtype=pl.FP32)
+            result = pl.add(x, other)
+            return result
+
+    first = Program.get_function("first")
+    second = Program.get_function("second")
+    assert first is not None and second is not None
+    first_type = first.params[0].type
+    second_type = second.params[1].type
+    assert isinstance(first_type, ir.TensorType)
+    assert isinstance(second_type, ir.TensorType)
+    assert second_type.shape[0].same_as(second.params[0])
+    assert not first_type.shape[0].same_as(second.params[0])
+    assert codegen.collect_tensor_shape_dyn_vars(second) == []
+    for stmt in _body_assigns(second):
+        assert isinstance(stmt.var.type, ir.TensorType)
+        assert stmt.var.type.shape[0].same_as(second.params[0])
+
+
+@pytest.mark.parametrize("symbol_name", ["B", "rows"])
+@pytest.mark.parametrize("extent", ["SHAPE[0] * 2", "(SHAPE[0] + 15) // 16 * 16", "-SHAPE[0] + 128"])
+def test_compound_shape_alias_uses_local_scalar(symbol_name, extent):
+    """Evaluated compound aliases must agree with shapes constructed in the body."""
+    body_extent = extent.replace("SHAPE[0]", "B")
+    program = pl.parse(f'''import pypto.language as pl
+B = pl.dynamic("{symbol_name}")
+SHAPE = [B, 16]
+@pl.program
+class Program:
+    @pl.function(type=pl.FunctionType.Opaque)
+    def first(self, x: pl.Tensor[SHAPE, pl.FP32]) -> pl.Tensor[SHAPE, pl.FP32]:
+        return x
+
+    @pl.function(type=pl.FunctionType.Opaque)
+    def second(
+        self,
+        B: pl.Scalar[pl.INDEX],
+        x: pl.Tensor[[{extent}, 16], pl.FP32],
+    ) -> pl.Tensor[[{extent}, 16], pl.FP32]:
+        other = pl.create_tensor([{body_extent}, 16], dtype=pl.FP32)
+        result = pl.add(x, other)
+        return result
+
+    @pl.function(type=pl.FunctionType.Opaque)
+    def third(self, x: pl.Tensor[[{extent}, 16], pl.FP32]) -> pl.Tensor[[{extent}, 16], pl.FP32]:
+        return x
+''')
+    assert isinstance(program, ir.Program)
+    first = program.get_function("first")
+    second = program.get_function("second")
+    assert first is not None and second is not None
+    first_type = first.params[0].type
+    assert isinstance(first_type, ir.TensorType)
+    original = first_type.shape[0]
+    assert isinstance(original, ir.Var)
+    local_ids = {second.params[0].unique_id}
+    assert original.unique_id not in local_ids
+    third = program.get_function("third")
+    assert third is not None
+    third_type = third.params[0].type
+    assert isinstance(third_type, ir.TensorType)
+    assert {v.unique_id for v in codegen.collect_vars_from_shape_expr(third_type.shape[0])} == {
+        original.unique_id
+    }
+    types = [second.params[1].type, second.return_types[0], *[s.var.type for s in _body_assigns(second)]]
+    for ty in types:
+        assert isinstance(ty, ir.TensorType)
+        assert {v.unique_id for v in codegen.collect_vars_from_shape_expr(ty.shape[0])} == local_ids
+    assert codegen.collect_tensor_shape_dyn_vars(second) == []
+
+
+def test_local_shadow_keeps_unrelated_dynamic_symbols_shared():
+    """A fresh DynVar returned by a helper must still be interned program-wide."""
+    B = pl.dynamic("B")
+
+    def fresh_shape():
+        return [pl.dynamic("E"), 16]
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.Opaque)
+        def first(
+            self, B: pl.Scalar[pl.INDEX], x: pl.Tensor[fresh_shape(), pl.FP32]
+        ) -> pl.Tensor[fresh_shape(), pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Opaque)
+        def second(self, x: pl.Tensor[fresh_shape(), pl.FP32]) -> pl.Tensor[fresh_shape(), pl.FP32]:
+            return self.first(pl.const(1, pl.INDEX), x)
+
+    first = Program.get_function("first")
+    second = Program.get_function("second")
+    assert first is not None and second is not None
+    first_type = first.params[1].type
+    second_type = second.params[0].type
+    assert isinstance(first_type, ir.TensorType)
+    assert isinstance(second_type, ir.TensorType)
+    assert first_type.shape[0].same_as(second_type.shape[0])
+    assert B._ir_var is None
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+@pytest.mark.parametrize("symbol_name", ["D", "rows"])
+def test_late_shadow_checks_cached_dynamic_alias(symbol_name, initialized):
+    """A fresh or stale alias cannot shadow a symbol already used by a parameter."""
+    original = pl.dynamic(symbol_name)
+    D = pl.dynamic(symbol_name)
+    if initialized:
+        D.unwrap()
+
+    with pytest.raises(ParserTypeError, match="earlier parameter"):
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.Opaque)
+            def first(self, x: pl.Tensor[[original, 16], pl.FP32]):
+                return x
+
+            @pl.function(type=pl.FunctionType.Opaque)
+            def second(self, x: pl.Tensor[[D, 16], pl.FP32], D: pl.Scalar[pl.INDEX]):
+                return x
+
+
+def test_unshadowed_cached_alias_stays_canonical_in_compound_shapes():
+    """A shared-cache hit must also keep later DynVar arithmetic on that symbol."""
+    span = ir.Span.unknown()
+    original = ir.Var("E", ir.ScalarType(DataType.INDEX), span)
+    alias = pl.dynamic("E")
+    resolver = TypeResolver(ExprEvaluator({"Alias": alias}), dyn_var_cache={"E": original})
+    resolver.bind_local_dynamic_symbol("B", ir.Var("B", ir.ScalarType(DataType.INDEX), span))
+    bare = resolver.resolve_type(ast.parse("pl.Tensor[[Alias, 16], pl.FP32]", mode="eval").body)
+    compound = resolver.resolve_type(ast.parse("pl.Tensor[[Alias * 2, 16], pl.FP32]", mode="eval").body)
+    assert isinstance(bare, ir.TensorType)
+    assert isinstance(compound, ir.TensorType)
+    assert bare.shape[0].same_as(original)
+    assert {v.unique_id for v in codegen.collect_vars_from_shape_expr(compound.shape[0])} == {
+        original.unique_id
+    }
+
+
+@pytest.mark.parametrize("symbol_name", ["D", "B"])
+@pytest.mark.parametrize("initialized", [False, True])
+def test_body_dynamic_alias_does_not_leak_local_parameter(symbol_name, initialized):
+    """Reading a distinct same-name alias must not mutate it to a local parameter."""
+    D = pl.dynamic(symbol_name)
+    E = pl.dynamic(symbol_name)
+    if initialized:
+        E.unwrap()
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.Opaque)
+        def first(self, x: pl.Tensor[[E, 16], pl.FP32]):
+            return x
+
+        @pl.function(type=pl.FunctionType.Opaque)
+        def second(self, D: pl.Scalar[pl.INDEX], x: pl.Tensor[[E, 16], pl.FP32]):
+            other = pl.create_tensor([E, 16], dtype=pl.FP32)
+            return pl.add(x, other)
+
+        @pl.function(type=pl.FunctionType.Opaque)
+        def third(self, x: pl.Tensor[[D, 16], pl.FP32]):
+            other = pl.create_tensor([E, 16], dtype=pl.FP32)
+            return pl.add(x, other)
+
+    first = Program.get_function("first")
+    second = Program.get_function("second")
+    third = Program.get_function("third")
+    assert first is not None and second is not None and third is not None
+    first_type = first.params[0].type
+    assert isinstance(first_type, ir.TensorType)
+    original = first_type.shape[0]
+    assert E._ir_var is not None and E._ir_var.same_as(original)
+    for func, expected in [(second, second.params[0]), (third, original)]:
+        for stmt in _body_assigns(func):
+            assert isinstance(stmt.var.type, ir.TensorType)
+            assert stmt.var.type.shape[0].same_as(expected)
+    assert codegen.collect_tensor_shape_dyn_vars(second) == []
+
+
+def test_moved_type_helpers_keep_their_parser_spellings():
+    """A name that moved to the shared seam stays importable from the parser path.
+
+    ``type_semantics`` used to define the shape/view family itself, so both the
+    frontends in this repository and any downstream importer reach it by this
+    path. Re-exposing the seam's implementation keeps one implementation and no
+    broken imports; importing the private seam name directly would do neither.
+    """
+    from pypto.language.parser import type_semantics  # noqa: PLC0415 - regression seam
+    from pypto.language.typing import type_utils  # noqa: PLC0415 - regression seam
+
+    assert type_semantics.has_printable_tile_view is type_utils._has_printable_tile_view
+    assert type_semantics.shape_has_symbolic_dim is type_utils._shape_has_symbolic_dim
+    assert type_semantics.simplify_shape_dims is type_utils._simplify_shape_dims
 
 
 if __name__ == "__main__":

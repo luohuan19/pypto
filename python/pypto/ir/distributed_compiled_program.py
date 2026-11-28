@@ -16,48 +16,68 @@ through simpler's distributed runtime (Worker level=3)::
     compiled(a, b, c)   # executes via simpler Worker(level=3)
 """
 
+import hashlib
+import json
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeGuard
+from typing import TYPE_CHECKING, Any, BinaryIO, TypeGuard
 
 import torch
 
 from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
+from pypto._target import (
+    ExecutionMode,
+    _parse_platform,
+    _platform_string,
+    _resolve_target,
+    _warn_deprecated_platform,
+)
 from pypto.backend import BackendType
 from pypto.pypto_core.ir import ParamDirection, Program, Role, level_to_linqu_level
 from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 
-from .compiled_program import (
+from ._artifact_metadata import (
     _DISTRIBUTED_META_FILENAME,
+    _drop_foreign_build_markers,
+    _load_meta,
+    _meta_error,
+    _remove_meta,
+    _write_meta_atomically,
+)
+from .compiled_program import (
     CallArg,
     _default_platform,
-    _drop_foreign_build_markers,
     _extract_func_param_infos,
     _extract_param_infos,
     _is_int_list,
-    _load_meta,
-    _meta_error,
     _param_info_to_dict,
     _ParamInfo,
-    _remove_meta,
+    _reload_platform,
     _to_torch_dtype,
     _write_debug_runner,
-    _write_meta_atomically,
 )
-from .param_info import bind_complete_args
+from .param_info import bind_complete_args, collect_output_values
 
 # The sidecar filename itself lives beside its L2 counterpart in
-# ``compiled_program`` (both feed the build-kind marker table there) and is
+# ``_artifact_metadata`` (both feed the build-kind marker table there) and is
 # re-exported here, where the rest of the L3 metadata contract lives. Bump
 # ``_META_SCHEMA`` on any incompatible format change.
 _META_SCHEMA = 3
+_EXTERNAL_META_SCHEMA = 4
 
 if TYPE_CHECKING:
     from pypto.runtime._artifact_runtime import ArtifactRuntime
     from pypto.runtime.distributed_runner import DistributedWorker, ReadOnlyHostTensor
     from pypto.runtime.runner import RunConfig
+
+
+def _host_entry_digest(entry: Path, params: list[_ParamInfo]) -> str:
+    """Bind the generated HOST entry to the ordered public signature used at submission."""
+    digest = hashlib.sha256(entry.read_bytes())
+    digest.update(json.dumps([_param_info_to_dict(p) for p in params], sort_keys=True).encode())
+    return digest.hexdigest()
 
 
 @dataclass
@@ -124,7 +144,7 @@ def _distributed_config_from_dict(meta: dict[str, Any], meta_path: Path) -> Dist
     """Rebuild the :class:`DistributedConfig` a sidecar recorded.
 
     Validated like every other sidecar field (see
-    :func:`~pypto.ir.compiled_program._load_meta`): the block must be an object
+    :func:`~pypto.ir._artifact_metadata._load_meta`): the block must be an object
     keyed only by ``DistributedConfig`` fields, each correctly typed. A
     hand-edited ``device_ids`` therefore fails here, naming the file, instead of
     reaching ``DistributedConfig(**raw)`` as a raw ``TypeError`` or surfacing
@@ -185,7 +205,9 @@ class DistributedCompiledProgram:
 
     **One-shot dispatch**::
 
-        compiled = ir.compile(MyProgram, platform="a2a3", distributed_config=dc)
+        from pypto.runtime import ExecutionMode
+
+        compiled = ir.compile(MyProgram, execution_mode=ExecutionMode.ONBOARD, distributed_config=dc)
         compiled(host_inputs, host_outputs)   # blocks until all ranks finish
 
     **Persistent dispatch** (repeated launches without re-registering)::
@@ -204,8 +226,9 @@ class DistributedCompiledProgram:
         program: Program | None,
         output_dir: str,
         *,
-        backend_type: BackendType = BackendType.Ascend910B,
+        backend_type: BackendType = BackendType.Ascend910,
         platform: str | None = None,
+        execution_mode: ExecutionMode | None = None,
         distributed_config: DistributedConfig | None = None,
         _param_infos: list[_ParamInfo] | None = None,
         _output_indices: list[int] | None = None,
@@ -227,7 +250,11 @@ class DistributedCompiledProgram:
         self._program = program
         self._output_dir = Path(output_dir).resolve()
         self._backend_type = backend_type
-        self._platform = platform or _default_platform(backend_type)
+        self._platform = (
+            platform or _default_platform(backend_type)
+            if execution_mode is None
+            else _platform_string(*_resolve_target(backend_type, execution_mode, platform))
+        )
         self._distributed_config = distributed_config or DistributedConfig()
         self._param_infos = _param_infos
         self._output_indices = _output_indices
@@ -245,7 +272,10 @@ class DistributedCompiledProgram:
                 self._output_dir, keep=(_DISTRIBUTED_META_FILENAME, "orchestration/host_orch.py")
             )
             self._persist_metadata()
-            _write_debug_runner(self._output_dir, self._platform, self._get_metadata)
+            if not any(p.is_distributed for p in self._param_infos or ()):
+                _write_debug_runner(self._output_dir, self._platform, self._get_metadata)
+            else:
+                (self._output_dir / "debug" / "run.py").unlink(missing_ok=True)
 
     def _persist_metadata(self) -> None:
         """Write ``<output_dir>/distributed_meta.json`` for :meth:`from_dir`.
@@ -286,6 +316,11 @@ class DistributedCompiledProgram:
                 "aicpu_thread_num": dc.aicpu_thread_num,
             },
         }
+        if any(p.is_distributed for p in param_infos):
+            meta["schema"] = _EXTERNAL_META_SCHEMA
+            meta["entry_digest"] = _host_entry_digest(
+                self._output_dir / "orchestration" / "host_orch.py", param_infos
+            )
         _write_meta_atomically(self._output_dir / _DISTRIBUTED_META_FILENAME, meta)
 
     @classmethod
@@ -295,6 +330,7 @@ class DistributedCompiledProgram:
         *,
         platform: str | None = None,
         backend_type: BackendType | None = None,
+        execution_mode: ExecutionMode | None = None,
         distributed_config: DistributedConfig | None = None,
     ) -> "DistributedCompiledProgram":
         """Reconstruct a distributed program from an existing ``build_output/`` dir.
@@ -309,11 +345,15 @@ class DistributedCompiledProgram:
             output_dir: A build directory produced by a prior ``ir.compile`` of
                 a distributed (L3+) program. Must contain
                 ``distributed_meta.json``.
-            platform: Override the persisted platform (e.g. swap ``a2a3sim`` →
+            platform: Deprecated; use backend_type and execution_mode.
+                Override the persisted platform (e.g. swap ``a2a3sim`` →
                 ``a2a3`` to replay on hardware). ``None`` keeps the persisted
                 value.
+            execution_mode: Override the execution mode, retaining the persisted
+                backend unless backend_type is also supplied.
             backend_type: Override the persisted codegen backend. ``None`` keeps
-                the persisted value.
+                the persisted value. An override retains the saved execution mode
+                unless execution_mode or a legacy platform is also supplied.
             distributed_config: Override the persisted run config (e.g. to
                 replay on a different set of ``device_ids``). ``None`` rebuilds
                 the :class:`DistributedConfig` recorded at compile time.
@@ -328,6 +368,8 @@ class DistributedCompiledProgram:
             ValueError: ``distributed_meta.json`` is unreadable, malformed, or
                 records a ``schema`` version incompatible with this pypto build.
         """
+        if platform is not None:
+            _warn_deprecated_platform("DistributedCompiledProgram.from_dir")
         meta_path = Path(output_dir).resolve() / _DISTRIBUTED_META_FILENAME
         if not meta_path.exists():
             raise FileNotFoundError(
@@ -339,8 +381,33 @@ class DistributedCompiledProgram:
         # JSON, bad params, a ``backend_type`` naming a class attribute instead
         # of an enum member -- surfaces as one ValueError naming the file and
         # the recompile fix, rather than whichever internal exception it raised.
-        meta = _load_meta(meta_path, filename=_DISTRIBUTED_META_FILENAME, schema=_META_SCHEMA)
+        meta = _load_meta(
+            meta_path, filename=_DISTRIBUTED_META_FILENAME, schema=(_META_SCHEMA, _EXTERNAL_META_SCHEMA)
+        )
+        platform = _reload_platform(
+            meta["backend_type"],
+            meta["platform"],
+            backend_type=backend_type,
+            execution_mode=execution_mode,
+            platform=platform,
+        )
         param_infos = meta["param_infos"]
+        raw = meta["raw"]
+        entry = meta_path.parent / "orchestration" / "host_orch.py"
+        external = any(p.is_distributed for p in param_infos)
+        if raw["schema"] == _EXTERNAL_META_SCHEMA:
+            if (
+                not external
+                or not entry.is_file()
+                or raw.get("entry_digest") != _host_entry_digest(entry, param_infos)
+            ):
+                raise ValueError("External window parameter metadata disagrees with the generated HOST entry")
+        elif (
+            external
+            or "entry_digest" in raw
+            or (entry.is_file() and "\n_PYPTO_WINDOW_REQUIREMENTS = " in entry.read_text())
+        ):
+            raise ValueError(f"External windows require distributed schema {_EXTERNAL_META_SCHEMA}")
         output_indices = [i for i, p in enumerate(param_infos) if p.direction == ParamDirection.Out]
         # ``return_types`` contents are never inspected at runtime — only the
         # count matters (has_return = len(...) > 0), so placeholders suffice.
@@ -371,6 +438,16 @@ class DistributedCompiledProgram:
     def program(self) -> Program | None:
         """Post-pass IR, or ``None`` for a program reconstructed via :meth:`from_dir`."""
         return self._program
+
+    @property
+    def backend_type(self) -> BackendType:
+        """Code generation backend stored with this artifact."""
+        return self._backend_type
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Simulator or onboard execution for this artifact."""
+        return _parse_platform(self._platform)[1]
 
     @property
     def platform(self) -> str:
@@ -409,7 +486,7 @@ class DistributedCompiledProgram:
 
             if host_orch is not None:
                 self._param_infos, self._output_indices, self._return_types = _extract_func_param_infos(
-                    host_orch
+                    host_orch, host_entry=True
                 )
             else:
                 self._param_infos, self._output_indices, self._return_types = _extract_param_infos(
@@ -446,6 +523,10 @@ class DistributedCompiledProgram:
         from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
 
         param_infos, output_indices, return_types = self._get_metadata()
+        if any(p.is_distributed for p in param_infos):
+            raise TypeError(
+                "Use a prepared DistributedWorker and pass a DomainTensor for each external window"
+            )
         n_params = len(param_infos)
         n_inputs = n_params - len(output_indices)
         has_return = len(return_types) > 0
@@ -485,10 +566,7 @@ class DistributedCompiledProgram:
 
         _execute_distributed(self, coerced, config)
 
-        if not return_style:
-            return None
-        outputs = [coerced[i] for i in output_indices]
-        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+        return collect_output_values(coerced, output_indices, return_style=return_style)
 
     def prepare(
         self,
@@ -497,6 +575,7 @@ class DistributedCompiledProgram:
         extra_compiled: Sequence["DistributedCompiledProgram"] = (),
         persistent: bool = False,
         reset_persistent_windows: bool | None = None,
+        window_sources: Mapping[str, Sequence[BinaryIO | torch.Tensor]] | None = None,
         callbacks: dict[str, Callable[..., Any]] | None = None,
         sub_worker_overrides: dict[str, Callable[..., Any]] | None = None,
         inherited_host_tensors: "Sequence[torch.Tensor | ReadOnlyHostTensor] | None" = None,
@@ -538,10 +617,13 @@ class DistributedCompiledProgram:
                 and device ids. Defaults to none (single-program).
             persistent: Retain each compiled program's CommDomains across
                 dispatches. Every request still runs through its own
-                ``Worker.run`` completion fence. Retained windows are restored
-                to zero before reuse by default. Requires artifacts generated
-                by a PyPTO version that supports the internal domain-provider
+                ``Worker.run`` completion fence. Retained Host and Device windows are
+                restored to zero before reuse by default.
+                Requires artifacts generated by a PyPTO version that supports the internal domain-provider
                 hook.
+            window_sources: Runtime init keys mapped to binary files or contiguous CPU tensors,
+                in domain rank order.
+                Sources are copied only when a Host domain is created; the caller owns their lifetime.
             reset_persistent_windows: Whether to restore retained CommDomain
                 windows to zero before every reuse. ``None`` (the default)
                 enables reset in persistent mode. Set to ``False`` only when
@@ -585,6 +667,7 @@ class DistributedCompiledProgram:
             config,
             persistent=persistent,
             reset_persistent_windows=reset_persistent_windows,
+            window_sources=window_sources,
             callbacks=callbacks,
             sub_worker_overrides=sub_worker_overrides,
             inherited_host_tensors=inherited_host_tensors,

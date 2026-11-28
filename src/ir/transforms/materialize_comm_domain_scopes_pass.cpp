@@ -9,7 +9,9 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -17,6 +19,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -38,10 +41,17 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/collective_operand_utils.h"
+#include "pypto/ir/transforms/utils/dist_tensor_alias_utils.h"
+#include "pypto/ir/transforms/utils/external_window.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/transforms/utils/window_view_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
+#include "src/ir/transforms/utils/var_value_collector.h"
 
 namespace pypto {
 namespace ir {
@@ -72,7 +82,8 @@ namespace {
 // also returns `target` in-place (args_[1]) — same aliasing discipline as
 // IsTensorAllToAll above.
 [[nodiscard]] bool IsTensorAllToAllV(const CallPtr& call) {
-  return call && call->op_ && IsOp(call, "pld.tensor.all_to_all_v");
+  return call && call->op_ &&
+         (IsOp(call, "pld.tensor.all_to_all_v") || IsOp(call, "pld.tensor.indexed_all_to_all_v"));
 }
 
 /// Device coverage descriptor inferred from a dispatch ``device=`` expression.
@@ -203,6 +214,214 @@ class AllocAndWindowCollector : public IRVisitor {
   std::unordered_map<const Var*, ExprPtr> var_defs;
 };
 
+// Index 0 is URMA; index 1 is MTE. MTE is an analysis-only requirement:
+// its runtime domain uses an empty workspace-engine list.
+using BufferEngines = std::unordered_map<const Var*, std::array<bool, 2>>;
+
+std::array<bool, 2> EnginesFor(const BufferEngines& engines, const Var* buffer) {
+  const auto it = engines.find(buffer);
+  return it == engines.end() ? std::array<bool, 2>{} : it->second;
+}
+
+/// A host-orchestration function in PyPTO is declared as either
+/// ``@pl.function(type=FunctionType.Orchestration, level=Level.HOST)`` or
+/// (more common in distributed programs) ``@pl.function(level=Level.HOST,
+/// role=Role.Orchestrator)`` where ``func_type_`` may stay ``Opaque``. Accept
+/// either form so the pass works with the conventional host_orch declaration
+/// idiom used in distributed tests.
+[[nodiscard]] bool IsHostOrch(const FunctionPtr& func) {
+  if (!func || !func->level_.has_value() || *func->level_ != Level::HOST) return false;
+  return func->func_type_ == FunctionType::Orchestration ||
+         (func->role_.has_value() && *func->role_ == Role::Orchestrator);
+}
+
+// Collect effects per allocation, before compatible allocations are grouped.
+// Propagate callee requirements back to each actual argument independently;
+// caller facts never flow into shared formals and contaminate another call.
+// Each engine bit traverses an edge at most once: O(nodes + edges).
+class BufferEngineCollector : public IRVisitor {
+ public:
+  explicit BufferEngineCollector(ProgramPtr program) : program_(std::move(program)) {}
+
+  BufferEngines Collect(bool contexts_materialized) {
+    // Standalone invocations need not have normalized return statements yet.
+    // Share the existing memoized lineage analysis across all callee queries.
+    return_lineage::ScopedTraceCache lineage_cache;
+    for (const auto& [gv, func] : program_->functions_) {
+      if (func->func_type_ == FunctionType::SIMT) continue;
+      auto& plan = plans_[func->name_];
+      plan.returned_param_indices = return_lineage::ReturnedParamIndices(func, program_);
+      const bool host_entry = IsHostOrch(func);
+      for (size_t i = 0; i < func->params_.size(); ++i) {
+        const auto& param = func->params_[i];
+        if (!As<DistributedTensorType>(param->GetType())) continue;
+        plan.dist_param_indices.push_back(i);
+        plan.param_to_ctx[param.get()] = param;
+        if (host_entry) roots_[param.get()] = param;
+      }
+      if (contexts_materialized) {
+        // MaterializeDistTensorCtx appends one context per window, in parameter order.
+        const size_t first_ctx = func->params_.size() - plan.dist_param_indices.size();
+        for (size_t j = 0; j < plan.dist_param_indices.size(); ++j) {
+          const auto& ctx = func->params_[first_ctx + j];
+          if (IsA<CommCtxType>(ctx->GetType())) {
+            ctx_to_window_[ctx.get()] = func->params_[plan.dist_param_indices[j]].get();
+          }
+        }
+      }
+    }
+    for (const auto& [gv, func] : program_->functions_) {
+      auto plan = plans_.find(func->name_);
+      dist_tensor_alias::DistParamAliasCollector aliases(program_, &plans_,
+                                                         plan == plans_.end() ? nullptr : &plan->second);
+      AllocAndWindowCollector windows;
+      windows.VisitStmt(func->body_);
+      for (const auto& alloc : windows.allocs) roots_[alloc->ptr_var.get()] = alloc->ptr_var;
+      // Seed raw views with their allocation identity. The same alias walker
+      // used by context materialization handles returns, loop carries and views.
+      for (const auto& view : windows.windows) {
+        aliases.alias_to_ctx[view.old_view_var.get()] = view.alloc->ptr_var;
+      }
+      aliases.VisitStmt(func->body_);
+      aliases_ = &aliases;
+      VisitStmt(func->body_);
+      RecordSessionEngines(func->body_);
+    }
+    aliases_ = nullptr;
+    // Record may append work; consume by index without retaining iterators.
+    size_t next = 0;
+    while (next < pending_.size()) {
+      const auto [node, engine] = pending_[next++];
+      for (const auto* caller : callers_[node]) Record(caller, engine);
+    }
+    if (roots_.empty()) {
+      // A standalone CHIP entry has no allocation sites yet, but incompatible
+      // uses of the same formal still necessarily refer to one buffer.
+      for (const auto& [buffer, engines] : engines_) Check(buffer, engines);
+    } else {
+      for (const auto& [buffer, owner] : roots_) Check(buffer, EnginesFor(engines_, buffer));
+    }
+    return std::move(engines_);
+  }
+
+ protected:
+  void VisitStmt_(const CommDomainScopeStmtPtr& op) override {
+    // Re-running the pass must retain allocation identity even for explicit
+    // materialized IR whose body contains no alloc_window_buffer calls.
+    for (const auto& slot : op->slots_) roots_[slot->base_.get()] = slot->base_;
+    IRVisitor::VisitStmt_(op);
+  }
+  void VisitExpr_(const CallPtr& op) override {
+    Analyze(op->op_, op->args_, op->span_);
+    IRVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const SubmitPtr& op) override {
+    Analyze(op->op_, op->args_, op->span_);
+    IRVisitor::VisitExpr_(op);
+  }
+
+ private:
+  const Var* Resolve(const ExprPtr& expr) const {
+    if (auto type = As<DistributedTensorType>(expr->GetType()); type && type->window_buffer_) {
+      return (*type->window_buffer_)->base_.get();
+    }
+    return aliases_->ResolveCtx(expr).get();
+  }
+
+  void Analyze(const OpPtr& op, const std::vector<ExprPtr>& args, const Span& span) {
+    if (IsOp(op, "pld.system.make_session")) {
+      session_contexts_.push_back(args[0]);
+      return;
+    }
+    if (auto roles = GetCollectiveOperandRoles(op)) {
+      for (size_t index : roles->context_args) {
+        INTERNAL_CHECK_SPAN(index < args.size(), span) << "Collective is missing a remote operand";
+        if (const auto* buffer = Resolve(args[index])) {
+          Record(buffer, roles->target_uses_urma && index == roles->context_args.front() ? 0 : 1);
+        }
+      }
+    }
+    if (auto global = As<GlobalVar>(op)) {
+      auto callee = program_->GetFunction(global->name_);
+      auto plan = plans_.find(global->name_);
+      if (!callee || plan == plans_.end()) return;
+      // Before context suffixes are appended, Submit supplies an ordinary
+      // parameter prefix; omitted runtime-owned outputs have no actual buffer.
+      for (size_t index : plan->second.dist_param_indices) {
+        if (index >= args.size()) continue;
+        if (const auto* actual = Resolve(args[index])) {
+          callers_[callee->params_[index].get()].push_back(actual);
+        }
+      }
+      return;
+    }
+    size_t target = 0;
+    const bool scatter_get = IsOp(op, "pld.tile.get_async");
+    const bool urma_get = IsOp(op, "pld.tensor.get_async") || scatter_get;
+    const bool urma = IsOp(op, "pld.tensor.put_async") || urma_get;
+    if (urma_get || IsOp(op, "pld.tensor.get") || IsOp(op, "pld.tile.get")) {
+      target = 2;
+    } else if (IsOp(op, "pld.tensor.remote_store") || IsOp(op, "pld.tile.remote_store")) {
+      target = 1;
+    } else if (!urma && !IsOp(op, "pld.system.notify") && !IsOp(op, "pld.tile.remote_load") &&
+               !IsOp(op, "pld.tensor.put") && !IsOp(op, "pld.tile.put")) {
+      return;
+    }
+    INTERNAL_CHECK_SPAN(args.size() > target, span)
+        << "Communication primitive is missing its window operand";
+    // Scatter descriptors require the local destination to reside in the session's registered MR.
+    // Classify a destination window before engine grouping separates it from the remote source.
+    if (scatter_get && IsA<DistributedTensorType>(args[0]->GetType())) {
+      if (const auto* dst = Resolve(args[0])) Record(dst, 0);
+    }
+    if (const auto* buffer = Resolve(args[target])) Record(buffer, urma ? 0 : 1);
+  }
+
+  // A session may be constructed without issuing a GET. Provision each window
+  // that can supply its context, including branch yields and loop carries.
+  void RecordSessionEngines(const StmtPtr& body) {
+    if (session_contexts_.empty()) return;
+    VarValueCollector definitions;
+    definitions.VisitStmt(body);
+    std::unordered_set<const Var*> visited;
+    while (!session_contexts_.empty()) {
+      auto ctx = session_contexts_.back();
+      session_contexts_.pop_back();
+      if (auto query = As<Call>(ctx); IsOp(query, "pld.system.get_comm_ctx")) {
+        if (const auto* window = Resolve(query->args_[0])) Record(window, 0);
+      } else if (auto var = AsVarLike(ctx); var && visited.insert(var.get()).second) {
+        if (auto window = ctx_to_window_.find(var.get()); window != ctx_to_window_.end()) {
+          Record(window->second, 0);
+        } else if (auto it = definitions.values.find(var.get()); it != definitions.values.end()) {
+          session_contexts_.insert(session_contexts_.end(), it->second.begin(), it->second.end());
+        }
+      }
+    }
+  }
+
+  std::vector<ExprPtr> session_contexts_;
+  void Record(const Var* buffer, size_t engine) {
+    if (engines_[buffer][engine]) return;
+    engines_[buffer][engine] = true;
+    pending_.emplace_back(buffer, engine);
+  }
+  static void Check(const Var* buffer, const std::array<bool, 2>& engines) {
+    CHECK_SPAN(!engines[0] || !engines[1], buffer->span_)
+        << "Communication buffer '" << buffer->name_hint_
+        << "' cannot combine URMA async transfers with MTE primitives "
+           "(remote_load/store, put/get, notify or collective operands), regardless of peer rank.";
+  }
+
+  ProgramPtr program_;
+  std::unordered_map<std::string, dist_tensor_alias::FunctionCtxPlan> plans_;
+  const dist_tensor_alias::DistParamAliasCollector* aliases_ = nullptr;
+  std::unordered_map<const Var*, const Var*> ctx_to_window_;
+  std::unordered_map<const Var*, VarPtr> roots_;
+  std::unordered_map<const Var*, std::vector<const Var*>> callers_;
+  BufferEngines engines_;
+  std::vector<std::pair<const Var*, size_t>> pending_;
+};
+
 /// Detects whether a Call resolves to a chip-level Orchestration function (i.e.
 /// the host_orch is dispatching down one level). Such calls carry the
 /// ``device=`` attr written by the N3 parser pass.
@@ -255,7 +474,7 @@ DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device, const std::vecto
         // as the direct ``pl.range(pld.system.world_size())`` form.
         ExprPtr stop = UnwrapStopExpr(fs->stop_, var_defs);
         if (auto stop_call = As<Call>(stop)) {
-          if (stop_call->op_ && IsOp(stop_call, "pld.system.world_size")) {
+          if (IsOp(stop_call, "pld.system.world_size") || IsOp(stop_call, "pld.system.num_workers")) {
             desc.is_all = true;
             return desc;
           }
@@ -320,6 +539,9 @@ class DispatchAnalyzer : public IRVisitor {
     --repeating_scope_depth_;
   }
 
+  const std::unordered_map<const Var*, size_t>* external_params = nullptr;
+  std::map<size_t, DeviceDescriptor> external_devices;
+
   void AnalyzeDispatch(const CallPtr& op) {
     if (!IsChipOrchDispatch(op, chip_orchs_)) return;
     ExprPtr device;
@@ -335,6 +557,12 @@ class DispatchAnalyzer : public IRVisitor {
     for (const auto& arg : op->args_) {
       auto arg_var = AsVarLike(arg);
       if (!arg_var) continue;
+      if (external_params) {
+        if (IsA<CommCtxType>(arg->GetType())) arg_var = AsVarLike(UnwrapStopExpr(arg_var, var_defs_));
+        auto it = external_params->find(arg_var.get());
+        if (it != external_params->end()) external_devices[it->second].Merge(desc);
+        continue;
+      }
       auto window = ResolveWindowRecord(arg_var);
       if (window) {
         window->alloc->seen.push_back(desc);
@@ -350,8 +578,9 @@ class DispatchAnalyzer : public IRVisitor {
     INTERNAL_CHECK_SPAN(view_var, expr->span_)
         << "MaterializeCommDomainScopes: " << op_name << " " << role << " must be a window view Var";
     auto window = ResolveWindowRecord(view_var);
-    INTERNAL_CHECK_SPAN(window, expr->span_) << "MaterializeCommDomainScopes: " << op_name << " " << role
-                                             << " must be produced by pld.tensor.window";
+    CHECK_SPAN(window, expr->span_) << "HOST builtin collectives require locally allocated windows; external "
+                                       "DistributedTensor is unsupported: "
+                                    << op_name << " " << role << " must be produced by pld.tensor.window";
     return window->alloc;
   }
 
@@ -368,6 +597,8 @@ class DispatchAnalyzer : public IRVisitor {
 
   void AnalyzeCollective(const CallPtr& op) {
     if (!op || !op->op_) return;
+    CHECK_SPAN(!IsOp(op, "pld.tensor.indexed_all_to_all_v"), op->span_)
+        << "indexed_all_to_all_v supports only L2 orchestration on A5 URMA; HOST is unsupported";
 
     if (IsOp(op, "pld.tensor.allreduce") || IsOp(op, "pld.tensor.broadcast") ||
         IsOp(op, "pld.tensor.reduce_scatter")) {
@@ -436,17 +667,15 @@ class DispatchAnalyzer : public IRVisitor {
       //                          to this pass's comm-domain scoping)
       INTERNAL_CHECK_SPAN(op->args_.size() == 6, op->span_)
           << "MaterializeCommDomainScopes: pld.tensor.all_to_all_v expects exactly 6 args";
-      // LowerCompositeOps' CheckAllReduceLoopUse guards the InCore path but
-      // never runs for a HOST-orch call (LowerCompositeOps just defers it
-      // there). This is the HOST-side equivalent, using repeating_scope_depth_
-      // (tracked across both ForStmt and WhileStmt — see the VisitStmt_
-      // overrides above).
+      // HOST-orch calls still need loop-carried comm-domain window lifetime
+      // management, even though the credit barrier supports rank-uniform
+      // InCore loops. Track HOST repetition across both ForStmt and WhileStmt
+      // with repeating_scope_depth_ (see the VisitStmt_ overrides above).
       CHECK_SPAN(repeating_scope_depth_ == 0, op->span_)
           << "pld.tensor.all_to_all_v is not supported inside a for/while loop in a HOST "
              "orchestrator yet: dynamic re-invocation needs loop-carried comm-domain window "
              "lifetime management this compiler does not model (the credit-based signal "
-             "itself is reusable across sequential calls). Same restriction LowerCompositeOps "
-             "enforces on the InCore path via CheckAllReduceLoopUse.";
+             "itself is reusable across sequential calls and rank-uniform InCore loops).";
       auto* data_alloc = ResolveWindowAlloc(op->args_[1], "pld.tensor.all_to_all_v", "target");
       auto* signal_alloc = ResolveWindowAlloc(op->args_[2], "pld.tensor.all_to_all_v", "signal");
       auto* recv_counts_alloc = ResolveWindowAlloc(op->args_[4], "pld.tensor.all_to_all_v", "recv_counts");
@@ -464,7 +693,7 @@ class DispatchAnalyzer : public IRVisitor {
 
   void VisitExpr_(const CallPtr& op) override {
     AnalyzeDispatch(op);
-    AnalyzeCollective(op);
+    if (!external_params) AnalyzeCollective(op);
     IRVisitor::VisitExpr_(op);
   }
 
@@ -524,18 +753,6 @@ class DispatchAnalyzer : public IRVisitor {
   std::vector<ForStmtPtr> for_stack_;
   int repeating_scope_depth_ = 0;
 };
-
-/// A host-orchestration function in PyPTO is declared as either
-/// ``@pl.function(type=FunctionType.Orchestration, level=Level.HOST)`` or
-/// (more common in distributed programs) ``@pl.function(level=Level.HOST,
-/// role=Role.Orchestrator)`` where ``func_type_`` may stay ``Opaque``. Accept
-/// either form so the pass works with the conventional host_orch declaration
-/// idiom used in distributed tests.
-[[nodiscard]] bool IsHostOrch(const FunctionPtr& func) {
-  if (!func || !func->level_.has_value() || *func->level_ != Level::HOST) return false;
-  return func->func_type_ == FunctionType::Orchestration ||
-         (func->role_.has_value() && *func->role_ == Role::Orchestrator);
-}
 
 [[nodiscard]] bool IsChipOrch(const FunctionPtr& func) {
   if (!func || !func->level_.has_value() || *func->level_ != Level::CHIP) return false;
@@ -614,7 +831,7 @@ class DefiningCallRetyper : public IRMutator {
 
     auto retyped = std::make_shared<const DistributedTensorType>(
         call_dt->shape_, call_dt->dtype_, call_dt->memref_, call_dt->tensor_view_, var_dt->window_buffer_);
-    if (!structural_equal(retyped, var_dt)) return base;
+    if (!structural_equal(CloneTypeWithoutMemRef(retyped), CloneTypeWithoutMemRef(var_dt))) return base;
 
     auto new_call =
         std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_, retyped, call->span_);
@@ -661,7 +878,8 @@ class DefiningCallRetyper : public IRMutator {
       cur = AsVarLike(call->args_[1]);
       continue;
     }
-    if (call && IsOp(call, "pld.tensor.all_to_all_v") && call->args_.size() > 1) {
+    if (call && (IsOp(call, "pld.tensor.all_to_all_v") || IsOp(call, "pld.tensor.indexed_all_to_all_v")) &&
+        call->args_.size() > 1) {
       cur = AsVarLike(call->args_[1]);
       continue;
     }
@@ -675,13 +893,87 @@ class DefiningCallRetyper : public IRMutator {
 /// with type-updated copies, and wrap the body in a chain of
 /// ``CommDomainScopeStmt`` (one per inferred comm domain, outer = first
 /// declared, inner = last declared).
-FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string, FunctionPtr>& chip_orchs) {
+FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string, FunctionPtr>& chip_orchs,
+                            const BufferEngines& engines) {
   // Idempotence: if this function's body is already wrapped in a
   // CommDomainScopeStmt, the pass has run on it before — skip to avoid
   // double-wrapping the body and minting a fresh set of WindowBuffer
   // instances that would shadow the existing ones on every view.
   if (func->body_ && As<CommDomainScopeStmt>(func->body_)) {
-    return func;
+    // Preserve the WindowBuffer objects referenced by existing tensor types,
+    // but split an old scope if newly introduced uses need distinct engines.
+    class EngineUpdater : public IRMutator {
+     public:
+      explicit EngineUpdater(const BufferEngines& engines) : engines_(engines) {}
+      std::set<std::string> names;
+      StmtPtr VisitStmt_(const CommDomainScopeStmtPtr& op) override {
+        auto updated = As<CommDomainScopeStmt>(IRMutator::VisitStmt_(op));
+        std::array<bool, 2> combined{};
+        for (const auto& slot : updated->slots_) {
+          const auto uses = EnginesFor(engines_, slot->base_.get());
+          combined[0] |= uses[0];
+          combined[1] |= uses[1];
+        }
+        // Explicit materialized IR may declare a workspace for an opaque
+        // kernel. With no recognized uses, retain that declaration unchanged.
+        if (!combined[0] && !combined[1]) return updated;
+        std::array<std::vector<WindowBufferPtr>, 2> groups;
+        for (const auto& slot : updated->slots_) {
+          const auto uses = EnginesFor(engines_, slot->base_.get());
+          const bool urma = uses[0] || (!uses[1] && combined[0] && !combined[1]);
+          groups[urma ? 1 : 0].push_back(slot);
+        }
+        auto engines = updated->engines_;
+        engines.erase(std::remove(engines.begin(), engines.end(), "urma"), engines.end());
+        const bool split = !groups[0].empty() && !groups[1].empty();
+        if (!split) {
+          if (!groups[1].empty()) engines.emplace_back("urma");
+          if (engines == updated->engines_) return updated;
+          auto result = MutableCopy(updated);
+          result->engines_ = std::move(engines);
+          return result;
+        }
+        // Keep the original name on the outer scope. New names are allocated
+        // from one monotonic sequence, avoiding collisions with existing IR.
+        std::string name;
+        do {
+          name = "comm_engine_" + std::to_string(next_name_++);
+        } while (!names.insert(name).second);
+        const auto first = EnginesFor(engines_, updated->slots_.front()->base_.get());
+        const size_t outer_group = first[0] ? 1 : 0;
+        const size_t inner_group = 1 - outer_group;
+        auto inner = MutableCopy(updated);
+        inner->name_hint_ = std::move(name);
+        inner->slots_ = std::move(groups[inner_group]);
+        inner->engines_ = engines;
+        if (inner_group == 1) inner->engines_.emplace_back("urma");
+        auto outer = MutableCopy(updated);
+        outer->slots_ = std::move(groups[outer_group]);
+        outer->engines_ = std::move(engines);
+        if (outer_group == 1) outer->engines_.emplace_back("urma");
+        outer->body_ = inner;
+        return outer;
+      }
+
+     private:
+      const BufferEngines& engines_;
+      size_t next_name_ = 0;
+    } updater(engines);
+    class NameCollector : public IRVisitor {
+     public:
+      std::set<std::string> names;
+      void VisitStmt_(const CommDomainScopeStmtPtr& op) override {
+        names.insert(op->name_hint_);
+        IRVisitor::VisitStmt_(op);
+      }
+    } names;
+    names.VisitStmt(func->body_);
+    updater.names = std::move(names.names);
+    auto body = updater.VisitStmt(func->body_);
+    if (body == func->body_) return func;
+    auto result = MutableCopy(func);
+    result->body_ = std::move(body);
+    return result;
   }
 
   StmtPtr materialization_body = func->body_;
@@ -742,9 +1034,25 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   // Phase 4: construct WindowBuffer for each alloc. Final descriptor merging
   // happens in Phase 6 below (per-group), so we don't precompute it here.
   for (auto& rec : collector.allocs) {
-    rec->wb = std::make_shared<const WindowBuffer>(rec->ptr_var, rec->size_expr,
-                                                   /*load_from_host=*/false,
-                                                   /*store_to_host=*/false, rec->span);
+    rec->wb = std::make_shared<const WindowBuffer>(
+        rec->ptr_var, rec->size_expr,
+        /*load_from_host=*/false,
+        /*store_to_host=*/false, rec->span, rec->alloc_call->GetKwarg<std::string>("memory_source", "device"),
+        rec->alloc_call->GetKwarg<std::string>("init", ""));
+  }
+
+  // Every direct pld.tensor.window view must fit the logical size of its
+  // allocation. Reject an oversized view even if the program only accesses a
+  // prefix: the view itself must be valid independently of its consumers.
+  for (const auto& w : collector.windows) {
+    auto view_dt = As<DistributedTensorType>(w.old_view_var->GetType());
+    INTERNAL_CHECK_SPAN(view_dt, w.old_view_var->span_)
+        << "MaterializeCommDomainScopes: pld.tensor.window result should have DistributedTensorType";
+    const auto fit = EvaluateWindowViewFit(*view_dt, *w.alloc->wb);
+    CHECK_SPAN(fit.fit != WindowViewFit::kViolation,
+               w.window_call ? w.window_call->span_ : w.old_view_var->span_)
+        << "MaterializeCommDomainScopes: "
+        << DescribeWindowViewFit(w.old_view_var->name_hint_, *w.alloc->wb, fit);
   }
 
   // Phase 5: build var substitution map for every pld.tensor.window result Var,
@@ -784,10 +1092,10 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   for (const auto& fs : collector.loops) sync_loop_carries(fs->iter_args_, fs->return_vars_);
   for (const auto& ws : collector.whiles) sync_loop_carries(ws->iter_args_, ws->return_vars_);
 
-  // Phase 6: cluster allocs into pending domain entries by merged descriptor
-  // (alloc-order within a domain). Use a vector for deterministic order: scan
+  // Phase 6: cluster allocs by merged device descriptor, memory source and
+  // engine category (alloc-order within a domain). Use a vector for deterministic order: scan
   // collector.allocs in source order and append to the first matching entry
-  // or create a new one. `desc_to_index` maps a merged descriptor to its
+  // or create a new one. `desc_to_index` maps the composite grouping key to its
   // `pending` slot (O(log domains) via DeviceDescriptor::operator<, per
   // pass-complexity.md — a per-alloc linear scan of `pending` would make this
   // Phase O(allocs^2) for programs with many distinct comm domains). Store
@@ -798,18 +1106,37 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
     std::vector<WindowBufferPtr> slots;
     std::set<std::string> names;  // sanity check
     Span span;
+    bool uses_urma;
   };
   std::vector<PendingDomain> pending;
-  std::map<DeviceDescriptor, size_t> desc_to_index;
+  using Coverage = std::pair<DeviceDescriptor, std::string>;
+  std::map<Coverage, std::array<bool, 2>> coverage_engines;
+  std::unordered_map<const Var*, Coverage> coverage;
   for (const auto& rec : collector.allocs) {
     DeviceDescriptor merged;
     for (const auto& d : rec->seen) merged.Merge(d);
-    auto it = desc_to_index.find(merged);
+    auto key = std::make_pair(merged, rec->wb->memory_source_);
+    coverage.emplace(rec->ptr_var.get(), key);
+    const auto uses = EnginesFor(engines, rec->ptr_var.get());
+    auto& combined = coverage_engines[key];
+    combined[0] |= uses[0];
+    combined[1] |= uses[1];
+  }
+  std::map<std::tuple<DeviceDescriptor, std::string, bool>, size_t> desc_to_index;
+  for (const auto& rec : collector.allocs) {
+    const auto& [merged, memory_source] = coverage.at(rec->ptr_var.get());
+    const auto uses = EnginesFor(engines, rec->ptr_var.get());
+    const auto combined = coverage_engines.at(coverage.at(rec->ptr_var.get()));
+    // Unclassified local-only slots may share a compatible domain. Prefer the
+    // default MTE/no-workspace group when both explicit categories are present.
+    const bool uses_urma = uses[0] || (!uses[1] && combined[0] && !combined[1]);
+    const auto key = std::make_tuple(merged, memory_source, uses_urma);
+    auto it = desc_to_index.find(key);
     size_t index;
     if (it == desc_to_index.end()) {
       index = pending.size();
-      desc_to_index.emplace(merged, index);
-      pending.push_back({merged, {}, {}, rec->span});
+      desc_to_index.emplace(key, index);
+      pending.push_back({merged, {}, {}, rec->span, uses_urma});
     } else {
       index = it->second;
     }
@@ -841,8 +1168,10 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   for (size_t i = pending.size(); i-- > 0;) {
     auto& g = pending[i];
     std::string name_hint = "comm_d" + std::to_string(i);
-    new_body = std::make_shared<const CommDomainScopeStmt>(g.desc.ToDevices(), std::move(g.slots),
-                                                           std::move(name_hint), new_body, g.span);
+    new_body = std::make_shared<const CommDomainScopeStmt>(
+        g.desc.ToDevices(), std::move(g.slots), std::move(name_hint), new_body, g.span,
+        std::vector<std::string>{}, std::vector<std::pair<std::string, std::any>>{},
+        g.uses_urma ? std::vector<std::string>{"urma"} : std::vector<std::string>{});
   }
 
   if (new_body.get() == func->body_.get()) return func;
@@ -853,10 +1182,61 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
 
 }  // namespace
 
+ExternalWindowAnalysis AnalyzeExternalWindows(const ProgramPtr& program, const FunctionPtr& host) {
+  ExternalWindowAnalysis result;
+  std::unordered_map<std::string, dist_tensor_alias::FunctionCtxPlan> plans;
+  std::map<std::string, FunctionPtr> chips;
+  for (const auto& [gv, function] : program->functions_) {
+    if (IsChipOrch(function)) chips[function->name_] = function;
+    plans[function->name_].returned_param_indices = return_lineage::ReturnedParamIndices(function, program);
+  }
+  auto& host_plan = plans.at(host->name_);
+  for (size_t i = 0; i < host->params_.size(); ++i) {
+    const auto& param = host->params_[i];
+    if (As<DistributedTensorType>(param->GetType())) {
+      host_plan.param_to_ctx[param.get()] = param;
+      host_plan.dist_param_indices.push_back(i);
+      result.parameter_indices.emplace(param.get(), i);
+    }
+  }
+  dist_tensor_alias::DistParamAliasCollector aliases(program, &plans, &host_plan);
+  aliases.VisitStmt(host->body_);
+  for (const auto& [var, root] : aliases.alias_to_ctx) {
+    result.parameter_indices.emplace(var, result.parameter_indices.at(root.get()));
+  }
+  AllocAndWindowCollector collector;
+  collector.VisitStmt(host->body_);
+  DispatchAnalyzer analyzer(collector.view_to_window, chips, collector.var_defs);
+  const size_t first_ctx = host->params_.size() - host_plan.dist_param_indices.size();
+  for (size_t i = 0; i < first_ctx; ++i) {
+    INTERNAL_CHECK_SPAN(!IsA<CommCtxType>(host->params_[i]->GetType()), host->span_)
+        << "CommCtx must form the entry suffix";
+  }
+  for (size_t j = 0; j < host_plan.dist_param_indices.size(); ++j) {
+    const auto& ctx = host->params_[first_ctx + j];
+    INTERNAL_CHECK_SPAN(
+        IsA<CommCtxType>(ctx->GetType()) && host->param_directions_[first_ctx + j] == ParamDirection::In,
+        host->span_)
+        << "Expected one input CommCtx suffix per DistributedTensor parameter";
+    result.parameter_indices.emplace(ctx.get(), host_plan.dist_param_indices[j]);
+  }
+  analyzer.external_params = &result.parameter_indices;
+  analyzer.VisitStmt(host->body_);
+  auto engines = BufferEngineCollector(program).Collect(/*contexts_materialized=*/true);
+  for (const auto& [param, root] : host_plan.param_to_ctx) {
+    size_t i = result.parameter_indices.at(param);
+    const auto& devices = analyzer.external_devices[i];
+    auto engine = EnginesFor(engines, param);
+    result.uses.emplace(i, ExternalWindowUse{devices.is_all, devices.ToDevices(), engine[0], engine[1]});
+  }
+  return result;
+}
+
 namespace pass {
 
 Pass MaterializeCommDomainScopes() {
   auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
+    const auto engines = BufferEngineCollector(program).Collect(/*contexts_materialized=*/false);
     // Index chip-level Orchestration functions by name so the dispatch
     // analyzer can recognise host → chip Calls.
     std::map<std::string, FunctionPtr> chip_orchs;
@@ -872,7 +1252,7 @@ Pass MaterializeCommDomainScopes() {
         new_functions[gvar] = func;
         continue;
       }
-      auto new_func = ProcessHostOrch(func, chip_orchs);
+      auto new_func = ProcessHostOrch(func, chip_orchs, engines);
       new_functions[gvar] = new_func;
       if (new_func.get() != func.get()) modified = true;
     }

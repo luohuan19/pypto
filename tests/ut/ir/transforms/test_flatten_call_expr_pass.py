@@ -19,6 +19,7 @@ Uses assert_structural_equal to compare pass output with expected IR.
 import pypto.language as pl
 import pytest
 from pypto import ir, passes
+from pypto.language.parser import parse_program
 from pypto.pypto_core import passes as _core_passes
 
 
@@ -32,6 +33,114 @@ def NormalizeIR(program):
     to succeed.
     """
     return passes.normalize_stmt_structure()(program)
+
+
+def test_tensor_dim_in_loop_carried_type_stays_an_expression():
+    """Type metadata must not acquire statement-local temporaries (#2951)."""
+
+    @pl.program
+    class Before:
+        @pl.function
+        def main(self, x: pl.Tensor[[8, 32], pl.FP32]):
+            flat = pl.reshape(x, [pl.tensor.dim(x, 0) * 2, 16])
+            for i, (acc,) in pl.range(2, init_values=(flat,)):
+                result = pl.yield_(pl.add(pl.exp(acc), 1.0))
+            return result
+
+    after = passes.flatten_call_expr()(Before)
+    before_func = next(iter(Before.functions.values()))
+    after_func = next(iter(after.functions.values()))
+    assert isinstance(before_func.body, ir.SeqStmts)
+    assert isinstance(after_func.body, ir.SeqStmts)
+    before_assign = before_func.body.stmts[0]
+    assert isinstance(before_assign, ir.AssignStmt)
+    before_flat = before_assign.var
+    after_flat = next(
+        stmt.var
+        for stmt in after_func.body.stmts
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint == "flat"
+    )
+    ir.assert_structural_equal(before_flat, after_flat)
+    assert before_flat.unique_id == after_flat.unique_id
+    assert "__FREE_VAR" not in ir.python_print(after)
+
+
+def test_asymmetric_atomic_operands_keep_evaluation_order():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.SIMT)
+        def main(self, buf: pl.InOut[pl.Tensor[[1], pl.INT32]]):
+            one = pl.const(1, pl.INT32)
+            two = pl.const(2, pl.INT32)
+            result = pl.simt.atomic_exch(buf, (0,), one) - (pl.simt.atomic_exch(buf, (0,), two) + one)
+            pl.simt.store(buf, (0,), result)
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.SIMT)
+        def main(self, buf: pl.InOut[pl.Tensor[[1], pl.INT32]]):
+            one = pl.const(1, pl.INT32)
+            two = pl.const(2, pl.INT32)
+            t__tmp_v0 = pl.simt.atomic_exch(buf, (0,), one)
+            t__tmp_v1 = pl.simt.atomic_exch(buf, (0,), two)
+            result = t__tmp_v0 - (t__tmp_v1 + one)
+            pl.simt.store(buf, (0,), result)
+
+    # Deeper nesting on the right must not make its exchange execute first.
+    after = passes.flatten_call_expr()(Before)
+    ir.assert_structural_equal(after, NormalizeIR(Expected))
+
+
+def test_tuple_projection_materializes_all_atomic_elements_in_order():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.SIMT)
+        def main(self, buf: pl.InOut[pl.Tensor[[1], pl.INT32]]):
+            one = pl.const(1, pl.INT32)
+            two = pl.const(2, pl.INT32)
+            result = (pl.simt.atomic_exch(buf, (0,), one), pl.simt.atomic_exch(buf, (0,), two) + one)[0]
+            pl.simt.store(buf, (0,), result)
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.SIMT)
+        def main(self, buf: pl.InOut[pl.Tensor[[1], pl.INT32]]):
+            one = pl.const(1, pl.INT32)
+            two = pl.const(2, pl.INT32)
+            t__tmp_v0 = pl.simt.atomic_exch(buf, (0,), one)
+            t__tmp_v1 = pl.simt.atomic_exch(buf, (0,), two)
+            result = (t__tmp_v0, t__tmp_v1 + one)[0]
+            pl.simt.store(buf, (0,), result)
+
+    # Both slots are evaluated before projection, including the unselected one.
+    after = passes.flatten_call_expr()(Before)
+    ir.assert_structural_equal(after, NormalizeIR(Expected))
+    # Composite lowering may fold the projection only after calls are bound.
+    ir.assert_structural_equal(passes.lower_composite_ops()(after), passes.lower_composite_ops()(Expected))
+
+
+def test_asymmetric_range_operands_keep_evaluation_order():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.SIMT)
+        def main(self, buf: pl.InOut[pl.Tensor[[1], pl.INT32]]):
+            one = pl.const(1, pl.INT32)
+            two = pl.const(2, pl.INT32)
+            for i in pl.range(pl.simt.atomic_exch(buf, (0,), one), pl.simt.atomic_exch(buf, (0,), two) + one):
+                pl.simt.store(buf, (0,), pl.cast(i, pl.INT32))
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.SIMT)
+        def main(self, buf: pl.InOut[pl.Tensor[[1], pl.INT32]]):
+            one = pl.const(1, pl.INT32)
+            two = pl.const(2, pl.INT32)
+            t__tmp_v0 = pl.simt.atomic_exch(buf, (0,), one)
+            t__tmp_v1 = pl.simt.atomic_exch(buf, (0,), two)
+            for i in pl.range(t__tmp_v0, t__tmp_v1 + one):
+                pl.simt.store(buf, (0,), pl.cast(i, pl.INT32))
+
+    ir.assert_structural_equal(passes.flatten_call_expr()(Before), NormalizeIR(Expected))
 
 
 class TestFlattenCallInCallArgs:
@@ -387,6 +496,53 @@ class TestFlattenCallInWhileCondition:
 
         After = passes.flatten_call_expr()(Before)
         ir.assert_structural_equal(After, NormalizeIR(Expected))
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "pl.simt.vote_any(n > 0)",
+        "pl.simt.vote_any(pl.simt.shuffle_idx(n, 0) > 0)",
+        "pl.simt.vote_ballot(n > 0) != 0",
+        "not pl.simt.vote_all(n <= 0)",
+    ],
+)
+def test_simt_while_condition_keeps_calls_in_loop(condition):
+    """Condition calls use loop IterArgs and must execute on every check."""
+    before = parse_program(f"""
+@pl.program
+class Before:
+    @pl.function(type=pl.FunctionType.SIMT)
+    def helper(self, dst: pl.InOut[pl.Tensor[[32], pl.INT32]]):
+        n = pl.simt.lane_id()
+        while {condition}:
+            pl.simt.store(dst, (n,), pl.cast(pl.simt.redux_max(n) + 1, pl.INT32))
+            n = pl.cast(n - 1, pl.INT32)
+        return
+""")
+    before = passes.convert_to_ssa()(before)
+    props = _core_passes.IRPropertySet()
+    props.insert(_core_passes.IRProperty.NoNestedCalls)
+    # Exempting conditions must not also exempt nested calls in the body.
+    assert _core_passes.PropertyVerifierRegistry.verify(props, before)
+    after = passes.flatten_call_expr()(before)
+    props.insert(_core_passes.IRProperty.SSAForm)
+    props.insert(_core_passes.IRProperty.UseAfterDef)
+    assert not _core_passes.PropertyVerifierRegistry.verify(props, after)
+
+    def condition_of(program):
+        loops = []
+
+        class Collector(ir.IRVisitor):
+            def visit_while_stmt(self, op):
+                loops.append(op)
+                super().visit_while_stmt(op)
+
+        Collector().visit_program(program)
+        assert len(loops) == 1
+        return loops[0].condition
+
+    ir.assert_structural_equal(condition_of(before), condition_of(after))
 
 
 class TestFlattenCallInForRange:

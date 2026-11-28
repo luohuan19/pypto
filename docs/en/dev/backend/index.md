@@ -10,6 +10,8 @@ means adding a handler, not editing passes.
 | Page | What it covers |
 | ---- | -------------- |
 | [BackendHandler: principled backend dispatch](00-backend_handler.md) | The virtual interface, how passes query it, and what adding a new backend requires |
+| [Synchronization hardware resources](01-sync_resources.md) | Resource domain queries, ID ranges, and compiler reservation policy |
+| [ISA macro synchronization resources](02-macro_resources.md) | Backend-owned ISA signal occupancy declarations and queries |
 
 ## Registered operator inventory
 
@@ -18,7 +20,7 @@ Query a concrete backend to enumerate its actual operator registrations:
 ```python
 from pypto import backend
 
-target = backend.get_backend_instance(backend.BackendType.Ascend910B)
+target = backend.get_backend_instance(backend.BackendType.Ascend910)
 names = target.get_registered_op_names()
 ```
 
@@ -56,3 +58,11 @@ instruction mappings or claiming complete form coverage.
 
 - [Pass, PassContext, PassPipeline, and PassManager](../passes/00-pass_manager.md) — where the handler comes from.
 - [PTO ISA reference](../../reference/index.md) — the hardware differences the handlers abstract over.
+
+## Backend names
+
+Use `BackendType.Ascend910` for the A2/A3 backend and `BackendType.Ascend950`
+for A5. The A2/A3 singleton is `Backend910.instance()`. Its type name is
+`910`, and its serialized backend enum name is `Ascend910`.
+When loading an artifact that uses the former A2/A3 spelling, update its
+`backend_type` field to `Ascend910`. Its platform remains `a2a3` or `a2a3sim`.

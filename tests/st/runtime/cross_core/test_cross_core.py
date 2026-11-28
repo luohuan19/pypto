@@ -29,7 +29,9 @@ from typing import Any
 import pypto.language as pl
 import pytest
 import torch
+from harness import st
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
+from pypto.pypto_core.passes import MemoryPlanner
 
 M = 32
 K = 64
@@ -59,27 +61,33 @@ SLOTNUM_LOCAL_SLOT_NUM = 4
 SLOTNUM_BUFFER_SIZE = SLOTNUM_SLOT_SIZE * SLOTNUM_LOCAL_SLOT_NUM
 
 
-@pl.program
-class V2CUDProgram:
+_LOAD_POLICIES = [policy for policy in pl.CachePolicy if int(policy) >= 2]
+_STORE_POLICIES = [
+    policy
+    for policy in _LOAD_POLICIES
+    if policy not in (pl.CachePolicy.NOT_ALLOC_KEEP, pl.CachePolicy.NOT_ALLOC_DROP)
+]
+
+
+@pl.jit
+def v2c_ud(
+    a: pl.Tensor[[32, 32], pl.FP32],
+    b: pl.Tensor[[32, 32], pl.FP32],
+    output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+) -> pl.Tensor[[32, 32], pl.FP32]:
     """V2C updown-split cross-core program.
 
     Vector producer: loads tiles a and b, computes add and sub, pushes both to Cube.
-    Cube consumer: pops tiles, performs matmul, stores result.
-    """
-
-    @pl.function(type=pl.FunctionType.Opaque)
-    def main(
-        self,
-        a: pl.Tensor[[32, 32], pl.FP32],
-        b: pl.Tensor[[32, 32], pl.FP32],
-        output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
-    ) -> pl.Tensor[[32, 32], pl.FP32]:
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
-            a_plus_b = pl.add(a, b)
-            sub = pl.sub(a, b)
-            out = pl.matmul(a_plus_b, sub)
-            output = pl.assemble(output, out, [0, 0])
-        return output
+    Cube consumer: pops tiles, performs matmul, stores result."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+            a_half = a[lane * 16 : lane * 16 + 16, :]
+            b_half = b[lane * 16 : lane * 16 + 16, :]
+            a_plus_b = pl.aic_gather(pl.add(a_half, b_half))
+            sub = pl.aic_gather(pl.sub(a_half, b_half))
+        out = pl.matmul(a_plus_b, sub)
+        output = pl.assemble(output, out, [0, 0])
+    return output
 
 
 class V2CUDTest(PTOTestCase):
@@ -98,7 +106,7 @@ class V2CUDTest(PTOTestCase):
         ]
 
     def get_program(self) -> Any:
-        return V2CUDProgram
+        return v2c_ud.specialize()
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         a = tensors["a"].float()
@@ -106,27 +114,25 @@ class V2CUDTest(PTOTestCase):
         tensors["output"][:] = torch.matmul(a + b, a - b)
 
 
-@pl.program
-class V2CLRProgram:
+@pl.jit
+def v2c_lr(
+    a: pl.Tensor[[32, 32], pl.FP32],
+    b: pl.Tensor[[32, 32], pl.FP32],
+    output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+) -> pl.Tensor[[32, 32], pl.FP32]:
     """V2C left-right-split cross-core program.
 
     Vector producer: loads tiles a and b, computes add and sub, pushes both to Cube.
-    Cube consumer: pops tiles, performs matmul, stores result.
-    """
-
-    @pl.function(type=pl.FunctionType.Opaque)
-    def main(
-        self,
-        a: pl.Tensor[[32, 32], pl.FP32],
-        b: pl.Tensor[[32, 32], pl.FP32],
-        output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
-    ) -> pl.Tensor[[32, 32], pl.FP32]:
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.LEFT_RIGHT)]):
-            a_plus_b = pl.add(a, b)
-            sub = pl.sub(a, b)
-            out = pl.matmul(a_plus_b, sub)
-            output = pl.assemble(output, out, [0, 0])
-        return output
+    Cube consumer: pops tiles, performs matmul, stores result."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+            a_half = a[:, lane * 16 : lane * 16 + 16]
+            b_half = b[:, lane * 16 : lane * 16 + 16]
+            a_plus_b = pl.aic_gather(pl.add(a_half, b_half))
+            sub = pl.aic_gather(pl.sub(a_half, b_half))
+        out = pl.matmul(a_plus_b, sub)
+        output = pl.assemble(output, out, [0, 0])
+    return output
 
 
 class V2CLRTest(PTOTestCase):
@@ -145,7 +151,7 @@ class V2CLRTest(PTOTestCase):
         ]
 
     def get_program(self) -> Any:
-        return V2CLRProgram
+        return v2c_lr.specialize()
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         a = tensors["a"].float()
@@ -153,27 +159,22 @@ class V2CLRTest(PTOTestCase):
         tensors["output"][:] = torch.matmul(a + b, a - b)
 
 
-@pl.program
-class V2CNoSplitProgram:
+@pl.jit
+def v2c_nosplit(
+    a: pl.Tensor[[32, 32], pl.FP32],
+    b: pl.Tensor[[32, 32], pl.FP32],
+    output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+) -> pl.Tensor[[32, 32], pl.FP32]:
     """V2C no-split cross-core program.
 
     Vector producer: loads tiles a and b, computes add and sub, pushes both to Cube.
-    Cube consumer: pops tiles, performs matmul, stores result.
-    """
-
-    @pl.function(type=pl.FunctionType.Opaque)
-    def main(
-        self,
-        a: pl.Tensor[[32, 32], pl.FP32],
-        b: pl.Tensor[[32, 32], pl.FP32],
-        output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
-    ) -> pl.Tensor[[32, 32], pl.FP32]:
-        with pl.at(level=pl.Level.CORE_GROUP):
-            a_plus_b = pl.add(a, b)
-            sub = pl.sub(a, b)
-            out = pl.matmul(a_plus_b, sub)
-            output = pl.assemble(output, out, [0, 0])
-        return output
+    Cube consumer: pops tiles, performs matmul, stores result."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        a_plus_b = pl.add(a, b)
+        sub = pl.sub(a, b)
+        out = pl.matmul(a_plus_b, sub)
+        output = pl.assemble(output, out, [0, 0])
+    return output
 
 
 class V2CNoSplitTest(PTOTestCase):
@@ -192,7 +193,7 @@ class V2CNoSplitTest(PTOTestCase):
         ]
 
     def get_program(self) -> Any:
-        return V2CNoSplitProgram
+        return v2c_nosplit.specialize()
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         a = tensors["a"].float()
@@ -200,31 +201,30 @@ class V2CNoSplitTest(PTOTestCase):
         tensors["output"][:] = torch.matmul(a + b, a - b)
 
 
-@pl.program
-class C2VLRProgram:
+@pl.jit
+def c2v_lr(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Tensor[[M, N], pl.FP32],
+) -> pl.Tensor[[M, N], pl.FP32]:
     """C2V left-right-split cross-core program.
 
     Cube producer: computes matmul in blocks over N, pushes results to Vector.
-    Vector consumer: accumulates result into output tensor.
-    """
-
-    @pl.function(type=pl.FunctionType.Opaque)
-    def main(
-        self,
-        a: pl.Tensor[[M, K], pl.FP32],
-        b: pl.Tensor[[K, N], pl.FP32],
-        c: pl.Tensor[[M, N], pl.FP32],
-    ) -> pl.Tensor[[M, N], pl.FP32]:
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.LEFT_RIGHT)]):
-            for cb in pl.range(0, N_BLOCKS // 4):
-                for ci in pl.range(0, 4):
-                    nb = cb * 4 + ci
-                    n0 = nb * N_BLOCK
-                    c_prev = pl.slice(c, [M, N_BLOCK], [0, n0])
-                    b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
-                    c_next = pl.add(c_prev, pl.matmul(a, b_chunk))
-                    c = pl.assemble(c, c_next, [0, n0])
-        return c
+    Vector consumer: accumulates result into output tensor."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for cb in pl.range(0, N_BLOCKS // 4):
+            for ci in pl.range(0, 4):
+                nb = cb * 4 + ci
+                n0 = nb * N_BLOCK
+                b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
+                acc = pl.matmul(a, b_chunk)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                    half = pl.aiv_shard(acc)
+                    col = n0 + lane * (N_BLOCK // 2)
+                    c_prev = pl.slice(c, [M, N_BLOCK // 2], [0, col])
+                    c_next = pl.add(c_prev, half)
+                    c = pl.assemble(c, c_next, [0, col])
+    return c
 
 
 class C2VLRTest(PTOTestCase):
@@ -243,7 +243,7 @@ class C2VLRTest(PTOTestCase):
         ]
 
     def get_program(self) -> Any:
-        return C2VLRProgram
+        return c2v_lr.specialize()
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         a = tensors["a"]
@@ -252,31 +252,30 @@ class C2VLRTest(PTOTestCase):
         tensors["c"][:] = c_prev + torch.matmul(a, b)
 
 
-@pl.program
-class C2VUDProgram:
+@pl.jit
+def c2v_ud(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Tensor[[M, N], pl.FP32],
+) -> pl.Tensor[[M, N], pl.FP32]:
     """C2V updown-split cross-core program.
 
     Cube producer: computes matmul in blocks over N, pushes results to Vector.
-    Vector consumer: accumulates result into output tensor.
-    """
-
-    @pl.function(type=pl.FunctionType.Opaque)
-    def main(
-        self,
-        a: pl.Tensor[[M, K], pl.FP32],
-        b: pl.Tensor[[K, N], pl.FP32],
-        c: pl.Tensor[[M, N], pl.FP32],
-    ) -> pl.Tensor[[M, N], pl.FP32]:
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
-            for cb in pl.range(0, N_BLOCKS // 4):
-                for ci in pl.range(0, 4):
-                    nb = cb * 4 + ci
-                    n0 = nb * N_BLOCK
-                    c_prev = pl.slice(c, [M, N_BLOCK], [0, n0])
-                    b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
-                    c_next = pl.add(c_prev, pl.matmul(a, b_chunk))
-                    c = pl.assemble(c, c_next, [0, n0])
-        return c
+    Vector consumer: accumulates result into output tensor."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for cb in pl.range(0, N_BLOCKS // 4):
+            for ci in pl.range(0, 4):
+                nb = cb * 4 + ci
+                n0 = nb * N_BLOCK
+                b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
+                acc = pl.matmul(a, b_chunk)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    half = pl.aiv_shard(acc)
+                    row = lane * (M // 2)
+                    c_prev = pl.slice(c, [M // 2, N_BLOCK], [row, n0])
+                    c_next = pl.add(c_prev, half)
+                    c = pl.assemble(c, c_next, [row, n0])
+    return c
 
 
 class C2VUDTest(PTOTestCase):
@@ -295,7 +294,7 @@ class C2VUDTest(PTOTestCase):
         ]
 
     def get_program(self) -> Any:
-        return C2VUDProgram
+        return c2v_ud.specialize()
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         a = tensors["a"]
@@ -304,31 +303,26 @@ class C2VUDTest(PTOTestCase):
         tensors["c"][:] = c_prev + torch.matmul(a, b)
 
 
-@pl.program
-class C2VNoSplitProgram:
+@pl.jit
+def c2v_nosplit(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Tensor[[M, N], pl.FP32],
+) -> pl.Tensor[[M, N], pl.FP32]:
     """C2V no-split cross-core program.
 
     Cube producer: computes matmul in blocks over N, pushes results to Vector.
-    Vector consumer: accumulates result into output tensor.
-    """
-
-    @pl.function(type=pl.FunctionType.Opaque)
-    def main(
-        self,
-        a: pl.Tensor[[M, K], pl.FP32],
-        b: pl.Tensor[[K, N], pl.FP32],
-        c: pl.Tensor[[M, N], pl.FP32],
-    ) -> pl.Tensor[[M, N], pl.FP32]:
-        with pl.at(level=pl.Level.CORE_GROUP):
-            for cb in pl.range(0, N_BLOCKS // 4):
-                for ci in pl.range(0, 4):
-                    nb = cb * 4 + ci
-                    n0 = nb * N_BLOCK
-                    c_prev = pl.slice(c, [M, N_BLOCK], [0, n0])
-                    b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
-                    c_next = pl.add(c_prev, pl.matmul(a, b_chunk))
-                    c = pl.assemble(c, c_next, [0, n0])
-        return c
+    Vector consumer: accumulates result into output tensor."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for cb in pl.range(0, N_BLOCKS // 4):
+            for ci in pl.range(0, 4):
+                nb = cb * 4 + ci
+                n0 = nb * N_BLOCK
+                c_prev = pl.slice(c, [M, N_BLOCK], [0, n0])
+                b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
+                c_next = pl.add(c_prev, pl.matmul(a, b_chunk))
+                c = pl.assemble(c, c_next, [0, n0])
+    return c
 
 
 class C2VNoSplitTest(PTOTestCase):
@@ -347,7 +341,7 @@ class C2VNoSplitTest(PTOTestCase):
         ]
 
     def get_program(self) -> Any:
-        return C2VNoSplitProgram
+        return c2v_nosplit.specialize()
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         a = tensors["a"]
@@ -356,31 +350,32 @@ class C2VNoSplitTest(PTOTestCase):
         tensors["c"][:] = c_prev + torch.matmul(a, b)
 
 
-@pl.program
-class BiDirectUDProgram:
+@pl.jit
+def bidirect_ud(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Tensor[[M, N], pl.FP32],
+) -> pl.Tensor[[M, N], pl.FP32]:
     """Bidirectional (V→C→V) updown-split cross-core program.
 
-    Vector sends data to Cube for matmul, Cube sends results back to Vector.
-    """
-
-    @pl.function(type=pl.FunctionType.Opaque)
-    def main(
-        self,
-        a: pl.Tensor[[M, K], pl.FP32],
-        b: pl.Tensor[[K, N], pl.FP32],
-        c: pl.Tensor[[M, N], pl.FP32],
-    ) -> pl.Tensor[[M, N], pl.FP32]:
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
-            for cb in pl.range(0, N_BLOCKS // 4):
-                for ci in pl.range(0, 4):
-                    nb = cb * 4 + ci
-                    n0 = nb * N_BLOCK
-                    c_prev = pl.slice(c, [M, N_BLOCK], [0, n0])
-                    a_add = pl.add(a, 1.0)
-                    b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
-                    c_next = pl.add(c_prev, pl.matmul(a_add, b_chunk))
-                    c = pl.assemble(c, c_next, [0, n0])
-        return c
+    Vector sends data to Cube for matmul, Cube sends results back to Vector."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for cb in pl.range(0, N_BLOCKS // 4):
+            for ci in pl.range(0, 4):
+                nb = cb * 4 + ci
+                n0 = nb * N_BLOCK
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    a_half = a[lane * (M // 2) : lane * (M // 2) + M // 2, :]
+                    a_add = pl.aic_gather(pl.add(a_half, 1.0))
+                b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
+                acc = pl.matmul(a_add, b_chunk)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    half = pl.aiv_shard(acc)
+                    row = lane * (M // 2)
+                    c_prev = pl.slice(c, [M // 2, N_BLOCK], [row, n0])
+                    c_next = pl.add(c_prev, half)
+                    c = pl.assemble(c, c_next, [row, n0])
+    return c
 
 
 class BiDirectUDTest(PTOTestCase):
@@ -399,7 +394,7 @@ class BiDirectUDTest(PTOTestCase):
         ]
 
     def get_program(self) -> Any:
-        return BiDirectUDProgram
+        return bidirect_ud.specialize()
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         a = tensors["a"]
@@ -408,31 +403,32 @@ class BiDirectUDTest(PTOTestCase):
         tensors["c"][:] = c_prev + torch.matmul(a + 1, b)
 
 
-@pl.program
-class BiDirectLRProgram:
+@pl.jit
+def bidirect_lr(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Tensor[[M, N], pl.FP32],
+) -> pl.Tensor[[M, N], pl.FP32]:
     """Bidirectional (V→C→V) left-right-split cross-core program.
 
-    Vector sends data to Cube for matmul, Cube sends results back to Vector.
-    """
-
-    @pl.function(type=pl.FunctionType.Opaque)
-    def main(
-        self,
-        a: pl.Tensor[[M, K], pl.FP32],
-        b: pl.Tensor[[K, N], pl.FP32],
-        c: pl.Tensor[[M, N], pl.FP32],
-    ) -> pl.Tensor[[M, N], pl.FP32]:
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.LEFT_RIGHT)]):
-            for cb in pl.range(0, N_BLOCKS // 4):
-                for ci in pl.range(0, 4):
-                    nb = cb * 4 + ci
-                    n0 = nb * N_BLOCK
-                    c_prev = pl.slice(c, [M, N_BLOCK], [0, n0])
-                    a_add = pl.add(a, 1.0)
-                    b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
-                    c_next = pl.add(c_prev, pl.matmul(a_add, b_chunk))
-                    c = pl.assemble(c, c_next, [0, n0])
-        return c
+    Vector sends data to Cube for matmul, Cube sends results back to Vector."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for cb in pl.range(0, N_BLOCKS // 4):
+            for ci in pl.range(0, 4):
+                nb = cb * 4 + ci
+                n0 = nb * N_BLOCK
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                    a_half = a[:, lane * (K // 2) : lane * (K // 2) + K // 2]
+                    a_add = pl.aic_gather(pl.add(a_half, 1.0))
+                b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
+                acc = pl.matmul(a_add, b_chunk)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                    half = pl.aiv_shard(acc)
+                    col = n0 + lane * (N_BLOCK // 2)
+                    c_prev = pl.slice(c, [M, N_BLOCK // 2], [0, col])
+                    c_next = pl.add(c_prev, half)
+                    c = pl.assemble(c, c_next, [0, col])
+    return c
 
 
 class BiDirectLRTest(PTOTestCase):
@@ -451,7 +447,7 @@ class BiDirectLRTest(PTOTestCase):
         ]
 
     def get_program(self) -> Any:
-        return BiDirectLRProgram
+        return bidirect_lr.specialize()
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         a = tensors["a"]
@@ -460,31 +456,26 @@ class BiDirectLRTest(PTOTestCase):
         tensors["c"][:] = c_prev + torch.matmul(a + 1, b)
 
 
-@pl.program
-class BiDirectNoSplitProgram:
+@pl.jit
+def bidirect_nosplit(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Tensor[[M, N], pl.FP32],
+) -> pl.Tensor[[M, N], pl.FP32]:
     """Bidirectional (V→C→V) no-split cross-core program.
 
-    Vector sends data to Cube for matmul, Cube sends results back to Vector.
-    """
-
-    @pl.function(type=pl.FunctionType.Opaque)
-    def main(
-        self,
-        a: pl.Tensor[[M, K], pl.FP32],
-        b: pl.Tensor[[K, N], pl.FP32],
-        c: pl.Tensor[[M, N], pl.FP32],
-    ) -> pl.Tensor[[M, N], pl.FP32]:
-        with pl.at(level=pl.Level.CORE_GROUP):
-            for cb in pl.range(0, N_BLOCKS // 4):
-                for ci in pl.range(0, 4):
-                    nb = cb * 4 + ci
-                    n0 = nb * N_BLOCK
-                    c_prev = pl.slice(c, [M, N_BLOCK], [0, n0])
-                    a_add = pl.add(a, 1.0)
-                    b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
-                    c_next = pl.add(c_prev, pl.matmul(a_add, b_chunk))
-                    c = pl.assemble(c, c_next, [0, n0])
-        return c
+    Vector sends data to Cube for matmul, Cube sends results back to Vector."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for cb in pl.range(0, N_BLOCKS // 4):
+            for ci in pl.range(0, 4):
+                nb = cb * 4 + ci
+                n0 = nb * N_BLOCK
+                c_prev = pl.slice(c, [M, N_BLOCK], [0, n0])
+                a_add = pl.add(a, 1.0)
+                b_chunk = pl.slice(b, [K, N_BLOCK], [0, n0])
+                c_next = pl.add(c_prev, pl.matmul(a_add, b_chunk))
+                c = pl.assemble(c, c_next, [0, n0])
+    return c
 
 
 class BiDirectNoSplitTest(PTOTestCase):
@@ -503,7 +494,7 @@ class BiDirectNoSplitTest(PTOTestCase):
         ]
 
     def get_program(self) -> Any:
-        return BiDirectNoSplitProgram
+        return bidirect_nosplit.specialize()
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
         a = tensors["a"]
@@ -853,6 +844,8 @@ class TestCrossCore:
         result = test_runner.run(C2VUDTest())
         assert result.passed, f"Cross-core C2V updown compilation failed: {result.error}"
 
+    # Re-enable on A5 hardware once the pinned PTO-ISA fixes no-split error 507018.
+    @pytest.mark.platforms("a2a3", "a2a3sim", "a5sim")
     def test_tpop_c2v_nosplit(self, test_runner):
         """C2V no-split pipe: compile through full pipeline and verify correctness."""
         result = test_runner.run(C2VNoSplitTest())
@@ -868,11 +861,15 @@ class TestCrossCore:
         result = test_runner.run(BiDirectLRTest())
         assert result.passed, f"Cross-core bidirect left-right compilation failed: {result.error}"
 
+    # Re-enable on A5 hardware once the pinned PTO-ISA fixes no-split error 507018.
+    @pytest.mark.platforms("a2a3", "a2a3sim", "a5sim")
     def test_tpop_bidirect_nosplit(self, test_runner):
         """Bidirect no-split pipe: compile through full pipeline and verify correctness."""
         result = test_runner.run(BiDirectNoSplitTest())
         assert result.passed, f"Cross-core bidirect no-split compilation failed: {result.error}"
 
+    # Re-enable on A5 hardware once the pinned PTO-ISA fixes no-split error 507018.
+    @pytest.mark.platforms("a2a3", "a2a3sim", "a5sim")
     def test_tpop_bidirect_spmd_nosplit(self, test_runner):
         """Bidirect cube<->vec + transpose fused in one no-split pl.spmd scope.
 
@@ -906,6 +903,442 @@ class TestCrossCore:
         """Explicit slot_num / local_slot_num: compile through full pipeline and verify correctness."""
         result = test_runner.run(ExplicitSlotNumTest())
         assert result.passed, f"Cross-core explicit slot_num failed: {result.error}"
+
+
+def _l2_hint_case(load_hint, store_hint, planner):
+    """Exercise explicit hints beside ordinary transfers inside a tile loop."""
+
+    @pl.jit.incore
+    def hinted_kernel(
+        x: pl.Tensor[[64, 32], pl.FP32],
+        y: pl.Tensor[[64, 32], pl.FP32],
+        out: pl.Out[pl.Tensor[[64, 32], pl.FP32]],
+    ) -> pl.Tensor[[64, 32], pl.FP32]:
+        for i, (out_iter,) in pl.range(2, init_values=(out,)):
+            a = pl.load(x, [i * 32, 0], [32, 32], cache=load_hint)
+            b = pl.load(y, [i * 32, 0], [32, 32])
+            updated = pl.store(pl.add(a, b), [i * 32, 0], out_iter, cache=store_hint)
+            out = pl.yield_(updated)
+        return out
+
+    @pl.jit
+    def hinted_add(
+        x: pl.Tensor[[64, 32], pl.FP32],
+        y: pl.Tensor[[64, 32], pl.FP32],
+        out: pl.Out[pl.Tensor[[64, 32], pl.FP32]],
+    ) -> pl.Tensor[[64, 32], pl.FP32]:
+        return hinted_kernel(x, y, out)
+
+    x = (torch.arange(64 * 32).reshape(64, 32) % 127 - 63).float()
+    y = (torch.arange(64 * 32).reshape(64, 32) % 31 - 15).float()
+    return st.case(
+        hinted_add,
+        x,
+        y,
+        torch.full_like(x, float("nan")),
+        name=f"l2_{load_hint.name}_{store_hint.name}_{planner.name}",
+        golden=lambda tensors: tensors["x"] + tensors["y"],
+        memory_planner=planner,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@pytest.mark.platforms("a5", "a5sim")
+@st.cases(
+    *[
+        _l2_hint_case(load_hint, store_hint, planner)
+        for load_hint in _LOAD_POLICIES
+        for store_hint in _STORE_POLICIES
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+    ]
+)
+def test_l2_hints_preserve_results(_cache_case_run):
+    """Check numerical results and the selected ISA modes on A5 CI."""
+    case_run, work_dir = _cache_case_run
+    case_run.assert_passed()
+    sources = list((work_dir / "kernels").rglob("*.cpp"))
+    assert sources, "the compiled case must retain its kernel sources"
+    cpp = "\n".join(path.read_text() for path in sources)
+    load_policy = next(p for p in _LOAD_POLICIES if case_run.case.name.startswith(f"l2_{p.name}_"))
+    suffix = case_run.case.name.removeprefix(f"l2_{load_policy.name}_")
+    store_policy = next(p for p in _STORE_POLICIES if suffix.startswith(f"{p.name}_"))
+    load_hint = "".join(word.title() for word in load_policy.name.split("_"))
+    store_hint = "".join(word.title() for word in store_policy.name.split("_"))
+    assert f"TLOAD<pto::TLoadL2Hint::{load_hint}" in cpp
+    assert f"TSTORE<pto::TStoreL2Hint::{store_hint}" in cpp
+    assert "__pypto_l2_hint" not in cpp
+
+
+def _scope_rebind_case(policy, planner, explicit_default):
+    override = pl.CachePolicy.DEFAULT if explicit_default else None
+
+    @pl.jit
+    def scoped_rebind(x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_cache_policy(out, policy)
+            value = pl.add(x, x)
+            out = pl.assemble(out, value, [0, 0])
+            first = pl.load(out, [0, 0], [32, 32])
+            out = pl.store(pl.add(first, first), [0, 0], out)
+            second = pl.load(out, [0, 0], [32, 32], cache=override)
+            out = pl.store(second, [0, 0], out)
+        return out
+
+    name = f"l2_scope_rebind_{policy.name}_{explicit_default}_{planner.name}"
+    x = (torch.arange(32 * 32).reshape(32, 32) % 127 - 63).float()
+    case = st.case(
+        scoped_rebind,
+        x,
+        torch.full_like(x, float("nan")),
+        name=name,
+        golden=lambda tensors: tensors["x"] * 4,
+        memory_planner=planner,
+        rtol=0.0,
+        atol=0.0,
+    )
+    return pytest.param(policy, explicit_default, case, id=name)
+
+
+@pytest.fixture
+def _cache_case_run(_st_case, test_runner, tmp_path, monkeypatch):
+    # CI runs inline under --forked; keep its sources as well as batch artifacts.
+    monkeypatch.setattr(test_runner.config, "save_kernels", True)
+    monkeypatch.setattr(test_runner.config, "save_kernels_dir", str(tmp_path))
+    run = st.CaseRun(_st_case, test_runner.run(_st_case))
+    return run, run.work_dir or (tmp_path / _st_case.name)
+
+
+@pytest.mark.platforms("a5", "a5sim")
+@pytest.mark.parametrize(
+    "policy, explicit_default, _st_case",
+    [
+        _scope_rebind_case(policy, planner, explicit_default)
+        for policy in (
+            pl.CachePolicy.NORMAL_FIRST_VICTIM,
+            pl.CachePolicy.NORMAL_LAST_VICTIM,
+            pl.CachePolicy.NORMAL_PERSISTENT,
+        )
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+        for explicit_default in (False, True)
+    ],
+)
+def test_scope_cache_policy_survives_gm_rebinding(_cache_case_run, policy, explicit_default):
+    """Check inherited ISA modes as well as values after assemble/store rebindings."""
+    _assert_scope_rebind_hints(_cache_case_run, policy, explicit_default)
+
+
+def _assert_scope_rebind_hints(scope_rebind_run, policy, explicit_default):
+    case_run, work_dir = scope_rebind_run
+    case_run.assert_passed()
+    sources = list((work_dir / "kernels").rglob("*.cpp"))
+    assert sources, "the compiled case must retain its kernel sources"
+    cpp = "\n".join(path.read_text() for path in sources)
+    hint = {
+        pl.CachePolicy.NORMAL_FIRST_VICTIM: "NormalFirstVictim",
+        pl.CachePolicy.NORMAL_LAST_VICTIM: "NormalLastVictim",
+        pl.CachePolicy.NORMAL_PERSISTENT: "NormalPersistent",
+    }[policy]
+    assert cpp.count(f"TLOAD<pto::TLoadL2Hint::{hint}>") == (1 if explicit_default else 2)
+    assert "TSTORE<pto::TStoreL2Hint" not in cpp, "scope policies govern reads only"
+
+
+def _scope_conditional_rebind_case(policy, planner, take_then):
+    @pl.jit
+    def scoped_conditional_rebind(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        flags: pl.Tensor[[1], pl.INT32],
+        out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    ):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_cache_policy(out, policy)
+            if pl.read(flags, [0]) > 0:
+                out = pl.assemble(out, pl.add(x, x), [0, 0])
+            else:
+                value = pl.load(x, [0, 0], [32, 32])
+                out = pl.store(pl.add(value, pl.add(value, value)), [0, 0], out)
+            first = pl.load(out, [0, 0], [32, 32])
+            out = pl.store(pl.add(first, first), [0, 0], out)
+            second = pl.load(out, [0, 0], [32, 32])
+            out = pl.store(second, [0, 0], out)
+        return out
+
+    name = f"l2_scope_if_{take_then}_{policy.name}_{planner.name}"
+    x = (torch.arange(32 * 32).reshape(32, 32) % 127 - 63).float()
+    factor = 4 if take_then else 6
+    case = st.case(
+        scoped_conditional_rebind,
+        x,
+        torch.tensor([int(take_then)], dtype=torch.int32),
+        torch.full_like(x, float("nan")),
+        name=name,
+        golden=lambda tensors: tensors["x"] * factor,
+        memory_planner=planner,
+        rtol=0.0,
+        atol=0.0,
+    )
+    return pytest.param(policy, case, id=name)
+
+
+@pytest.mark.platforms("a5", "a5sim")
+@pytest.mark.parametrize(
+    "policy, _st_case",
+    [
+        _scope_conditional_rebind_case(policy, planner, take_then)
+        for policy in (
+            pl.CachePolicy.NORMAL_FIRST_VICTIM,
+            pl.CachePolicy.NORMAL_LAST_VICTIM,
+            pl.CachePolicy.NORMAL_PERSISTENT,
+        )
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+        for take_then in (False, True)
+    ],
+)
+def test_scope_cache_policy_survives_conditional_gm_rebinding(_cache_case_run, policy):
+    """Both runtime branches retain the selected read mode after their GM merge."""
+    _assert_scope_rebind_hints(_cache_case_run, policy, False)
+
+
+def _scope_loop_rebind_case(policy, planner, explicit_default, use_while, steps):
+    override = pl.CachePolicy.DEFAULT if explicit_default else None
+
+    @pl.jit.inline
+    def for_rebind(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        out: pl.Tensor[[32, 32], pl.FP32],
+        limit: pl.Scalar[pl.INT32],
+    ):
+        for i, (carried,) in pl.range(limit, init_values=(out,)):
+            updated = pl.assemble(carried, pl.add(carried, x), [0, 0])
+            out = pl.yield_(updated)
+        return out
+
+    @pl.jit.inline
+    def while_rebind(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        out: pl.Tensor[[32, 32], pl.FP32],
+        limit: pl.Scalar[pl.INT32],
+    ):
+        for i, carried in pl.while_(init_values=(0, out)):
+            pl.cond(i < limit)
+            updated = pl.assemble(carried, pl.add(carried, x), [0, 0])
+            _i, out = pl.yield_(i + 1, updated)
+        return out
+
+    rebind = while_rebind if use_while else for_rebind
+
+    @pl.jit
+    def scoped_loop_rebind(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        counts: pl.Tensor[[1], pl.INT32],
+        out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    ):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_cache_policy(out, policy)
+            out = pl.assemble(out, pl.add(x, x), [0, 0])
+            limit = pl.read(counts, [0])
+            out = rebind(x, out, limit)
+            second = pl.load(out, [0, 0], [32, 32], cache=override)
+            out = pl.store(pl.add(second, second), [0, 0], out)
+        return out
+
+    kind = "while" if use_while else "for"
+    name = f"l2_scope_loop_{kind}_{steps}_{policy.name}_{explicit_default}_{planner.name}"
+    x = (torch.arange(32 * 32).reshape(32, 32) % 127 - 63).float()
+    case = st.case(
+        scoped_loop_rebind,
+        x,
+        torch.tensor([steps], dtype=torch.int32),
+        torch.full_like(x, float("nan")),
+        name=name,
+        golden=lambda tensors: tensors["x"] * (4 + 2 * steps),
+        memory_planner=planner,
+        rtol=0.0,
+        atol=0.0,
+    )
+    return pytest.param(policy, explicit_default, case, id=name)
+
+
+@pytest.mark.platforms("a5", "a5sim")
+@pytest.mark.parametrize(
+    "policy, explicit_default, _st_case",
+    [
+        _scope_loop_rebind_case(policy, planner, explicit_default, use_while, steps)
+        for policy in (
+            pl.CachePolicy.NORMAL_FIRST_VICTIM,
+            pl.CachePolicy.NORMAL_LAST_VICTIM,
+            pl.CachePolicy.NORMAL_PERSISTENT,
+        )
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+        for explicit_default in (False, True)
+        for use_while in (False, True)
+        for steps in (0, 2)
+    ],
+)
+def test_scope_cache_policy_survives_loop_results(_cache_case_run, policy, explicit_default):
+    """Check zero/multiple iterations and ISA hints after for/while GM results."""
+    _assert_scope_rebind_hints(_cache_case_run, policy, explicit_default)
+
+
+def _acc_store_cache_case(policy, planner, quantized, with_relu):
+    scale = 0.5 if quantized else None
+
+    @pl.jit.incore
+    def acc_store(
+        x: pl.Tensor[[16, 64], pl.FP16],
+        y: pl.Tensor[[32, 64], pl.FP16],
+        out: pl.Out[pl.Tensor[[16, 32], pl.FP16]],
+    ):
+        lhs = pl.load(x, [0, 0], [16, 64], target_memory=pl.Mem.Mat)
+        rhs = pl.load(y, [0, 0], [32, 64], target_memory=pl.Mem.Mat)
+        acc = pl.matmul(
+            pl.tile.move(lhs, target_memory=pl.Mem.Left),
+            pl.tile.move(pl.tile.transpose_view(rhs), target_memory=pl.Mem.Right),
+        )
+        return pl.store(acc, [0, 0], out, cache=policy, pre_quant=scale, pre_relu=with_relu)
+
+    @pl.jit
+    def acc_writeback(
+        x: pl.Tensor[[16, 64], pl.FP16],
+        y: pl.Tensor[[32, 64], pl.FP16],
+        out: pl.Out[pl.Tensor[[16, 32], pl.FP16]],
+    ):
+        return acc_store(x, y, out)
+
+    def golden(tensors):
+        value = tensors["x"].float() @ tensors["y"].float().T
+        if with_relu:
+            value = torch.relu(value)
+        return (value * (0.5 if quantized else 1.0)).half()
+
+    name = f"l2_acc_{policy.name}_quant{quantized}_relu{with_relu}_{planner.name}"
+    case = st.case(
+        acc_writeback,
+        (torch.arange(16 * 64).reshape(16, 64) % 7 - 3).half(),
+        (torch.arange(32 * 64).reshape(32, 64) % 5 - 2).half(),
+        torch.full((16, 32), float("nan"), dtype=torch.float16),
+        name=name,
+        golden=golden,
+        memory_planner=planner,
+        rtol=0.0,
+        atol=0.0,
+    )
+    return pytest.param(policy, case, id=name)
+
+
+@pytest.mark.platforms("a5", "a5sim")
+@pytest.mark.parametrize(
+    "policy, _st_case",
+    [
+        _acc_store_cache_case(policy, planner, quantized, with_relu)
+        for policy in _STORE_POLICIES
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+        for quantized in (False, True)
+        for with_relu in (False, True)
+    ],
+)
+def test_acc_store_cache_policy_preserves_results(case_run, policy):
+    """All four A5 store modes preserve plain/ReLU/quantized ACC writeback."""
+    case_run.assert_passed()
+
+
+def _direct_push(final: bool, *, bf16: bool):
+    dtype = pl.BF16 if bf16 else pl.FP32
+
+    @pl.jit.incore(level=pl.Level.AIC)
+    def produce(
+        a: pl.Tensor[[64, 64], pl.BF16],
+        b: pl.Tensor[[64, 128], pl.BF16],
+    ):
+        mailbox: pl.Tile[[32, 128], dtype, pl.MemRef("ub"), pl.Mem.Vec] = pl.tile.create(
+            [32, 128], dtype, target_memory=pl.Mem.Vec
+        )
+        if bf16:
+            right = pl.tile.load(b, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+            left0 = pl.tile.load(a, [0, 0], [32, 64], target_memory=pl.Mem.Mat)
+            acc0 = pl.tile.matmul(left0, right)
+            pl.tpush_to_aiv(acc0, split=0, dst=mailbox, aiv_subblockid=0)
+            left1 = pl.tile.load(a, [32, 0], [32, 64], target_memory=pl.Mem.Mat)
+            acc1 = pl.tile.matmul(left1, right)
+            pl.tpush_to_aiv(acc1, split=0, dst=mailbox, aiv_subblockid=1)
+        elif final:
+            left = pl.tile.load(a, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+            right = pl.tile.load(b, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+            acc = pl.tile.matmul(left, right, acc_phase=pl.AccPhase.Partial)
+            acc = pl.tile.matmul_acc(acc, left, right, acc_phase=pl.AccPhase.Final)
+            pl.tpush_to_aiv(acc, split=1, dst=mailbox, st_phase=pl.STPhase.Final)
+        else:
+            left = pl.tile.load(a, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+            for part in pl.range(2):
+                right = pl.tile.load(b, [0, part * 64], [64, 64], target_memory=pl.Mem.Mat)
+                acc = pl.tile.matmul(left, right)
+                pl.tpush_to_aiv(acc, split=1, dst=mailbox, offset=[0, part * 64])
+
+        # Signal each lane after FIX has written its full 32 x 128 mailbox.
+        pl.system.set_intra_block(4, pipe=pl.PipeType.FIX)
+        pl.system.set_intra_block(20, pipe=pl.PipeType.FIX)
+
+    @pl.jit.incore(level=pl.Level.AIV)
+    def consume(out: pl.Out[pl.Tensor[[64, 128], dtype]]):
+        pl.func_attr({"split_aiv": True, "split": pl.SplitMode.NONE})
+        mailbox: pl.Tile[[32, 128], dtype, pl.MemRef("ub"), pl.Mem.Vec] = pl.tile.create(
+            [32, 128], dtype, target_memory=pl.Mem.Vec
+        )
+        pl.system.wait_intra_block(4, pipe=pl.PipeType.MTE3)
+        pl.tile.mark_remote_written(mailbox)
+        return pl.tile.store(mailbox, [pl.tile.get_subblock_idx() * 32, 0], out)
+
+    @pl.jit.incore(level=pl.Level.CORE_GROUP)
+    def group(
+        a: pl.Tensor[[64, 64], pl.BF16],
+        b: pl.Tensor[[64, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[64, 128], dtype]],
+    ):
+        produce(a, b)
+        return consume(out)
+
+    @pl.jit(auto_scope=False)
+    def main(
+        a: pl.Tensor[[64, 64], pl.BF16],
+        b: pl.Tensor[[64, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[64, 128], dtype]],
+    ):
+        with pl.spmd(1):
+            out = group(a, b, out)
+        return out
+
+    return main
+
+
+def _direct_push_case(final: bool, *, bf16: bool = False):
+    a = torch.arange(1, 65, dtype=torch.bfloat16).reshape(64, 1).expand(64, 64).contiguous()
+    b = torch.arange(1, 129, dtype=torch.bfloat16).expand(64, 128).contiguous()
+    out = torch.zeros(64, 128, dtype=torch.bfloat16 if bf16 else torch.float32)
+
+    def golden(tensors):
+        product = tensors["a"].float() @ tensors["b"].float()
+        if bf16:
+            # The two 32-row products differ, so swapping or broadcasting either lane fails.
+            return product.bfloat16()
+        return product * 2 if final else product
+
+    name = "direct_bf16_selected_lane" if bf16 else ("direct_final" if final else "direct_column_fragments")
+    return st.case(
+        _direct_push(final, bf16=bf16),
+        a,
+        b,
+        out,
+        name=name,
+        golden=golden,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.platforms("a5")
+@st.cases(_direct_push_case(False), _direct_push_case(True), _direct_push_case(False, bf16=True))
+def test_direct_tpush_to_aiv(case_run):
+    case_run.assert_passed()
 
 
 if __name__ == "__main__":

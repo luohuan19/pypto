@@ -10,12 +10,15 @@
 """Private spellings for lossless IR text; not a kernel authoring API.
 
 The AST parser also recognizes ``comm_domain``, ``window_buffer``, ``window_ref``,
-``alloc_window_buffer``, and ``call`` inside printed programs. These are syntax
+``alloc_window_buffer``, ``call``, ``submit``, and ``yield_`` inside printed programs. These are syntax
 markers rather than Python functions: function bodies are parsed, not executed.
 Window descriptors use named references, for example
 ``window_buffer("buf_window", base="buf", size=16)`` and
 ``window_ref("buf_window")``. Labels encode object sharing without adding IR
 fields. ``call`` accepts any result type supported by the type parser.
+``submit(pl.submit(...), result_type)`` preserves a Submit result descriptor.
+Multi-result ``yield_(..., types=[...])`` preserves each region result's type,
+including allocation metadata that differs from the yielded operands.
 """
 
 import re
@@ -26,6 +29,7 @@ from pypto.pypto_core import ir
 # Annotation-only marker values. The parser resolves the spelling, not the value.
 WindowBuffer = ir.WindowBufferType.get()
 Unknown = ir.UnknownType()
+UReg = ir.RegType.ureg()
 
 
 def float64(bits: str) -> float:

@@ -20,8 +20,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, cast
 
+from pypto._target import runtime_implementation_name
 from pypto.pypto_core import DataType
-from pypto.pypto_core.passes import MemoryPlanner, RuntimeKind, runtime_kind_to_name
+from pypto.pypto_core.passes import MemoryPlanner, RuntimeKind
 
 if TYPE_CHECKING:
     from pypto.ir.pass_manager import OptimizationStrategy
@@ -141,6 +142,7 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     dep_layouts: tuple[tuple[str, str, str], ...] = (),
     runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
     enable_buffer_ir: bool = True,
+    enable_software_pipeline: bool = False,
 ) -> CacheKey:
     """Build a cache key for a JIT call site.
 
@@ -194,11 +196,11 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
             changes the placement and whether physical addresses are baked
             into the artifact; without it, compiling one kernel under multiple
             planners would hand a later call the wrong artifact.
-        enable_pypto_l0c_double_buffer: Effective legacy-PYPTO chooser dbC=2
-            (L0C double-buffer) opt-in resolved from the active ``PassContext``.
-            Included for ``PYPTO`` because it changes AutoTileMatmulL0 output
-            and allocation. Canonicalized to false for ``DSA_RP`` and ``PTOAS``,
-            which enable dbC=2 automatically regardless of this flag.
+        enable_pypto_l0c_double_buffer: Stored legacy flag resolved from the
+            active ``PassContext``. Its existing key representation is retained
+            for compatibility: included for ``PYPTO``, canonicalized to false
+            for ``DSA_RP`` and ``PTOAS``. Automatic dbC is disabled for PYPTO
+            and DSA_RP; PTOAS retains it independently of this value.
         runtime: Effective Simpler runtime ABI resolved from the active
             ``PassContext``. Included in the key because it is baked into the
             artifact's ``kernel_config.py`` and decides which worker can bind
@@ -207,6 +209,8 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         enable_buffer_ir: Whole-kernel Buffer IR selection from the active
             ``PassContext``. It changes storage legalization and separates
             artifacts from explicit Off mode under every memory planner.
+        enable_software_pipeline: Effective software pipeline opt-in. Separates
+            rotating-slot kernels from kernels produced by unroll lowering.
 
     Returns:
         Hashable CacheKey tuple.
@@ -240,9 +244,13 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         ("memory_planner", None if memory_planner is None else str(memory_planner)),
         ("enable_pypto_l0c_double_buffer", effective_pypto_dbc),
         ("dep_layouts", dep_layouts),
-        ("runtime", runtime_kind_to_name(runtime)),
+        ("runtime", runtime_implementation_name(runtime, platform)),
         ("enable_buffer_ir", enable_buffer_ir),
-        ("buffer_ir_version", 5 if enable_buffer_ir else 0),
+        ("buffer_ir_version", 14 if enable_buffer_ir else 0),
+        # Tile fallback also changed: native compare gather needs its full scratch
+        # backing, even when Buffer IR is disabled. Invalidate pre-contract kernels.
+        ("gather_compare_scratch_version", 2),
+        ("enable_software_pipeline", enable_software_pipeline),
     )
     return CacheKey(
         source_hash,

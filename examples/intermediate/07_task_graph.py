@@ -26,6 +26,10 @@ Concepts introduced:
 
 Run:  python examples/intermediate/07_task_graph.py
 Next: examples/advanced/03_mixed_kernel.py
+
+Legacy Python API example: platform= calls below are retained for compatibility
+and emit DeprecationWarning. New Python code should use backend_type and
+execution_mode; see docs/en/dev/08-entry-points.md#legacy-platform-examples.
 """
 
 import pypto.language as pl
@@ -79,7 +83,8 @@ if __name__ == "__main__":
     for name, kernel in _MODES.items():
         scratch = torch.zeros(ROWS, COLS, dtype=torch.float32)
         out = torch.zeros(ROWS, COLS, dtype=torch.float32)
-        kernel(x, scratch, out, config=cfg)
+        compiled = kernel.compile(x, scratch, out, config=cfg)
+        compiled(x, scratch, out, config=cfg)
         assert torch.allclose(out, expected, rtol=1e-5, atol=1e-5), (
             f"{name}: max diff = {(out - expected).abs().max().item()}"
         )

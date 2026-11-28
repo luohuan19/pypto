@@ -15,21 +15,20 @@ lower-level primitives only when building a custom protocol.
 | `NotifyOp` | `AtomicAdd`, `Set` | Signal deposit mode. `AtomicAdd`: atomically increment the peer's signal slot (use for multi-rank barriers). `Set`: overwrite the peer's signal slot (use for 1:1 handshakes). |
 | `WaitCmp` | `Eq`, `Ge` | Wait predicate. `Eq`: block until signal slot equals expected value. `Ge`: block until signal slot >= expected value. |
 | `ReduceOp` | `Sum`, `Max`, `Min`, `Prod` | Reduction operator for collective operations. Support is per-operation: `allreduce` accepts all four; `reduce_scatter` accepts all four on the InCore rail, while the HOST builtin rail currently lowers only `Sum`. |
-| `AtomicType` | `None_`, `Add` | Remote-store combine mode. `None_`: plain store. `Add`: atomically accumulate into peer's destination — requires an `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8` destination, and a `bf16` destination requires the Ascend910B (A2/A3) profile. |
+| `AtomicType` | `None_`, `Add` | Remote-store combine mode. `None_`: plain store. `Add`: atomically accumulate into peer's destination — requires an `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8` destination, and a `bf16` destination requires the Ascend910 (A2/A3) profile. |
 | `DistributedTensor` | — | A tensor view bound to a comm-domain window buffer. Every collective and RMA op requires this type on the window side. |
 | `CommCtx` | — | Communication context handle. Produced by `get_comm_ctx()`; consumed by `rank()` and `nranks()`. |
 
 ## System Substrate (`pld.system.*`)
 
-These are the lowest-level distributed primitives. Scope varies per op —
-`world_size` is host-only; `get_comm_ctx` works in both host orchestrator and
-InCore kernel code; `rank`, `nranks`, `notify`, `wait`, and `defer_wait` have codegen
-support only in InCore kernel code (there is no host-orchestrator lowering
-for them).
+The parser accepts `world_size` and `num_workers` in HOST and CLUSTER_0 orchestration.
+`get_comm_ctx` works in both host orchestrators and InCore kernels. Codegen supports
+`rank`, `nranks`, `notify`, `wait`, and `defer_wait` only in InCore kernels.
 
 | Name | Signature | Description |
 | ---- | --------- | ----------- |
-| `world_size` | `() -> Scalar` | **Host-only.** Number of ranks in the distributed execution. Returns `INT64`. |
+| `world_size` | `() -> Scalar` | Number of ranks in the distributed execution. Returns `INT64`. |
+| `num_workers` | `() -> Scalar` | Number of immediate child workers. Returns `INT64`. |
 | `get_comm_ctx` | `(dist_tensor: DT) -> Ctx` | Lift a `DistributedTensor` to its `CommCtx` handle. Works in host orchestrator and InCore code. The verifier rejects plain `pl.Tensor`. |
 | `rank` | `(ctx: Ctx) -> Scalar` | **InCore-only.** Local rank index (`INT32`). Lowers to a load of `CommContext::rankId`. |
 | `nranks` | `(ctx: Ctx) -> Scalar` | **InCore-only.** Number of ranks in this comm group (`INT32`). Lowers to a load of `CommContext::rankNum`. |
@@ -45,7 +44,7 @@ even though they are as foundational as the substrate above.
 | Name | Signature | Description |
 | ---- | --------- | ----------- |
 | `window` | `(buf: Ptr, shape: Sequence[IntLike], *, dtype: DataType) -> DT` | Materialise a window-buffer `Ptr` as a `DistributedTensor` view. `buf` comes from `alloc_window_buffer`. |
-| `alloc_window_buffer` | `(size: IntLike, *, name: str = "") -> Ptr` | Allocate a per-rank HCCL window buffer. **Size is in bytes.** The `name` kwarg is injected by the parser from the LHS assignment — never pass it explicitly. |
+| `alloc_window_buffer` | `(size: IntLike, *, name: str = "") -> Ptr` | Declare a per-rank HCCL window buffer in HOST or CLUSTER_0 orchestration. **Size is in bytes.** The `name` kwarg is injected by the parser from the LHS assignment — never pass it explicitly. |
 | `alloc_window_buffer` | `(shape: Sequence[IntLike], *, dtype: DataType, name: str = "") -> Ptr` | Convenience overload. `size = prod(shape) x dtype.get_byte()` computed automatically. |
 
 ## Notify & Wait: The Signal Handshake
@@ -264,7 +263,7 @@ get(dst, peer=B, src, ...)   this rank: dst (Out) <--read---  peer B: src (In)
 
 | Name | Signature | Mutation | Description |
 | ---- | --------- | -------- | ----------- |
-| `put` | `(dst: DT, peer: IntLike, src: DT \| Tensor, dst_offsets=None, src_offsets=None, shape=None, *, atomic=AtomicType.None_, chunk_rows=0, chunk_cols=0, pipeline=False) -> Call` | `dst: InOut`, `src: In` | Write local `src` into peer rank's `dst`. `dst` **must** be window-bound; `src` may be plain `Tensor`. With no offsets/shape, writes the full local slice. `atomic=Add` accumulates instead of overwriting (hardware atomic-add dtypes only: `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8`; `bf16` is Ascend910B-only). |
+| `put` | `(dst: DT, peer: IntLike, src: DT \| Tensor, dst_offsets=None, src_offsets=None, shape=None, *, atomic=AtomicType.None_, chunk_rows=0, chunk_cols=0, pipeline=False) -> Call` | `dst: InOut`, `src: In` | Write local `src` into peer rank's `dst`. `dst` **must** be window-bound; `src` may be plain `Tensor`. With no offsets/shape, writes the full local slice. `atomic=Add` accumulates instead of overwriting (hardware atomic-add dtypes only: `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8`; `bf16` is Ascend910-only). |
 
 ### Get (Read from Peer)
 

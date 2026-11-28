@@ -1,5 +1,9 @@
 # Runtime Overhead
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Five ways to spend less time per task without changing what the tasks compute.
 
 > **Prerequisites:** [Task granularity](01-task-granularity.md).
@@ -43,24 +47,26 @@ def fresh(rows=ROWS):
 tasks: the cube task finishes, writes GM, and the vector task is dispatched to read it
 back.
 
-**How:** one `pl.at` scope carrying both, with a split mode telling the compiler how to
-divide the vector half across the two AIVs that share a cube:
+**How:** one `pl.at` scope carrying both, with explicit shards and per-lane addresses for the two AIVs that share a cube:
 
 ```python
 with pl.at(
     level=pl.Level.CORE_GROUP,
-    optimizations=[pl.split(pl.SplitMode.UP_DOWN), pl.cross_core_slot(slot_num=2)],
+    optimizations=[pl.cross_core_slot(slot_num=1)],
 ):
     acc = pl.matmul(a, b, out_dtype=pl.FP32)   # cube (AIC)
-    out[:] = pl.add(acc, bias)                 # vector (AIV)
+    for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+        half = pl.aiv_shard(acc)
+        row = lane * HALF_ROWS
+        out[row:row + HALF_ROWS, :] = pl.add(half, bias[row:row + HALF_ROWS, :])
 ```
 
 `examples/advanced/03_mixed_kernel.py` runs this in three modes, and
 [the tutorial](../tutorials/03-mixed-kernel.md) walks through it.
 
-**Cost:** `pl.split` halves only the **vector** sub-region; the cube side stays full-size,
+**Cost:** Explicit sharding partitions the **vector** work; the cube side stays full-size,
 so the vector buffers shrink but the cube buffers do not. And the cross-core ring that
-carries the intermediate between engines is real memory: it defaults to **8 slots**, which
+carries the intermediate between engines is real memory: it defaults to **2 slots**, which
 for a large intermediate is far more than the vector budget can spare. `slot_num=` is
 usually not optional — the compiler tells you at compile time when the default does not
 fit.
@@ -124,7 +130,8 @@ def spmd_blocks(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
 
 for kernel in (per_block_tasks, spmd_blocks):
     c = fresh()
-    kernel(A, B, c, config=CFG)
+    compiled = kernel.compile(A, B, c, config=CFG)
+    compiled(A, B, c, config=CFG)
     torch.testing.assert_close(c, A + B, rtol=1e-4, atol=1e-4)
 ```
 
@@ -165,7 +172,8 @@ def gated(a: pl.Tensor, gate: pl.Tensor, out: pl.Out[pl.Tensor]):
 for gate_value, expected in ((0, A * 2.0), (1, A * 2.0 + 1.0)):
     gate = torch.full((1, 1), gate_value, dtype=torch.int32)
     out = fresh()
-    gated(A, gate, out, config=CFG)
+    compiled = gated.compile(A, gate, out, config=CFG)
+    compiled(A, gate, out, config=CFG)
     torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 ```
 
@@ -219,7 +227,8 @@ def early_resolve(a: pl.Tensor, b: pl.Tensor, scratch: pl.Out[pl.Tensor], out: p
     return scratch, out
 
 scratch, out = fresh(TILE_ROWS), fresh(TILE_ROWS)
-early_resolve(A[:TILE_ROWS], B[:TILE_ROWS], scratch, out, config=CFG)
+compiled = early_resolve.compile(A[:TILE_ROWS], B[:TILE_ROWS], scratch, out, config=CFG)
+compiled(A[:TILE_ROWS], B[:TILE_ROWS], scratch, out, config=CFG)
 torch.testing.assert_close(out, torch.exp(A[:TILE_ROWS] + B[:TILE_ROWS]), rtol=1e-3, atol=1e-4)
 ```
 

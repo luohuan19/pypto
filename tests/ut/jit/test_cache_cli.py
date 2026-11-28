@@ -45,19 +45,37 @@ def _write(tmp_path, requests, **extra):
     return path
 
 
-def test_metadata_only_warmup_and_relative_paths(tmp_path, cli_kernel):
+@pytest.mark.filterwarnings("error::DeprecationWarning")
+@pytest.mark.parametrize("platform", [None, "a2a3", "a2a3sim", "a5", "a5sim"])
+def test_metadata_only_warmup_and_relative_paths(tmp_path, cli_kernel, platform):
     module, calls = cli_kernel
     path = _write(
         tmp_path,
-        [{"kernel": "kernel", "tensors": {n: {"shape": [16, 16], "dtype": "FP32"} for n in ("x", "out")}}],
+        [
+            {
+                "kernel": "kernel",
+                "tensors": {n: {"shape": [16, 16], "dtype": "FP32"} for n in ("x", "out")},
+                "run_config": {"platform": platform} if platform is not None else {},
+            }
+        ],
         cache={"enabled": True, "root": "cache", "extra_source_paths": ["sources"]},
     )
     result = warm(module, path)
     assert result["requests"][0]["storage"] == "private"
     assert len(calls) == 1
+    assert calls[0]["config"].platform == (platform or "a2a3sim")
     assert calls[0]["x"].device.type == "meta"
     assert calls[0]["config"].cache_config.root == tmp_path / "cache"
     assert calls[0]["config"].cache_config.extra_source_paths == (tmp_path / "sources",)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_warmup_preserves_software_pipeline_option(tmp_path, cli_kernel, enabled):
+    module, calls = cli_kernel
+    path = _write(tmp_path, [{"kernel": "kernel", "run_config": {"enable_software_pipeline": enabled}}])
+    warm(module, path)
+    assert len(calls) == 1
+    assert calls[0]["config"].compile_kwargs()["enable_software_pipeline"] == enabled
 
 
 @pytest.mark.parametrize(
@@ -69,6 +87,7 @@ def test_metadata_only_warmup_and_relative_paths(tmp_path, cli_kernel):
         {"kernel": "kernel", "tensors": {"x": {"shape": [16, 16], "dtype": "unknown"}}},
         {"kernel": "kernel", "tensors": {"x": {"shape": [32, 16], "dtype": "FP32"}}},
         {"kernel": "kernel", "run_config": {"typo": 1}},
+        {"kernel": "kernel", "run_config": {"enable_software_pipeline": "true"}},
     ],
 )
 def test_validate_all_requests_before_any_build(tmp_path, cli_kernel, invalid_request):

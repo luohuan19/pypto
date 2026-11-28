@@ -233,7 +233,12 @@ def _assert_buffer_result(case_run, request):
     case_run.assert_passed()
     if request.config.getoption("--precompile-workers") is not None:
         assert case_run.work_dir is not None
-        program = ir.deserialize((case_run.work_dir / "buffer_ir.msgpack").read_bytes())
+        receipt = case_run.work_dir / "buffer_ir.msgpack"
+        if not case_run.case.get_enable_buffer_ir():
+            # The harness emits a stage receipt only when Buffer is enabled.
+            assert not receipt.exists()
+            return
+        program = ir.deserialize(receipt.read_bytes())
         kernels = [f for f in program.functions.values() if ir.is_incore_type(f.func_type)]
         expected = (
             ir.FunctionIRStage.Buffer
@@ -345,6 +350,659 @@ def _typed_mul(a: pl.Tensor, b: pl.Tensor, out: pl.Out[pl.Tensor]):
     ]
 )
 def test_default_typed_arithmetic(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+@pl.jit.incore
+def _softmax_full(a: pl.Tensor, out: pl.InOut[pl.Tensor]):
+    source = pl.load(a, [0, 0], [64, 64])
+    scratch = pl.create_tile([64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+    maximum = pl.row_max(source, scratch)
+    shifted = pl.row_expand_sub(source, maximum)
+    exponent = pl.exp(shifted)
+    total = pl.row_sum(exponent, scratch)
+    result = pl.row_expand_div(exponent, total)
+    out = pl.store(result, [0, 0], out)
+    return pl.store(source, [64, 0], out)
+
+
+@pl.jit.incore
+def _softmax_partial(a: pl.Tensor, out: pl.InOut[pl.Tensor]):
+    source = pl.load(a, [0, 0], [16, 128], valid_shape=[13, 117])
+    scratch = pl.create_tile([16, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+    maximum = pl.row_max(source, scratch)
+    shifted = pl.row_expand_sub(source, maximum)
+    exponent = pl.exp(shifted)
+    total = pl.row_sum(exponent, scratch)
+    result = pl.row_expand_div(exponent, total)
+    out = pl.store(result, [0, 0], out)
+    return pl.store(source, [16, 0], out)
+
+
+@pl.jit
+def _softmax_core_group(a: pl.Tensor, out: pl.InOut[pl.Tensor]):
+    # Match the public softmax example's outlining and lane-splitting path.
+    with pl.at(level=pl.Level.CORE_GROUP):
+        source = pl.load(a, [0, 0], [64, 64])
+        scratch = pl.create_tile([64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        maximum = pl.row_max(source, scratch)
+        shifted = pl.row_expand_sub(source, maximum)
+        exponent = pl.exp(shifted)
+        total = pl.row_sum(exponent, scratch)
+        result = pl.row_expand_div(exponent, total)
+        out = pl.store(result, [0, 0], out)
+        out = pl.store(source, [64, 0], out)
+    return out
+
+
+def _softmax_entry(kernel):
+    @pl.jit
+    def entry(a: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        return kernel(a, out)
+
+    return entry
+
+
+def _softmax_golden(tensors, valid):
+    source, output = tensors["a"], tensors["out"].clone()
+    rows, cols = valid
+    output[:rows, :cols] = torch.softmax(source[:rows, :cols], dim=-1)
+    start = source.shape[0]
+    output[start : start + rows, :cols] = source[:rows, :cols]
+    return output
+
+
+@st.cases(
+    *[
+        st.case(
+            kernel,
+            torch.randn(shape, generator=torch.Generator().manual_seed(19)) * 4,
+            torch.full((2 * shape[0], shape[1]), -777.0),
+            name=f"buffer_softmax_{name}_{planner.name.lower()}",
+            golden=lambda tensors, valid=valid: _softmax_golden(tensors, valid),
+            memory_planner=planner,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        for kernel, name, shape, valid in (
+            (_softmax_entry(_softmax_full), "full", (64, 64), (64, 64)),
+            (_softmax_entry(_softmax_partial), "partial", (16, 128), (13, 117)),
+            (_softmax_core_group, "core_group", (64, 64), (64, 64)),
+        )
+        for planner in _PLANNERS
+    ]
+)
+def test_default_softmax_device_results(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+@pl.jit.incore
+def _row_vector_states(a: pl.Tensor, out: pl.InOut[pl.Tensor]):
+    source = pl.load(a, [0, 0], [16, 64])
+    scratch = pl.create_tile([16, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+    maximum = pl.row_max(source, scratch)
+    narrowed = pl.tile.set_validshape(maximum, 13, 1)
+    partial = pl.tile.set_validshape(source, 13, 64)
+    shifted_partial = pl.row_expand_sub(partial, narrowed)
+    out = pl.store(shifted_partial, [0, 0], out)
+    shifted = pl.row_expand_sub(source, maximum)
+    out = pl.store(shifted, [16, 0], out)
+    total = pl.row_sum(source, scratch)
+    scaled = pl.row_expand_div(source, total)
+    return pl.store(scaled, [32, 0], out)
+
+
+def _row_vector_golden(tensors):
+    source, output = tensors["a"], tensors["out"].clone()
+    maximum = torch.amax(source, dim=-1, keepdim=True)
+    output[:13] = source[:13] - maximum[:13]
+    output[16:32] = source - maximum
+    output[32:] = source / torch.sum(source, dim=-1, keepdim=True)
+    return output
+
+
+@st.cases(
+    *[
+        st.case(
+            _softmax_entry(_row_vector_states),
+            torch.randn((16, 64), generator=torch.Generator().manual_seed(37)) + 4,
+            torch.full((48, 64), -777.0),
+            name=f"buffer_row_vectors_{planner.name.lower()}",
+            golden=_row_vector_golden,
+            memory_planner=planner,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        for planner in _PLANNERS
+    ]
+)
+def test_default_row_vector_states(case_run, request):
+    # A narrowed column descriptor must not change the original value's valid
+    # rows; matrix broadcasts expose the values and preserve untouched GM rows.
+    _assert_buffer_result(case_run, request)
+
+
+def _cast_select_entry(scalar, valid):
+    rows, cols = valid
+
+    @pl.jit.incore
+    def kernel(a: pl.Tensor, b: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        a_tile = pl.load(a, [0, 0], [8, 64], valid_shape=[rows, cols])
+        b_tile = pl.load(b, [0, 0], [8, 64], valid_shape=[rows, cols])
+        x = pl.cast(a_tile, pl.FP32, mode="rint")
+        y = pl.cast(b_tile, pl.FP32, mode="rint")
+        if scalar:
+            mask = pl.tile.cmps(x, 0.0, cmp_type=4)
+            scalar_scratch = pl.create_tile([1, 64], dtype=pl.FP32)
+            selected = pl.tile.sels(mask, x, scalar_scratch, -3.0)
+        else:
+            mask = pl.tile.cmp(x, y, cmp_type=4)
+            tile_scratch = pl.create_tile([1, 16], dtype=pl.UINT32)
+            selected = pl.tile.sel(mask, x, y, tile_scratch)
+        result = pl.cast(selected, pl.FP16, mode="rint")
+        out = pl.store(result, [0, 0], out)
+        out = pl.store(a_tile, [8, 0], out)
+        return pl.store(b_tile, [16, 0], out)
+
+    @pl.jit
+    def entry(a: pl.Tensor, b: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        return kernel(a, b, out)
+
+    return entry
+
+
+def _cast_select_golden(tensors, scalar, valid):
+    rows, cols = valid
+    a, b = tensors["a"], tensors["b"]
+    out = tensors["out"].clone()
+    lhs, rhs = a[:rows, :cols].float(), b[:rows, :cols].float()
+    condition = lhs > (0.0 if scalar else rhs)
+    out[:rows, :cols] = torch.where(condition, lhs, -3.0 if scalar else rhs).half()
+    out[8 : 8 + rows, :cols] = a[:rows, :cols]
+    out[16 : 16 + rows, :cols] = b[:rows, :cols]
+    return out
+
+
+@st.cases(
+    *[
+        st.case(
+            _cast_select_entry(scalar, valid),
+            ((torch.arange(512).reshape(8, 64) % 17) - 8).half() / 4,
+            torch.flip(((torch.arange(512).reshape(8, 64) % 17) - 8).half() / 4, [1]),
+            torch.full((24, 64), -777.0, dtype=torch.float16),
+            name=f"buffer_cast_select_{'scalar' if scalar else 'tile'}_{valid[1]}_{planner.name.lower()}",
+            golden=lambda tensors, scalar=scalar, valid=valid: _cast_select_golden(tensors, scalar, valid),
+            memory_planner=planner,
+            rtol=0,
+            atol=0,
+        )
+        for scalar in (False, True)
+        for valid in ((8, 64), (7, 61))
+        for planner in _PLANNERS
+    ]
+)
+def test_default_cast_compare_select(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+def _half_rounding_entry(valid, mode):
+    rows, cols = valid
+
+    @pl.jit.incore
+    def kernel(a: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        source = pl.load(a, [0, 0], [8, 64], valid_shape=[rows, cols])
+        result = pl.cast(source, pl.FP16, mode=mode, saturation_mode="off")
+        return pl.store(result, [0, 0], out)
+
+    return _softmax_entry(kernel)
+
+
+def _half_rounding_data():
+    data = torch.linspace(-3, 3, 512).reshape(8, 64)
+    # Consecutive half-way values round down/up under ties-to-even. Negative
+    # values and tiny subnormals expose sign and underflow handling as well.
+    data[0, :8] = torch.tensor(
+        [1 + 2**-11, 1 + 3 * 2**-11, -1 - 2**-11, -1 - 3 * 2**-11, 2**-25, 3 * 2**-25, -(2**-25), -3 * 2**-25]
+    )
+    return data
+
+
+def _half_rounding_golden(tensors, valid):
+    rows, cols = valid
+    result = tensors["out"].clone()
+    result[:rows, :cols] = tensors["a"][:rows, :cols].half()
+    return result
+
+
+@st.cases(
+    *[
+        st.case(
+            _half_rounding_entry(valid, mode),
+            _half_rounding_data(),
+            torch.full((8, 64), -777.0, dtype=torch.float16),
+            name=f"buffer_half_rounding_{mode}_{valid[1]}_{planner.name.lower()}",
+            golden=lambda tensors, valid=valid: _half_rounding_golden(tensors, valid),
+            memory_planner=planner,
+            rtol=0,
+            atol=0,
+        )
+        for mode in ("none", "rint")
+        for valid in ((8, 64), (7, 61))
+        for planner in _PLANNERS
+    ]
+)
+def test_default_half_rounding(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+def _indexed_gather_entry():
+    @pl.jit.incore
+    def kernel(a: pl.Tensor, idx: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        source = pl.load(a, [0, 0], [8, 64])
+        indices = pl.load(idx, [0, 0], [4, 32])
+        scratch = pl.create_tile([4, 32], dtype=pl.INT32)
+        gathered = pl.tile.gather(source, indices, scratch)
+        out = pl.store(gathered, [0, 0], out)
+        return pl.store(source, [4, 0], out)
+
+    @pl.jit
+    def entry(a: pl.Tensor, idx: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        return kernel(a, idx, out)
+
+    return entry
+
+
+def _indexed_gather_golden(tensors):
+    result = tensors["out"].clone()
+    result[:4, :32] = tensors["a"].reshape(-1)[tensors["idx"].long()]
+    result[4:] = tensors["a"]
+    return result
+
+
+@st.cases(
+    *[
+        st.case(
+            _indexed_gather_entry(),
+            torch.arange(512).reshape(8, 64).to(dtype),
+            ((torch.arange(128).reshape(4, 32) * 37) % 512).to(torch.int32),
+            torch.full((12, 64), -777, dtype=dtype),
+            name=f"buffer_indexed_gather_{dtype}_{planner.name.lower()}",
+            golden=_indexed_gather_golden,
+            memory_planner=planner,
+            rtol=0,
+            atol=0,
+        )
+        for dtype in (torch.float16, torch.float32, torch.int32)
+        for planner in _PLANNERS
+    ]
+)
+def test_default_indexed_gather(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+def _indexed_scatter_entry(valid):
+    rows, cols = valid
+
+    @pl.jit.incore
+    def kernel(a: pl.Tensor, values: pl.Tensor, idx: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        old = pl.load(a, [0, 0], [8, 64])
+        source = pl.load(values, [0, 0], [4, 32], valid_shape=[rows, cols])
+        indices = pl.load(idx, [0, 0], [4, 32], valid_shape=[rows, cols])
+        zero = pl.tile.full([8, 64], pl.FP32, 0.0)
+        scattered = pl.tile.scatter(zero, source, indices)
+        ones = pl.tile.full([4, 32], pl.FP32, 1.0)
+        active_ones = pl.tile.set_validshape(ones, rows, cols)
+        mask_zero = pl.tile.full([8, 64], pl.FP32, 0.0)
+        written = pl.tile.scatter(mask_zero, active_ones, indices)
+        predicate = pl.tile.cmps(written, 0.0, cmp_type=1)
+        scratch = pl.create_tile([1, 16], dtype=pl.UINT32)
+        result = pl.tile.sel(predicate, scattered, old, scratch)
+        out = pl.store(result, [0, 0], out)
+        out = pl.store(old, [8, 0], out)
+        return pl.store(source, [16, 0], out)
+
+    @pl.jit
+    def entry(a: pl.Tensor, values: pl.Tensor, idx: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        return kernel(a, values, idx, out)
+
+    return entry
+
+
+def _indexed_scatter_golden(tensors, valid):
+    rows, cols = valid
+    result = tensors["out"].clone()
+    result[:8] = tensors["a"]
+    result[8:16] = tensors["a"]
+    result[16 : 16 + rows, :cols] = tensors["values"][:rows, :cols]
+    # Distinct values at repeated indices expose scan order; negative base
+    # sentinels expose lost preservation or an accidentally skipped scatter.
+    for row in range(rows):
+        for col in range(cols):
+            result[:8].view(-1)[tensors["idx"][row, col]] = tensors["values"][row, col]
+    return result
+
+
+@st.cases(
+    *[
+        st.case(
+            _indexed_scatter_entry(valid),
+            -torch.arange(1, 513).reshape(8, 64).float(),
+            torch.arange(1, 129).reshape(4, 32).float(),
+            ((torch.arange(128).reshape(4, 32) // 2 * 7) % 512).to(torch.int32),
+            torch.full((20, 64), -777.0),
+            name=f"buffer_indexed_scatter_{valid[1]}_{planner.name.lower()}",
+            golden=lambda tensors, valid=valid: _indexed_scatter_golden(tensors, valid),
+            memory_planner=planner,
+            rtol=0,
+            atol=0,
+        )
+        for valid in ((4, 32), (3, 29))
+        for planner in _PLANNERS
+    ]
+)
+def test_default_indexed_scatter(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+def _tensor_scatter_entry():
+    @pl.jit.incore
+    def kernel(base: pl.Tensor, index: pl.Tensor, values: pl.Tensor, out: pl.Out[pl.Tensor]):
+        result = pl.tensor.scatter(base, dim=-1, index=index, src=values)
+        return pl.assemble(out, result, [0, 0])
+
+    @pl.jit
+    def entry(base: pl.Tensor, index: pl.Tensor, values: pl.Tensor, out: pl.Out[pl.Tensor]):
+        return kernel(base, index, values, out)
+
+    return entry
+
+
+def _tensor_scatter_golden(tensors):
+    result = tensors["base"].clone()
+    for col in range(32):
+        result[0, tensors["index"][0, col]] = tensors["values"][0, col]
+    return result
+
+
+@st.cases(
+    *[
+        st.case(
+            _tensor_scatter_entry(),
+            -torch.arange(1, 65).reshape(1, 64).float(),
+            (torch.arange(32).reshape(1, 32) // 2 * 3).to(torch.int32),
+            torch.arange(1, 33).reshape(1, 32).float(),
+            torch.empty((1, 64)),
+            name=f"buffer_tensor_scatter_{planner.name.lower()}",
+            golden=_tensor_scatter_golden,
+            memory_planner=planner,
+            rtol=0,
+            atol=0,
+        )
+        for planner in _PLANNERS
+    ]
+)
+def test_default_tensor_scatter(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+def _compare_gather_entry(store_indices, dtype):
+    threshold = 1 if dtype == pl.INT32 else 1.0
+    mode = "eq" if dtype == pl.INT32 else "gt"
+
+    @pl.jit.incore
+    def kernel(
+        a: pl.Tensor,
+        indices_out: pl.InOut[pl.Tensor],
+        counts_out: pl.InOut[pl.Tensor],
+        live_out: pl.InOut[pl.Tensor],
+        temporary_out: pl.InOut[pl.Tensor],
+    ):
+        source = pl.load(a, [0, 0], [8, 128])
+        scratch = pl.create_tile([1, 8192], dtype=pl.UINT8)
+        indices, counts = pl.tile.gather_compare(
+            source, pl.const(threshold, dtype), scratch, cmp_mode=mode, out_cols=128, offset=7
+        )
+        # A later temporary may reuse scratch, while the source and both
+        # results remain live. This exercises typed workspace preservation.
+        temporary = pl.tile.full([8, 128], pl.FP32, -999.0)
+        temporary_out = pl.store(temporary, [0, 0], temporary_out)
+        if store_indices:
+            indices_out = pl.store(indices, [0, 0], indices_out)
+        counts_out = pl.store(counts, [0, 0], counts_out)
+        live_out = pl.store(source, [0, 0], live_out)
+        return indices_out, counts_out, live_out, temporary_out
+
+    @pl.jit
+    def entry(
+        a: pl.Tensor,
+        indices_out: pl.InOut[pl.Tensor],
+        counts_out: pl.InOut[pl.Tensor],
+        live_out: pl.InOut[pl.Tensor],
+        temporary_out: pl.InOut[pl.Tensor],
+    ):
+        return kernel(a, indices_out, counts_out, live_out, temporary_out)
+
+    return entry
+
+
+def _compare_gather_golden(tensors):
+    a = tensors["a"]
+    matches = a == 1 if a.dtype == torch.int32 else a > 1
+    counts = matches.sum(dim=1).reshape(1, 8).int()
+    # The full-match case defines the entire index output. The mixed-match
+    # case deliberately leaves indices unread and verifies the other result.
+    indices = (torch.arange(1024).reshape(8, 128) + 7).int() if torch.all(matches) else tensors["indices_out"]
+    return {
+        "indices_out": indices,
+        "counts_out": counts,
+        "live_out": a.clone(),
+        "temporary_out": torch.full((8, 128), -999.0),
+    }
+
+
+@st.cases(
+    *[
+        st.case(
+            _compare_gather_entry(full_match, dtype),
+            (
+                torch.full((8, 128), 1 if dtype == pl.INT32 else 2)
+                if full_match
+                else torch.arange(1024).reshape(8, 128) % 5
+            ).to(torch_dtype),
+            torch.full((8, 128), -777, dtype=torch.int32),
+            torch.full((1, 8), -777, dtype=torch.int32),
+            torch.full((8, 128), -777, dtype=torch_dtype),
+            torch.full((8, 128), -777.0),
+            name=f"buffer_compare_gather_{torch_dtype}_{full_match}_{planner.name.lower()}",
+            golden=_compare_gather_golden,
+            memory_planner=planner,
+            rtol=0,
+            atol=0,
+        )
+        for dtype, torch_dtype in (
+            (pl.FP32, torch.float32),
+            (pl.FP16, torch.float16),
+            (pl.INT32, torch.int32),
+        )
+        for full_match in (True, False)
+        for planner in _PLANNERS
+    ]
+)
+def test_default_compare_gather(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+def _row_compute_entry(valid):
+    rows, cols = valid
+
+    @pl.jit
+    def entry(a: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            source = pl.load(a, [0, 0], [16, 64], valid_shape=[rows, cols])
+            scratch = pl.create_tile([16, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            minimum = pl.tile.row_min(source, scratch)
+            product = pl.tile.row_prod(source, scratch)
+            added = pl.tile.row_expand_add(source, minimum)
+            multiplied = pl.tile.row_expand_mul(source, product)
+            maximum = pl.tile.row_expand_max(source, product)
+            bounded = pl.tile.row_expand_min(source, minimum)
+            out = pl.store(added, [0, 0], out)
+            out = pl.store(multiplied, [16, 0], out)
+            out = pl.store(maximum, [32, 0], out)
+            out = pl.store(bounded, [48, 0], out)
+            out = pl.store(source, [64, 0], out)
+        return out
+
+    return entry
+
+
+def _row_compute_golden(tensors, valid):
+    rows, cols = valid
+    active = tensors["a"][:rows, :cols]
+    minimum, product = active.amin(dim=-1, keepdim=True), active.prod(dim=-1, keepdim=True)
+    output = tensors["out"].clone()
+    for index, value in enumerate(
+        (
+            active + minimum,
+            active * product,
+            torch.maximum(active, product),
+            torch.minimum(active, minimum),
+            active,
+        )
+    ):
+        output[index * 16 : index * 16 + rows, :cols] = value
+    return output
+
+
+@st.cases(
+    *[
+        st.case(
+            _row_compute_entry(valid),
+            torch.rand((16, 64), generator=torch.Generator().manual_seed(28)) * 0.02 + 0.99,
+            torch.full((80, 64), -777.0),
+            name=f"buffer_row_compute_{valid[0]}_{valid[1]}_{planner.name.lower()}_{enabled}",
+            golden=lambda tensors, valid=valid: _row_compute_golden(tensors, valid),
+            memory_planner=planner,
+            enable_buffer_ir=enabled,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        for valid in ((16, 64), (13, 57))
+        for planner in _PLANNERS
+        for enabled in (False, True)
+    ]
+)
+def test_default_extended_row_compute(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+def _transpose_compute_entry(shape):
+    rows, cols = shape
+
+    @pl.jit
+    def entry(a: pl.Tensor, out: pl.Out[pl.Tensor], old: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            source = pl.load(a, [0, 0], [rows, cols])
+            transposed = pl.tile.transpose(source, -2, -1)
+            out = pl.store(transposed, [0, 0], out)
+            old = pl.store(source, [0, 0], old)
+        return out, old
+
+    return entry
+
+
+@st.cases(
+    *[
+        st.case(
+            _transpose_compute_entry(shape),
+            torch.arange(shape[0] * shape[1], dtype=torch.float32).reshape(shape),
+            torch.zeros((shape[1], shape[0])),
+            torch.zeros(shape),
+            name=f"buffer_transpose_compute_{shape[0]}_{shape[1]}_{planner.name.lower()}_{enabled}",
+            golden=lambda tensors: {"out": tensors["a"].T.contiguous(), "old": tensors["a"]},
+            memory_planner=planner,
+            enable_buffer_ir=enabled,
+            rtol=0,
+            atol=0,
+        )
+        for shape in ((16, 32), (32, 64), (24, 40))
+        for planner in _PLANNERS
+        for enabled in (False, True)
+    ]
+)
+def test_default_transpose_compute(case_run, request):
+    _assert_buffer_result(case_run, request)
+
+
+def _column_compute_entry(valid):
+    rows, cols = valid
+
+    @pl.jit
+    def entry(a: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            source = pl.load(a, [0, 0], [16, 64], valid_shape=[rows, cols])
+            total = pl.tile.col_sum(source)
+            minimum = pl.tile.col_min(source)
+            maximum = pl.tile.col_max(source)
+            product = pl.tile.col_prod(source)
+            added = pl.tile.col_expand_add(source, total)
+            subtracted = pl.tile.col_expand_sub(source, maximum)
+            multiplied = pl.tile.col_expand_mul(source, product)
+            divided = pl.tile.col_expand_div(source, total)
+            upper = pl.tile.col_expand_max(source, maximum)
+            lower = pl.tile.col_expand_min(source, minimum)
+            out = pl.store(added, [0, 0], out)
+            out = pl.store(subtracted, [16, 0], out)
+            out = pl.store(multiplied, [32, 0], out)
+            out = pl.store(divided, [48, 0], out)
+            out = pl.store(upper, [64, 0], out)
+            out = pl.store(lower, [80, 0], out)
+            out = pl.store(source, [96, 0], out)
+        return out
+
+    return entry
+
+
+def _column_compute_golden(tensors, valid):
+    rows, cols = valid
+    active = tensors["a"][:rows, :cols]
+    total, product = active.sum(dim=0, keepdim=True), active.prod(dim=0, keepdim=True)
+    minimum, maximum = active.amin(dim=0, keepdim=True), active.amax(dim=0, keepdim=True)
+    output = tensors["out"].clone()
+    for index, value in enumerate(
+        (
+            active + total,
+            active - maximum,
+            active * product,
+            active / total,
+            torch.maximum(active, maximum),
+            torch.minimum(active, minimum),
+            active,
+        )
+    ):
+        output[index * 16 : index * 16 + rows, :cols] = value
+    return output
+
+
+@st.cases(
+    *[
+        st.case(
+            _column_compute_entry(valid),
+            torch.rand((16, 64), generator=torch.Generator().manual_seed(29)) * 0.02 + 0.99,
+            torch.full((112, 64), -777.0),
+            name=f"buffer_column_compute_{valid[0]}_{valid[1]}_{planner.name.lower()}_{enabled}",
+            golden=lambda tensors, valid=valid: _column_compute_golden(tensors, valid),
+            memory_planner=planner,
+            enable_buffer_ir=enabled,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        for valid in ((16, 64), (13, 57))
+        for planner in _PLANNERS
+        for enabled in (False, True)
+    ]
+)
+def test_default_column_compute(case_run, request):
     _assert_buffer_result(case_run, request)
 
 

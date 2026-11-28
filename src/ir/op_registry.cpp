@@ -199,11 +199,21 @@ const BufferResultSpec& OpRegistryEntry::GetBufferResultSpec(size_t result_index
   return it->second;
 }
 
+OpRegistryEntry& OpRegistryEntry::set_tuple_result_alias(size_t result_index, size_t arg_index) {
+  CHECK(ir_stage_ == OpIRStage::Functional && output_arity_ > 1 && result_index < output_arity_)
+      << "Operator '" << name_ << "' requires a declared tuple element for result alias " << result_index;
+  CHECK(arg_index < GetArgumentCount()) << "Operator '" << name_ << "' has no argument " << arg_index;
+  CHECK(tuple_result_aliases_.emplace(result_index, arg_index).second)
+      << "Operator '" << name_ << "' declares result alias " << result_index << " twice";
+  return *this;
+}
+
 void OpRegistryEntry::ValidateIRStage() const {
   CHECK(!validate_explicit_type_.has_value() || (ir_stage_ == OpIRStage::Buffer && internal_only_))
       << "Operator '" << name_ << "' explicit type validation requires an internal-only Buffer operator";
   if (ir_stage_ == OpIRStage::Functional) {
-    CHECK(output_arity_ > 0) << "Functional operator '" << name_ << "' must produce at least one value";
+    CHECK(output_arity_ > 0 || op_category_ == "SimtOp")
+        << "Functional operator '" << name_ << "' must produce at least one value";
     CHECK(buffer_arg_effects_.empty() && buffer_results_.empty())
         << "Functional operator '" << name_ << "' cannot carry buffer contracts";
     return;
@@ -240,9 +250,15 @@ void OpRegistryEntry::ValidateIRStage() const {
 void OpRegistryEntry::ValidateCall(const std::vector<ExprPtr>& args, const TypePtr& result_type,
                                    const Span& span) const {
   INTERNAL_CHECK_SPAN(result_type, span) << "Type deduction failed for '" << name_ << "'";
+  if (mutable_session_arg_) {
+    const size_t i = *mutable_session_arg_;
+    INTERNAL_CHECK_SPAN(i < args.size() && args[i] && IsA<AsyncSessionType>(args[i]->GetType()), span)
+        << "Operator '" << name_ << "' argument " << i << " must be an AsyncSession";
+  }
   auto tuple = As<TupleType>(result_type);
   if (output_arity_ == 0) {
-    INTERNAL_CHECK_SPAN(ir_stage_ == OpIRStage::Buffer && As<VoidType>(result_type), span)
+    INTERNAL_CHECK_SPAN(
+        (ir_stage_ == OpIRStage::Buffer || op_category_ == "SimtOp") && As<VoidType>(result_type), span)
         << "Operator '" << name_ << "' declares zero results but did not deduce VoidType";
   } else {
     INTERNAL_CHECK_SPAN(!As<VoidType>(result_type), span)
@@ -254,6 +270,14 @@ void OpRegistryEntry::ValidateCall(const std::vector<ExprPtr>& args, const TypeP
       INTERNAL_CHECK_SPAN(tuple->types_.size() == output_arity_, span)
           << "Operator '" << name_ << "' declares set_output_arity(" << output_arity_
           << ") but deduced a TupleType with " << tuple->types_.size() << " elements";
+      for (const auto& [result, arg] : tuple_result_aliases_) {
+        INTERNAL_CHECK_SPAN(result < tuple->types_.size() && arg < args.size() && args[arg] &&
+                                AsTensorTypeLike(args[arg]->GetType()) &&
+                                (tuple->types_[result] == args[arg]->GetType() ||
+                                 structural_equal(tuple->types_[result], args[arg]->GetType())),
+                            span)
+            << "Operator '" << name_ << "' tuple result " << result << " must return tensor argument " << arg;
+      }
     } else {
       INTERNAL_CHECK_SPAN(!tuple, span)
           << "Operator '" << name_ << "' deduced a TupleType result without declaring set_output_arity("
@@ -324,6 +348,45 @@ void ValidateKwargs(const std::vector<std::pair<std::string, std::any>>& kwargs,
   }
 }
 
+std::vector<std::pair<std::string, std::any>> NormalizeRegKwargs(
+    const std::string& op_name, const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  auto normalized = kwargs;
+  auto has_kwarg = [&normalized](const std::string& key) {
+    return std::any_of(normalized.begin(), normalized.end(),
+                       [&key](const auto& item) { return item.first == key; });
+  };
+  if (op_name.rfind("reg.", 0) != 0) return normalized;
+  const auto op = OpRegistry::GetInstance().GetOp(op_name);
+  // Every public register pmode currently defaults to zero. Drive this from
+  // the schema so DSL, Builder and raw IR construction cannot drift as new
+  // operations are added; carry ops have no pmode and remain attribute-free.
+  if (op->GetAttrs().count("pmode") && !has_kwarg("pmode")) {
+    normalized.emplace_back("pmode", std::string("zero"));
+  }
+  if (IsOp(op, "reg.index_gen") && !has_kwarg("order")) {
+    normalized.emplace_back("order", std::string("ascending"));
+  }
+  return normalized;
+}
+
+void RejectRawNoOpConvert(const std::string& op_name, const std::vector<ExprPtr>& args,
+                          const std::vector<std::pair<std::string, std::any>>& kwargs, const Span& span) {
+  if (op_name != "reg.convert" || args.size() != 1) return;
+  bool has_rounding = false;
+  bool has_saturate = false;
+  const DataType* target = nullptr;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "rounding") has_rounding = true;
+    if (key == "saturate") has_saturate = true;
+    if (key == "dtype") target = std::any_cast<DataType>(&value);
+  }
+  if (has_rounding || has_saturate || target == nullptr || !args[0]) return;
+  auto source = std::dynamic_pointer_cast<const RegType>(args[0]->GetType());
+  if (source && source->GetRegKind() == RegKind::VecReg && source->GetDType() == *target) {
+    CHECK_SPAN(false, span) << "Raw reg.convert same-dtype no-op is non-canonical; use the operand directly";
+  }
+}
+
 OpRegistry& OpRegistry::GetInstance() {
   static OpRegistry instance;
   return instance;
@@ -355,7 +418,8 @@ CallPtr OpRegistry::Create(const std::string& op_name, const std::vector<ExprPtr
 
 CallPtr OpRegistry::Create(const std::string& op_name, const std::vector<ExprPtr>& args,
                            const std::vector<std::pair<std::string, std::any>>& kwargs, Span span) const {
-  return CreateImpl(op_name, args, kwargs, std::move(span), /*allow_internal=*/true);
+  return CreateImpl(op_name, args, NormalizeRegKwargs(op_name, kwargs), std::move(span),
+                    /*allow_internal=*/true);
 }
 
 CallPtr OpRegistry::CreateUserFacing(const std::string& op_name, const std::vector<ExprPtr>& args,
@@ -366,7 +430,9 @@ CallPtr OpRegistry::CreateUserFacing(const std::string& op_name, const std::vect
 CallPtr OpRegistry::CreateUserFacing(const std::string& op_name, const std::vector<ExprPtr>& args,
                                      const std::vector<std::pair<std::string, std::any>>& kwargs,
                                      Span span) const {
-  return CreateImpl(op_name, args, kwargs, std::move(span), /*allow_internal=*/false);
+  auto normalized = NormalizeRegKwargs(op_name, kwargs);
+  RejectRawNoOpConvert(op_name, args, normalized, span);
+  return CreateImpl(op_name, args, normalized, std::move(span), /*allow_internal=*/false);
 }
 
 CallPtr OpRegistry::CreateInternal(const std::string& op_name, const std::vector<ExprPtr>& args,
@@ -377,14 +443,16 @@ CallPtr OpRegistry::CreateInternal(const std::string& op_name, const std::vector
 CallPtr OpRegistry::CreateInternal(const std::string& op_name, const std::vector<ExprPtr>& args,
                                    const std::vector<std::pair<std::string, std::any>>& kwargs,
                                    Span span) const {
-  return CreateImpl(op_name, args, kwargs, std::move(span), /*allow_internal=*/true);
+  return CreateImpl(op_name, args, NormalizeRegKwargs(op_name, kwargs), std::move(span),
+                    /*allow_internal=*/true);
 }
 
 CallPtr OpRegistry::CreateInternal(const std::string& op_name, const std::vector<ExprPtr>& args,
                                    const std::vector<std::pair<std::string, std::any>>& kwargs,
                                    const TypePtr& result_type, Span span) const {
   CHECK_SPAN(result_type, span) << "Operator '" << op_name << "' explicit result type must not be null";
-  return CreateImpl(op_name, args, kwargs, std::move(span), /*allow_internal=*/true, result_type);
+  return CreateImpl(op_name, args, NormalizeRegKwargs(op_name, kwargs), std::move(span),
+                    /*allow_internal=*/true, result_type);
 }
 
 TypePtr OpRegistry::ResolveAndValidateCallType(const OpRegistryEntry& entry, const std::vector<ExprPtr>& args,
@@ -396,7 +464,7 @@ TypePtr OpRegistry::ResolveAndValidateCallType(const OpRegistryEntry& entry, con
   try {
     if (!kwargs.empty()) {
       const auto& allowed_kwargs = op->GetAttrs();
-      if (!allowed_kwargs.empty() || entry.GetIRStage() == OpIRStage::Buffer) {
+      if (!allowed_kwargs.empty() || entry.GetIRStage() == OpIRStage::Buffer || entry.GetRegSpec()) {
         ValidateKwargs(kwargs, allowed_kwargs, op_name);
       }
     }
@@ -629,10 +697,13 @@ void OpRegistry::ValidateMultiOutputOps() const {
         unclassified.push_back(name + " (argument " + std::to_string(i) + ")");
         continue;
       }
-      // A written argument is either scratch the hardware needs or a result the
-      // caller reads. The first is legitimate and must say so; the second is a
-      // destination that belongs in the TupleType.
-      if (entry.MayWriteArg(i) && !entry.IsWorkspaceArg(i)) {
+      // Tensor writes require a returned alias or a workspace declaration.
+      // Submissions can also update an opaque session whose identity stays the same.
+      const auto& aliases = entry.GetTupleResultAliases();
+      const bool returned =
+          std::any_of(aliases.begin(), aliases.end(), [i](const auto& alias) { return alias.second == i; });
+      if (entry.MayWriteArg(i) && !entry.IsWorkspaceArg(i) && entry.GetMutableSessionArg() != i &&
+          !returned) {
         leaked_destinations.push_back(name + " (argument " + std::to_string(i) + ")");
       }
     }
@@ -670,11 +741,10 @@ void OpRegistry::ValidateMultiOutputOps() const {
   }
   if (!leaked_destinations.empty()) {
     fail(
-        "The following multi-output ops write through an argument that was never declared "
-        "scratch. A written argument is either a workspace the hardware needs — say so with "
-        ".set_workspace_arg(<index>) — or a destination the caller reads, which must be an "
-        "element of the deduced TupleType instead. A destination in the argument list makes "
-        "the caller pre-allocate a buffer InitMemRef owns:",
+        "The following multi-output ops write an argument without declaring its role. Use "
+        "set_workspace_arg for scratch, set_mutable_session_arg for queue state, or set_tuple_result_alias "
+        "for a tensor "
+        "returned as a tuple element. Fresh tile outputs belong in the TupleType:",
         std::move(leaked_destinations));
   }
   if (!workspace_out_of_range.empty()) {

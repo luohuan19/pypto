@@ -50,23 +50,15 @@ std::string PTOCodegen::EmitArithCmpi(const std::string& predicate, const std::s
 std::string PTOCodegen::EmitArithOperand(const ir::ExprPtr& expr, const std::string& wanted_mlir_type) {
   CHECK(!wanted_mlir_type.empty()) << "EmitArithOperand: empty wanted_mlir_type";
 
-  if (wanted_mlir_type == "index") {
-    if (auto ci = As<ir::ConstInt>(expr)) {
-      return GetOrEmitConstant(ci->value_, DataType::INDEX);
-    }
-  } else if (wanted_mlir_type == "i64") {
-    if (auto ci = As<ir::ConstInt>(expr)) {
-      return GetOrEmitConstant(ci->value_, DataType::INT64);
-    }
-  } else if (wanted_mlir_type == "i32") {
-    if (auto ci = As<ir::ConstInt>(expr)) {
+  if (auto ci = As<ir::ConstInt>(expr)) {
+    if (wanted_mlir_type == "index") return GetOrEmitConstant(ci->value_, DataType::INDEX);
+    if (wanted_mlir_type == "i64") return GetOrEmitConstant(ci->value_, DataType::INT64);
+    if (wanted_mlir_type == "i32") {
       return GetOrEmitConstant(static_cast<int64_t>(static_cast<int32_t>(ci->value_)), DataType::INT32);
     }
   }
 
-  VisitExpr(expr);
-  std::string ssa = fs_.current_expr_value;
-
+  std::string ssa = GetExprAsCode(expr);
   const ::pypto::DataType dt = ir::GetScalarDtype(expr);
   if (dt.IsFloat()) {
     CHECK(wanted_mlir_type == GetTypeString(dt)) << "EmitArithOperand: float type mismatch (want "
@@ -74,26 +66,22 @@ std::string PTOCodegen::EmitArithOperand(const ir::ExprPtr& expr, const std::str
     return ssa;
   }
 
-  std::string have_mlir = (dt == ::pypto::DataType::INDEX) ? "index" : GetTypeString(dt);
+  const std::string have_mlir = GetTypeString(dt);
   if (have_mlir == wanted_mlir_type) {
     return ssa;
   }
-
-  std::string casted = NewTemp();
+  if (wanted_mlir_type == "index") return EmitCastToIndex(expr, ssa);
+  if (wanted_mlir_type == "i64") return EmitCastToI64(expr, ssa);
+  if (wanted_mlir_type == "i32") return EmitCastToI32(expr, ssa);
+  if (dt.IsUnsignedInt() && wanted_mlir_type == have_mlir.substr(1)) {
+    const auto signless = NewTemp();
+    Emit(signless + " = builtin.unrealized_conversion_cast " + ssa + " : " + have_mlir + " to " +
+         wanted_mlir_type);
+    return signless;
+  }
   if (have_mlir == "index") {
+    const auto casted = NewTemp();
     Emit(casted + " = arith.index_cast " + ssa + " : index to " + wanted_mlir_type);
-    return casted;
-  }
-  if (wanted_mlir_type == "index") {
-    Emit(casted + " = arith.index_cast " + ssa + " : " + have_mlir + " to index");
-    return casted;
-  }
-  if (have_mlir == "i32" && wanted_mlir_type == "i64") {
-    Emit(casted + " = arith.extsi " + ssa + " : i32 to i64");
-    return casted;
-  }
-  if (have_mlir == "i64" && wanted_mlir_type == "i32") {
-    Emit(casted + " = arith.trunci " + ssa + " : i64 to i32");
     return casted;
   }
   CHECK(false) << "EmitArithOperand: unsupported cast from " << have_mlir << " to " << wanted_mlir_type;
@@ -111,6 +99,30 @@ void PTOCodegen::VisitBinaryArithExpr(const BinaryExprPtr& op, const std::string
     } else if (scalar_type->dtype_ != ::pypto::DataType::INDEX) {
       result_type = GetTypeString(scalar_type->dtype_);
     }
+  }
+
+  if (ir::GetScalarDtype(op).IsUnsignedInt()) {
+    // MLIR arithmetic uses signless integers; bridge back afterward so the
+    // expression retains its unsigned type for captures and index casts.
+    const auto signless_type = result_type.substr(1);
+    auto operand = [&](const ir::ExprPtr& expr) {
+      VisitExpr(expr);
+      const auto source = fs_.current_expr_value;
+      const auto converted = NewTemp();
+      Emit(converted + " = builtin.unrealized_conversion_cast " + source + " : " + result_type + " to " +
+           signless_type);
+      return converted;
+    };
+    const auto lhs = operand(op->left_);
+    const auto rhs = operand(op->right_);
+    if (mlir_op == "arith.divsi") mlir_op = "arith.divui";
+    if (mlir_op == "arith.remsi") mlir_op = "arith.remui";
+    const auto value = EmitArithBinaryOp(mlir_op, lhs, rhs, signless_type);
+    const auto result = NewTemp();
+    Emit(result + " = builtin.unrealized_conversion_cast " + value + " : " + signless_type + " to " +
+         result_type);
+    fs_.current_expr_value = result;
+    return;
   }
 
   if (mlir_op == float_op) {
@@ -149,14 +161,21 @@ void PTOCodegen::VisitCmpExpr(const BinaryExprPtr& op, const std::string& predic
     auto it = pred_map.find(predicate);
     INTERNAL_CHECK_SPAN(it != pred_map.end(), op->span_) << "Unsupported float predicate for " << predicate;
     std::string float_pred = it->second;
+    // SIMT scalar comparison follows the IR's IEEE/Python inequality contract:
+    // a NaN is unequal, so the ordered predicate would silently lose a lane.
+    if (inside_simt_function_ && predicate == "ne") float_pred = "une";
 
     std::string result = NewTemp();
     Emit(result + " = arith.cmpf " + float_pred + ", " + lhs + ", " + rhs + " : " + operand_type);
     fs_.current_expr_value = result;
   } else {
+    const auto unsigned_operands = ir::GetScalarDtype(op->left_).IsUnsignedInt();
+    if (unsigned_operands) operand_type = operand_type.substr(1);
     std::string lhs = EmitArithOperand(op->left_, operand_type);
     std::string rhs = EmitArithOperand(op->right_, operand_type);
-    fs_.current_expr_value = EmitArithCmpi(predicate, lhs, rhs, operand_type);
+    auto unsigned_predicate = predicate;
+    if (unsigned_operands && unsigned_predicate[0] == 's') unsigned_predicate[0] = 'u';
+    fs_.current_expr_value = EmitArithCmpi(unsigned_predicate, lhs, rhs, operand_type);
   }
 }
 
@@ -192,11 +211,68 @@ void PTOCodegen::VisitExpr_(const ir::ConstBoolPtr& op) {
 void PTOCodegen::VisitExpr_(const ir::AddPtr& op) { VisitBinaryArithExpr(op, "arith.addi", "arith.addf"); }
 void PTOCodegen::VisitExpr_(const ir::SubPtr& op) { VisitBinaryArithExpr(op, "arith.subi", "arith.subf"); }
 void PTOCodegen::VisitExpr_(const ir::MulPtr& op) { VisitBinaryArithExpr(op, "arith.muli", "arith.mulf"); }
+
 void PTOCodegen::VisitExpr_(const ir::FloorDivPtr& op) {
-  VisitBinaryArithExpr(op, "arith.divsi", "arith.divf");
+  // Match FloorMod's floor semantics so q * divisor + remainder reconstructs
+  // the dividend even when either operand is negative. PTOAS expands the native
+  // floor operation into truncating division plus a conditional correction.
+  const auto dtype = ir::GetScalarDtype(op);
+  const bool signed_integer = dtype == DataType::INDEX || dtype.IsSignedInt();
+  const bool truncation_is_exact = fs_.truncating_floor_div_mod.count(op.get()) != 0;
+  VisitBinaryArithExpr(op, (signed_integer && !truncation_is_exact) ? "arith.floordivsi" : "arith.divsi",
+                       "arith.divf");
 }
+
 void PTOCodegen::VisitExpr_(const ir::FloorModPtr& op) {
-  VisitBinaryArithExpr(op, "arith.remsi", "arith.remf");
+  // CanonicalSlotCollector proves these INDEX operands nonnegative. Preserve
+  // the unsigned remainder PTOAS uses for slot synchronization, while ordinary
+  // FloorMod expressions keep the signed floor correction below.
+  if (fs_.unsigned_slot_remainders.count(op.get())) {
+    VisitBinaryArithExpr(op, "arith.remui", "arith.remf");
+    return;
+  }
+  const auto dtype = ir::GetScalarDtype(op);
+  if ((dtype != DataType::INDEX && !dtype.IsSignedInt()) || fs_.truncating_floor_div_mod.count(op.get())) {
+    VisitBinaryArithExpr(op, "arith.remsi", "arith.remf");
+    return;
+  }
+
+  const std::string type = GetTypeString(dtype);
+  const std::string lhs = EmitArithOperand(op->left_, type);
+  const std::string rhs = EmitArithOperand(op->right_, type);
+  const std::string remainder = EmitArithBinaryOp("arith.remsi", lhs, rhs, type);
+  const std::string zero = GetOrEmitConstant(int64_t{0}, dtype);
+
+  // FloorMod follows the divisor's sign, whereas remsi follows the dividend's.
+  // Correct only nonzero remainders with the opposite sign. A constant divisor
+  // needs just one comparison; for example, -97 % 24 must be 23, not -1.
+  const auto divisor = As<ir::ConstInt>(op->right_);
+  int64_t divisor_value = divisor ? divisor->value_ : 0;
+  // Interpret signless MLIR literals at their emitted signed width, including
+  // EmitArithOperand's i32 narrowing (for example, 253 : i8 represents -3).
+  if (dtype == DataType::INT8) {
+    divisor_value = static_cast<uint8_t>(divisor_value);
+    if (divisor_value >= 128) divisor_value -= 256;
+  } else if (dtype == DataType::INT16) {
+    divisor_value = static_cast<int16_t>(divisor_value);
+  } else if (dtype == DataType::INT32) {
+    divisor_value = static_cast<int32_t>(divisor_value);
+  }
+  std::string needs_correction;
+  if (divisor && divisor_value != 0) {
+    needs_correction = EmitArithCmpi(divisor_value > 0 ? "slt" : "sgt", remainder, zero, type);
+  } else {
+    const std::string remainder_negative = EmitArithCmpi("slt", remainder, zero, type);
+    const std::string divisor_negative = EmitArithCmpi("slt", rhs, zero, type);
+    const std::string signs_differ =
+        EmitArithBinaryOp("arith.xori", remainder_negative, divisor_negative, "i1");
+    const std::string nonzero = EmitArithCmpi("ne", remainder, zero, type);
+    needs_correction = EmitArithBinaryOp("arith.andi", nonzero, signs_differ, "i1");
+  }
+  const std::string corrected = EmitArithBinaryOp("arith.addi", remainder, rhs, type);
+  const std::string result = NewTemp();
+  Emit(result + " = arith.select " + needs_correction + ", " + corrected + ", " + remainder + " : " + type);
+  fs_.current_expr_value = result;
 }
 
 // ========================================================================
@@ -232,6 +308,49 @@ void PTOCodegen::VisitExpr_(const ir::CastPtr& op) {
   if (src_dtype == dst_dtype) {
     fs_.current_expr_value = src;
     return;
+  } else if (inside_simt_function_ && dst_dtype == DataType::BOOL) {
+    // Numeric truth is nonzero (including NaN), not the low bit of an integer
+    // or an fptosi conversion into i1. Keep Python scalar semantics in SIMT.
+    std::string zero;
+    if (src_is_uint) {
+      const auto signless = NewTemp();
+      const auto type = src_type.substr(1);
+      Emit(signless + " = builtin.unrealized_conversion_cast " + src + " : " + src_type + " to " + type);
+      src = signless;
+      src_type = type;
+      zero = NewTemp();
+      Emit(zero + " = arith.constant 0 : " + type);
+    } else {
+      zero = src_is_float ? GetOrEmitConstant(0.0, src_dtype) : GetOrEmitConstant(int64_t{0}, src_dtype);
+    }
+    Emit(result + (src_is_float ? " = arith.cmpf une, " : " = arith.cmpi ne, ") + src + ", " + zero + " : " +
+         src_type);
+    fs_.current_expr_value = result;
+    return;
+  } else if (src_dtype == DataType::BOOL && (dst_dtype.IsInt() || dst_is_index || dst_is_float)) {
+    // A logical BOOL is 0/1, whereas interpreting its i1 representation as
+    // signed would make true equal -1. Normalize before numeric conversion.
+    if (dst_is_index) {
+      mlir_op = "arith.index_castui";
+    } else if (dst_is_float) {
+      // PTOAS can lower a direct i1-to-float cast to (float)bool, which A3
+      // rejects. An i32 carrier preserves 0/1 and avoids that device cast.
+      src = EmitCastToI32(op->operand_, src);
+      src_type = "i32";
+      mlir_op = "arith.sitofp";
+    } else if (dst_is_uint) {
+      // Arithmetic extensions require signless result types. Bridge to uiN
+      // only after zero-extending the logical value to the matching iN.
+      const std::string signless_dst = dst_type.substr(1);
+      const std::string extended = NewTemp();
+      Emit(extended + " = arith.extui " + src + " : i1 to " + signless_dst);
+      Emit(result + " = builtin.unrealized_conversion_cast " + extended + " : " + signless_dst + " to " +
+           dst_type);
+      fs_.current_expr_value = result;
+      return;
+    } else {
+      mlir_op = "arith.extui";
+    }
   } else if (src_is_index || dst_is_index) {
     CHECK(!src_is_float && !dst_is_float) << "Cast between float and index types is not supported";
     // arith.index_cast requires signless integer types. For unsigned source/destination,
@@ -247,18 +366,22 @@ void PTOCodegen::VisitExpr_(const ir::CastPtr& op) {
       return;
     }
     if (src_is_uint) {
-      // uiN -> index : bridge uiN -> iN, then arith.index_cast iN -> index
-      std::string signless_src = src_type.substr(1);  // "ui32" -> "i32"
-      std::string signless_tmp = NewTemp();
-      Emit(signless_tmp + " = builtin.unrealized_conversion_cast " + src + " : " + src_type + " to " +
-           signless_src);
-      Emit(result + " = arith.index_cast " + signless_tmp + " : " + signless_src + " to " + dst_type);
-      fs_.current_expr_value = result;
+      fs_.current_expr_value = EmitCastToIndex(op->operand_, src);
       return;
     }
     mlir_op = "arith.index_cast";
   } else if (src_is_float && dst_is_float) {
-    mlir_op = (dst_dtype.GetBit() > src_dtype.GetBit()) ? "arith.extf" : "arith.truncf";
+    if (inside_simt_function_ && src_dtype.GetBit() == dst_dtype.GetBit()) {
+      // FP16 and BF16 have equal width but different exponent/significand
+      // layouts. arith.truncf cannot express this conversion directly.
+      const auto wide = NewTemp();
+      Emit(wide + " = arith.extf " + src + " : " + src_type + " to f32");
+      src = wide;
+      src_type = "f32";
+      mlir_op = "arith.truncf";
+    } else {
+      mlir_op = (dst_dtype.GetBit() > src_dtype.GetBit()) ? "arith.extf" : "arith.truncf";
+    }
   } else if (!src_is_float && !dst_is_float) {
     if (dst_dtype.GetBit() == src_dtype.GetBit()) {
       // MLIR arithmetic casts only change integer width and require signless
@@ -275,47 +398,68 @@ void PTOCodegen::VisitExpr_(const ir::CastPtr& op) {
     mlir_op = dst_is_uint ? "arith.fptoui" : "arith.fptosi";
   }
 
+  // All arithmetic conversion operations require signless integer types.
+  // Preserve the public unsigned ABI with bit-preserving bridges at the edges.
+  if (mlir_op != "builtin.unrealized_conversion_cast") {
+    if (src_is_uint) {
+      const auto converted = NewTemp();
+      Emit(converted + " = builtin.unrealized_conversion_cast " + src + " : " + src_type + " to " +
+           src_type.substr(1));
+      src = converted;
+      src_type = src_type.substr(1);
+    }
+    if (dst_is_uint) {
+      const auto converted = NewTemp();
+      Emit(converted + " = " + mlir_op + " " + src + " : " + src_type + " to " + dst_type.substr(1));
+      Emit(result + " = builtin.unrealized_conversion_cast " + converted + " : " + dst_type.substr(1) +
+           " to " + dst_type);
+      fs_.current_expr_value = result;
+      return;
+    }
+  }
   Emit(result + " = " + mlir_op + " " + src + " : " + src_type + " to " + dst_type);
   fs_.current_expr_value = result;
 }
 
 std::string PTOCodegen::EmitCastToIndex(const ir::VarPtr& var, const std::string& mlir_name) {
-  if (auto scalar_type = As<ScalarType>(var->GetType())) {
-    CHECK(!scalar_type->dtype_.IsFloat())
-        << "EmitCastToIndex does not support floating-point types (got " << GetTypeString(scalar_type->dtype_)
-        << " for var '" << var->name_hint_ << "')";
-    if (scalar_type->dtype_ != DataType::INDEX) {
-      std::string idx_name = NewNamedTemp(var->name_hint_ + "_idx");
-      std::string src_type = GetTypeString(scalar_type->dtype_);
-      Emit(idx_name + " = arith.index_cast " + mlir_name + " : " + src_type + " to index");
-      return idx_name;
-    }
-  }
-  return mlir_name;
+  return EmitCastToIndex(std::static_pointer_cast<const ir::Expr>(var), mlir_name);
 }
 
 std::string PTOCodegen::EmitCastToIndex(const ir::ExprPtr& expr, const std::string& mlir_name) {
-  if (auto var = As<ir::Var>(expr)) {
-    return EmitCastToIndex(var, mlir_name);
-  }
   if (auto scalar_type = As<ScalarType>(expr->GetType())) {
     CHECK(!scalar_type->dtype_.IsFloat()) << "EmitCastToIndex does not support floating-point types (got "
                                           << GetTypeString(scalar_type->dtype_) << ")";
     if (scalar_type->dtype_ != DataType::INDEX) {
-      std::string idx_name = NewTemp();
+      auto var = As<ir::Var>(expr);
+      const std::string idx_name = var ? NewNamedTemp(var->name_hint_ + "_idx") : NewTemp();
       std::string src_type = GetTypeString(scalar_type->dtype_);
-      Emit(idx_name + " = arith.index_cast " + mlir_name + " : " + src_type + " to index");
+      std::string source = mlir_name;
+      const bool is_unsigned = scalar_type->dtype_.IsUnsignedInt();
+      if (is_unsigned) {
+        // Arithmetic index casts require signless integer operands. Preserve
+        // unsigned values with a bit-preserving bridge and zero extension.
+        const std::string signless = src_type.substr(1);
+        source = NewTemp();
+        Emit(source + " = builtin.unrealized_conversion_cast " + mlir_name + " : " + src_type + " to " +
+             signless);
+        src_type = signless;
+      }
+      const std::string opcode = is_unsigned ? "arith.index_castui" : "arith.index_cast";
+      Emit(idx_name + " = " + opcode + " " + source + " : " + src_type + " to index");
       return idx_name;
     }
   }
   return mlir_name;
 }
 
-std::string PTOCodegen::EmitCastToI32(const ir::ExprPtr& expr, const std::string& mlir_name) {
+std::string PTOCodegen::EmitCastToInt(const ir::ExprPtr& expr, const std::string& mlir_name,
+                                      unsigned target_bits, const char* api_name) {
+  const DataType target_dtype = target_bits == 64 ? DataType::INT64 : DataType::INT32;
+  const std::string target_type = target_bits == 64 ? "i64" : "i32";
   if (auto scalar_type = As<ScalarType>(expr->GetType())) {
-    CHECK(!scalar_type->dtype_.IsFloat()) << "EmitCastToI32 does not support floating-point types (got "
+    CHECK(!scalar_type->dtype_.IsFloat()) << api_name << " does not support floating-point types (got "
                                           << GetTypeString(scalar_type->dtype_) << ")";
-    if (scalar_type->dtype_ != DataType::INT32) {
+    if (scalar_type->dtype_ != target_dtype) {
       const bool is_unsigned = scalar_type->dtype_.IsUnsignedInt();
       std::string source_name = mlir_name;
       std::string src_type = GetTypeString(scalar_type->dtype_);
@@ -324,30 +468,39 @@ std::string PTOCodegen::EmitCastToI32(const ir::ExprPtr& expr, const std::string
         std::string signless_type = src_type.substr(1);  // "uiN" -> "iN"
         Emit(signless_name + " = builtin.unrealized_conversion_cast " + source_name + " : " + src_type +
              " to " + signless_type);
-        if (scalar_type->dtype_.GetBit() == 32) {
+        if (scalar_type->dtype_.GetBit() == target_bits) {
           return signless_name;
         }
         source_name = signless_name;
         src_type = signless_type;
       }
 
-      std::string i32_name = NewTemp();
-      // Use arith.index_cast for index→i32, arith.trunci/extsi/extui for int→int.
+      std::string result_name = NewTemp();
+      // Use arith.index_cast for index→iN, arith.trunci/extsi/extui for int→int.
       // MLIR arithmetic casts require signless integer operands, so unsigned
       // inputs are bridged to iN above before any width conversion.
       std::string mlir_op;
       if (scalar_type->dtype_ == DataType::INDEX) {
         mlir_op = "arith.index_cast";
-      } else if (scalar_type->dtype_.GetBit() > 32) {
+      } else if (scalar_type->dtype_.GetBit() > target_bits) {
         mlir_op = "arith.trunci";
       } else {
-        mlir_op = is_unsigned ? "arith.extui" : "arith.extsi";
+        // BOOL is not an unsigned integer dtype, but still represents 0/1.
+        mlir_op = (is_unsigned || scalar_type->dtype_ == DataType::BOOL) ? "arith.extui" : "arith.extsi";
       }
-      Emit(i32_name + " = " + mlir_op + " " + source_name + " : " + src_type + " to i32");
-      return i32_name;
+      Emit(result_name + " = " + mlir_op + " " + source_name + " : " + src_type + " to " + target_type);
+      return result_name;
     }
   }
   return mlir_name;
+}
+
+std::string PTOCodegen::EmitCastToI32(const ir::ExprPtr& expr, const std::string& mlir_name) {
+  return EmitCastToInt(expr, mlir_name, /*target_bits=*/32, "EmitCastToI32");
+}
+
+std::string PTOCodegen::EmitCastToI64(const ir::ExprPtr& expr, const std::string& mlir_name) {
+  return EmitCastToInt(expr, mlir_name, /*target_bits=*/64, "EmitCastToI64");
 }
 
 // ========================================================================
@@ -389,6 +542,33 @@ void PTOCodegen::VisitExpr_(const ir::MaxPtr& op) {
   VisitBinaryArithExpr(op, int_op, "arith.maximumf");
 }
 
+void PTOCodegen::VisitExpr_(const ir::PowPtr& op) {
+  const auto exponent = As<ir::ConstInt>(op->right_);
+  const auto dtype = ir::GetScalarDtype(op);
+  CHECK_SPAN(exponent && exponent->value_ >= 0 && (dtype.IsInt() || dtype == DataType::INDEX), op->span_)
+      << "PTO integer power requires a nonnegative constant integer exponent";
+  const auto result_type = GetTypeString(dtype);
+  const auto arithmetic_type = dtype.IsUnsignedInt() ? result_type.substr(1) : result_type;
+  auto base = EmitArithOperand(op->left_, arithmetic_type);
+  auto value = NewTemp();
+  Emit(value + " = arith.constant 1 : " + arithmetic_type);
+  auto remaining = static_cast<uint64_t>(exponent->value_);
+  // Exponentiation by squaring emits O(log exponent) scalar operations without
+  // adding a loop or changing hardware-loop nesting.
+  while (remaining != 0) {
+    if ((remaining & 1U) != 0) value = EmitArithBinaryOp("arith.muli", value, base, arithmetic_type);
+    remaining >>= 1;
+    if (remaining != 0) base = EmitArithBinaryOp("arith.muli", base, base, arithmetic_type);
+  }
+  if (dtype.IsUnsignedInt()) {
+    const auto converted = NewTemp();
+    Emit(converted + " = builtin.unrealized_conversion_cast " + value + " : " + arithmetic_type + " to " +
+         result_type);
+    value = converted;
+  }
+  fs_.current_expr_value = value;
+}
+
 // ========================================================================
 // Expression visitors - Unary
 // ========================================================================
@@ -398,6 +578,13 @@ void PTOCodegen::VisitExpr_(const ir::NotPtr& op) {
   std::string src = fs_.current_expr_value;
   ::pypto::DataType src_dtype = ir::GetScalarDtype(op->operand_);
   std::string src_type = GetTypeString(src_dtype);
+  if (src_dtype.IsUnsignedInt()) {
+    const auto converted = NewTemp();
+    Emit(converted + " = builtin.unrealized_conversion_cast " + src + " : " + src_type + " to " +
+         src_type.substr(1));
+    src = converted;
+    src_type = src_type.substr(1);
+  }
   std::string zero = NewTemp();
   std::string result = NewTemp();
   if (src_dtype.IsFloat()) {
@@ -416,6 +603,19 @@ void PTOCodegen::VisitExpr_(const ir::NegPtr& op) {
   ::pypto::DataType dtype = ir::GetScalarDtype(op);
   std::string type_str = GetTypeString(dtype);
   std::string result = NewTemp();
+  if (dtype.IsUnsignedInt()) {
+    const auto converted = NewTemp();
+    Emit(converted + " = builtin.unrealized_conversion_cast " + src + " : " + type_str + " to " +
+         type_str.substr(1));
+    const auto zero = NewTemp();
+    const auto negated = NewTemp();
+    Emit(zero + " = arith.constant 0 : " + type_str.substr(1));
+    Emit(negated + " = arith.subi " + zero + ", " + converted + " : " + type_str.substr(1));
+    Emit(result + " = builtin.unrealized_conversion_cast " + negated + " : " + type_str.substr(1) + " to " +
+         type_str);
+    fs_.current_expr_value = result;
+    return;
+  }
   if (dtype.IsFloat()) {
     Emit(result + " = arith.negf " + src + " : " + type_str);
   } else {
@@ -430,6 +630,7 @@ void PTOCodegen::VisitExpr_(const ir::AbsPtr& op) {
   VisitExpr(op->operand_);
   std::string src = fs_.current_expr_value;
   ::pypto::DataType dtype = ir::GetScalarDtype(op);
+  if (dtype.IsUnsignedInt()) return;
   std::string type_str = GetTypeString(dtype);
   std::string result = NewTemp();
   if (dtype.IsFloat()) {
@@ -445,10 +646,24 @@ void PTOCodegen::VisitExpr_(const ir::BitNotPtr& op) {
   std::string src = fs_.current_expr_value;
   ::pypto::DataType dtype = ir::GetScalarDtype(op);
   std::string type_str = GetTypeString(dtype);
+  const bool unsigned_value = dtype.IsUnsignedInt();
+  const auto arithmetic_type = unsigned_value ? type_str.substr(1) : type_str;
+  if (unsigned_value) {
+    const auto signless = NewTemp();
+    Emit(signless + " = builtin.unrealized_conversion_cast " + src + " : " + type_str + " to " +
+         arithmetic_type);
+    src = signless;
+  }
   std::string all_ones = NewTemp();
-  Emit(all_ones + " = arith.constant -1 : " + type_str);
+  Emit(all_ones + " = arith.constant -1 : " + arithmetic_type);
   std::string result = NewTemp();
-  Emit(result + " = arith.xori " + src + ", " + all_ones + " : " + type_str);
+  Emit(result + " = arith.xori " + src + ", " + all_ones + " : " + arithmetic_type);
+  if (unsigned_value) {
+    const auto converted = NewTemp();
+    Emit(converted + " = builtin.unrealized_conversion_cast " + result + " : " + arithmetic_type + " to " +
+         type_str);
+    result = converted;
+  }
   fs_.current_expr_value = result;
 }
 

@@ -47,6 +47,10 @@ Concepts introduced:
     something the recording can reproduce
 
 Run:  python examples/advanced/04_moe_graph_predicate.py -p a2a3sim
+
+Legacy Python API example: platform= calls below are retained for compatibility
+and emit DeprecationWarning. New Python code should use backend_type and
+execution_mode; see docs/en/dev/08-entry-points.md#legacy-platform-examples.
 """
 
 import argparse
@@ -178,7 +182,8 @@ def expected_bands(
 def _run_and_check(x, w_gate, w_up, w_down, counts, cfg) -> None:
     out = torch.zeros((EXPERTS * D, D), dtype=torch.float32)
     with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
-        moe_decode(x, w_gate, w_up, w_down, counts, out, config=cfg)
+        compiled = moe_decode.compile(x, w_gate, w_up, w_down, counts, out, config=cfg)
+        compiled(x, w_gate, w_up, w_down, counts, out, config=cfg)
 
     want = expected_bands(x, w_gate, w_up, w_down, counts)
     for e in range(EXPERTS):

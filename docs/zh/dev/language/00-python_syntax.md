@@ -174,9 +174,11 @@ Python 变量上。`@pl.jit` 会在一个新的模块命名空间里重新解析
 不属于 Vec / Mat / Acc、valid shape 是运行期值,或某个槽位作为 phi 被带出 `if` / 循环。这些都
 会报出指明具体形态的错误,而不是静默回退,因为回退就等于把你声明的隔离抹掉。
 
-默认的 PyPTO 规划器不受影响:它烘焙地址,沿用 `alloc_tile` 形式。`--pto-level=level3` 下的区域
-需要显式的基地址 `addr`,而 codegen 目前还不发射它;ptoas 自 0.55 起已支持这种形式
-（[PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106),已关闭）。
+默认 PyPTO 规划器的默认 codegen 仍把地址写入 `alloc_tile`。
+开启 `enable_software_pipeline=True` 后，合格的等大槽位分配可在 level3 下生成
+`alloc_multi_tile addr = <base>`；PyPTO 继续负责地址分配并预留所有槽位。
+同一开关将合格 Vec `pl.pipeline` 循环下降为 preload/main/drain，预取距离为 `stage - 1`。
+参见 [LowerPipelineToSlots](../passes/32-lower_pipeline_to_slots.md)。
 
 声明的名字自成命名空间——不会解析到恰好同名的 Python 变量。内存空间**必须**写（`TileType`
 始终要求 MemRef 与空间成对出现），且绑定到同一块分配的 tile 必须一致。未加注解的 tile 保持
@@ -188,7 +190,7 @@ Python 变量上。`@pl.jit` 会在一个新的模块命名空间里重新解析
 一块分配；希望编译器管理的层次则不加注解。
 
 在 `memory_planner=PTOAS` 下，编译器用的是**同一套**机制而非另一套：
-[`LowerPipelineToSlots`](../passes/30-lower_pipeline_to_slots.md) 会为合格 `pl.pipeline` 循环体中
+[`LowerPipelineToSlots`](../passes/32-lower_pipeline_to_slots.md) 会为合格 `pl.pipeline` 循环体中
 **顶层**的每个 `tile.load` 合成与上文完全一致的声明——`slots=F`、以 `iv % F` 索引——于是单份循环体
 轮转各个槽位而不被复制。你自己绑定过的 tile 不受影响；该 pass 未接手的循环仍走复制路径
 （上述拒绝规则对其依然成立）。
@@ -204,8 +206,8 @@ for stack, (out_outer,) in pl.pipeline(STACKS, stage=2, init_values=(out,)):
         pong: pl.Tile[[K, STEP], pl.BF16, l0b_pong, pl.Mem.Right] = ...
 ```
 
-参见 [InitMemRef](../passes/34-init_memref.md#声明式分配) 与
-[MemoryReuse](../passes/36-memory_reuse.md#声明式分配)。
+参见 [InitMemRef](../passes/38-init_memref.md#声明式分配) 与
+[MemoryReuse](../passes/40-memory_reuse.md#声明式分配)。
 
 ### Tile 视图 (TileView)
 
@@ -352,9 +354,15 @@ pl.create_tensor([64], dtype=pl.FP32)       # Promoted from tensor
 # System operations (synchronization primitives)
 pl.system.sync_src(set_pipe=pl.PipeType.MTE2, wait_pipe=pl.PipeType.V, event_id=0)
 pl.system.sync_dst(set_pipe=pl.PipeType.MTE2, wait_pipe=pl.PipeType.V, event_id=0)
-pl.system.bar_v()                        # Vector barrier
-pl.system.bar_m()                        # Matrix barrier
-pl.system.bar_all()                      # Global barrier
+pl.system.barrier(pipe=pl.PipeType.V)     # Vector pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.M)     # Matrix pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.S)     # Scalar pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.MTE1)  # L1 -> L0A/L0B operand feed
+pl.system.barrier(pipe=pl.PipeType.MTE2)  # GM -> UB/L1 load pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.MTE3)  # UB -> GM store pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.FIX)   # L0C writeback pipeline barrier
+pl.system.barrier(pipe=pl.PipeType.ALL)   # All pipelines on the current core
+pl.system.barrier(pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)  # cube lane only
 
 # Cross-core operations (TPUSH/TPOP protocol)
 pl.tpush_to_aic(tile0, split=0, id=0)        # Vector → Cube push on pipe 0
@@ -375,6 +383,16 @@ pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=512, i
 pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf, dir_mask=2, slot_size=512, slot_num=16, local_slot_num=4)
 ```
 
+`pl.system.barrier(*, pipe, core_type=None)` 要求传入 `pl.PipeType` 成员，全部成员均被接受。
+`core_type`（`pl.KernelType.AIC` / `.AIV`）用于在混合 InCore 函数被展开成 AIC 与 AIV 两个
+kernel 时，把屏障钉到单个 lane —— 两个 lane 拥有不同的流水，而无操作数的屏障默认会被复制到
+两边。在已声明为 AIC/AIV 的函数中请省略。屏障在 `pl.pipeline` 内被拒绝，与显式 flag 一致。
+它为所选流水线的前后工作建立顺序，不占用事件槽。`ALL` 只覆盖当前核；跨核屏障
+使用 `pl.system.syncall(...)`。原有 `bar_v()`、`bar_m()`、`bar_all()` 包装接口
+已移除，Python IR printer 统一打印为对应的 `barrier(pipe=...)` 写法。内部 IR
+算子名及原生屏障下沉保持不变。独立的 `set_flag` / `wait_flag` 调用仍保留具有
+源、目标方向的流水线事件语义。
+
 #### 统一算子的跨路径参数 (Cross-path arguments)
 
 统一算子 `pl.<op>` 接受两个层级参数的并集，因此只有*另一条*分发路径才能处理的
@@ -390,7 +408,7 @@ pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf, dir_mask=2, slot_size=512, sl
 
 ```python
 pl.matmul(tile_a, tile_b, b_trans=True)   # TypeError — tile 转置是视图，不是标志位
-pl.rsqrt(tile, high_precision=True)       # TypeError — tile 精度通过传入 tmp 选择
+pl.rsqrt(tile, high_precision=True)       # ValueError — 高精度需要 tmp=workspace
 pl.div(tile, 2.0, high_precision=True)    # TypeError — high_precision 需要 Tile rhs
 pl.row_max(tile)                          # TypeError — Tile 输入必须提供 tmp_tile
 pl.slice(tile, [64, 64], [64, 0])         # ValueError — 窗口越出源 tile 边界

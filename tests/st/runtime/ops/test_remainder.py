@@ -15,14 +15,14 @@ current pinned PTO-ISA contract:
 
 * TREM/TREMS: FP32 and INT32;
 * TFMOD/TFMODS: FP32;
-* TREM uses a same-dtype scratch tile with two valid rows;
-* TREMS uses a same-dtype scratch tile with one valid row.
+* TREM/TREMS use same-dtype scratch tiles with two/one valid rows, including
+  candidate, mask, and address-buffer capacity.
 * TREM/TFMOD cover default and ``high_precision`` PTOAS attributes; A2/A3
-  accepts but ignores the high-precision selection, as specified by PTO-ISA.
+  honours high-precision TREM; TFMOD still ignores the selector.
 * For A2/A3 INT32 TREM/TREMS, every source element and scalar must stay in
   the inclusive PTO-ISA domain ``[-2**24, 2**24]``.
 * INT32 TREM/TREMS store their source tiles again after the instruction to
-  verify that the temporary in-place FP32 conversion is fully restored.
+  verify that the sources are left intact.
 
 Inputs combine positive, negative, and zero dividends with positive and
 negative, strictly non-zero divisors. Full, row-tail, column-tail, and combined
@@ -109,6 +109,17 @@ def _make_program(
 ):
     pl_dtype = _PL_DT[dtype]
     valid = list(valid_shape)
+    # With N=64, DEFAULT needs 64 candidate + 8 mask + 8 address elements;
+    # INT32 keeps three (TREM) or two (TREMS) 64-element data areas.
+    # HIGH_PRECISION TREM additionally needs staged state and a fused buffer
+    # (912 elements total).
+    if high_precision:
+        scratch_cols = 912
+    elif dtype == DataType.INT32:
+        scratch_cols = 208 if op_name == "rem" else 144
+    else:
+        scratch_cols = 80
+    scratch_rows = 2 if op_name == "rem" else 1
 
     if op_name == "rem":
         if dtype == DataType.INT32:
@@ -130,13 +141,12 @@ def _make_program(
                 ]:
                     lhs_tile = pl.load(lhs, [0, 0], [M, N], valid_shape=valid)
                     rhs_tile = pl.load(rhs, [0, 0], [M, N], valid_shape=valid)
-                    tmp: pl.Tile[[2, N], pl_dtype] = pl.tile.create(
-                        [2, N], dtype=pl_dtype, target_memory=pl.MemorySpace.Vec
+                    tmp: pl.Tile[[scratch_rows, scratch_cols], pl_dtype] = pl.tile.create(
+                        [scratch_rows, scratch_cols], dtype=pl_dtype, target_memory=pl.MemorySpace.Vec
                     )
                     result = pl.tile.rem(lhs_tile, rhs_tile, tmp, high_precision=high_precision)
                     out = pl.store(result, [0, 0], out)
-                    # A2/A3 temporarily converts both sources INT32 -> FP32 in place.
-                    # Re-read them after TREM so a broken restore path is observable.
+                    # Re-read the sources after TREM to check they are left intact.
                     lhs_after = pl.store(lhs_tile, [0, 0], lhs_after)
                     rhs_after = pl.store(rhs_tile, [0, 0], rhs_after)
                     return out, lhs_after, rhs_after
@@ -169,8 +179,8 @@ def _make_program(
             ) -> pl.Tensor[[M, N], pl_dtype]:
                 lhs_tile = pl.load(lhs, [0, 0], [M, N], valid_shape=valid)
                 rhs_tile = pl.load(rhs, [0, 0], [M, N], valid_shape=valid)
-                tmp: pl.Tile[[2, N], pl_dtype] = pl.tile.create(
-                    [2, N], dtype=pl_dtype, target_memory=pl.MemorySpace.Vec
+                tmp: pl.Tile[[scratch_rows, scratch_cols], pl_dtype] = pl.tile.create(
+                    [scratch_rows, scratch_cols], dtype=pl_dtype, target_memory=pl.MemorySpace.Vec
                 )
                 result = pl.tile.rem(lhs_tile, rhs_tile, tmp, high_precision=high_precision)
                 return pl.store(result, [0, 0], out)
@@ -201,12 +211,12 @@ def _make_program(
                     lhs_after: pl.InOut[pl.Tensor[[M, N], pl_dtype]],
                 ) -> tuple[pl.Tensor[[M, N], pl_dtype], pl.Tensor[[M, N], pl_dtype]]:
                     lhs_tile = pl.load(lhs, [0, 0], [M, N], valid_shape=valid)
-                    tmp: pl.Tile[[1, N], pl_dtype] = pl.tile.create(
-                        [1, N], dtype=pl_dtype, target_memory=pl.MemorySpace.Vec
+                    tmp: pl.Tile[[scratch_rows, scratch_cols], pl_dtype] = pl.tile.create(
+                        [scratch_rows, scratch_cols], dtype=pl_dtype, target_memory=pl.MemorySpace.Vec
                     )
                     result = pl.tile.rems(lhs_tile, scalar, tmp)
                     out = pl.store(result, [0, 0], out)
-                    # Re-read the source after TREMS to verify its INT32 restore path.
+                    # Re-read the source after TREMS to check it is left intact.
                     lhs_after = pl.store(lhs_tile, [0, 0], lhs_after)
                     return out, lhs_after
 
@@ -230,8 +240,8 @@ def _make_program(
                 out: pl.InOut[pl.Tensor[[M, N], pl_dtype]],
             ) -> pl.Tensor[[M, N], pl_dtype]:
                 lhs_tile = pl.load(lhs, [0, 0], [M, N], valid_shape=valid)
-                tmp: pl.Tile[[1, N], pl_dtype] = pl.tile.create(
-                    [1, N], dtype=pl_dtype, target_memory=pl.MemorySpace.Vec
+                tmp: pl.Tile[[scratch_rows, scratch_cols], pl_dtype] = pl.tile.create(
+                    [scratch_rows, scratch_cols], dtype=pl_dtype, target_memory=pl.MemorySpace.Vec
                 )
                 result = pl.tile.rems(lhs_tile, scalar, tmp)
                 return pl.store(result, [0, 0], out)

@@ -28,7 +28,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto import ir
-from pypto.language.parser.diagnostics.exceptions import InvalidOperationError, ParserSyntaxError
+from pypto.language.parser.diagnostics import InvalidOperationError, ParserSyntaxError
 
 _OP_TILE_GET_SUBBLOCK_IDX = ir.get_op("tile.get_subblock_idx").name
 
@@ -641,6 +641,26 @@ class TestSplitTransferTensorForm:
                 for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):  # noqa: B007
                     h = pl.aiv_shard(data)  # noqa: F841
                 return out
+
+
+def test_split_scope_yields_bind_enclosing_if_results():
+    """A split region is transparent; its yield belongs to the enclosing if."""
+
+    @pl.program
+    class Original:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(self, flag: pl.Scalar[pl.BOOL], x: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec]):
+            if flag:
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    result = pl.yield_(x)
+            else:
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    result = pl.yield_(x)
+            return result
+
+    restored = pl.parse(str(Original))
+    ir.assert_structural_equal(Original, restored)
+    assert ir.structural_hash(Original) == ir.structural_hash(restored)
 
 
 if __name__ == "__main__":

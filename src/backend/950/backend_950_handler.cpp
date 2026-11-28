@@ -11,20 +11,50 @@
 
 #include "pypto/backend/950/backend_950_handler.h"
 
+#include <cstdint>
 #include <initializer_list>
 
+#include "pypto/backend/950/backend_950.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/type.h"
+#include "pypto/sync/resource_catalog.h"
+#include "runtime/src/a5/platform/include/common/platform_config.h"
+#include "src/backend/common/sync_resources.h"
 
 namespace pypto {
 namespace backend {
 
+int64_t Ascend950Handler::GetUrmaScatterScratchBytes() const {
+  // Each physical AIV writes one private descriptor cache line.
+  return PLATFORM_MAX_AIV_PER_THREAD * int64_t{64};
+}
+
+Ascend950Handler::Ascend950Handler() : BackendHandler(Backend950::Instance()) {}
+
+bool Ascend950Handler::SupportsRegType(const ir::RegType& type) const {
+  if (type.GetRegKind() == ir::RegKind::UReg) return true;
+  if (type.GetShape() <= 0) return false;
+  const auto dtype = type.GetDType();
+  if (type.GetRegKind() == ir::RegKind::MaskReg) return dtype == DataType::BOOL;
+  return dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32 ||
+         dtype == DataType::FP8E4M3FN || dtype == DataType::INT8 || dtype == DataType::UINT8 ||
+         dtype == DataType::INT16 || dtype == DataType::UINT16 || dtype == DataType::INT32 ||
+         dtype == DataType::UINT32;
+}
+
 const Ascend950Handler& Ascend950Handler::Instance() {
   static const Ascend950Handler instance;
   return instance;
+}
+
+/// Own the A5 resource model independently of the process-global target.
+const sync::ResourceCatalog& Ascend950Handler::GetSyncResourceCatalog() const {
+  // PTOAS UnifiedSyncModel::ResourceModel exposes 32 AIV buffer credits on A5.
+  static const auto catalog = MakeAscendSyncResourceCatalog(GetPtoTargetArch(), 32);
+  return catalog;
 }
 
 ir::TileView Ascend950Handler::BuildCrossCoreTransferView(ir::MemorySpace dest_ms,
@@ -69,7 +99,7 @@ const TcvtAdjacency& Ascend950Handler::GetTcvtAdjacency() const {
     add(DataType::FP16, {DataType::FP32, DataType::INT32, DataType::INT16, DataType::INT8, DataType::UINT8});
     add(DataType::FP16, {DataType::HF8});
     add(DataType::BF16,
-        {DataType::FP32, DataType::INT32, DataType::FP16, DataType::FP4, DataType::FP4E2M1X2});
+        {DataType::FP32, DataType::INT32, DataType::FP16, DataType::FP4E2M1X2, DataType::FP4E1M2X2});
     add(DataType::INT16, {DataType::FP16, DataType::FP32, DataType::UINT8, DataType::UINT32});
     add(DataType::INT16, {DataType::INT32});
     add(DataType::INT32, {DataType::FP32, DataType::INT16, DataType::INT64, DataType::UINT16});
@@ -81,8 +111,10 @@ const TcvtAdjacency& Ascend950Handler::GetTcvtAdjacency() const {
     add(DataType::FP8E4M3FN, {DataType::FP32});
     add(DataType::FP8E5M2, {DataType::FP32});
     add(DataType::HF8, {DataType::FP32});
-    add(DataType::FP4, {DataType::BF16});
-    add(DataType::FP4E2M1X2, {DataType::BF16});
+    // E2M1 widens exactly using the pinned A5 register decoder, including
+    // direct NZ stores. E1M2 and E5M2 still use the ordinary BF16 bridge.
+    add(DataType::FP4E2M1X2, {DataType::BF16, DataType::FP8E4M3FN});
+    add(DataType::FP4E1M2X2, {DataType::BF16});
     return t;
   }();
   return kTable;

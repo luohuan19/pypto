@@ -39,8 +39,10 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/storage_size.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto::ir {
 
@@ -83,15 +85,47 @@ inline TypePtr CloneTypeWithMemRef(const TypePtr& type, const std::optional<MemR
   return type;
 }
 
-/// Keep newly inferred shape / dtype / view metadata, filling only missing storage metadata.
-/// Op type deduction may omit a declared MemRef or tile memory space. For a
-/// re-deduced assignment, carry them from the assigned Var's type: ConvertToSSA
-/// records allocation metadata there, not on the RHS Call.
-inline TypePtr WithCarriedMemRef(const TypePtr& deduced, const TypePtr& original) {
+/// Remove allocation annotations before comparing value descriptors. Keep
+/// window identity, layouts, and every other type field. Memoize tuple DAGs.
+inline TypePtr CloneTypeWithoutMemRef(const TypePtr& root) {
+  std::unordered_map<const Type*, TypePtr> cache;
+  auto strip = [&](auto&& self, const TypePtr& type) -> TypePtr {
+    if (!type) return type;
+    if (auto found = cache.find(type.get()); found != cache.end()) {
+      return found->second;
+    }
+    TypePtr result = type;
+    if (auto tuple = As<TupleType>(type)) {
+      std::vector<TypePtr> elements;
+      bool changed = false;
+      for (const auto& element : tuple->types_) {
+        auto next = self(self, element);
+        changed |= next != element;
+        elements.push_back(std::move(next));
+      }
+      if (changed) result = std::make_shared<TupleType>(std::move(elements));
+    } else if (auto shaped = As<ShapedType>(type); shaped && shaped->memref_) {
+      result = CloneTypeWithMemRef(type, std::nullopt);
+    }
+    cache.emplace(type.get(), result);
+    return result;
+  };
+  return strip(strip, root);
+}
+
+/// Keep inferred shape / dtype / view metadata, filling missing storage metadata.
+/// When re-deducing a definition, preserve_declared_binding keeps its declaration
+/// even if inference supplies an operand's MemRef (gather_row), so InitMemRef can
+/// reject conflicting alias bindings. Do not enable it for control-flow result
+/// types: their old binding is inferred and must follow the new yield/init value.
+inline TypePtr WithCarriedMemRef(const TypePtr& deduced, const TypePtr& original,
+                                 bool preserve_declared_binding = false) {
   auto memref = GetTypeMemRef(deduced);
+  auto original_memref = GetTypeMemRef(original);
   bool changed = false;
-  if (!memref && GetTypeMemRef(original)) {
-    memref = GetTypeMemRef(original);
+  if (original_memref && (!memref || (preserve_declared_binding && (*original_memref)->is_pinned_)) &&
+      memref != original_memref) {
+    memref = original_memref;
     changed = true;
   }
   std::optional<MemorySpace> memory_space;
@@ -112,11 +146,13 @@ inline TypePtr GetAuthoritativeAssignmentType(const TypePtr& lhs_type, const Exp
                                                   As<TupleType>(value_type);
   auto chosen = value_type && !As<UnknownType>(value_type) && rhs_carries_authoritative_metadata ? value_type
                                                                                                  : lhs_type;
-  // The RHS wins on shape / dtype / view metadata. Op type deduction does not
-  // produce a MemRef, so an LHS MemRef supplies additional allocation metadata
-  // (an author-declared allocation or a re-parsed post-allocation dump).
-  if (!GetTypeMemRef(chosen).has_value() && GetTypeMemRef(lhs_type).has_value()) {
-    chosen = CloneTypeWithMemRef(chosen, GetTypeMemRef(lhs_type));
+  // The RHS wins on shape / dtype / view metadata, but a fresh definition's
+  // pinned LHS constrains even a plain alias with inherited storage. Callers
+  // must clear stale LHS storage on mutable redefinitions before selecting
+  // their type; explicit alias reannotations use a separate fresh binding.
+  auto lhs_memref = GetTypeMemRef(lhs_type);
+  if (lhs_memref && (!GetTypeMemRef(chosen) || (*lhs_memref)->is_pinned_)) {
+    chosen = CloneTypeWithMemRef(chosen, lhs_memref);
   }
   return chosen;
 }
@@ -465,12 +501,25 @@ inline ExprPtr AddByteOffsets(const ExprPtr& lhs, const ExprPtr& rhs) {
   auto const_lhs = As<ConstInt>(lhs);
   auto const_rhs = As<ConstInt>(rhs);
   if (const_lhs && const_rhs) {
-    return std::make_shared<ConstInt>(const_lhs->value_ + const_rhs->value_, DataType::INDEX,
-                                      Span::unknown());
+    int64_t sum;
+    CHECK(!__builtin_add_overflow(const_lhs->value_, const_rhs->value_, &sum))
+        << "View address addition exceeds int64";
+    return MakeIndexConst(sum);
   }
   if (const_rhs && const_rhs->value_ == 0) return lhs;
   if (const_lhs && const_lhs->value_ == 0) return rhs;
   return std::make_shared<Add>(lhs, rhs, DataType::INDEX, Span::unknown());
+}
+
+/// Derive an alias window from its current source, preserving allocation-slot identity.
+/// The offset is relative to the source, never the alias's previous absolute offset.
+inline MemRefPtr MakeAliasingMemRef(const MemRefPtr& source, const ExprPtr& relative_offset, uint64_t size,
+                                    const Span& span = Span::unknown()) {
+  INTERNAL_CHECK(source) << "Internal error: alias source must carry a MemRef";
+  auto zero = As<ConstInt>(relative_offset);
+  if (zero && zero->value_ == 0 && size == source->size_) return source;
+  return std::make_shared<MemRef>(source->base_, AddByteOffsets(source->byte_offset_, relative_offset), size,
+                                  span, source->is_pinned_, source->slot_count_, source->slot_index_);
 }
 
 /// Create a multiply expression: lhs * rhs.
@@ -479,8 +528,10 @@ inline ExprPtr MulByteOffsets(const ExprPtr& lhs, const ExprPtr& rhs) {
   auto const_lhs = As<ConstInt>(lhs);
   auto const_rhs = As<ConstInt>(rhs);
   if (const_lhs && const_rhs) {
-    return std::make_shared<ConstInt>(const_lhs->value_ * const_rhs->value_, DataType::INDEX,
-                                      Span::unknown());
+    int64_t product;
+    CHECK(!__builtin_mul_overflow(const_lhs->value_, const_rhs->value_, &product))
+        << "View address multiplication exceeds int64";
+    return MakeIndexConst(product);
   }
   if (const_rhs && const_rhs->value_ == 1) return lhs;
   if (const_lhs && const_lhs->value_ == 1) return rhs;
@@ -547,7 +598,7 @@ inline ExprPtr ComputeAccumulatorSliceByteOffset(const std::vector<ExprPtr>& off
 ///    parent's. A row-narrowing window has NO correct standalone base address —
 ///    its box columns are strided by the parent's `rows`, its descriptor's by its
 ///    own — so it is left on the arithmetic it has always had rather than swapped
-///    for a differently wrong number. See docs/en/dev/passes/33-init_memref.md.
+///    for a differently wrong number. See docs/en/dev/passes/37-init_memref.md.
 ///  * a non-zero row origin, which is only reachable together with a narrowed row
 ///    extent and is unrepresentable for the same reason;
 ///  * a static column origin that is not a multiple of the 16-wide box. Such a
@@ -593,11 +644,40 @@ inline std::optional<tile_view_semantics::AccumulatorTileGeometry> GetSliceAccum
   return geometry;
 }
 
+/// Convert a physical element offset to the MemRef byte address, including
+/// the existing nibble-alignment rules for packed slices.
+inline ExprPtr SliceElementOffsetToBytes(const ExprPtr& result, const DataType& dtype, const Span& span) {
+  const uint64_t storage_bits = storage_size::GetStorageBitWidth(dtype);
+  INTERNAL_CHECK_SPAN(storage_bits > 0, span)
+      << "Internal error: slice dtype has no storage width: " << dtype.ToString();
+  if (storage_bits % 8 == 0) {
+    auto elem_size_expr =
+        std::make_shared<ConstInt>(static_cast<int64_t>(storage_bits / 8), DataType::INDEX, Span::unknown());
+    return MulByteOffsets(result, elem_size_expr);
+  }
+
+  auto logical_offset = As<ConstInt>(result);
+  CHECK_SPAN(logical_offset, span)
+      << "Packed 4-bit slice offsets must be compile-time constants because MemRef cannot represent "
+         "a dynamic nibble offset";
+  CHECK_SPAN(logical_offset->value_ >= 0, span)
+      << "Packed 4-bit slice offsets must be non-negative, but got logical offset " << logical_offset->value_;
+  const auto byte_offset =
+      storage_size::StaticLogicalOffsetToByte(static_cast<uint64_t>(logical_offset->value_), dtype);
+  CHECK_SPAN(byte_offset.has_value(), span)
+      << "Packed 4-bit slice origins must be byte-aligned; logical linear offset " << logical_offset->value_
+      << " selects the second nibble of a byte";
+  CHECK_SPAN(*byte_offset <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()), span)
+      << "Packed 4-bit slice byte offset overflows int64";
+  return std::make_shared<ConstInt>(static_cast<int64_t>(*byte_offset), DataType::INDEX, Span::unknown());
+}
+
 /// Compute byte offset for a slice operation.
 /// byte_offset = (o0 * s1 * ... * sN + o1 * s2 * ... * sN + ... + oN) * storage_bits / 8
 ///
-/// MemRef carries a byte offset rather than a nibble offset. Packed 4-bit
-/// slices therefore require a static, byte-aligned logical origin in v1.
+/// MemRef carries a byte offset rather than a nibble offset. INT4/UINT4/HF4
+/// slices therefore require a static, byte-aligned origin. FP4 x2 carrier
+/// offsets are already byte offsets and need no sub-byte alignment conversion.
 ///
 /// @param acc_geometry NZ box geometry, supplied by ``GetSliceAccumulatorGeometry``
 ///        for the accumulator (L0C) windows it can address exactly. Every other
@@ -627,35 +707,47 @@ inline ExprPtr ComputeSliceByteOffset(
     result = AddByteOffsets(result, MulByteOffsets(offsets[i], stride));
   }
 
-  const uint64_t storage_bits = storage_size::GetStorageBitWidth(dtype);
-  INTERNAL_CHECK_SPAN(storage_bits > 0, span)
-      << "Internal error: slice dtype has no storage width: " << dtype.ToString();
-  if (storage_bits % 8 == 0) {
-    auto elem_size_expr =
-        std::make_shared<ConstInt>(static_cast<int64_t>(storage_bits / 8), DataType::INDEX, Span::unknown());
-    return MulByteOffsets(result, elem_size_expr);
-  }
+  return SliceElementOffsetToBytes(result, dtype, span);
+}
 
-  auto logical_offset = As<ConstInt>(result);
-  CHECK_SPAN(logical_offset, span)
-      << "Packed 4-bit slice offsets must be compile-time constants because MemRef cannot represent "
-         "a dynamic nibble offset";
-  CHECK_SPAN(logical_offset->value_ >= 0, span)
-      << "Packed 4-bit slice offsets must be non-negative, but got logical offset " << logical_offset->value_;
-  const auto byte_offset =
-      storage_size::StaticLogicalOffsetToByte(static_cast<uint64_t>(logical_offset->value_), dtype);
-  CHECK_SPAN(byte_offset.has_value(), span)
-      << "Packed 4-bit slice origins must be byte-aligned; logical linear offset " << logical_offset->value_
-      << " selects the second nibble of a byte";
-  CHECK_SPAN(*byte_offset <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()), span)
-      << "Packed 4-bit slice byte offset overflows int64";
-  return std::make_shared<ConstInt>(static_cast<int64_t>(*byte_offset), DataType::INDEX, Span::unknown());
+/// Displacement in elements from the immediate tensor origin. Nested GM
+/// windows use their parent descriptor's physical strides.
+inline ExprPtr TensorElementOffset(const TensorTypePtr& tensor, const std::vector<ExprPtr>& indices) {
+  INTERNAL_CHECK(indices.size() == tensor->shape_.size()) << "Tensor index rank must match its descriptor";
+  const auto& view = tensor->tensor_view_;
+  const auto strides = view && !view->stride.empty()
+                           ? view->stride
+                           : tensor_view_semantics::BuildLogicalStridesFromLayout(
+                                 tensor->shape_, view ? view->layout : TensorLayout::ND);
+  INTERNAL_CHECK(strides.size() == indices.size()) << "Tensor stride rank mismatch";
+  auto offset = MakeZeroByteOffset();
+  for (size_t i = 0; i < strides.size(); ++i) {
+    offset = AddByteOffsets(offset, MulByteOffsets(indices[i], strides[i]));
+  }
+  return offset;
+}
+
+inline ExprPtr TensorElementOffset(const TensorTypePtr& tensor, const MakeTuplePtr& indices) {
+  INTERNAL_CHECK(indices) << "Tensor indices must be a tuple";
+  return TensorElementOffset(tensor, indices->elements_);
+}
+
+inline bool IsWindowTensorView(const CallPtr& call) {
+  return IsOp(call, "tensor.view") && call->args_.size() >= 4;
 }
 
 /// Compute additional byte offset for a view operation.
 /// Dispatches: slice ops → stride-based offset, others → zero offset.
 inline ExprPtr ComputeViewByteOffset(const CallPtr& call, const TypePtr& parent_type) {
-  const std::string& op_name = call->op_->name_;
+  if (IsWindowTensorView(call)) {
+    auto parent = AsTensorTypeLike(parent_type);
+    INTERNAL_CHECK_SPAN(parent, call->span_) << "tensor.view window source must be a GM tensor";
+    auto elements = TensorElementOffset(parent, As<MakeTuple>(call->args_[2]));
+    const auto bits = storage_size::GetStorageBitWidth(parent->dtype_);
+    CHECK_SPAN(bits > 0 && bits % 8 == 0, call->span_)
+        << "tensor.view window requires byte-addressable storage";
+    return MulByteOffsets(elements, MakeIndexConst(static_cast<int64_t>(bits / 8), call->span_));
+  }
 
   if (IsOp(call, "tensor.slice") || IsOp(call, "tile.slice")) {
     auto shaped = std::dynamic_pointer_cast<const ShapedType>(parent_type);
@@ -665,9 +757,17 @@ inline ExprPtr ComputeViewByteOffset(const CallPtr& call, const TypePtr& parent_
     // tile.slice(input, shape, offset[, valid_shape]) → offset is args[2]
     size_t offset_arg_idx = 2;
     INTERNAL_CHECK_SPAN(offset_arg_idx < call->args_.size(), call->span_)
-        << "Internal error: " << op_name << " missing offset argument";
+        << "Internal error: " << call->op_->name_ << " missing offset argument";
 
-    // Extract individual offset elements from the MakeTuple expression
+    auto tensor = AsTensorTypeLike(parent_type);
+    auto window = As<TupleType>(call->args_[1]->GetType());
+    auto indices = As<TupleType>(call->args_[2]->GetType());
+    if (window && indices &&
+        HasRectangularSliceStrides(tensor, window->types_.size(), indices->types_.size())) {
+      auto offsets = ExtractTupleElements(call->args_[2], indices->types_.size());
+      return SliceElementOffsetToBytes(TensorElementOffset(tensor, offsets), tensor->dtype_, call->span_);
+    }
+
     std::vector<ExprPtr> offsets;
     if (auto make_tuple = As<MakeTuple>(call->args_[offset_arg_idx])) {
       offsets = make_tuple->elements_;
@@ -675,12 +775,8 @@ inline ExprPtr ComputeViewByteOffset(const CallPtr& call, const TypePtr& parent_
       offsets.push_back(call->args_[offset_arg_idx]);
     }
 
-    // An accumulator (L0C) parent is NZ-boxed, not row-major dense. Ask for the
-    // box strides; every other parent — including tensor.slice, which has no
-    // TileType at all — yields nullopt and keeps the row-major arithmetic
-    // bit-for-bit. This must stay a pure function of (call, parent_type):
-    // MemoryReuse re-derives the same offset from the same two inputs when it
-    // re-anchors a view onto a retargeted buffer, and the two must agree.
+    // Accumulator slices can use NZ-box geometry. The remaining slices retain
+    // their existing shape-based addressing.
     auto acc_geometry = GetSliceAccumulatorGeometry(call, parent_type);
 
     return ComputeSliceByteOffset(offsets, shaped->shape_, shaped->dtype_, call->span_, acc_geometry);

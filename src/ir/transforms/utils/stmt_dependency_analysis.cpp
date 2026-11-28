@@ -23,6 +23,7 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
@@ -37,8 +38,9 @@ namespace stmt_dep {
 // BuildStmtDependencyGraph
 // ---------------------------------------------------------------------------
 
-StmtDependencyGraph BuildStmtDependencyGraph(const StmtPtr& region, const ProgramPtr& program) {
-  if (program) CheckInOutUseDiscipline(region, program);
+StmtDependencyGraph BuildStmtDependencyGraph(const StmtPtr& region, const ProgramPtr& program,
+                                             bool check_discipline) {
+  if (program && check_discipline) CheckInOutUseDiscipline(region, program);
 
   StmtDependencyGraph graph;
   if (!region) return graph;
@@ -60,6 +62,57 @@ StmtDependencyGraph BuildStmtDependencyGraph(const StmtPtr& region, const Progra
   // Last stmt in the region that defined each Var (tracked by raw pointer).
   std::unordered_map<const Var*, const Stmt*> last_def;
 
+  // A register region or SIMT launch can read or mutate storage also named by older Tile
+  // SSA values or overlapping views. Until general memory SSA exists, preserve
+  // the entire region's source order whenever it contains these storage effects.
+  // This covers ordinary Tile accesses, unknown aliases, nested loops and WAW,
+  // without a quadratic pairwise alias scan. Def-use-only graphs are otherwise
+  // unchanged. The extra chain has at most N-1 edges.
+  class StorageEffectPresence final : public IRVisitor {
+   public:
+    bool found = false;
+    bool has_wait = false;
+    ProgramPtr program;
+
+   protected:
+    void VisitStmt_(const SimtLaunchStmtPtr& op) override {
+      found = true;
+      IRVisitor::VisitStmt_(op);
+    }
+    void VisitStmt_(const RegScopeStmtPtr& op) override {
+      found = true;
+      IRVisitor::VisitStmt_(op);
+    }
+    void VisitExpr_(const CallPtr& call) override {
+      if (IsOp(call, "pld.system.wait_event")) has_wait = true;
+      auto callee = program ? program->GetFunction(call->op_->name_) : nullptr;
+      if (callee && callee->func_type_ == FunctionType::VF) found = true;
+      auto& registry = OpRegistry::GetInstance();
+      if (registry.IsRegistered(call->op_->name_) && registry.GetEntry(call->op_->name_).GetRegSpec()) {
+        found = true;
+      }
+      IRVisitor::VisitExpr_(call);
+    }
+  } effects;
+  effects.program = program;
+  // A wait observes DMA completion even when its boolean result is unused.
+  // Bound each segment by its adjacent waits. Independent statements within
+  // a segment can still reorder, and each contributes at most two edges.
+  const Stmt* last_wait = nullptr;
+  size_t segment_begin = 0;
+  for (size_t i = 0; i < graph.stmts.size(); ++i) {
+    const auto& stmt = graph.stmts[i];
+    effects.has_wait = false;
+    effects.VisitStmt(stmt);
+    auto& predecessors = graph.predecessors[stmt.get()];
+    if (last_wait) predecessors.insert(last_wait);
+    if (effects.has_wait) {
+      for (size_t j = segment_begin; j < i; ++j) predecessors.insert(graph.stmts[j].get());
+      last_wait = stmt.get();
+      segment_begin = i + 1;
+    }
+  }
+  const Stmt* previous = nullptr;
   for (const auto& stmt : graph.stmts) {
     var_collectors::VarDefUseCollector collector;
     collector.VisitStmt(stmt);
@@ -80,6 +133,9 @@ StmtDependencyGraph BuildStmtDependencyGraph(const StmtPtr& region, const Progra
     for (const Var* v : collector.var_defs) {
       last_def[v] = raw_stmt;
     }
+
+    if (effects.found && previous) graph.predecessors[raw_stmt].insert(previous);
+    previous = raw_stmt;
   }
 
   return graph;
@@ -140,7 +196,10 @@ class InOutUseDisciplineChecker : public IRVisitor {
     // handled as Mode B in RFC #1026, which is out of scope here.
     if (!program_) return;
     FunctionPtr callee = program_->GetFunction(op->op_->name_);
-    if (!callee) return;
+    // VF helpers borrow caller storage: old SSA names remain usable after a
+    // call. BuildStmtDependencyGraph detects VF calls and retains their source
+    // order to preserve these storage effects independently of return values.
+    if (!callee || callee->func_type_ == FunctionType::VF) return;
 
     const size_t n = std::min(callee->param_directions_.size(), op->args_.size());
     for (size_t i = 0; i < n; ++i) {
@@ -164,6 +223,17 @@ class InOutUseDisciplineChecker : public IRVisitor {
     if (op->var_) {
       dead_.erase(op->var_.get());
       dead_origin_.erase(op->var_.get());
+    }
+  }
+
+  void VisitStmt_(const SimtLaunchStmtPtr& op) override {
+    for (const auto& dim : op->block_dims_) VisitExpr(dim);
+    for (const auto& arg : op->args_) VisitExpr(arg);
+    // Tile inputs retain value semantics; GM inputs are reference handles.
+    // Neither becomes a dead SSA value through this device-side launch.
+    for (const auto& result : op->results_) {
+      dead_.erase(result.get());
+      dead_origin_.erase(result.get());
     }
   }
 

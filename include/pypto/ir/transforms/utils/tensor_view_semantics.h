@@ -12,6 +12,7 @@
 #ifndef PYPTO_IR_TRANSFORMS_UTILS_TENSOR_VIEW_SEMANTICS_H_
 #define PYPTO_IR_TRANSFORMS_UTILS_TENSOR_VIEW_SEMANTICS_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -135,20 +136,9 @@ inline void CheckNzLogicalRank(size_t rank, const char* what, const Span& span =
 
 /// Number of elements in one NZ C0 line (32 bytes) for ``dtype``.
 ///
-/// Derived from the *bit* width, not ``GetByte()``. ``GetByte()`` is
-/// ``ceil(bits/8)``, so every sub-byte dtype (INT4 / UINT4 / FP4 / HF4 / BOOL)
-/// reports 1 and would yield ``c0 = 32`` instead of the 64 elements that
-/// actually fit in a 32-byte C0 line — silently mis-blocking the tensor and
-/// accepting misaligned extents (e.g. FP4 ``C = 544`` passes ``% 32`` but is
-/// not a multiple of 64).
-///
-/// Sub-byte dtypes are rejected for now. This is a **PyPTO milestone-1 scope
-/// limit, not a hardware or pto-isa one**: pto-isa's NZ machinery does handle
-/// FP4 (``tload_common.hpp`` carries explicit ``caps::IsFP4`` branches through
-/// the NZ paths and asserts ``staticShape[4] == C0_SIZE_BYTE / sizeof(DType)``).
-/// Supporting it here means validating the packed-nibble addressing end to end,
-/// which milestone 1 does not attempt. The bit-based formula above is already
-/// the correct one to build on when it does.
+/// Derived from the bit width; sub-byte INT4, UINT4, HF4, and BOOL have no
+/// supported NZ addressing contract here. Both packed FP4 x2 formats use
+/// eight-bit byte carriers, so one C0 line contains 32 carrier elements.
 inline int64_t NzC0Elems(DataType dtype) {
   const auto bits = static_cast<int64_t>(dtype.GetBit());
   CHECK(bits >= 8) << "NZ layout does not support the sub-byte dtype '" << dtype.ToString() << "' (" << bits
@@ -458,11 +448,9 @@ inline bool IsProvableNonNegative(const ExprPtr& expr, const NzOffsetFacts& fact
   // non-negative. This is what a split-K block index reaches for --
   // ``(block % OK) * K_SLICE`` names the K half.
   //
-  // The dividend has to be proven too, rather than resting on the name:
-  // ``FloorMod`` lowers to ``arith.remsi`` (``pto_scalar_expr_codegen.cpp``),
-  // which truncates toward zero, so a negative dividend yields a negative
-  // remainder -- and a negative partition offset is clamped to 0 rather than
-  // caught, which is the silent wrong read this whole proof exists to prevent.
+  // Keep the proof conservative: signed integer and INDEX FloorMod codegen
+  // corrects arith.remsi to floor semantics, but this predicate still requires
+  // a non-negative dividend instead of relying on that stronger result bound.
   if (auto mod = As<FloorMod>(expr)) {
     auto divisor = As<ConstInt>(mod->right_);
     return divisor && divisor->value_ > 0 && IsProvableNonNegative(mod->left_, facts, budget);
@@ -645,6 +633,32 @@ inline bool IsBlockedMxShape(const std::vector<ExprPtr>& shape) {
          fractal_cols->value_ == tile_view_semantics::kMXSFractalCols;
 }
 
+/// PTOAS v0.74 accepts logical MX views; their layout tag owns physical packing.
+/// ZZ/NN retain static fractal alignment. ND activation scales are already
+/// row-major GM data: rows may be dynamic and need no 16-row alignment, while
+/// the contiguous group axis still consists of complete scale pairs.
+inline bool IsLogicalMxShape(const std::vector<ExprPtr>& shape, TensorLayout layout) {
+  if (shape.size() != 2 || !IsMxTensorLayout(layout)) return false;
+  if (layout == TensorLayout::MX_A_ND) {
+    auto rows = As<ConstInt>(shape[0]);
+    auto groups = As<ConstInt>(shape[1]);
+    return (!rows || rows->value_ > 0) && groups && groups->value_ > 0 &&
+           groups->value_ % tile_view_semantics::kMXSFractalCols == 0;
+  }
+  const bool is_a = layout == TensorLayout::MX_A_ZZ;
+  auto block = As<ConstInt>(shape[is_a ? 0 : 1]);
+  auto group = As<ConstInt>(shape[is_a ? 1 : 0]);
+  return block && group && block->value_ > 0 && group->value_ > 0 &&
+         block->value_ % tile_view_semantics::kMXSFractalRows == 0 &&
+         group->value_ % tile_view_semantics::kMXSFractalCols == 0;
+}
+
+/// Accept the default logical form or legacy blocked ZZ/NN views. MX_A_ND
+/// always retains its rank-2 row-major ABI, including in the legacy pass.
+inline bool IsCanonicalMxShape(const std::vector<ExprPtr>& shape, TensorLayout layout) {
+  return IsLogicalMxShape(shape, layout) || (layout != TensorLayout::MX_A_ND && IsBlockedMxShape(shape));
+}
+
 /// Build packed canonical strides for the given (shape, layout).
 ///
 /// Definitions (per RFC #1300 §2.3, amended for NZ / MX):
@@ -658,9 +672,9 @@ inline bool IsBlockedMxShape(const std::vector<ExprPtr>& shape) {
 ///        ordinary row-major and match pto-isa's ``BaseShape2D<..., NZ>``
 ///        exactly. Callers must block the shape first — ``CheckNzViewIsBlocked``
 ///        enforces that invariant downstream.
-///   MX : row-major over the blocked rank-5 shape. Logical rank-2 MX strides
-///        are not physical GM addressing; callers must block first, and
-///        ``IsBlockedMxShape`` enforces that invariant downstream.
+///   MX : logical rank-2 row-major strides for PTOAS-owned packing, or physical
+///        row-major strides for the explicit legacy rank-5 blocking pass.
+///        MX_A_ND already matches row-major GM data and always remains rank 2.
 ///
 /// Throws ``pypto::ValueError`` for DN layout with rank < 2.
 inline std::vector<ExprPtr> BuildLogicalStridesFromLayout(const std::vector<ExprPtr>& shape,
@@ -770,12 +784,12 @@ inline std::optional<bool> StaticGreaterEqual(const ExprPtr& lhs, const ExprPtr&
 
 /// Verify (shape, stride, layout) is canonical per RFC #1300 §2.2:
 ///   - rank consistency
-///   - innermost-stride constant 1 at the layout-specific axis
+///   - non-overlapping storage axes for ND/DN, including sampled inner axes
+///   - packed innermost stride for blocked layouts
 ///   - strided-family inequality (when statically decidable)
 ///
 /// ``relaxed_symbolic`` (default true): when an inequality cannot be statically
-/// decided due to symbolic dims, accept the relaxed form (only the innermost
-/// stride structural equality is enforced). When false, symbolic cases that
+/// decided due to symbolic dims, accept the relaxed form. When false, symbolic cases that
 /// cannot prove the inequality are flagged.
 inline CanonicalCheckResult CheckCanonicalView(const std::vector<ExprPtr>& shape,
                                                const std::vector<ExprPtr>& stride, TensorLayout layout,
@@ -797,59 +811,66 @@ inline CanonicalCheckResult CheckCanonicalView(const std::vector<ExprPtr>& shape
 
   size_t n = shape.size();
 
-  // Blocked NZ is row-major over its rank-5 shape, so it shares the ND
-  // canonical form. ``CheckNzViewIsBlocked`` separately enforces that an NZ
-  // view has actually been blocked; this only checks the stride structure.
-  if (layout == TensorLayout::ND || layout == TensorLayout::NZ || IsMxTensorLayout(layout)) {
-    if (!detail::IsConstOne(stride[n - 1])) {
-      return {false, TensorLayoutToString(layout) + " layout requires innermost stride to be ConstInt(1)"};
-    }
-    // Outer-dim strided family: stride[k] >= stride[k+1] * shape[k+1].
-    // Statically decidable cases enforce; symbolic cases pass under relaxed_symbolic.
-    for (int k = static_cast<int>(n) - 2; k >= 0; --k) {
-      auto packed = MakeIndexMul(stride[k + 1], shape[k + 1]);
-      auto cmp = detail::StaticGreaterEqual(stride[k], packed);
-      if (cmp.has_value() && !*cmp) {
-        std::ostringstream oss;
-        oss << TensorLayoutToString(layout) << " stride[" << k << "] is smaller than packed stride["
-            << (k + 1) << "] * shape[" << (k + 1) << "]";
-        return {false, oss.str()};
+  if (layout == TensorLayout::ND || layout == TensorLayout::DN) {
+    if (layout == TensorLayout::DN && n < 2) return {false, "DN layout requires rank >= 2"};
+    // The distance between adjacent outer slices must cover the span of the
+    // inner axes, including holes from sampling. For example a 5-wide row
+    // sampled at columns 0, 2, 4 spans 5 elements, not 3 * 2.
+    const bool empty = std::any_of(shape.begin(), shape.end(), [](const ExprPtr& dim) {
+      auto value = As<ConstInt>(dim);
+      return value && value->value_ == 0;
+    });
+    std::optional<int64_t> span = 1;
+    for (size_t i = n; i-- > 0;) {
+      const size_t axis = layout == TensorLayout::DN && i >= n - 2 ? (i == n - 1 ? n - 2 : n - 1) : i;
+      auto pitch = As<ConstInt>(stride[axis]);
+      auto extent = As<ConstInt>(shape[axis]);
+      if ((!pitch || !span) && !relaxed_symbolic) {
+        return {false, TensorLayoutToString(layout) + " stride relation is symbolic"};
       }
-      if (!cmp.has_value() && !relaxed_symbolic) {
-        return {false, TensorLayoutToString(layout) +
-                           " outer-dim stride relation is symbolic and cannot be statically verified"};
+      if (pitch && (pitch->value_ < 0 || (pitch->value_ == 0 && !empty))) {
+        return {false, "ordinary tensor view strides must be positive for a nonempty shape"};
+      }
+      if (pitch && span && pitch->value_ < *span) {
+        return {false, TensorLayoutToString(layout) + " stride is smaller than the inner storage span"};
+      }
+      if (!extent || !pitch || !span) {
+        span.reset();
+      } else if (extent->value_ == 0) {
+        span = 0;
+      } else {
+        int64_t delta;
+        int64_t next_span;
+        if (extent->value_ < 0 || __builtin_mul_overflow(extent->value_ - 1, pitch->value_, &delta) ||
+            __builtin_add_overflow(*span, delta, &next_span)) {
+          return {false, "tensor view storage span overflows index range"};
+        }
+        span = next_span;
       }
     }
     return {true, ""};
   }
 
-  // layout == DN
-  if (n < 2) {
-    return {false, "DN layout requires rank >= 2"};
+  // Blocked NZ is row-major over its rank-5 shape, so it shares the ND
+  // canonical form. ``CheckNzViewIsBlocked`` separately enforces that an NZ
+  // view has actually been blocked; this only checks the stride structure.
+  if (!detail::IsConstOne(stride[n - 1])) {
+    return {false, TensorLayoutToString(layout) + " layout requires innermost stride to be ConstInt(1)"};
   }
-  if (!detail::IsConstOne(stride[n - 2])) {
-    return {false, "DN layout requires stride[-2] to be ConstInt(1)"};
-  }
-  // Trailing stride: stride[-1] >= shape[-2].
-  auto trailing_cmp = detail::StaticGreaterEqual(stride[n - 1], shape[n - 2]);
-  if (trailing_cmp.has_value() && !*trailing_cmp) {
-    return {false, "DN stride[-1] is smaller than shape[-2]"};
-  }
-  if (!trailing_cmp.has_value() && !relaxed_symbolic) {
-    return {false, "DN trailing-stride relation is symbolic and cannot be statically verified"};
-  }
-  // Outer-dim relation: stride[k] >= stride[k+1] * shape[k+1] for k <= n-3.
-  for (int k = static_cast<int>(n) - 3; k >= 0; --k) {
+  // Outer-dim strided family: stride[k] >= stride[k+1] * shape[k+1].
+  // Statically decidable cases enforce; symbolic cases pass under relaxed_symbolic.
+  for (int k = static_cast<int>(n) - 2; k >= 0; --k) {
     auto packed = MakeIndexMul(stride[k + 1], shape[k + 1]);
     auto cmp = detail::StaticGreaterEqual(stride[k], packed);
     if (cmp.has_value() && !*cmp) {
       std::ostringstream oss;
-      oss << "DN stride[" << k << "] is smaller than packed stride[" << (k + 1) << "] * shape[" << (k + 1)
-          << "]";
+      oss << TensorLayoutToString(layout) << " stride[" << k << "] is smaller than packed stride[" << (k + 1)
+          << "] * shape[" << (k + 1) << "]";
       return {false, oss.str()};
     }
     if (!cmp.has_value() && !relaxed_symbolic) {
-      return {false, "DN outer-dim stride relation is symbolic and cannot be statically verified"};
+      return {false, TensorLayoutToString(layout) +
+                         " outer-dim stride relation is symbolic and cannot be statically verified"};
     }
   }
   return {true, ""};

@@ -1,5 +1,9 @@
 # Reduction and Softmax
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Where one output element depends on a whole row, and the tile vocabulary grows two new
 shapes.
 
@@ -93,7 +97,8 @@ def softmax(
 torch.manual_seed(0)
 a = torch.randn(64, 64)
 out = torch.zeros(64, 64)
-softmax(a, out, config=RunConfig(platform="a2a3sim"))
+compiled = softmax.compile(a, out, config=RunConfig(platform="a2a3sim"))
+compiled(a, out, config=RunConfig(platform="a2a3sim"))
 assert torch.allclose(out, torch.softmax(a, dim=1), rtol=1e-5, atol=1e-5)
 ```
 

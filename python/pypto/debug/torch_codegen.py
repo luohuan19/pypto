@@ -21,6 +21,8 @@ import pypto.language as pl
 from pypto import DataType
 from pypto import ir as _ir
 from pypto._function_attrs import DUAL_AIV_DISPATCH_ATTR
+from pypto.pypto_core import backend as _backend
+from pypto.pypto_core import ir as _ir_core
 
 # ---------------------------------------------------------------------------
 # DataType -> torch dtype string
@@ -44,7 +46,22 @@ _DTYPE_MAP: dict[str, str] = {
 
 
 def _torch_dtype(dt: DataType) -> str:
+    if dt in (DataType.FP4E2M1X2, DataType.FP4E1M2X2):
+        raise ValueError(
+            "torch_codegen does not implement packed FP4 encoding or decoding; "
+            "use an independent byte-level reference for FP4 verification"
+        )
     return _DTYPE_MAP.get(str(dt), "torch.float32")
+
+
+def _validate_reference_type(typ: _ir.Type) -> None:
+    if isinstance(typ, (_ir.TensorType, _ir.TileType, _ir.BufferType, _ir.ScalarType)):
+        _torch_dtype(typ.dtype)
+    elif isinstance(typ, _ir.TupleType):
+        for element in typ.types:
+            _validate_reference_type(element)
+    elif isinstance(typ, _ir.MultiBufferType):
+        _validate_reference_type(typ.element_type)
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +86,7 @@ import torch
 import threading
 import time
 import traceback
-from collections import deque
+from collections import defaultdict, deque
 
 _PIPE_WAIT_TIMEOUT_SEC = 10.0
 _MIXED_KERNEL_TIMEOUT_SEC = 30.0
@@ -116,6 +133,20 @@ def _is_odd_split(split):
     return split in (3, 4)
 
 
+class _PipeQueues:
+    def __init__(self):
+        self.c2v_dtype = None
+        self.pre_relu = False
+        self.to_aiv = deque()
+        # Split queue keys are physical AIVs. Logical band selection must not
+        # change which producer/consumer FIFO frame advances.
+        self.to_aiv_split = {c: {0: deque(), 1: deque()} for c in _SPLIT_CODES}
+        self.to_aiv_dual_nosplit = {0: deque(), 1: deque()}
+        self.to_aic = deque()
+        self.to_aic_split = {c: {0: deque(), 1: deque()} for c in _SPLIT_CODES}
+        self.to_aic_dual_nosplit = {0: deque(), 1: deque()}
+
+
 class _CrossCoreRuntime:
     def __init__(self):
         self._lock = threading.Lock()
@@ -125,64 +156,69 @@ class _CrossCoreRuntime:
     def reset(self, no_split_dual_aiv_dispatch=False):
         with self._cv:
             self._no_split_dual_aiv_dispatch = bool(no_split_dual_aiv_dispatch)
-            self._to_aiv = deque()
-            self._to_aiv_split = {c: {0: deque(), 1: deque()} for c in _SPLIT_CODES}
-            self._to_aiv_dual_nosplit = {0: deque(), 1: deque()}
-            self._to_aic = deque()
-            self._to_aic_split = {c: {0: deque(), 1: deque()} for c in _SPLIT_CODES}
-            self._to_aic_dual_nosplit = {0: deque(), 1: deque()}
+            # Independent frontend IDs own independent queues in both
+            # directions, including split and dual-AIV dispatch modes.
+            self._pipes = defaultdict(_PipeQueues)
             self._cv.notify_all()
 
-    def snapshot(self):
+    def snapshot(self, pipe_id=0):
         with self._lock:
-            return self._snapshot_locked()
+            return self._snapshot_locked(pipe_id)
 
     def notify_all(self):
         with self._cv:
             self._cv.notify_all()
 
-    def _snapshot_locked(self):
+    def initialize_c2v_pipe(self, dtype, pre_relu=False, pipe_id=0):
+        with self._cv:
+            queues = self._pipes[int(pipe_id)]
+            queues.c2v_dtype = dtype
+            queues.pre_relu = bool(pre_relu)
+
+    def _snapshot_locked(self, pipe_id=0):
+        queues = self._pipes[int(pipe_id)]
         return {
+            "pipe_id": int(pipe_id),
             "no_split_dual_aiv_dispatch": self._no_split_dual_aiv_dispatch,
-            "to_aiv": len(self._to_aiv),
+            "to_aiv": len(queues.to_aiv),
             "to_aiv_dual_nosplit": {
-                0: len(self._to_aiv_dual_nosplit[0]),
-                1: len(self._to_aiv_dual_nosplit[1]),
+                0: len(queues.to_aiv_dual_nosplit[0]),
+                1: len(queues.to_aiv_dual_nosplit[1]),
             },
             "to_aiv_split": {
-                c: {0: len(self._to_aiv_split[c][0]), 1: len(self._to_aiv_split[c][1])}
+                c: {0: len(queues.to_aiv_split[c][0]), 1: len(queues.to_aiv_split[c][1])}
                 for c in _SPLIT_CODES
             },
-            "to_aic": len(self._to_aic),
+            "to_aic": len(queues.to_aic),
             "to_aic_dual_nosplit": {
-                0: len(self._to_aic_dual_nosplit[0]),
-                1: len(self._to_aic_dual_nosplit[1]),
+                0: len(queues.to_aic_dual_nosplit[0]),
+                1: len(queues.to_aic_dual_nosplit[1]),
             },
             "to_aic_split": {
-                c: {0: len(self._to_aic_split[c][0]), 1: len(self._to_aic_split[c][1])}
+                c: {0: len(queues.to_aic_split[c][0]), 1: len(queues.to_aic_split[c][1])}
                 for c in _SPLIT_CODES
             },
         }
 
-    def _wait_for_locked(self, predicate, op_name, split, lane):
+    def _wait_for_locked(self, predicate, op_name, split, lane, pipe_id=0):
         deadline = time.monotonic() + _PIPE_WAIT_TIMEOUT_SEC
         while not predicate():
             cancel_event = _get_runtime_cancel_event()
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError(
                     f"{op_name} cancelled (split={split}, lane={lane}); "
-                    f"pipe_state={self._snapshot_locked()}"
+                    f"pipe_state={self._snapshot_locked(pipe_id)}"
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError(
                     f"{op_name} timeout (split={split}, lane={lane}); "
-                    f"pipe_state={self._snapshot_locked()}"
+                    f"pipe_state={self._snapshot_locked(pipe_id)}"
                 )
             self._cv.wait(timeout=min(0.05, remaining))
 
     @staticmethod
-    def _split_tile(tile, split, lane_stride=None):
+    def _split_tile(tile, split, lane_stride=None, *, valid_shape=None):
         # Partition a pushed tile between the two AIV lanes exactly the way the
         # compiler did: lane L owns [L * S, L * S + S) of the split axis, where S
         # is the partition stride (`lane_stride` when a ragged boundary was
@@ -204,7 +240,8 @@ class _CrossCoreRuntime:
                 f"Split mode {split} got an out-of-range lane stride {stride} for a {size}-wide "
                 f"axis (per-lane box {box_half})"
             )
-        valid_shape = getattr(tile, "_pypto_valid_shape", None)
+        if valid_shape is None:
+            valid_shape = getattr(tile, "_pypto_valid_shape", None)
         valid = int(valid_shape[dim]) if valid_shape is not None else size
         lane0 = min(valid, stride)
         lane1 = min(max(valid - stride, 0), stride)
@@ -236,7 +273,6 @@ class _CrossCoreRuntime:
             part0._pypto_full_shape = tuple(full0)
             part1._pypto_full_shape = tuple(full1)
 
-        valid_shape = getattr(tile, "_pypto_valid_shape", None)
         if valid_shape is not None:
             valid0 = list(int(s) for s in valid_shape)
             valid1 = list(int(s) for s in valid_shape)
@@ -271,105 +307,143 @@ class _CrossCoreRuntime:
 
         return merged
 
-    def push_to_aiv(self, tile, split, lane_stride=0):
+    def push_to_aiv(self, tile, split, lane_stride=0, pipe_id=0, *, valid_shape=None):
         split = int(split)
         lane_stride = int(lane_stride)
         with self._cv:
+            queues = self._pipes[int(pipe_id)]
+            if queues.c2v_dtype is not None:
+                valid_shape = None
+            if valid_shape is not None:
+                if split != 1 or lane_stride or tile.dtype != torch.float32:
+                    raise ValueError("A5 valid-row partition requires an UP_DOWN split of an FP32 tile")
+                rows, cols = _coerce_shape(valid_shape)
+                if not 0 < rows <= tile.shape[0] or rows % 2 or cols != tile.shape[1]:
+                    raise ValueError(
+                        "A5 valid-row partition requires positive even rows within the tile and full columns"
+                    )
+                valid_shape = (rows, cols)
+                lane_stride = rows // 2
+            # Configuration follows the executed pipe initialization, so a
+            # push delegated to an inline helper sees the same contract.
+            if queues.c2v_dtype is not None:
+                source = tile
+                if queues.pre_relu:
+                    tile = torch.maximum(tile, torch.zeros_like(tile))
+                tile = _copy_region_attrs(source, tile.to(queues.c2v_dtype))
             if split == 0:
                 if self._no_split_dual_aiv_dispatch:
-                    self._to_aiv_dual_nosplit[0].append(_copy_region_attrs(tile, tile.clone()))
-                    self._to_aiv_dual_nosplit[1].append(_copy_region_attrs(tile, tile.clone()))
+                    queues.to_aiv_dual_nosplit[0].append(_copy_region_attrs(tile, tile.clone()))
+                    queues.to_aiv_dual_nosplit[1].append(_copy_region_attrs(tile, tile.clone()))
                 else:
-                    self._to_aiv.append(_copy_region_attrs(tile, tile.clone()))
+                    queues.to_aiv.append(_copy_region_attrs(tile, tile.clone()))
             elif split in _SPLIT_CODES:
-                lane0, lane1 = self._split_tile(tile, split, lane_stride)
-                self._to_aiv_split[split][0].append(lane0)
-                self._to_aiv_split[split][1].append(lane1)
+                frame = self._split_tile(tile, split, lane_stride, valid_shape=valid_shape)
+                queues.to_aiv_split[split][0].append(frame)
+                queues.to_aiv_split[split][1].append(frame)
             else:
                 raise ValueError(f"Unsupported split mode for push_to_aiv: {split}")
             self._cv.notify_all()
 
-    def pop_from_aic(self, split):
+    def pop_from_aic(self, split, pipe_id=0, aiv_subblockid=None):
         split = int(split)
-        lane = _get_subblock_idx()
+        physical_lane = _get_subblock_idx()
+        lane = physical_lane if aiv_subblockid is None else int(aiv_subblockid)
         with self._cv:
+            queues = self._pipes[int(pipe_id)]
             if split == 0:
                 if self._no_split_dual_aiv_dispatch:
                     if lane not in (0, 1):
                         raise ValueError(
                             f"No-split dual-dispatch tpop_from_aic requires lane in {{0,1}}, got {lane}"
                         )
-                    queue = self._to_aiv_dual_nosplit[lane]
-                    self._wait_for_locked(lambda: len(queue) > 0, "tpop_from_aic", split, lane)
+                    queue = queues.to_aiv_dual_nosplit[lane]
+                    self._wait_for_locked(lambda: len(queue) > 0, "tpop_from_aic", split, lane, pipe_id)
                     return queue.popleft()
-                self._wait_for_locked(lambda: len(self._to_aiv) > 0, "tpop_from_aic", split, lane)
-                return self._to_aiv.popleft()
+                self._wait_for_locked(lambda: len(queues.to_aiv) > 0, "tpop_from_aic", split, lane, pipe_id)
+                return queues.to_aiv.popleft()
             if split in _SPLIT_CODES:
                 if lane not in (0, 1):
                     raise ValueError(f"Split tpop_from_aic requires lane in {{0,1}}, got {lane}")
-                queue = self._to_aiv_split[split][lane]
-                self._wait_for_locked(lambda: len(queue) > 0, "tpop_from_aic", split, lane)
-                return queue.popleft()
+                queue = queues.to_aiv_split[split][physical_lane]
+                self._wait_for_locked(lambda: len(queue) > 0, "tpop_from_aic", split, physical_lane, pipe_id)
+                part = queue.popleft()[lane]
+                # Each physical AIV has independent local storage, even when
+                # both readers choose the same logical band of a GM frame.
+                return _copy_region_attrs(part, part.clone())
             raise ValueError(f"Unsupported split mode for pop_from_aic: {split}")
 
-    def push_to_aic(self, tile, split):
+    def push_to_aic(self, tile, split, pipe_id=0, aiv_subblockid=None):
         split = int(split)
         if _is_odd_split(split):
             # pto-isa places lane 1's Vector -> Cube band at lane 1's own extent,
             # so the two only abut when the lanes are equal: there is no odd V2C
             # transport, and PTO codegen rejects these codes too.
             raise ValueError(f"Unsupported odd split mode for push_to_aic: {split}")
-        lane = _get_subblock_idx()
+        physical_lane = _get_subblock_idx()
+        lane = physical_lane if aiv_subblockid is None else int(aiv_subblockid)
         with self._cv:
+            queues = self._pipes[int(pipe_id)]
             if split == 0:
                 if self._no_split_dual_aiv_dispatch:
                     if lane not in (0, 1):
                         raise ValueError(
                             f"No-split dual-dispatch tpush_to_aic requires lane in {{0,1}}, got {lane}"
                         )
-                    self._to_aic_dual_nosplit[lane].append(_copy_region_attrs(tile, tile.clone()))
+                    queues.to_aic_dual_nosplit[lane].append(_copy_region_attrs(tile, tile.clone()))
                 else:
-                    self._to_aic.append(_copy_region_attrs(tile, tile.clone()))
+                    queues.to_aic.append(_copy_region_attrs(tile, tile.clone()))
             elif split in _SPLIT_CODES:
                 if lane not in (0, 1):
                     raise ValueError(f"Split tpush_to_aic requires lane in {{0,1}}, got {lane}")
-                self._to_aic_split[split][lane].append(_copy_region_attrs(tile, tile.clone()))
+                payload = _copy_region_attrs(tile, tile.clone())
+                queues.to_aic_split[split][physical_lane].append((lane, payload))
             else:
                 raise ValueError(f"Unsupported split mode for push_to_aic: {split}")
             self._cv.notify_all()
 
-    def pop_from_aiv(self, split):
+    def pop_from_aiv(self, split, pipe_id=0):
         split = int(split)
         if _is_odd_split(split):
             raise ValueError(f"Unsupported odd split mode for pop_from_aiv: {split}")
         lane = _get_subblock_idx()
         with self._cv:
+            queues = self._pipes[int(pipe_id)]
             if split == 0:
                 if self._no_split_dual_aiv_dispatch:
-                    lane0_q = self._to_aic_dual_nosplit[0]
-                    lane1_q = self._to_aic_dual_nosplit[1]
+                    lane0_q = queues.to_aic_dual_nosplit[0]
+                    lane1_q = queues.to_aic_dual_nosplit[1]
                     self._wait_for_locked(
                         lambda: len(lane0_q) > 0 and len(lane1_q) > 0,
                         "tpop_from_aiv",
                         split,
                         lane,
+                        pipe_id,
                     )
                     lane0_tile = lane0_q.popleft()
                     lane1_q.popleft()
                     return lane0_tile
-                self._wait_for_locked(lambda: len(self._to_aic) > 0, "tpop_from_aiv", split, lane)
-                return self._to_aic.popleft()
+                self._wait_for_locked(lambda: len(queues.to_aic) > 0, "tpop_from_aiv", split, lane, pipe_id)
+                return queues.to_aic.popleft()
             if split in _SPLIT_CODES:
-                lane0_q = self._to_aic_split[split][0]
-                lane1_q = self._to_aic_split[split][1]
+                lane0_q = queues.to_aic_split[split][0]
+                lane1_q = queues.to_aic_split[split][1]
                 self._wait_for_locked(
                     lambda: len(lane0_q) > 0 and len(lane1_q) > 0,
                     "tpop_from_aiv",
                     split,
                     lane,
+                    pipe_id,
                 )
-                part0 = lane0_q.popleft()
-                part1 = lane1_q.popleft()
+                selection0, part0 = lane0_q.popleft()
+                selection1, part1 = lane1_q.popleft()
+                if selection0 == selection1:
+                    raise ValueError(
+                        f"Split tpop_from_aiv requires complementary logical lanes for each frame, "
+                        f"got {selection0} and {selection1}"
+                    )
+                if selection0 == 1:
+                    part0, part1 = part1, part0
                 return self._merge_tile(part0, part1, split)
             raise ValueError(f"Unsupported split mode for pop_from_aiv: {split}")
 
@@ -542,10 +616,17 @@ def _buffer_set_valid(buffer, valid_shape):
     buffer._pypto_valid_shape = tuple(int(s) for s in valid_shape)
     return buffer
 
-def _buffer_alloc(shape, dtype, valid_shape, dynamic_valid):
+def _buffer_alloc(pools, space, address, shape, dtype, valid_shape, dynamic_valid):
     dynamic = iter(dynamic_valid)
     valid = tuple(next(dynamic) if s < 0 else s for s in valid_shape)
-    return _buffer_set_valid(torch.empty(shape, dtype=dtype), valid)
+    if address is None:
+        buffer = torch.empty(shape, dtype=dtype)
+    else:
+        size = torch.empty((), dtype=dtype).element_size()
+        for extent in shape:
+            size *= extent
+        buffer = pools[space][address:address + size].view(dtype).view(shape)
+    return _buffer_set_valid(buffer, valid)
 
 class _MatrixBuffer:
     # Each descriptor indexes shared physical bytes, including fractal relabels.
@@ -601,16 +682,94 @@ def _buffer_active(buffer):
 def _buffer_copy(source, destination):
     _buffer_write(destination, _buffer_active(source))
 
+def _buffer_gather(source, indices, destination):
+    index = _buffer_active(indices).to(torch.int64)
+    if torch.any(index < 0) or torch.any(index >= source.numel()):
+        raise ValueError("buffer.gather index is outside the source allocation")
+    _buffer_write(destination, source.reshape(-1)[index])
+
+def _buffer_gather_compare(source, threshold, indices, counts, mode, offset):
+    values = _buffer_active(source)
+    matches = values == threshold if mode == 0 else values > threshold
+    for row in range(values.shape[0]):
+        columns = torch.nonzero(matches[row], as_tuple=False).flatten()
+        counts[0, row] = columns.numel()
+        # Native gather defines only the matching prefix. Neither the unused
+        # index tail nor count padding is implicitly initialized.
+        indices[row, :columns.numel()] = columns + row * source.shape[1] + offset
+
+def _buffer_scatter(source, indices, destination):
+    index = _buffer_active(indices).to(torch.int64).reshape(-1)
+    if torch.any(index < 0) or torch.any(index >= destination.numel()):
+        raise ValueError("buffer.scatter index is outside the destination allocation")
+    destination.zero_()
+    values = _buffer_active(source).reshape(-1)
+    # Preserve the native ascending scan order for repeated destination indices.
+    flat = destination.view(-1)
+    for i in range(index.numel()):
+        flat[index[i]] = values[i]
+
+def _buffer_pack_predicate(values, destination):
+    # Preserve the physical byte layout rather than storing a logical bool tile.
+    # Zero-fill unused bits of the final valid byte; later selection trims them.
+    rows, cols = values.shape
+    padded = torch.zeros((rows, ((cols + 7) // 8) * 8), dtype=torch.int64)
+    padded[:, :cols] = values.to(torch.int64)
+    bits = torch.arange(8, dtype=torch.int64)
+    packed = (padded.reshape(rows, -1, 8) << bits).sum(dim=-1).to(torch.uint8)
+    _buffer_write(destination, packed)
+
+def _buffer_select(mask, lhs, rhs, destination):
+    rows, cols = destination._pypto_valid_shape
+    bit = torch.arange(cols, dtype=torch.int64)
+    packed = _buffer_active(mask).to(torch.int64)
+    condition = ((packed[:rows, bit // 8] >> (bit % 8)) & 1).bool()
+    _buffer_write(destination, torch.where(condition, _buffer_active(lhs), rhs))
+
 def _buffer_extract(source, row, column, destination):
     rows, cols = destination._pypto_valid_shape
     data = _buffer_active(source)[int(row):int(row) + rows, int(column):int(column) + cols]
     _buffer_write(destination, data)
 
-def _buffer_matmul(lhs, rhs, destination, accumulate):
+def _hf32_round(value, mode):
+    # HF32 keeps FP32's exponent and ten fraction bits. Drop thirteen fraction
+    # bits, with a half-ULP bias adjusted by the retained LSB for ties-to-even.
+    # Integer rounding handles both signs without changing inputs or global
+    # Torch precision settings. Preserve infinities and NaNs before bit carries.
+    bits = value.contiguous().view(torch.int32)
+    if mode == "round_even":
+        bias = 4095 + ((bits >> 13) & 1)
+    elif mode == "round_away":
+        bias = 4096
+    else:
+        raise ValueError(f"Unsupported HF32 rounding mode: {mode!r}")
+    rounded = ((bits + bias) & -8192).view(torch.float32)
+    return torch.where(torch.isfinite(value), rounded, value)
+
+def _hf32_matmul(lhs, rhs, mode):
+    return torch.matmul(_hf32_round(lhs, mode), _hf32_round(rhs, mode))
+
+def _cube_matmul(lhs, rhs):
+    # The A5 Cube multiplies 1-byte float operands (FP8 E4M3FN / E5M2, HF8) and
+    # the mixed FP8 orders, always accumulating in FP32. Torch has no matmul
+    # kernel for those dtypes and refuses a mixed float pair outright, so widen
+    # both operands to FP32 first -- that is what the hardware computes anyway.
+    # Equal wide dtypes (FP16 / BF16 / FP32 / INT8) keep their native kernel so
+    # the reference preserves their rounding behaviour.
+    # Width comes from Tensor.element_size(), not torch.dtype.itemsize: the
+    # latter only exists from torch 2.1, while the package declares torch>=2.0.0
+    # (pyproject.toml) and guards every optional dtype with getattr elsewhere.
+    both_float = lhs.dtype.is_floating_point and rhs.dtype.is_floating_point
+    if both_float and (lhs.dtype != rhs.dtype or lhs.element_size() == 1):
+        return torch.matmul(lhs.float(), rhs.float())
+    return torch.matmul(lhs, rhs)
+
+def _buffer_matmul(lhs, rhs, destination, accumulate, tf32_mode=None):
     left = _buffer_active(lhs)
     right = _buffer_active(rhs)[:left.shape[1]]
     dtype = torch.int32 if lhs.dtype == torch.int8 else torch.float32
-    product = left.to(dtype) @ right.to(dtype)
+    product = (left.to(dtype) @ right.to(dtype) if tf32_mode is None
+               else _hf32_matmul(left, right, tf32_mode))
     if accumulate:
         product = product + _buffer_active(destination)
     _buffer_write(destination, product)
@@ -643,6 +802,17 @@ def _tensor_slice(tensor, offsets, shapes, valid_shape=None):
         sliced._pypto_valid_shape = _coerce_shape(valid_shape)
         sliced._pypto_full_shape = shapes_t
     return sliced
+
+def _tensor_window(tensor, shape, offsets, steps, valid_shape=None):
+    shape = _coerce_shape(shape)
+    offsets = _coerce_shape(offsets)
+    steps = _coerce_shape(steps)
+    slices = tuple(slice(o, o + n * s, s) for o, n, s in zip(offsets, shape, steps))
+    result = tensor[slices]
+    if valid_shape is not None:
+        result._pypto_valid_shape = _coerce_shape(valid_shape)
+        result._pypto_full_shape = shape
+    return result
 
 def _tensor_view(tensor, shape, is_dn, valid_shape=None):
     shape = _coerce_shape(shape)
@@ -692,10 +862,13 @@ def _assemble(target, source, offsets, atomic=0):
     valid_shape = getattr(source, "_pypto_valid_shape", tuple(source.shape))
     slices = tuple(slice(o, o + s) for o, s in zip(offsets_t, valid_shape))
     valid_slices = tuple(slice(0, s) for s in valid_shape)
+    # Read the complete logical operand before writing a possibly overlapping
+    # destination. Torch's strided assignment need not snapshot that operand.
+    values = source[valid_slices].clone()
     if atomic:
-        target[slices] += source[valid_slices]
+        target[slices] += values
     else:
-        target[slices] = source[valid_slices]
+        target[slices] = values
     return target
 
 def _acc_init(acc, prod, init_cond):
@@ -746,13 +919,21 @@ def _noop(comment: str = "") -> OpHandler:
     return lambda _a, _kw: f"None  # {comment}" if comment else "None"
 
 
+def _matmul_expr(lhs: str, rhs: str, kw: dict[str, Any]) -> str:
+    """Round only the multiplicands when an operation requests HF32."""
+    mode = kw.get("tf32_mode")
+    if mode is not None:
+        return f"_hf32_matmul({lhs}, {rhs}, {mode!r})"
+    return f"_cube_matmul({lhs}, {rhs})"
+
+
 def _handle_tensor_matmul(a: list[str], kw: dict[str, Any]) -> str:
     lhs, rhs = a[0], a[1]
     if kw.get("a_trans"):
         lhs = f"{lhs}.mT"
     if kw.get("b_trans"):
         rhs = f"{rhs}.mT"
-    expr = f"torch.matmul({lhs}, {rhs})"
+    expr = _matmul_expr(lhs, rhs, kw)
     out_dtype = kw.get("out_dtype")
     if isinstance(out_dtype, DataType):
         expr = f"{expr}.to({_torch_dtype(out_dtype)})"
@@ -798,16 +979,22 @@ def _handle_tensor_matmul_acc(a: list[str], kw: dict[str, Any]) -> str:
         lhs = f"{lhs}.mT"
     if kw.get("b_trans"):
         rhs = f"{rhs}.mT"
-    expr = _acc_expr(acc, f"torch.matmul({lhs}, {rhs})", _init_cond_arg(a, 3))
+    expr = _acc_expr(acc, _matmul_expr(lhs, rhs, kw), _init_cond_arg(a, 3))
     out_dtype = kw.get("out_dtype")
     if isinstance(out_dtype, DataType):
         expr = f"{expr}.to({_torch_dtype(out_dtype)})"
     return expr
 
 
-def _tile_matmul_acc(a: list[str], _kw: dict[str, Any]) -> str:
+def _tile_matmul_acc(a: list[str], kw: dict[str, Any]) -> str:
     """Accumulating tile matmul; `.float()` matches hardware FP32 accumulation."""
-    return _acc_expr(a[0], f"torch.matmul({a[1]}, {a[2]}).float()", _init_cond_arg(a, 3))
+    return _acc_expr(a[0], f"{_matmul_expr(a[1], a[2], kw)}.float()", _init_cond_arg(a, 3))
+
+
+def _torch_buffer_dtype(dtype: DataType) -> str:
+    # UINT32 is opaque scratch storage here. INT32 preserves its four-byte
+    # width on older supported Torch versions that do not expose torch.uint32.
+    return "torch.int32" if dtype == DataType.UINT32 else _torch_dtype(dtype)
 
 
 def _handle_cast(a: list[str], kw: dict[str, Any]) -> str:
@@ -900,24 +1087,48 @@ def _lane_stride_kwarg(kw: dict[str, Any]) -> int:
     return int(kw.get("lane_stride", 0) or 0)
 
 
-def _handle_tpush_to_aiv(a: list[str], kw: dict[str, Any]) -> str:
-    # The stride is emitted only when a ragged boundary was rebalanced, so every
-    # other kernel keeps the two-argument form.
+def _pipe_id_kwarg(kw: dict[str, Any]) -> str:
+    """Keep default-ID output stable while carrying independent pipe IDs."""
+    pipe_id = int(kw.get("id", 0))
+    return f", pipe_id={pipe_id}" if pipe_id else ""
+
+
+def _handle_tpush_to_aiv(a: list[str], kw: dict[str, Any], *, valid_shape: str | None = None) -> str:
+    # Generated boundaries can explicitly carry the stride used by their TPOP.
     stride = _lane_stride_kwarg(kw)
     stride_arg = f", {stride}" if stride else ""
-    return f"_cross_core_rt.push_to_aiv({a[0]}, {_split_kwarg(kw)}{stride_arg})"
+    valid_shape_arg = f", valid_shape={valid_shape}" if valid_shape is not None else ""
+    return (
+        f"_cross_core_rt.push_to_aiv({a[0]}, {_split_kwarg(kw)}{stride_arg}"
+        f"{_pipe_id_kwarg(kw)}{valid_shape_arg})"
+    )
+
+
+def _handle_aic_initialize_pipe(_a: list[str], kw: dict[str, Any]) -> str:
+    dtype = kw.get("c2v_dtype")
+    if dtype is None:
+        if not int(kw.get("dir_mask", 1)) & 1:
+            return "# aic_initialize_pipe"
+        return f"_cross_core_rt.initialize_c2v_pipe(None, False{_pipe_id_kwarg(kw)})"
+    if dtype not in (DataType.FP32, DataType.FP16, DataType.BF16):
+        raise ValueError(f"c2v_dtype must be FP32, FP16, or BF16, got {dtype}")
+    relu = bool(kw.get("pre_relu", False))
+    return f"_cross_core_rt.initialize_c2v_pipe({_torch_dtype(dtype)}, {relu}{_pipe_id_kwarg(kw)})"
 
 
 def _handle_tpush_to_aic(a: list[str], kw: dict[str, Any]) -> str:
-    return f"_cross_core_rt.push_to_aic({a[0]}, {_split_kwarg(kw)})"
+    # Keep pipe_id's established positional slot when selecting a logical lane.
+    lane_arg = f", aiv_subblockid={a[1]}" if len(a) == 2 else ""
+    return f"_cross_core_rt.push_to_aic({a[0]}, {_split_kwarg(kw)}{_pipe_id_kwarg(kw)}{lane_arg})"
 
 
-def _handle_tpop_from_aic(_a: list[str], kw: dict[str, Any]) -> str:
-    return f"_cross_core_rt.pop_from_aic({_split_kwarg(kw)})"
+def _handle_tpop_from_aic(a: list[str], kw: dict[str, Any]) -> str:
+    lane_arg = f", aiv_subblockid={a[0]}" if a else ""
+    return f"_cross_core_rt.pop_from_aic({_split_kwarg(kw)}{_pipe_id_kwarg(kw)}{lane_arg})"
 
 
 def _handle_tpop_from_aiv(_a: list[str], kw: dict[str, Any]) -> str:
-    return f"_cross_core_rt.pop_from_aiv({_split_kwarg(kw)})"
+    return f"_cross_core_rt.pop_from_aiv({_split_kwarg(kw)}{_pipe_id_kwarg(kw)})"
 
 
 # Built through the registry getter, which raises on an unregistered name, so a renamed operator
@@ -1085,6 +1296,16 @@ def _register_expands(m: dict[str, OpHandler], prefix: str) -> None:
     m[f"{prefix}.col_expand_expdif"] = lambda a, _kw: f"torch.exp({a[0]} - {a[1]})"
 
 
+def _reject_named_intra_block(_args: list[str], _kwargs: dict[str, Any]) -> str:
+    # Ignoring these events is unsound when a mixed reference shares payloads
+    # between AIC/AIV threads. Event banks and native pipe ordering are not
+    # modeled here, so reject before starting any reference worker threads.
+    raise ValueError(
+        "torch_codegen cannot model named intra-block synchronization; "
+        "use the native PTO backend for programs with set_intra_block/wait_intra_block"
+    )
+
+
 def _register_ops() -> None:  # noqa: PLR0915
     m = _OP_MAP
 
@@ -1170,6 +1391,7 @@ def _register_ops() -> None:  # noqa: PLR0915
         m[f"{prefix}.row_expand_sub"] = _binop("-")
         m[f"{prefix}.row_expand_mul"] = _binop("*")
         m[f"{prefix}.row_expand_div"] = _binop("/")
+        m[f"{prefix}.col_expand_add"] = _binop("+")
         m[f"{prefix}.col_expand_mul"] = _binop("*")
         m[f"{prefix}.col_expand_sub"] = _binop("-")
         m[f"{prefix}.col_expand_div"] = _binop("/")
@@ -1197,6 +1419,9 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tile.move"] = _identity()
     m["tile.slice"] = _handle_slice
     m["tile.extract"] = _handle_tile_extract
+    m["tile.extract_into"] = lambda a, _kw: (
+        f"{a[0]}.copy_(_tensor_slice({a[1]}, [{a[2]}, {a[3]}], {a[0]}.shape))"
+    )
     m["tile.read"] = lambda a, _kw: f"{a[0]}[{a[1]}]"
     m["tile.write"] = lambda a, _kw: f"_write_and_return({a[0]}, {a[1]}, {a[2]})"
     m["tile.get_block_idx"] = lambda _a, _kw: "0"
@@ -1210,14 +1435,20 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tile.cmps"] = _handle_cmp
 
     # tile matmul variants — .float() to match hardware FP32 accumulation output
-    m["tile.matmul"] = lambda a, _kw: f"torch.matmul({a[0]}, {a[1]}).float()"
-    m["tile.batch_matmul"] = lambda a, _kw: f"torch.matmul({a[0]}, {a[1]}).float()"
+    m["tile.matmul"] = lambda a, kw: f"{_matmul_expr(a[0], a[1], kw)}.float()"
+    # batch_matmul carries no tf32_mode, but shares tile.matmul's operand-pair
+    # contract, so it needs the same widening of 1-byte / mixed float operands.
+    m["tile.batch_matmul"] = lambda a, _kw: f"_cube_matmul({a[0]}, {a[1]}).float()"
     m["tile.matmul_acc"] = _tile_matmul_acc
     m["tile.batch_matmul_acc"] = _tile_matmul_acc
-    m["tile.matmul_bias"] = lambda a, _kw: f"(torch.matmul({a[0]}, {a[1]}).float() + {a[2]})"
-    m["tile.gemv"] = lambda a, _kw: f"torch.matmul({a[0]}, {a[1]}).float()"
+    m["tile.matmul_bias"] = lambda a, kw: f"({_matmul_expr(a[0], a[1], kw)}.float() + {a[2]})"
+    # The GEMV family is the M==1 Cube matmul and shares its operand-pair table,
+    # so it needs the same widening of 1-byte / mixed float operands. gemv_acc
+    # reaches it through `_tile_matmul_acc` -> `_matmul_expr`; neither gemv form
+    # carries tf32_mode (an FP32-operand feature the ops do not expose).
+    m["tile.gemv"] = lambda a, _kw: f"_cube_matmul({a[0]}, {a[1]}).float()"
     m["tile.gemv_acc"] = _tile_matmul_acc
-    m["tile.gemv_bias"] = lambda a, _kw: f"(torch.matmul({a[0]}, {a[1]}).float() + {a[2]})"
+    m["tile.gemv_bias"] = lambda a, _kw: f"(_cube_matmul({a[0]}, {a[1]}).float() + {a[2]})"
 
     # tile ternary ops (third arg is workspace/tmp, ignore it)
     m["tile.prelu"] = lambda a, _kw: f"torch.where({a[0]} > 0, {a[0]}, {a[0]} * {a[1]})"
@@ -1242,8 +1473,8 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["buffer.set_validshape"] = lambda a, _kw: f"_buffer_set_valid({a[0]}, {a[1]})"
     m["buffer.copy"] = lambda a, _kw: f"_buffer_copy({', '.join(a)})"
     m["buffer.extract"] = lambda a, _kw: f"_buffer_extract({', '.join(a)})"
-    m["buffer.matmul"] = lambda a, _kw: f"_buffer_matmul({', '.join(a)}, False)"
-    m["buffer.matmul_acc"] = lambda a, _kw: f"_buffer_matmul({', '.join(a)}, True)"
+    m["buffer.matmul"] = lambda a, kw: f"_buffer_matmul({', '.join(a)}, False, {kw.get('tf32_mode')!r})"
+    m["buffer.matmul_acc"] = lambda a, kw: f"_buffer_matmul({', '.join(a)}, True, {kw.get('tf32_mode')!r})"
     # Evaluate all inputs before copy_ so exact source/destination aliases remain safe.
     for suffix in (
         "add",
@@ -1271,6 +1502,64 @@ def _register_ops() -> None:  # noqa: PLR0915
             f"{fn([f'_buffer_active({a[0]})', f'torch.as_tensor({a[1]}, dtype={a[0]}.dtype)'], kw)})"
         )
     m["buffer.full"] = lambda a, _kw: f"_buffer_active({a[1]}).fill_({a[0]})"
+    m["buffer.gather_compare"] = lambda a, kw: (
+        f"_buffer_gather_compare({a[0]}, {a[1]}, {a[4]}, {a[5]}, {kw['cmp_mode']}, {kw.get('offset', 0)})"
+    )
+    m["buffer.gather"] = lambda a, _kw: f"_buffer_gather({a[0]}, {a[1]}, {a[3]})"
+    m["buffer.scatter"] = lambda a, _kw: f"_buffer_scatter({a[0]}, {a[1]}, {a[2]})"
+    m["buffer.cast"] = lambda a, _kw: f"_buffer_write({a[1]}, _buffer_active({a[0]}).to({a[1]}.dtype))"
+    m["buffer.cmp"] = lambda a, kw: (
+        "_buffer_pack_predicate("
+        f"{_handle_cmp([f'_buffer_active({a[0]})', f'_buffer_active({a[1]})'], kw)}, {a[2]})"
+    )
+    m["buffer.cmps"] = lambda a, kw: (
+        f"_buffer_pack_predicate({_handle_cmp([f'_buffer_active({a[0]})', a[1]], kw)}, {a[2]})"
+    )
+    m["buffer.sel"] = lambda a, _kw: f"_buffer_select({a[0]}, {a[1]}, _buffer_active({a[2]}), {a[4]})"
+    m["buffer.sels"] = lambda a, _kw: f"_buffer_select({a[0]}, {a[1]}, {a[3]}, {a[4]})"
+
+    for suffix, reduction in (
+        ("row_max", "amax"),
+        ("row_sum", "sum"),
+        ("row_min", "amin"),
+        ("row_prod", "prod"),
+    ):
+        m[f"buffer.{suffix}"] = lambda a, _kw, fn=reduction: (
+            f"_buffer_write({a[2]}, torch.{fn}(_buffer_active({a[0]}), dim=-1, keepdim=True))"
+        )
+    for suffix, reduction in (
+        ("col_max", "amax"),
+        ("col_sum", "sum"),
+        ("col_min", "amin"),
+        ("col_prod", "prod"),
+    ):
+        m[f"buffer.{suffix}"] = lambda a, _kw, fn=reduction: (
+            f"_buffer_write({a[1]}, torch.{fn}(_buffer_active({a[0]}), dim=0, keepdim=True))"
+        )
+    for suffix, operation in (
+        ("col_expand_add", "+"),
+        ("col_expand_sub", "-"),
+        ("col_expand_mul", "*"),
+        ("col_expand_div", "/"),
+        ("row_expand_add", "+"),
+        ("row_expand_sub", "-"),
+        ("row_expand_mul", "*"),
+        ("row_expand_div", "/"),
+    ):
+        m[f"buffer.{suffix}"] = lambda a, _kw, op=operation: (
+            f"_buffer_write({a[2]}, _buffer_active({a[0]}) {op} _buffer_active({a[1]}))"
+        )
+
+    for suffix, operation in (
+        ("row_expand_max", "maximum"),
+        ("row_expand_min", "minimum"),
+        ("col_expand_max", "maximum"),
+        ("col_expand_min", "minimum"),
+    ):
+        m[f"buffer.{suffix}"] = lambda a, _kw, op=operation: (
+            f"_buffer_write({a[2]}, torch.{op}(_buffer_active({a[0]}), _buffer_active({a[1]})))"
+        )
+    m["buffer.transpose"] = lambda a, _kw: (f"_buffer_write({a[2]}, _buffer_active({a[0]}).transpose(0, 1))")
 
     m["buffer.get_block_idx"] = lambda _a, _kw: "0"
     m["buffer.get_block_num"] = lambda _a, _kw: "1"
@@ -1283,15 +1572,27 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tile.tpop_from_aiv"] = _handle_tpop_from_aiv
     m["tile.get_subblock_idx"] = lambda _a, _kw: "_get_subblock_idx()"
 
+    m["system.set_intra_block"] = _reject_named_intra_block
+    m["system.wait_intra_block"] = _reject_named_intra_block
+
     # --- System ops (no-ops) ---
     for op_name in (
         "system.sync_src",
         "system.sync_dst",
         "system.sync_set",
         "system.sync_wait",
+        "system.set_flag",
+        "system.wait_flag",
+        "system.get_buf",
+        "system.rls_buf",
         "system.set_ffts",
         "system.bar_v",
         "system.bar_m",
+        "system.bar_mte1",
+        "system.bar_mte2",
+        "system.bar_mte3",
+        "system.bar_fix",
+        "system.bar_s",
         "system.bar_all",
         "system.fence",
         "system.cacheinvalid",
@@ -1303,6 +1604,8 @@ def _register_ops() -> None:  # noqa: PLR0915
         "system.tfree_to_aiv",
     ):
         m[op_name] = _noop(op_name.split(".")[-1])
+
+    m["system.aic_initialize_pipe"] = _handle_aic_initialize_pipe
 
 
 _register_ops()
@@ -1343,29 +1646,25 @@ _BINARY_OP_STR: dict[type, str] = {
 # ---------------------------------------------------------------------------
 
 
-class _MatrixAllocationSizes(_ir.IRVisitor):
-    """Index addressed cube allocations once so overlapping descriptors share bytes."""
+class _BufferAllocationSizes(_ir.IRVisitor):
+    """Index addressed allocations once so overlapping descriptors share bytes."""
 
     def __init__(self) -> None:
         super().__init__()
         self.sizes: dict[int, int] = {}
-        self.has_matrix = False
+        self.has_buffer = False
 
     def visit_iter_arg(self, op: _ir.IterArg) -> None:
         pass
 
     def visit_call(self, op: _ir.Call) -> None:
         descriptor = op.type
-        if (
-            op.op.name == _ir.get_op("buffer.alloc").name
-            and isinstance(descriptor, _ir.BufferType)
-            and descriptor.memory_space != _ir.MemorySpace.Vec
-        ):
-            self.has_matrix = True
+        if op.op.name == _ir.get_op("buffer.alloc").name and isinstance(descriptor, _ir.BufferType):
+            self.has_buffer = True
             if len(op.args) == 2:
                 address = op.args[1]
                 if not isinstance(address, _ir.ConstInt) or address.value < 0:
-                    raise ValueError("torch_codegen requires static nonnegative matrix allocation addresses")
+                    raise ValueError("torch_codegen requires static nonnegative buffer allocation addresses")
                 size = descriptor.dtype.get_bit() // 8
                 for extent in descriptor.shape:
                     size *= extent
@@ -1378,7 +1677,11 @@ class TorchCodegen(_ir.IRVisitor):
     """Emit executable PyTorch code from PyPTO IR."""
 
     def __init__(
-        self, *, check_shapes: bool = False, group_meta: dict[str, dict[str, Any]] | None = None
+        self,
+        *,
+        check_shapes: bool = False,
+        group_meta: dict[str, dict[str, Any]] | None = None,
+        backend_type: _backend.BackendType | None = None,
     ) -> None:
         super().__init__()
         self._lines: list[str] = []
@@ -1392,10 +1695,16 @@ class TorchCodegen(_ir.IRVisitor):
         # reusing object ids for short-lived nanobind wrappers.
         self._seen_var_refs: list[_ir.Var] = []
         self._name_counter: dict[str, int] = {}
-        self._matrix_pools_name = "matrix_storage"
+        self._buffer_pools_name = "buffer_storage"
         self._yield_targets: list[str] = []  # names to assign on yield
         self._check_shapes: bool = check_shapes
         self._group_meta: dict[str, dict[str, Any]] = group_meta or {}
+        if backend_type is None and _backend.is_backend_configured():
+            backend_type = _backend.get_backend_type()
+        self._hardware_c2v_split = False
+        if backend_type is not None:
+            handler = _backend.get_backend_instance(backend_type).get_handler()
+            self._hardware_c2v_split = handler.splits_cube_to_vector_transport_in_hardware()
 
     # -- helpers --
 
@@ -1538,6 +1847,10 @@ class TorchCodegen(_ir.IRVisitor):
                 self._emit(f"{name} = {param_name}.shape[{axis}]")
 
     def visit_function(self, func: _ir.Function) -> None:
+        for param in func.params:
+            _validate_reference_type(param.type)
+        for result_type in func.return_types:
+            _validate_reference_type(result_type)
         # Keep names function-local. IR may reuse object ids across functions;
         # sharing maps at program scope can emit stale names.
         self._var_names_by_id = {}
@@ -1555,12 +1868,12 @@ class TorchCodegen(_ir.IRVisitor):
                 # so only check dtype — not shape — for all function params.
                 self._emit_shape_dtype_check(self._name_of(p), p.type, shape=False)
         self._emit_dyn_dim_symbols(func)
-        allocations = _MatrixAllocationSizes()
+        allocations = _BufferAllocationSizes()
         allocations.visit_stmt(func.body)
-        self._matrix_pools_name = self._unique_name("matrix_storage")
-        if allocations.has_matrix:
+        self._buffer_pools_name = self._unique_name("buffer_storage")
+        if allocations.has_buffer:
             self._emit(
-                f"{self._matrix_pools_name} = "
+                f"{self._buffer_pools_name} = "
                 f"{{space: torch.empty(size, dtype=torch.uint8) "
                 f"for space, size in {allocations.sizes!r}.items()}}"
             )
@@ -1633,11 +1946,20 @@ class TorchCodegen(_ir.IRVisitor):
         if not isinstance(descriptor, _ir.BufferType):
             raise ValueError("torch_codegen requires a Buffer descriptor")
         if descriptor.memory_space == _ir.MemorySpace.Vec:
+            # A single physical column is contiguous in both tensor views;
+            # retaining its descriptor layout still matters to native codegen.
+            column_vector = (
+                descriptor.dtype == DataType.FP32
+                and len(descriptor.shape) == 2
+                and descriptor.shape[1] == 1
+                and descriptor.blayout == _ir.TileLayout.col_major
+            )
             if (
-                descriptor.blayout != _ir.TileLayout.row_major
-                or descriptor.slayout != _ir.TileLayout.none_box
-            ):
-                raise ValueError("torch_codegen requires dense row-major Vec Buffer descriptors")
+                descriptor.blayout != _ir.TileLayout.row_major and not column_vector
+            ) or descriptor.slayout != _ir.TileLayout.none_box:
+                raise ValueError(
+                    "torch_codegen requires dense row-major Vec or FP32 column-vector descriptors"
+                )
         elif (
             descriptor.memory_space
             not in (_ir.MemorySpace.Mat, _ir.MemorySpace.Left, _ir.MemorySpace.Right, _ir.MemorySpace.Acc)
@@ -1652,7 +1974,7 @@ class TorchCodegen(_ir.IRVisitor):
     @staticmethod
     def _matrix_descriptor_args(descriptor: _ir.BufferType) -> str:
         return (
-            f"{tuple(descriptor.shape)!r}, {_torch_dtype(descriptor.dtype)}, "
+            f"{tuple(descriptor.shape)!r}, {_torch_buffer_dtype(descriptor.dtype)}, "
             f"{tuple(descriptor.valid_shape)!r}, "
             f"{descriptor.blayout == _ir.TileLayout.row_major}, "
             f"{descriptor.slayout == _ir.TileLayout.row_major}, {descriptor.fractal}"
@@ -1662,15 +1984,16 @@ class TorchCodegen(_ir.IRVisitor):
         op_name = op.op.name
         if op_name == _ir.get_op("buffer.alloc").name:
             descriptor = self._buffer_descriptor(op)
+            address = arg_strs[1] if len(arg_strs) == 2 else "None"
             if descriptor.memory_space == _ir.MemorySpace.Vec:
                 self._expr_result = (
-                    f"_buffer_alloc({tuple(descriptor.shape)!r}, {_torch_dtype(descriptor.dtype)}, "
+                    f"_buffer_alloc({self._buffer_pools_name}, {descriptor.memory_space.value}, {address}, "
+                    f"{tuple(descriptor.shape)!r}, {_torch_buffer_dtype(descriptor.dtype)}, "
                     f"{tuple(descriptor.valid_shape)!r}, {arg_strs[0]})"
                 )
             else:
-                address = arg_strs[1] if len(arg_strs) == 2 else "None"
                 self._expr_result = (
-                    f"_matrix_alloc({self._matrix_pools_name}, {descriptor.memory_space.value}, {address}, "
+                    f"_matrix_alloc({self._buffer_pools_name}, {descriptor.memory_space.value}, {address}, "
                     f"{self._matrix_descriptor_args(descriptor)})"
                 )
         elif op_name == _ir.get_op("buffer.subview").name:
@@ -1683,7 +2006,7 @@ class TorchCodegen(_ir.IRVisitor):
             descriptor = self._buffer_descriptor(op)
             if descriptor.memory_space == _ir.MemorySpace.Vec:
                 self._expr_result = (
-                    f"_buffer_set_valid({arg_strs[0]}.view({_torch_dtype(descriptor.dtype)})"
+                    f"_buffer_set_valid({arg_strs[0]}.view({_torch_buffer_dtype(descriptor.dtype)})"
                     f".view({tuple(descriptor.shape)!r}), {tuple(descriptor.valid_shape)!r})"
                 )
             else:
@@ -1694,7 +2017,20 @@ class TorchCodegen(_ir.IRVisitor):
             return False
         return True
 
+    def _tpush_valid_shape(self, tile_type: _ir.Type, kw: dict[str, Any]) -> str | None:
+        if not self._hardware_c2v_split or kw.get("split") != 1 or "lane_stride" in kw:
+            return None
+        if (
+            not isinstance(tile_type, _ir.TileType)
+            or _ir_core._get_a5_c2v_row_tail_box_stride(tile_type) is None
+        ):
+            return None
+        view = tile_type.get_effective_tile_view()
+        rows, cols = (self._visit_expr_str(dim) for dim in view.valid_shape)
+        return f"({rows}, {cols})"
+
     def visit_call(self, op: _ir.Call) -> None:
+        _validate_reference_type(op.type)
         op_name = op.op.name
         handler = _OP_MAP.get(op_name)
 
@@ -1705,7 +2041,9 @@ class TorchCodegen(_ir.IRVisitor):
         if self._visit_buffer_call(op, arg_strs):
             return
         if op_name == _ir.get_op("tensor.view").name:
-            if len(arg_strs) >= 2:
+            if len(arg_strs) >= 4:
+                self._expr_result = f"_tensor_window({', '.join(arg_strs)})"
+            elif len(arg_strs) >= 2:
                 result_view = getattr(op.type, "tensor_view", None)
                 is_dn = result_view is not None and result_view.layout == _ir.TensorLayout.DN
                 valid_shape = f", {arg_strs[2]}" if len(arg_strs) == 3 else ""
@@ -1718,6 +2056,9 @@ class TorchCodegen(_ir.IRVisitor):
                     self._expr_result = f"{arg_strs[0]}.mT"
                 else:
                     self._expr_result = arg_strs[0]
+        elif op_name == _ir.get_op("tile.tpush_to_aiv").name:
+            valid_shape = self._tpush_valid_shape(op.args[0].type, kw)
+            self._expr_result = _handle_tpush_to_aiv(arg_strs, kw, valid_shape=valid_shape)
         elif handler is not None:
             self._expr_result = handler(arg_strs, kw)
         elif isinstance(op.op, _ir.GlobalVar):
@@ -1987,6 +2328,7 @@ def _collect_pass_ir_files(ir_dir: str) -> list[Path]:
 
 def _build_codegen_entry(
     ir_file: Path,
+    backend_type: _backend.BackendType | None,
 ) -> tuple[_ir.Function, Callable[..., Any]]:
     binary_path = ir_file.with_suffix(".msgpack")
     parsed = _ir.deserialize(binary_path.read_bytes()) if binary_path.is_file() else pl.loads(str(ir_file))
@@ -1996,7 +2338,7 @@ def _build_codegen_entry(
         )
 
     entry_func = _select_entry_function(parsed)
-    code = torch_codegen(parsed, check_shapes=True)
+    code = torch_codegen(parsed, check_shapes=True, backend_type=backend_type)
     namespace: dict[str, Any] = {}
     exec(code, namespace)  # noqa: S102
 
@@ -2044,7 +2386,12 @@ def _compare_expected_tensors(
 # ---------------------------------------------------------------------------
 
 
-def torch_codegen(node: _ir.Program | _ir.Function, *, check_shapes: bool = False) -> str:
+def torch_codegen(
+    node: _ir.Program | _ir.Function,
+    *,
+    check_shapes: bool = False,
+    backend_type: _backend.BackendType | None = None,
+) -> str:
     """Emit executable PyTorch code from a PyPTO IR Program or Function.
 
     The generated code can be exec()'d with torch available to numerically
@@ -2054,6 +2401,7 @@ def torch_codegen(node: _ir.Program | _ir.Function, *, check_shapes: bool = Fals
         node: A Program or Function IR node
         check_shapes: If True, emit runtime assertions to verify that every
             tensor/tile variable's shape and dtype match the IR type annotations.
+        backend_type: Backend whose cross-core transport is replayed. Defaults to the configured backend.
 
     Returns:
         String of executable Python/PyTorch code
@@ -2062,7 +2410,7 @@ def torch_codegen(node: _ir.Program | _ir.Function, *, check_shapes: bool = Fals
     if isinstance(node, _ir.Program):
         group_meta = _build_group_meta(node)
 
-    cg = TorchCodegen(check_shapes=check_shapes, group_meta=group_meta)
+    cg = TorchCodegen(check_shapes=check_shapes, group_meta=group_meta, backend_type=backend_type)
     lines = [_PREAMBLE]
     if group_meta:
         lines.append(f"_GROUP_META.update({group_meta!r})")
@@ -2088,6 +2436,7 @@ def validate_pass_ir_codegen_results(
     *,
     rtol: float = 5e-2,
     atol: float = 5e-2,
+    backend_type: _backend.BackendType | None = None,
 ) -> None:
     """Validate torch_codegen correctness on each pass IR file in a directory.
 
@@ -2100,6 +2449,7 @@ def validate_pass_ir_codegen_results(
         expected: Expected tensors keyed by tensor name.
         rtol: Relative tolerance for ``torch.allclose``.
         atol: Absolute tolerance for ``torch.allclose``.
+        backend_type: Backend whose cross-core transport is replayed.
 
     Prints:
         Per-pass validation summary with max absolute differences.
@@ -2120,7 +2470,7 @@ def validate_pass_ir_codegen_results(
     ir_files = _collect_pass_ir_files(ir_dir)
 
     for ir_file in ir_files:
-        entry_func, entry = _build_codegen_entry(ir_file)
+        entry_func, entry = _build_codegen_entry(ir_file, backend_type)
         run_tensors = {k: v.clone() for k, v in validated_tensors.items()}
         args = [_resolve_tensor_from_dict(param.name_hint, run_tensors) for param in entry_func.params]
         entry(*args)

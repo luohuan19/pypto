@@ -164,6 +164,28 @@ plan to attach a debugger:
 SKBUILD_CMAKE_DEFINE=PYPTO_DEBUG_INFO_LEVEL=1 pip install .
 ```
 
+The `libbacktrace` dependency uses different parallelism policies for the two build
+generators. With Unix Makefiles, its build and install steps share the outer GNU
+Make jobserver, so `cmake --build build --parallel N` controls their shared budget.
+With Ninja, both steps use a finite local budget, selected at CMake configuration
+time in this order:
+
+1. The explicit CMake option `-DPYPTO_EXTERNAL_BUILD_JOBS=N`.
+2. The nonempty `CMAKE_BUILD_PARALLEL_LEVEL` environment variable.
+3. One job when neither is supplied.
+
+For a Ninja-based pip build, an explicit dependency budget can be passed as:
+
+```bash
+SKBUILD_CMAKE_DEFINE=PYPTO_EXTERNAL_BUILD_JOBS=2 pip install .
+```
+
+The selected value must be a positive decimal integer; an explicitly empty CMake
+option is an error, while an empty environment variable uses the default. The
+option applies only to non-Makefile generators. Ninja's outer tasks and the
+dependency do not share a global budget. Changing only the later build command's
+`--parallel` value does not update the dependency budget; reconfigure to change it.
+
 `ccache` is detected and used automatically when present, which makes repeated builds
 substantially cheaper:
 
@@ -253,8 +275,9 @@ PYPTO_PROG_BUILD_DIR=/scratch/pypto-out python my_kernel.py
 [Distributed](distributed/index.md).
 
 **Most of these dispatch to hardware, not just compile.** `beginner/01_hello_world.py`,
-`intermediate/02_softmax.py`, and `models/01_ffn.py` all end by calling their kernel with
-`config=RunConfig()`, which assembles through ptoas and runs it — so they need the
+`intermediate/02_softmax.py`, and `models/01_ffn.py` compile their kernels explicitly,
+then call the returned programs with `config=RunConfig()`, assembling through ptoas
+and running them — so they need the
 runtime and a device or simulator platform, not only the `pip install` above:
 
 ```bash

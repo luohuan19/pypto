@@ -1,5 +1,9 @@
 # Shaping the Task Graph
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Getting the runtime to execute the graph you meant, rather than the one it inferred.
 
 > **Prerequisites:** [Your first operator](00-elementwise.md).
@@ -46,7 +50,8 @@ torch.manual_seed(0)
 x = torch.randn(128, 128)
 scratch = torch.zeros(128, 128)
 out = torch.zeros(128, 128)
-inferred(x, scratch, out, config=RunConfig(platform="a2a3sim"))
+compiled = inferred.compile(x, scratch, out, config=RunConfig(platform="a2a3sim"))
+compiled(x, scratch, out, config=RunConfig(platform="a2a3sim"))
 assert torch.allclose(out, (x + x) + (x + x), rtol=1e-5, atol=1e-5)
 ```
 

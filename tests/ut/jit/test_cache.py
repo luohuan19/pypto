@@ -12,15 +12,18 @@
 import ast
 import importlib
 import inspect
+import math
 import re
 import types
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Event, current_thread
 from typing import Any
 
 import pypto.language as pl
 import pytest
 from pypto.ir import DistributedConfig, OptimizationStrategy
+from pypto.jit._persistent import _specialization_digest
 from pypto.jit._source import capture_namespaces, function_namespace
 from pypto.jit.cache import (
     SCALAR_SEMANTICS,
@@ -30,16 +33,61 @@ from pypto.jit.cache import (
 from pypto.jit.decorator import (
     _resolve_enable_buffer_ir,
     _resolve_enable_pypto_l0c_double_buffer,
+    _resolve_enable_software_pipeline,
     _resolve_memory_planner,
     _resolve_runtime,
 )
-from pypto.language.parser.diagnostics.exceptions import ParserSyntaxError
+from pypto.language.diagnostics import ParserSyntaxError
 from pypto.pypto_core import DataType, ir, passes
 from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime import RunConfig
 
 
 class TestComputeSourceHash:
+    def test_rebinding_same_callable_wrapper_changes_call_wiring_hash(self):
+        def shared(out: pl.Out[pl.Tensor[[64, 128], pl.BF16]]):
+            return out
+
+        producer = pl.jit.incore(level=pl.Level.AIC)(shared)
+        consumer = pl.jit.incore(level=pl.Level.AIV)(shared)
+        selected = producer
+
+        @pl.jit
+        def entry(out: pl.Out[pl.Tensor[[64, 128], pl.BF16]]):
+            producer(out)
+            consumer(out)
+            return selected(out)
+
+        initial_deps = entry._get_deps()
+        source_hash = entry._get_source_hash()
+        persistent_digest = entry._persistent_source_digest()
+        selected = consumer
+        assert entry._get_deps() == initial_deps
+        assert entry._get_source_hash() != source_hash
+        assert entry._persistent_source_digest() != persistent_digest
+
+    def test_equivalent_wrapper_graph_hashes_do_not_depend_on_object_ids(self):
+        def shared(out: pl.Out[pl.Tensor[[64, 128], pl.BF16]]):
+            return out
+
+        def factory():
+            producer = pl.jit.incore(level=pl.Level.AIC)(shared)
+            consumer = pl.jit.incore(level=pl.Level.AIV)(shared)
+            alias = producer
+
+            @pl.jit
+            def entry(out: pl.Out[pl.Tensor[[64, 128], pl.BF16]]):
+                producer(out)
+                consumer(out)
+                return alias(out)
+
+            return entry
+
+        first = factory()
+        second = factory()
+        assert first._get_source_hash() == second._get_source_hash()
+        assert first._persistent_source_digest() == second._persistent_source_digest()
+
     def test_deterministic(self):
         h1 = compute_source_hash(["def f(): pass"])
         h2 = compute_source_hash(["def f(): pass"])
@@ -84,6 +132,7 @@ class TestMakeCacheKey:
         dep_layouts=(),
         runtime=passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
         enable_buffer_ir=False,
+        enable_software_pipeline=False,
     ):
         return make_cache_key(
             source_hash=source_hash,
@@ -101,6 +150,7 @@ class TestMakeCacheKey:
             dep_layouts=dep_layouts,
             runtime=runtime,
             enable_buffer_ir=enable_buffer_ir,
+            enable_software_pipeline=enable_software_pipeline,
         )
 
     def test_basic_key_structure(self):
@@ -127,6 +177,8 @@ class TestMakeCacheKey:
             ("runtime", "tensormap_and_ringbuffer"),
             ("enable_buffer_ir", False),
             ("buffer_ir_version", 0),
+            ("gather_compare_scratch_version", 2),
+            ("enable_software_pipeline", False),
         )
 
     def test_tensor_shape_in_key(self):
@@ -409,9 +461,11 @@ class TestMakeCacheKey:
         assert len(set(keys)) == len(keys), f"planner must split the cache key, got {keys}"
 
     def test_dbc_double_buffer_flag_splits_legacy_pypto_key(self):
-        """The legacy-PyPTO dbC=2 opt-in changes AutoTileMatmulL0/MemoryReuse output,
-        so a kernel compiled with it off must not reuse that artifact when later
-        called with it on."""
+        """Preserve the historical PYPTO key split for the compatibility flag.
+
+        Automatic dbC is disabled regardless of this value; distinct keys
+        preserve the legacy cache contract, not different AutoTile output.
+        """
         key_off = self._make_key(
             param_names=["a"],
             tensor_shapes={"a": (8, 8)},
@@ -426,11 +480,11 @@ class TestMakeCacheKey:
             memory_planner=MemoryPlanner.PYPTO,
             enable_pypto_l0c_double_buffer=True,
         )
-        assert key_off != key_on, "dbC=2 opt-in must split the cache key"
+        assert key_off != key_on, "legacy PYPTO flag values must retain distinct compatibility keys"
 
     @pytest.mark.parametrize("planner", [MemoryPlanner.DSA_RP, MemoryPlanner.PTOAS])
-    def test_dbc_double_buffer_flag_does_not_split_automatic_planner_key(self, planner):
-        """DSA_RP and PTOAS enable dbC automatically, so the legacy-PyPTO flag is inert."""
+    def test_dbc_double_buffer_flag_does_not_split_non_pypto_key(self, planner):
+        """Non-PYPTO keys omit the legacy flag; their dbC policy is planner-owned."""
         kwargs: dict[str, Any] = {
             "param_names": ["a"],
             "tensor_shapes": {"a": (8, 8)},
@@ -448,7 +502,32 @@ class TestMakeCacheKey:
         assert off != on
         assert off.compile_opts is not None and on.compile_opts is not None
         assert ("buffer_ir_version", 0) in off.compile_opts
-        assert ("buffer_ir_version", 5) in on.compile_opts
+        assert ("buffer_ir_version", 14) in on.compile_opts
+
+    @pytest.mark.parametrize("planner", [MemoryPlanner.PYPTO, MemoryPlanner.DSA_RP, MemoryPlanner.PTOAS])
+    @pytest.mark.parametrize("enable_buffer_ir", [False, True])
+    @pytest.mark.parametrize("previous_version", [None, 1])
+    def test_compare_gather_scratch_invalidates_legacy_persistent_key(
+        self, planner, enable_buffer_ir, previous_version
+    ):
+        # Before full-capacity scratch planning, Tile kernels had the same source,
+        # package version, and compile options. They must miss the persistent cache
+        # even when Buffer IR is disabled (or the kernel falls back to Tile).
+        current = self._make_key(memory_planner=planner, enable_buffer_ir=enable_buffer_ir)
+        assert current.compile_opts is not None
+        assert ("gather_compare_scratch_version", 2) in current.compile_opts
+        legacy = current._replace(
+            compile_opts=tuple(
+                (name, previous_version) if name == "gather_compare_scratch_version" else (name, value)
+                for name, value in current.compile_opts
+                if previous_version is not None or name != "gather_compare_scratch_version"
+            )
+        )
+        assert current != legacy
+        assert _specialization_digest(current) != _specialization_digest(legacy)
+
+    def test_software_pipeline_splits_key(self):
+        assert self._make_key() != self._make_key(enable_software_pipeline=True)
 
     def test_runtime_splits_key(self):
         """The runtime is baked into the artifact's ``kernel_config.py`` and decides
@@ -463,6 +542,14 @@ class TestMakeCacheKey:
         key_hbg = self._make_key(**kwargs, runtime=passes.RuntimeKind.HOST_BUILD_GRAPH)
         assert key_tmrb != key_hbg, "runtime must split the cache key"
 
+    def test_a5_hbg_cache_names_physical_implementation(self):
+        hbg = self._make_key(platform="a5", runtime=passes.RuntimeKind.HOST_BUILD_GRAPH)
+        experimental = self._make_key(platform="a5", runtime=passes.RuntimeKind.HOST_BUILD_GRAPH_EXPERIMENTAL)
+        assert hbg.compile_opts is not None
+        assert ("runtime", "percounter") in hbg.compile_opts
+        assert experimental.compile_opts is not None
+        assert ("runtime", "host_build_graph") in experimental.compile_opts
+
 
 class TestResolveRuntime:
     """The runtime the JIT keys on must match the one ``ir.compile()`` will use."""
@@ -475,6 +562,59 @@ class TestResolveRuntime:
         # context is the sole source the cache key can consult.
         with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
             assert _resolve_runtime() == passes.RuntimeKind.HOST_BUILD_GRAPH
+
+
+@pytest.mark.parametrize("hbg_first", [False, True], ids=["tmr-first", "hbg-first"])
+def test_graph_jit_caches_runtime_specific_artifacts(tmp_path, monkeypatch, hbg_first):
+    """Both compile orders cache the Graph implementation for their own ABI."""
+    from pypto.backend import pto_backend  # noqa: PLC0415
+    from pypto.jit import decorator  # noqa: PLC0415
+
+    monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(tmp_path))
+    monkeypatch.setattr(decorator, "_ptoas_available", lambda: True)
+    monkeypatch.setattr(
+        pto_backend,
+        "_run_ptoas",
+        lambda source, target, **kwargs: Path(target).write_text("// fake external PTOAS output\n"),
+    )
+
+    @pl.jit.incore
+    def copy(
+        x: pl.Tensor[[16, 16], pl.FP32], out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]]
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        return pl.store(pl.load(x, [0, 0], [16, 16]), [0, 0], out)
+
+    @pl.jit.graph
+    def layer(
+        x: pl.Tensor[[16, 16], pl.FP32], out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]]
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        return copy(x, out)
+
+    @pl.jit
+    def model(
+        x: pl.Tensor[[16, 16], pl.FP32], out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]]
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        pl.dump_tag(x)
+        return layer(x, out)
+
+    tmr, hbg = passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER, passes.RuntimeKind.HOST_BUILD_GRAPH
+    order = (hbg, tmr) if hbg_first else (tmr, hbg)
+    artifacts = {}
+    for runtime in order:
+        with passes.PassContext([], runtime=runtime):
+            artifacts[runtime] = model.compile()
+    assert artifacts[tmr] is not artifacts[hbg]
+    assert artifacts[tmr].output_dir != artifacts[hbg].output_dir
+    for runtime in order:
+        with passes.PassContext([], runtime=runtime):
+            assert model.compile() is artifacts[runtime]
+        output_dir = Path(artifacts[runtime].output_dir)
+        runtime_name = passes.runtime_kind_to_name(runtime)
+        assert f'"runtime": "{runtime_name}"' in (output_dir / "kernel_config.py").read_text()
+        code = (output_dir / "orchestration" / "model.cpp").read_text()
+        assert ("rt_submit_graph(" in code) is (runtime == hbg)
+        assert "rt_submit_aiv_task(" in code
+        assert ".dump(" in code
 
 
 class TestResolveMemoryPlanner:
@@ -503,16 +643,39 @@ def test_buffer_ir_cache_option_follows_active_context():
     assert _resolve_enable_buffer_ir() is True
 
 
+def test_software_pipeline_cache_option_follows_active_context():
+    assert _resolve_enable_software_pipeline() is False
+    with passes.PassContext([], enable_buffer_ir=False, enable_software_pipeline=True):
+        assert _resolve_enable_software_pipeline() is True
+        with passes.PassContext([]):
+            assert _resolve_enable_software_pipeline() is False
+        assert _resolve_enable_software_pipeline() is True
+    assert _resolve_enable_software_pipeline() is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_software_pipeline_cache_option_uses_explicit_value(enabled):
+    assert _resolve_enable_software_pipeline(enabled) == enabled
+
+
+@pytest.mark.parametrize("software", [None, False, True])
+def test_explicit_software_pipeline_selects_tile_ir_in_cache_key(software):
+    """Caching must mirror compile's effective default storage representation."""
+    assert _resolve_enable_buffer_ir(software) is (not software)
+
+
 class TestResolveEnablePyptoL0cDoubleBuffer:
-    """The legacy-PyPTO dbC=2 opt-in must match what ``ir.compile()`` inherits."""
+    """Preserve the legacy compatibility state inherited by ``ir.compile()``."""
 
     def test_defaults_to_off(self):
         assert _resolve_enable_pypto_l0c_double_buffer() is False
 
     def test_reads_the_active_pass_context(self):
-        """The flag is set by wrapping the call in a PassContext, which never
-        reaches RunConfig; keying only on RunConfig would let a flag-on call
-        reuse the flag-off artifact."""
+        """A PassContext-only value must survive even without a RunConfig field.
+
+        This preserves the historical PYPTO cache-key distinction, although
+        neither value enables automatic dbC.
+        """
         with passes.PassContext([], enable_pypto_l0c_double_buffer=True):
             assert _resolve_enable_pypto_l0c_double_buffer() is True
         assert _resolve_enable_pypto_l0c_double_buffer() is False
@@ -877,9 +1040,9 @@ class TestGlobalDependencies:
 
         initial_hash = entry._get_source_hash()
         entry.compile()
-        helper = pl.jit.incore(level=pl.Level.AIC)(implementation)
+        helper = pl.jit.incore(level=pl.Level.HOST)(implementation)
         assert entry._get_source_hash() != initial_hash
-        with pytest.raises(ParserSyntaxError, match="explicit level=AIC"):
+        with pytest.raises(ParserSyntaxError, match="explicit level=HOST"):
             entry.compile()
         assert len(compile_programs) == 1
 
@@ -913,7 +1076,7 @@ class TestGlobalDependencies:
 
         monkeypatch.setattr(entry, "_compute_static_source_hash", unexpected_recomputation)
         monkeypatch.setattr(
-            importlib.import_module("pypto.jit.decorator"), "_param_layouts", unexpected_recomputation
+            importlib.import_module("pypto.jit._arguments"), "param_layouts", unexpected_recomputation
         )
         with capture_namespaces():
             assert entry._get_source_hash() == initial_hash
@@ -980,7 +1143,7 @@ class TestGlobalDependencies:
             "def implementation(x: 'not a valid expression'):\n    return pl.add(x, _CACHE_BLOCK)\n"
         ).body[0]
         monkeypatch.setattr(
-            importlib.import_module("pypto.jit.decorator"), "_get_func_def", lambda _: definition
+            importlib.import_module("pypto.jit._ast_analysis"), "get_func_def", lambda _: definition
         )
         kernel = pl.jit(implementation)
         assert kernel._get_source_hash() == kernel._get_source_hash()
@@ -1363,6 +1526,31 @@ class TestConstexprParameters:
 
         assert records, "the dep's own binding must still be recorded"
         assert all(len(record) == 5 for record in records)
+
+
+def test_nonfinite_math_constant_cache_tracks_value_and_snapshot(monkeypatch):
+    """Qualified math constants share one value across hashing and specialization."""
+
+    @pl.jit
+    def kernel(x: pl.Tensor[[32], pl.FP32]):
+        return pl.add(x, math.inf)
+
+    initial = kernel._get_source_hash()
+    with capture_namespaces():
+        assert kernel._get_source_hash() == initial
+        monkeypatch.setattr(math, "inf", 1.0)
+        assert kernel._get_source_hash() == initial
+    assert kernel._get_source_hash() != initial
+
+
+def test_nonfinite_math_constant_cache_respects_shadowing(monkeypatch):
+    @pl.jit
+    def kernel(math: pl.Tensor[[32], pl.FP32]):
+        return pl.add(math, 1.0)
+
+    initial = kernel._get_source_hash()
+    monkeypatch.setattr(math, "inf", 1.0)
+    assert kernel._get_source_hash() == initial
 
 
 if __name__ == "__main__":

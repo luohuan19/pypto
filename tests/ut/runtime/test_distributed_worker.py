@@ -19,6 +19,7 @@ domains, handle-owned input lifetimes, and complete cleanup before publication.
 import ctypes
 import gc
 import importlib.util
+import io
 import json
 import sys
 import threading
@@ -53,8 +54,12 @@ from pypto.runtime.distributed_runner import (
     _collect_l3_swimlane,
     _construct_worker,
     _make_call_config,
+    _register_callables,
     _reset_dfx_dispatch_state,
     _submit_chip,
+    _submit_dispatch,
+    add_chip_tensor_arg,
+    validate_host_domain_runtime,
 )
 from pypto.runtime.runner import RunConfig
 
@@ -148,6 +153,28 @@ def _alloc_by_worker(worker_mock, buffers):
     return buffers
 
 
+def test_exportable_allocation_and_retirement_preserve_distributed_owner(kernel_env, patched_setup):
+    runtime = DistributedWorker(_fake_compiled([], []))
+    backend = patched_setup["worker"]
+    tensor = runtime.alloc_tensor((64,), torch.float32, worker_id=1, exportable=True)
+    assert backend.alloc_child_tensor.call_args.kwargs == {"exportable": True}
+    exported = runtime.export_buffer(tensor, worker_id=1)
+    backend.export_buffer.assert_called_once_with(tensor.buffer)
+    backend.check_exports_retired.side_effect = RuntimeError("external exports")
+    with pytest.raises(RuntimeError, match="external"):
+        runtime.close()
+    assert not runtime._closed and (1, tensor.data_ptr) in runtime._owned_tensors
+    backend.free.assert_not_called()
+    backend.close.assert_not_called()
+    runtime.release_export(exported)
+    backend.release_export.assert_called_once_with(exported)
+    backend.check_exports_retired.side_effect = None
+    runtime.close()
+    assert runtime._closed
+    backend.free.assert_called_once_with(tensor.buffer)
+    backend.close.assert_called_once()
+
+
 @pytest.fixture
 def patched_setup():
     """Patch every setup helper so DistributedWorker() does no real work.
@@ -158,6 +185,7 @@ def patched_setup():
     simpler = ModuleType("simpler")
     simpler.__path__ = []
     task_interface = ModuleType("simpler.task_interface")
+    setattr(task_interface, "TaskArgs", MagicMock)
     setattr(task_interface, "DataType", SimpleNamespace(UINT8=object()))
     setattr(simpler, "task_interface", task_interface)
     # `simpler.buffer` is the zero-copy naming path: a test can tell a named range from a
@@ -234,6 +262,49 @@ def _resident(
 
 
 class TestSetupOnce:
+    @pytest.mark.parametrize("one_shot", [True, False])
+    def test_kernel_mode_blocks_distributed_initialization(self, kernel_env, patched_setup, one_shot):
+        from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
+
+        kernel_env.state.ensure_worker(kernel_env.config)
+        compiled = _fake_compiled([_param("a", [8, 8])], [])
+        with pytest.raises(RuntimeError, match="already claimed kernel"):
+            if one_shot:
+                _execute_distributed(compiled, [torch.zeros(8, 8)])
+            else:
+                DistributedWorker(compiled)
+        patched_setup["worker"].init.assert_not_called()
+        patched_setup["dispatch"].assert_not_called()
+        kernel_env.state.close()
+
+    @pytest.mark.parametrize("dfx_enabled", [False, True])
+    def test_kernel_mode_rejection_preserves_one_shot_inputs_and_diagnostics(
+        self, kernel_env, patched_setup, tmp_path, dfx_enabled
+    ):
+        from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
+
+        kernel_env.state.ensure_worker(kernel_env.config)
+        compiled = _fake_compiled([_param("a", [8, 8])], [])
+        compiled.output_dir = tmp_path
+        arg = torch.zeros(8, 8)
+        original_ptr = arg.data_ptr()
+        # This directory is deliberately eligible for stale-dispatch cleanup.
+        # A rejected call must leave both it and the caller's storage untouched.
+        diagnostic = tmp_path / "dfx_outputs" / "rank0" / "d0" / "deps.json"
+        diagnostic.parent.mkdir(parents=True)
+        diagnostic.write_text("previous run")
+        config = RunConfig(enable_dep_gen=True) if dfx_enabled else None
+
+        with pytest.raises(RuntimeError, match="already claimed kernel"):
+            _execute_distributed(compiled, [arg], config)
+
+        assert not arg.is_shared() and arg.data_ptr() == original_ptr
+        assert diagnostic.read_text() == "previous run"
+        patched_setup["assemble"].assert_not_called()
+        patched_setup["construct"].assert_not_called()
+        patched_setup["dispatch"].assert_not_called()
+        kernel_env.state.close()
+
     def test_setup_runs_once_dispatch_many(self, patched_setup):
         m = patched_setup
         compiled = _fake_compiled([_param("a", [128, 128]), _param("b", [128, 128])], [])
@@ -494,7 +565,7 @@ class TestAsyncDispatchHandle:
         m["worker"]._accepted_run_handles = set()
         m["worker"]._hierarchical_start_cv = threading.Condition()
 
-        def interrupt_after_acceptance(*_args):
+        def interrupt_after_acceptance(*_args, **_kwargs):
             with m["worker"]._hierarchical_start_cv:
                 m["worker"]._accepted_run_handles.add(native)
             raise KeyboardInterrupt("interrupted after native acceptance")
@@ -592,6 +663,95 @@ class TestPreparedSwimlaneTwoPass:
 
     _CALL_CONFIG_ARG = 5
 
+    @pytest.mark.parametrize("prebuilt", [False, True])
+    def test_consecutive_runs_retain_and_convert_only_their_captures(
+        self, patched_setup, tmp_path, monkeypatch, fake_swimlane_converter, prebuilt
+    ):
+        compiled = _fake_compiled([], [])
+        compiled.platform = "a2a3"
+        compiled.output_dir = tmp_path / "program"
+        run_dir = tmp_path / "runs" if prebuilt else compiled.output_dir
+        if prebuilt:
+            compiled._artifact_runtime = SimpleNamespace(directory=compiled.output_dir, run_directory=run_dir)
+        programs = {"target": object(), "drafter": object()}
+        for program in programs:
+            _write_chip_program(compiled.output_dir, program, f"{program}_kernel")
+            if prebuilt:
+                manifest = {"schema": 2, "kernels": [{"func_id": 0, "name": f"{program}_kernel"}]}
+                (compiled.output_dir / "next_levels" / program / "binary_manifest.json").write_text(
+                    json.dumps(manifest)
+                )
+        converted = TestCollectL3Swimlane._spy_generate_swimlane(monkeypatch)
+        config = RunConfig(platform="a2a3", enable_chip_swimlane=1)
+        captures: list[Path] = []
+
+        def emit_pass(*args, dfx_dispatch_idx, **_kwargs):
+            cfg = args[self._CALL_CONFIG_ARG]
+            k = len(captures)
+            program = ("target", "drafter")[k // 2]
+            capture = _write_capture(
+                Path(cfg.output_prefix) / "rank0",
+                f"d{k}",
+                deps=cfg.enable_dep_gen,
+                records=bool(cfg.enable_chip_swimlane),
+                run_id=k,
+                capture_index=k,
+                digest=program,
+            )
+            orch = _RecordingOrch()
+            _reset_dfx_dispatch_state(orch, programs, dispatch_idx=dfx_dispatch_idx)
+            _submit_chip(orch, programs[program], None, cfg, 0)
+            captures.append(capture)
+            return _ImmediateNativeHandle()
+
+        with DistributedWorker(compiled) as worker:
+            monkeypatch.setattr(
+                sys.modules["simpler.task_interface"], "CallConfig", _BoolStrictCallConfig, raising=False
+            )
+            patched_setup["make_call_config"].side_effect = _make_call_config
+            patched_setup["submit_dispatch"].side_effect = emit_pass
+            worker.run(compiled, config=config)
+            worker.run(compiled, config=config)
+
+        assert [call.out_dir for call in converted] == captures[::2]
+        for capture, program in zip(captures[::2], ("target", "drafter"), strict=True):
+            assert (capture / "deps.json").is_file()
+            assert (capture / "chip_swimlane_records.json").is_file()
+            assert (capture / "dispatch_identity.timing.json").is_file()
+            assert json.loads((capture / "dispatch_program.json").read_text())["program"] == program
+            assert json.loads((capture / "name_map.json").read_text())["callable_id_to_name"]["0"] == (
+                f"{program}_kernel"
+            )
+        assert captures[0].parent.parent != captures[2].parent.parent
+        assert all(capture.is_relative_to(run_dir / "dfx_outputs") for capture in captures)
+
+    def test_new_session_cleans_only_closed_workers(self, patched_setup, tmp_path):
+        compiled = _fake_compiled([], [])
+        compiled.output_dir = tmp_path
+        config = RunConfig(platform="a2a3sim", enable_chip_swimlane=1)
+
+        def capture(worker: DistributedWorker) -> Path:
+            handle = worker.submit(compiled, config=config)
+            handle.result()
+            directory = handle.capture_directory
+            assert directory is not None
+            _write_dfx_dispatch_dirs(directory, "rank0/d0")
+            return directory
+
+        with DistributedWorker(compiled) as first:
+            first_dir = capture(first)
+            first.run(compiled, config=RunConfig(platform="a2a3sim", enable_dep_gen=True))
+            assert (first_dir / "rank0/d0/chip_swimlane_records.json").is_file()
+            with DistributedWorker(compiled) as second:
+                second_dir = capture(second)
+                assert second_dir != first_dir
+            assert second_dir.is_dir()
+            with DistributedWorker(compiled) as third:
+                third_dir = capture(third)
+                assert third_dir.is_dir()
+                assert first_dir.is_dir()
+                assert not second_dir.exists()
+
     def test_onboard_reuses_worker_for_graph_then_clean_timing(self, patched_setup, tmp_path, capsys):
         m = patched_setup
         compiled = _fake_compiled([_param("a", [16, 16])], [])
@@ -606,7 +766,7 @@ class TestPreparedSwimlaneTwoPass:
         timing_call_config = MagicMock(name="TimingCallConfig")
         m["make_call_config"].side_effect = [deps_call_config, timing_call_config]
         events: list[str] = []
-        m["submit_dispatch"].side_effect = lambda *args: (
+        m["submit_dispatch"].side_effect = lambda *args, **_kwargs: (
             events.append("deps" if args[self._CALL_CONFIG_ARG] is deps_call_config else "timing"),
             _ImmediateNativeHandle(),
         )[1]
@@ -618,28 +778,24 @@ class TestPreparedSwimlaneTwoPass:
             enable_scope_stats=True,
             enable_dump_args=2,
         )
-        with (
-            patch(
-                "pypto.runtime.distributed_runner._clear_dfx_dispatch_dirs",
-                side_effect=lambda _path: events.append("clear"),
-            ) as clear,
-            patch(
-                "pypto.runtime.distributed_runner._collect_l3_swimlane",
-                side_effect=lambda _output, _platform: events.append("collect"),
-            ) as collect,
-        ):
-            rt(_resident(rt, (16, 16)), config=run_config)
+        with patch(
+            "pypto.runtime.distributed_runner._collect_l3_swimlane",
+            side_effect=lambda *args, **kwargs: events.append("collect"),
+        ) as collect:
+            handle = rt.submit(compiled, _resident(rt, (16, 16)), config=run_config)
+            handle.result()
 
-        assert events == ["clear", "deps", "timing", "collect"]
+        assert events == ["deps", "timing", "collect"]
         assert m["submit_dispatch"].call_count == 2
         assert all(call.args[0] is m["worker"] for call in m["submit_dispatch"].call_args_list)
         assert m["construct"].call_count == 1
         assert m["worker"].init.call_count == 1
-        clear.assert_called_once_with(tmp_path / "dfx_outputs")
-        collect.assert_called_once_with(tmp_path, "a2a3")
+        assert handle.capture_directory is not None
+        collect.assert_called_once_with(tmp_path, "a2a3", dfx_base=handle.capture_directory)
 
         assert m["make_call_config"].call_count == 2
         deps_build, timing_build = m["make_call_config"].call_args_list
+        assert deps_build.kwargs["dfx_base"] == timing_build.kwargs["dfx_base"] == handle.capture_directory
         deps_config = deps_build.args[1]
         assert deps_config.enable_chip_swimlane == 0
         assert deps_config.enable_dep_gen is True
@@ -677,16 +833,18 @@ class TestPreparedSwimlaneTwoPass:
             enable_chip_swimlane=1,  # AICore-timing level, not just "on"
         )
         with patch("pypto.runtime.distributed_runner._collect_l3_swimlane") as collect:
-            rt(_resident(rt, (16, 16)), config=run_config)
+            handle = rt.submit(compiled, _resident(rt, (16, 16)), config=run_config)
+            handle.result()
 
         m["submit_dispatch"].assert_called_once()
         assert m["submit_dispatch"].call_args.args[self._CALL_CONFIG_ARG] is call_config
         m["make_call_config"].assert_called_once_with(
             compiled._distributed_config,
             run_config,
-            dfx_base=tmp_path / "dfx_outputs",
+            dfx_base=handle.capture_directory,
         )
-        collect.assert_called_once_with(tmp_path, "a2a3sim")
+        assert handle.capture_directory is not None
+        collect.assert_called_once_with(tmp_path, "a2a3sim", dfx_base=handle.capture_directory)
         rt.close()
 
     def test_dep_gen_without_swimlane_keeps_single_pass(self, patched_setup, tmp_path):
@@ -717,7 +875,7 @@ class TestPreparedSwimlaneTwoPass:
         compiled.output_dir = tmp_path
         rt = DistributedWorker(compiled)
 
-        # Exercise _dispatch_prepared's persistent branch without starting a
+        # Exercise the persistent two-pass path without starting a
         # background thread: the two-pass fallback still fences both requests.
         rt._persistent = True
         m["make_call_config"].reset_mock()
@@ -785,7 +943,7 @@ class TestPerCallValidation:
     def test_accepts_device_tensor_allocated_by_same_worker(self, patched_setup):
         submitted_tensors: dict[str, Any] = {}
 
-        def submit_dispatch(*args):
+        def submit_dispatch(*args, **_kwargs):
             submitted_tensors.update(args[2])
             return _ImmediateNativeHandle()
 
@@ -891,7 +1049,7 @@ class TestPerCallValidation:
         # are forwarded verbatim to the entry — common in serving dispatch.
         submitted_tensors: dict[str, Any] = {}
 
-        def submit_dispatch(*args):
+        def submit_dispatch(*args, **_kwargs):
             submitted_tensors.update(args[2])
             return _ImmediateNativeHandle()
 
@@ -1843,6 +2001,28 @@ class TestLoadOrchEntry:
         assert entry_fn.__name__ == "moe_ep_l3"
         assert alloc_fn is None
 
+    @pytest.mark.parametrize("initialized", [False, True])
+    def test_host_capabilities_checked_at_load_not_dispatch(self, tmp_path, monkeypatch, initialized):
+        from pypto.runtime.distributed_runner import _load_orch_entry  # noqa: PLC0415
+
+        orch_type = object()
+        runtime = ModuleType("simpler.orchestrator")
+        setattr(runtime, "Orchestrator", orch_type)
+        monkeypatch.setitem(sys.modules, "simpler.orchestrator", runtime)
+        root = self._write_orch(
+            tmp_path,
+            "def host(orch, args, config, **kw):\n    return 'ok'\n"
+            "host._pypto_distributed_entry = True\n"
+            "host._requires_host_domain = True\n"
+            f"host._window_source_keys = {('table',) if initialized else ()!r}\n",
+        )
+        with patch("pypto.runtime.distributed_runner.validate_host_domain_runtime") as check:
+            entry, _ = _load_orch_entry(root)
+            check.assert_called_once_with(orch_type, initialized=initialized)
+            for _ in range(3):
+                assert entry(None, None, None) == "ok"
+            assert check.call_count == 1
+
     def test_returns_alloc_intermediates_when_present(self, tmp_path):
         from pypto.runtime.distributed_runner import _load_orch_entry  # noqa: PLC0415
 
@@ -2014,7 +2194,7 @@ class TestMultiProgram:
         m = patched_setup
         submitted_tensors: list[dict[str, Any]] = []
 
-        def submit_dispatch(*args):
+        def submit_dispatch(*args, **_kwargs):
             submitted_tensors.append(dict(args[2]))
             return _ImmediateNativeHandle()
 
@@ -2203,6 +2383,48 @@ class TestAssembleChipCallables:
 
         assert enable_sdma is True
 
+    @pytest.mark.parametrize("artifact_cached", [False, True])
+    def test_host_transfer_contract_survives_registration(
+        self, tmp_path, stub_device_runner, monkeypatch, artifact_cached
+    ):
+        compiled = self._build(tmp_path, ["chip_a", "chip_b"])
+        chips = {
+            "chip_a": (object(), "host_build_graph", {"host_tensor_indices": [1]}),
+            "chip_b": (object(), "host_build_graph", {}),
+        }
+        if artifact_cached:
+            compiled._artifact_runtime = SimpleNamespace(load=lambda: chips)
+        else:
+            stub_device_runner._compile_and_assemble.side_effect = list(chips.values())
+        callables, _, _ = _assemble_chip_callables(compiled)
+        worker = MagicMock()
+        _, registered = _register_callables(worker, {}, callables)
+        buffer_module = ModuleType("simpler.buffer")
+        none_transfer = object()
+        setattr(buffer_module, "TensorTransfer", SimpleNamespace(NONE=none_transfer))
+        monkeypatch.setitem(sys.modules, "simpler.buffer", buffer_module)
+        # Inputs below are torch/DeviceTensor objects. Keep this registration
+        # unit test from importing native Simpler through the partially mocked
+        # package (which can retry an extension import after a failed import).
+        monkeypatch.setattr("pypto.runtime.distributed_runner._is_simpler_tensor", lambda tensor: False)
+        tensor = torch.zeros(2)
+        wire = object()
+        args = MagicMock()
+        with patch.object(
+            importlib.import_module("pypto.runtime.tensor_arg"), "make_tensor_arg", return_value=wire
+        ):
+            add_chip_tensor_arg(args, worker, tensor, "INOUT", registered, "chip_a", 1)
+            args.add_tensor.assert_called_once_with(wire, "INOUT", transfer=none_transfer)
+            args.reset_mock()
+            add_chip_tensor_arg(args, worker, tensor, "INPUT", registered, "chip_a", 0)
+            args.add_tensor.assert_called_once_with(wire, "INPUT")
+            args.reset_mock()
+            add_chip_tensor_arg(args, worker, tensor, "INOUT", registered, "chip_b", 1)
+            args.add_tensor.assert_called_once_with(wire, "INOUT")
+            resident = DeviceTensor(0xABCD, (2,), torch.float32)
+            with pytest.raises(ValueError, match="host control tensor slot 1 requires a CPU tensor"):
+                add_chip_tensor_arg(args, worker, resident, "INOUT", registered, "chip_a", 1)
+
     def test_raises_on_inconsistent_runtime(self, tmp_path, stub_device_runner):
         compiled = self._build(tmp_path, ["chip_a", "chip_b"])
         stub_device_runner._compile_and_assemble.side_effect = [
@@ -2285,16 +2507,64 @@ class TestSubmitChip:
         assert sorted(d.name for d in (tmp_path / "rank0").iterdir()) == ["d0", "d1", "d2"]
         assert [c[2] for c in orch.calls] == [str(tmp_path)] * 3
 
-    def test_counter_resets_when_orch_dispatch_idx_cleared(self, tmp_path):
-        # ``orch_fn`` clears ``_dfx_dispatch_idx`` at the top of every run, so a
-        # given card's dispatch numbering matches across the swimlane two-pass.
+    def test_oneshot_counter_resets_between_passes(self, tmp_path):
+        # The one-shot path forks a fresh child per pass, so its capture counter
+        # restarts; the reset with no ``dispatch_idx`` must mirror that.
         chip_cids = {"chip": object()}
         orch = _RecordingOrch()
-        _reset_dfx_dispatch_state(orch, chip_cids)
         cfg = _SpyDfxConfig(output_prefix=str(tmp_path))
+        _reset_dfx_dispatch_state(orch, chip_cids)
         _submit_chip(orch, chip_cids["chip"], "ta", cfg, 0)  # pass 1: d0
-        orch._dfx_dispatch_idx = {}  # what orch_fn does between passes
+        _reset_dfx_dispatch_state(orch, chip_cids)  # fresh child per pass
         _submit_chip(orch, chip_cids["chip"], "ta", cfg, 0)  # pass 2: d0 again
+        assert [d.name for d in (tmp_path / "rank0").iterdir()] == ["d0"]
+
+    def test_shared_counter_spans_prepared_runs(self, tmp_path):
+        # A prepared or persistent worker reuses one child, whose
+        # ``local_capture_index`` spans the process. The worker-owned dict must
+        # therefore keep counting across runs instead of restarting at d0, or
+        # the marker lands in a directory with no capture (plan 135, RC2).
+        chip_cids = {"chip": object()}
+        shared: dict[str, int] = {}
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix=str(tmp_path))
+
+        for _ in range(2):  # one two-pass run: graph then timing
+            _reset_dfx_dispatch_state(orch, chip_cids, dispatch_idx=shared)
+            _submit_chip(orch, chip_cids["chip"], "ta", cfg, 0)
+
+        # A later run on the same worker continues the child's numbering.
+        _reset_dfx_dispatch_state(orch, chip_cids, dispatch_idx=shared)
+        _submit_chip(orch, chip_cids["chip"], "ta", cfg, 0)
+
+        assert sorted(d.name for d in (tmp_path / "rank0").iterdir()) == ["d0", "d1", "d2"]
+        for name in ("d0", "d1", "d2"):
+            assert (tmp_path / "rank0" / name / "dispatch_program.json").is_file()
+
+    def test_rejected_submit_does_not_advance_the_shared_counter(self, tmp_path):
+        # A synchronous rejection creates no capture. Counting it would put every
+        # later marker one directory ahead of the child's numbering -- which the
+        # per-run reset used to hide and a prepared worker's shared counter would
+        # not (plan 135 review, codex P2).
+        chip_cids = {"chip": object()}
+        shared: dict[str, int] = {}
+        cfg = _SpyDfxConfig(output_prefix=str(tmp_path))
+
+        class _RejectingOrch(_RecordingOrch):
+            def submit_next_level(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+                raise RuntimeError("stale simpler tensor")
+
+        orch = _RejectingOrch()
+        _reset_dfx_dispatch_state(orch, chip_cids, dispatch_idx=shared)
+        with pytest.raises(RuntimeError, match="stale simpler tensor"):
+            _submit_chip(orch, chip_cids["chip"], "ta", cfg, 0)
+        assert shared.get("rank0", 0) == 0, shared
+
+        # The next accepted submit reuses d0 and overwrites the stale marker.
+        ok = _RecordingOrch()
+        _reset_dfx_dispatch_state(ok, chip_cids, dispatch_idx=shared)
+        _submit_chip(ok, chip_cids["chip"], "ta", cfg, 0)
+        assert shared["rank0"] == 1
         assert [d.name for d in (tmp_path / "rank0").iterdir()] == ["d0"]
 
     def test_dfx_off_forwards_unchanged(self):
@@ -2372,6 +2642,66 @@ class TestSubmitChip:
 
         assert orch.calls == [("chip_a", 0, str(tmp_path))]
         assert not (tmp_path / "rank0" / "d0" / "dispatch_program.json").exists()
+
+
+class TestDfxCounterWiring:
+    """The prepared paths hand their process-scoped counter to the run closure."""
+
+    def test_prepared_native_dispatch_passes_the_worker_counter(self, monkeypatch):
+        import pypto.runtime.distributed_runner as dr  # noqa: PLC0415
+
+        seen: dict[str, object] = {}
+
+        def _fake_submit(*_args: object, **kwargs: object) -> str:
+            seen.update(kwargs)
+            return "handle"
+
+        monkeypatch.setattr(dr, "_submit_dispatch", _fake_submit)
+        worker = dr.DistributedWorker.__new__(dr.DistributedWorker)
+        worker._persistent = False
+        worker._w = object()
+        worker._dfx_dispatch_idx = {}
+        state = {"entry_fn": None, "chip_cids": {}, "sub_ids": {}, "device_nums": 1, "window_sources": {}}
+
+        assert worker._submit_prepared_native(state, {}, None, [], []) == "handle"
+        assert seen["dfx_dispatch_idx"] is worker._dfx_dispatch_idx
+
+    def test_persistent_request_passes_the_worker_counter(self, monkeypatch):
+        import pypto.runtime.distributed_runner as dr  # noqa: PLC0415
+
+        seen: dict[str, object] = {}
+
+        def _fake_reset(_orch: object, _chip_cids: object, **kwargs: object) -> None:
+            seen.update(kwargs)
+
+        class _FakeWorker:
+            def submit(self, request):  # noqa: ANN001
+                request(object(), None, None)
+                return "handle"
+
+        monkeypatch.setattr(dr, "_reset_dfx_dispatch_state", _fake_reset)
+        worker = dr.DistributedWorker.__new__(dr.DistributedWorker)
+        worker._persistent_error = None
+        worker._persistent_error_reported = False
+        worker._persistent_domains_by_program = {}
+        worker._reset_persistent_windows = False
+        worker._dfx_dispatch_idx = {}
+        worker._w = _FakeWorker()
+
+        def _entry(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        state = {
+            "persistent_id": "p",
+            "chip_cids": {},
+            "sub_ids": {},
+            "device_nums": 1,
+            "entry_fn": _entry,
+            "window_sources": {},
+        }
+
+        assert worker._submit_persistent(state, {}, None, [], []) == "handle"
+        assert seen["dispatch_idx"] is worker._dfx_dispatch_idx
 
 
 def _write_dfx_dispatch_dirs(dfx: Path, *rels: str) -> None:
@@ -2724,11 +3054,10 @@ class TestCollectL3Swimlane:
     def test_pairing_recovers_the_program_marker_from_the_graph_capture(
         self, tmp_path, monkeypatch, fake_swimlane_converter
     ):
-        # ``_submit_chip`` derives the marker's directory from *this run's*
-        # dispatch ordinal, so the marker lands on the graph capture and the
-        # records' own capture has none. With two programs in the build the
-        # single-program fallback cannot save it (issue #2169), so the pairing
-        # has to carry the marker across.
+        # Older artifacts (or the one-shot layout) carry the marker only on the
+        # graph capture, and the records' own capture has none. With two
+        # programs in the build the single-program fallback cannot save it
+        # (issue #2169), so the pairing has to carry the marker across.
         seen = self._spy_generate_swimlane(monkeypatch)
         _write_chip_program(tmp_path, "lm_head", "lm_head_dispatch_push")
         _write_chip_program(tmp_path, "mtp_decode_layer", "mtp_projection_rms")
@@ -2742,6 +3071,82 @@ class TestCollectL3Swimlane:
         assert seen[0].work_dir == tmp_path / "next_levels" / "mtp_decode_layer"
         assert json.loads((graph / "name_map.json").read_text())["callable_id_to_name"] == {
             "0": "mtp_projection_rms"
+        }
+
+    def test_two_persistent_runs_each_resolve_their_own_program(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # A prepared/persistent worker's child keeps counting across runs, so the
+        # second run's captures start above zero (d2/d3). Each run's marker must
+        # land on its own graph capture and resolve its own program; two programs
+        # in the build rule out the single-program fallback (plan 135, RC2).
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "first_prog", "first_kernel")
+        _write_chip_program(tmp_path, "second_prog", "second_kernel")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+
+        run1_graph = _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0)
+        _mark_dispatch_program(run1_graph, "first_prog")
+        run1_timing = _write_capture(rank, "d1", records=True, run_id=2, capture_index=1)
+        _mark_dispatch_program(run1_timing, "first_prog")
+
+        run2_graph = _write_capture(rank, "d2", deps=True, run_id=3, capture_index=2)
+        _mark_dispatch_program(run2_graph, "second_prog")
+        run2_timing = _write_capture(rank, "d3", records=True, run_id=4, capture_index=3)
+        _mark_dispatch_program(run2_timing, "second_prog")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert not run1_timing.exists()
+        assert not run2_timing.exists()
+        by_dir = {s.out_dir: s for s in seen}
+        assert by_dir[run1_graph].work_dir == tmp_path / "next_levels" / "first_prog"
+        assert by_dir[run2_graph].work_dir == tmp_path / "next_levels" / "second_prog"
+
+    def test_folding_keeps_the_timing_pass_marker(self, tmp_path, monkeypatch, fake_swimlane_converter):
+        # Both passes are marked once the counter spans the process. Folding must
+        # not drop the timing pass's marker, and must not leave the timing dir
+        # behind just because the graph dir already has one.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        graph = _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0)
+        _mark_dispatch_program(graph, "only_chip")
+        timing = _write_capture(rank, "d1", records=True, run_id=2, capture_index=1)
+        _mark_dispatch_program(timing, "only_chip")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert not timing.exists()
+        assert json.loads((graph / "dispatch_program.json").read_text()) == {"program": "only_chip"}
+        assert json.loads((graph / "dispatch_program.timing.json").read_text()) == {"program": "only_chip"}
+        assert [s.out_dir for s in seen] == [graph]
+
+    def test_folding_promotes_the_timing_marker_when_the_graph_pass_left_none(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # ``_record_dispatch_program`` is best-effort, so the graph pass can fail
+        # to write its marker while the timing pass succeeds. Filing the survivor
+        # as ``dispatch_program.timing.json`` would hide it from
+        # ``_read_dispatch_program`` and lose the labels (plan 135 review).
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "first_prog", "first_kernel")
+        _write_chip_program(tmp_path, "second_prog", "second_kernel")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        graph = _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0)
+        timing = _write_capture(rank, "d1", records=True, run_id=2, capture_index=1)
+        _mark_dispatch_program(timing, "second_prog")  # graph pass wrote none
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert not timing.exists()
+        assert json.loads((graph / "dispatch_program.json").read_text()) == {"program": "second_prog"}
+        assert not (graph / "dispatch_program.timing.json").exists()
+        assert [s.out_dir for s in seen] == [graph]
+        # The promoted marker is what lets the converter resolve the labels.
+        assert seen[0].work_dir == tmp_path / "next_levels" / "second_prog"
+        assert json.loads((graph / "name_map.json").read_text())["callable_id_to_name"] == {
+            "0": "second_kernel"
         }
 
     def test_pairing_follows_the_dispatch_not_the_directory_order(
@@ -3058,6 +3463,15 @@ class _PersistentRunResources:
         self.requires_ordered_cleanup = False
 
 
+class _PersistentHostMapping:
+    def __init__(self, data: bytearray) -> None:
+        self.data = data
+
+    @property
+    def buf(self) -> memoryview:
+        return memoryview(self.data)
+
+
 class _PersistentDomainHandle:
     def __init__(
         self,
@@ -3072,6 +3486,8 @@ class _PersistentDomainHandle:
         self.name = name
         self.workers = tuple(workers)
         self.contexts = {}
+        self.buffer_specs = buffers
+        self.host_data = {worker: bytearray(window_size) for worker in workers}
         for worker_id in workers:
             local_window_base = 0x10000000 + allocation_index * 0x100000 + worker_id * 0x10000
             offset = 0
@@ -3082,6 +3498,7 @@ class _PersistentDomainHandle:
                     int(spec.nbytes),
                     owner_worker_id=worker_id,
                 )
+                setattr(named_buffers[spec.name], "shm", _PersistentHostMapping(self.host_data[worker_id]))
                 offset += int(spec.nbytes)
             self.contexts[worker_id] = SimpleNamespace(
                 local_window_base=local_window_base,
@@ -3097,6 +3514,17 @@ class _PersistentDomainHandle:
         self.freed = False
         self.release_error: BaseException | None = None
         self.free_on_release = True
+
+    def buffer_range(self, name):
+        offset = 0
+        for spec in self.buffer_specs:
+            if spec.name == name:
+                return offset, spec.nbytes
+            offset += spec.nbytes
+        raise KeyError(name)
+
+    def member(self, rank):
+        return self.contexts[self.workers[rank]]
 
     def __getitem__(self, worker_id: int):
         return self.contexts[worker_id]
@@ -3139,7 +3567,9 @@ class _PersistentOrch:
     def __init__(self, worker: Any) -> None:
         self.worker = worker
         self.allocate_calls: list[dict[str, Any]] = []
+        self.reuse_calls: list[dict[str, Any]] = []
         self.copy_calls: list[tuple[_FakeBuffer, _FakeBuffer, bytes]] = []
+        self.host_buffer_ids: set[int] = set()
         self.handles: list[_PersistentDomainHandle] = []
         self.resources: list[_PersistentRunResources] = []
         self.worker.close.side_effect = self._close_live_domains
@@ -3155,6 +3585,7 @@ class _PersistentOrch:
         self.worker._building_run_resources = None
         with resources.domain_lock:
             resources.retired = True
+            resources.live_domains.clear()
 
     def run(self, fn, *, before_retire=None, on_error=None):
         resources = self._begin_run()
@@ -3181,26 +3612,52 @@ class _PersistentOrch:
             self.worker._building_run_resources = None
         raise RuntimeError("run finalization abandoned")
 
-    def allocate_domain(self, **kwargs):
-        self.allocate_calls.append(kwargs)
+    def get_or_allocate_domain(self, **kwargs):
+        # Match Simpler's physical-size constraints so lifecycle tests cannot
+        # reach reset/reuse assertions with domains the real runtime rejects.
+        if kwargs["window_size"] % 64:
+            raise ValueError("domain window_size must be a multiple of 64 bytes")
+        for buffer in kwargs["buffers"]:
+            if buffer.nbytes % 64:
+                raise ValueError(
+                    f"domain buffer {buffer.name!r}: nbytes={buffer.nbytes} must be a multiple of 64 bytes"
+                )
+        self.reuse_calls.append(kwargs)
+        assert kwargs["retain_after_run"] is True
         resources = self.worker._building_run_resources
         assert isinstance(resources, _PersistentRunResources)
-        handle = _PersistentDomainHandle(
-            kwargs["name"],
-            list(kwargs["workers"]),
-            int(kwargs["window_size"]),
-            len(self.handles),
-            self.worker,
-            resources,
-            list(kwargs["buffers"]),
-        )
-        self.handles.append(handle)
-        self.worker._live_domains[handle.name] = handle
+        handle = self.worker._live_domains.get(kwargs["name"])
+        if handle is None:
+            self.allocate_calls.append(kwargs)
+            handle = _PersistentDomainHandle(
+                kwargs["name"],
+                list(kwargs["members"]),
+                int(kwargs["window_size"]),
+                len(self.handles),
+                self.worker,
+                resources,
+                list(kwargs["buffers"]),
+            )
+            if kwargs.get("memory_source") == "host":
+                self.host_buffer_ids.update(
+                    id(buffer) for context in handle.contexts.values() for buffer in context.buffers.values()
+                )
+            if initializer := kwargs.get("initializer"):
+                initializer(handle)
+            self.handles.append(handle)
+            self.worker._live_domains[handle.name] = handle
+        # Public reuse registers the domain with each run and moves its
+        # release fence to the latest use; PyPTO must not remove this claim.
+        handle.owner = resources
         resources.live_domains[handle.name] = handle
         resources.requires_ordered_cleanup = True
         return handle
 
     def copy_to(self, dst: _FakeBuffer, src: _FakeBuffer) -> None:
+        if id(dst) in self.host_buffer_ids:
+            raise ValueError(
+                "Worker.copy_to: use Buffer.shm.buf for CPU copies of Host-source domain buffers"
+            )
         payload = ctypes.string_at(int(src.base), int(src.nbytes))
         self.copy_calls.append((dst, src, payload))
 
@@ -3221,6 +3678,7 @@ def _persistent_entry(
     seen_handles: list[Any],
     *,
     buffer_nbytes: tuple[int, ...] | None = None,
+    memory_source: str | None = None,
 ):
     sizes = (window_size,) if buffer_nbytes is None else buffer_nbytes
 
@@ -3238,7 +3696,11 @@ def _persistent_entry(
     ):
         del orch, _args, config, tensors, callables, sub_ids, _keep
         assert _domain_provider is not None
+        resource_kwargs = (
+            {} if memory_source is None else {"memory_source": memory_source, "workspace_engines": ("urma",)}
+        )
         with _domain_provider(
+            **resource_kwargs,
             name="comm_d0",
             workers=[*range(world_size)],
             window_size=window_size,
@@ -3252,7 +3714,140 @@ def _persistent_entry(
     return entry
 
 
+@pytest.mark.parametrize("persistent", [False, True])
+def test_window_sources_are_forwarded_only_at_runtime(patched_setup, persistent):
+    m = patched_setup
+    seen = []
+
+    def entry(*args, _window_sources, _domain_provider=None, **kwargs):
+        seen.append(_window_sources)
+
+    setattr(entry, "_window_source_keys", ("engram",))
+    m["load_entry"].return_value = (entry, None)
+    compiled = _fake_compiled([_param("a", [16, 16])], [])
+    source = io.BytesIO(b"shard")
+    files = [source]
+    m["worker"].submit.side_effect = lambda fn: (fn(MagicMock(), None, None), _ImmediateNativeHandle())[1]
+    m["submit_dispatch"].side_effect = _submit_dispatch
+    with DistributedWorker(compiled, persistent=persistent, window_sources={"engram": files}) as rt:
+        files.clear()
+        rt(_resident(rt, (16, 16)))
+    assert seen == [{"engram": (source,)}]
+    assert not source.closed
+
+
+@pytest.mark.parametrize("bindings,pattern", [({}, "Missing window_sources"), ({"typo": []}, "not used")])
+def test_window_sources_validate_before_worker_init(patched_setup, bindings, pattern):
+    m = patched_setup
+
+    def entry(*args, **kwargs):
+        pass
+
+    setattr(entry, "_window_source_keys", ("engram",) if not bindings else ())
+    m["load_entry"].return_value = (entry, None)
+    compiled = _fake_compiled([_param("a", [16, 16])], [])
+    with pytest.raises(ValueError, match=pattern):
+        DistributedWorker(compiled, window_sources=bindings)
+    m["worker"].init.assert_not_called()
+
+
 class TestPersistentDistributedWorker:
+    @pytest.mark.parametrize("reset", [None, False, True])
+    def test_host_domain_reuse_and_reset_policy(self, patched_setup, reset):
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        m["worker"].create_buffer.side_effect = lambda size: _FakeBuffer(0, size, host=True)
+        orch = _PersistentOrch(m["worker"])
+
+        def worker_submit(fn):
+            orch.run(fn)
+            return _ImmediateNativeHandle()
+
+        m["worker"].submit.side_effect = worker_submit
+        handles = []
+        m["load_entry"].return_value = (
+            _persistent_entry(256, handles, buffer_nbytes=(64, 192), memory_source="host"),
+            None,
+        )
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled._distributed_config = DistributedConfig(device_ids=[0, 1])
+        rt = DistributedWorker(compiled, persistent=True, reset_persistent_windows=reset)
+        arg = _resident(rt, (16, 16))
+        try:
+            rt(arg)
+            for worker_id, data in handles[0].host_data.items():
+                data[:] = b"\xa5" * 320
+                handles[0][worker_id].actual_window_size = 320
+            m["worker"].create_buffer.reset_mock()
+            rt(arg)
+            assert handles[0] is handles[1]
+            assert len(orch.allocate_calls) == 1
+            assert orch.allocate_calls[0]["memory_source"] == "host"
+            assert orch.allocate_calls[0]["workspace_engines"] == ("urma",)
+            assert orch.copy_calls == []
+            m["worker"].create_buffer.assert_not_called()
+            expected_window = b"\xa5" * 256 if reset is False else bytes(256)
+            for data in handles[0].host_data.values():
+                assert data == expected_window + b"\xa5" * 64
+                # A leaked memoryview export would prevent resizing on cleanup.
+                data.extend(b"done")
+        finally:
+            rt.close()
+
+    @pytest.mark.parametrize("tensor_source", [False, True])
+    @pytest.mark.parametrize("reset", [None, False, True])
+    def test_initialized_host_and_device_reuse_share_reset_policy(self, patched_setup, tensor_source, reset):
+        from pypto.runtime.window_sources import make_window_initializer  # noqa: PLC0415
+
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        orch = _PersistentOrch(m["worker"])
+        m["worker"].submit.side_effect = lambda fn: (orch.run(fn), _ImmediateNativeHandle())[1]
+        m["worker"].create_buffer.side_effect = lambda size: _FakeBuffer(0, size, host=True)
+        source = torch.tensor(list(b"table"), dtype=torch.uint8) if tensor_source else io.BytesIO(b"table")
+        device_entry = _persistent_entry(64, [])
+        loaded = []
+
+        def entry(orch, *args, _window_sources, _domain_provider, **kwargs):
+            initializer = make_window_initializer(_window_sources, (("data", "engram", 5),), 1)
+            spec = SimpleNamespace(name="data", dtype="opaque", count=5, nbytes=64)
+            with _domain_provider(
+                name="host_table",
+                workers=[1],
+                window_size=64,
+                buffers=[spec],
+                memory_source="host",
+                workspace_engines=("urma",),
+                initializer=initializer,
+            ) as domain:
+                loaded.append(domain.host_data[1][:5])
+            device_entry(orch, *args, _domain_provider=_domain_provider, **kwargs)
+
+        setattr(entry, "_window_source_keys", ("engram",))
+        m["load_entry"].return_value = (entry, None)
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        with DistributedWorker(
+            compiled, persistent=True, reset_persistent_windows=reset, window_sources={"engram": [source]}
+        ) as rt:
+            arg = _resident(rt, (16, 16))
+            rt(arg)
+            # Reuse must neither reread a closed file nor copy mutated tensor data.
+            if isinstance(source, torch.Tensor):
+                source.zero_()
+            else:
+                source.close()
+            rt(arg)
+            assert loaded == [b"table", b"table" if reset is False else bytes(5)]
+            assert len(orch.allocate_calls) == 2
+            # Host bytes above follow the same reset policy as the Device
+            # window, but only the Device window may use orch.copy_to.
+            expected_copies = [] if reset is False else [(0, 64)]
+            assert [(dst.owner_worker_id, dst.nbytes) for dst, _src, _payload in orch.copy_calls] == (
+                expected_copies
+            )
+            assert all(payload == bytes(dst.nbytes) for dst, _src, payload in orch.copy_calls)
+            assert len(orch.reuse_calls) == 4
+
     def test_window_reset_requires_persistent_mode(self):
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         with pytest.raises(ValueError, match="requires persistent=True"):
@@ -3263,21 +3858,16 @@ class TestPersistentDistributedWorker:
         with pytest.raises(ValueError, match="requires regenerated host orchestration"):
             DistributedWorker(compiled, persistent=True)
 
-    @pytest.mark.parametrize("attribute", ["_live_domains", "_building_run_resources"])
-    def test_rejects_missing_persistent_runtime_hooks_before_init(self, patched_setup, attribute):
+    def test_initialization_does_not_require_private_retention_hooks(self, patched_setup):
         m = patched_setup
-        if attribute == "_live_domains":
-            m["worker"]._live_domains = None
-        else:
-            del m["worker"]._building_run_resources
+        del m["worker"]._live_domains
+        del m["worker"]._building_run_resources
         m["load_entry"].return_value = (_persistent_entry(64, []), None)
         compiled = _fake_compiled([_param("a", [16, 16])], [])
 
-        with pytest.raises(RuntimeError, match=attribute):
-            DistributedWorker(compiled, persistent=True)
-
-        m["worker"].init.assert_not_called()
-        m["worker"].close.assert_called_once_with()
+        rt = DistributedWorker(compiled, persistent=True)
+        m["worker"].init.assert_called_once()
+        rt.close()
 
     def test_request_run_fences_reuse_and_zero_domain_by_default(self, patched_setup):
         m = patched_setup
@@ -3302,16 +3892,21 @@ class TestPersistentDistributedWorker:
         orch = _PersistentOrch(m["worker"])
         submit_threads: list[int] = []
 
+        def assert_domain_owned_by_current_run() -> None:
+            resources = m["worker"]._building_run_resources
+            assert resources.live_domains == {"p0:comm_d0": orch.handles[0]}
+            assert orch.handles[0].owner is resources
+
         def worker_submit(fn):
             submit_threads.append(threading.get_ident())
-            orch.run(fn)
+            orch.run(fn, before_retire=assert_domain_owned_by_current_run)
             return _ImmediateNativeHandle()
 
         m["worker"].submit.side_effect = worker_submit
         seen_handles: list[Any] = []
-        window_size = (1 << 20) + 17
+        window_size = (1 << 20) + 64
         m["load_entry"].return_value = (
-            _persistent_entry(window_size, seen_handles, buffer_nbytes=(1 << 20, 17)),
+            _persistent_entry(window_size, seen_handles, buffer_nbytes=(1 << 20, 64)),
             None,
         )
         compiled = _fake_compiled([_param("a", [16, 16])], [])
@@ -3342,8 +3937,8 @@ class TestPersistentDistributedWorker:
         assert [(dst.owner_worker_id, dst.nbytes) for dst, _src, _payload in orch.copy_calls] == [
             (0, 1 << 20),
             (1, 1 << 20),
-            (0, 17),
-            (1, 17),
+            (0, 64),
+            (1, 64),
         ]
         assert all(payload == bytes(dst.nbytes) for dst, _src, payload in orch.copy_calls)
         assert [src for _dst, src, _payload in orch.copy_calls] == [
@@ -3388,6 +3983,9 @@ class TestPersistentDistributedWorker:
         assert len(rt._active_dispatch_handles) == 2
         assert len(orch.allocate_calls) == 1
         assert seen_handles == [domain, domain, domain]
+        assert len(orch.reuse_calls) == 3
+        assert all(call["members"] == [0] for call in orch.reuse_calls)
+        assert domain.owner is orch.resources[-1]
 
         closer = threading.Thread(target=rt.close)
         closer.start()
@@ -3423,13 +4021,66 @@ class TestPersistentDistributedWorker:
         assert orch.copy_calls == []
         assert m["worker"].submit.call_count == 2
 
+    @pytest.mark.parametrize("mapping_nbytes", [4096, 2 << 20])
+    def test_reset_accepts_aligned_physical_window(self, patched_setup, mapping_nbytes):
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        orch = _PersistentOrch(m["worker"])
+        m["worker"].submit.side_effect = lambda fn: (orch.run(fn), _ImmediateNativeHandle())[1]
+        seen_handles: list[Any] = []
+        m["load_entry"].return_value = (_persistent_entry(64, seen_handles), None)
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled._distributed_config = DistributedConfig(device_ids=[0, 1])
+        rt = DistributedWorker(compiled, persistent=True)
+        arg = _resident(rt, (16, 16))
+        try:
+            rt(arg)
+            # A5 reports its aligned physical mapping; named buffers still
+            # cover only the requested extent, so padding must not be copied.
+            for context in orch.handles[0].contexts.values():
+                context.actual_window_size = mapping_nbytes
+            rt(arg)
+
+            assert len(orch.allocate_calls) == 1
+            assert seen_handles[0] is seen_handles[1]
+            assert [(dst.owner_worker_id, len(payload)) for dst, _src, payload in orch.copy_calls] == [
+                (0, 64),
+                (1, 64),
+            ]
+            assert all(payload == bytes(64) for _dst, _src, payload in orch.copy_calls)
+        finally:
+            rt.close()
+        assert orch.handles[0].backend_release_count == 1
+        assert orch.handles[0].freed
+
+    def test_reset_rejects_undersized_physical_window(self, patched_setup):
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        orch = _PersistentOrch(m["worker"])
+        m["worker"].submit.side_effect = lambda fn: (orch.run(fn), _ImmediateNativeHandle())[1]
+        m["load_entry"].return_value = (_persistent_entry(64, []), None)
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled._distributed_config = DistributedConfig(device_ids=[0, 1])
+        rt = DistributedWorker(compiled, persistent=True)
+        arg = _resident(rt, (16, 16))
+        try:
+            rt(arg)
+            # Validate every rank before any copy, including a short mapping
+            # on a later rank after an earlier rank passed the size check.
+            orch.handles[0].contexts[1].actual_window_size = 32
+            with pytest.raises(RuntimeError, match="window.*worker 1"):
+                rt(arg)
+            assert orch.copy_calls == []
+        finally:
+            rt.close()
+
     def test_reset_rejects_unnamed_window_slack(self, patched_setup):
         m = patched_setup
         m["worker"]._live_domains = {}
         orch = _PersistentOrch(m["worker"])
         m["worker"].submit.side_effect = lambda fn: (orch.run(fn), _ImmediateNativeHandle())[1]
         m["load_entry"].return_value = (
-            _persistent_entry(64, [], buffer_nbytes=(4,)),
+            _persistent_entry(128, [], buffer_nbytes=(64,)),
             None,
         )
         compiled = _fake_compiled([_param("a", [16, 16])], [])
@@ -3647,7 +4298,7 @@ class TestPersistentDistributedWorker:
                 name="comm_d0",
                 workers=[*range(world_size)],
                 window_size=64,
-                buffers=[SimpleNamespace(name="signal", dtype="opaque", count=4, nbytes=4)],
+                buffers=[SimpleNamespace(name="signal", dtype="opaque", count=64, nbytes=64)],
             ):
                 raise RuntimeError("persistent dispatch failed")
 
@@ -3692,7 +4343,8 @@ class TestPersistentDistributedWorker:
         handle = orch.handles[0]
         owner = orch.resources[0]
         assert not owner.retired
-        assert owner.live_domains == {}
+        # An unfinished run keeps its ownership claim until Simpler drains it.
+        assert owner.live_domains == {"p0:comm_d0": handle}
         assert owner.pending_release_domains == []
         assert handle.release_count == 0
         assert m["worker"]._live_domains == {"p0:comm_d0": handle}
@@ -4298,6 +4950,201 @@ class TestDeviceMemoryInfo:
         with pytest.raises(RuntimeError, match="query failed"):
             rt.device_memory_info(0)
         rt.close()
+
+
+def test_host_domain_runtime_capability_check():
+    class OldOrch:
+        def allocate_domain(self, *, workers, window_size):
+            raise AssertionError("validation must not allocate")
+
+    class NewOrch:
+        def allocate_domain(self, *, memory_source, workspace_engines):
+            raise AssertionError("validation must not allocate")
+
+    setattr(NewOrch, "get_or_allocate_domain", NewOrch.allocate_domain)
+    with pytest.raises(RuntimeError, match="#2913"):
+        validate_host_domain_runtime(OldOrch())
+    validate_host_domain_runtime(NewOrch())
+    with pytest.raises(RuntimeError, match="#2939"):
+        validate_host_domain_runtime(NewOrch(), initialized=True)
+
+    class InitializingOrch:
+        def allocate_domain(self, *, memory_source, workspace_engines, initializer):
+            raise AssertionError("validation must not allocate")
+
+        get_or_allocate_domain = allocate_domain
+
+    validate_host_domain_runtime(InitializingOrch, initialized=True)
+
+
+def test_persistent_domain_identity_includes_source_and_workspace():
+    base = {"workers": [0, 1], "window_size": 256, "buffers": []}
+    device = DistributedWorker._persistent_domain_spec(base)
+    host = DistributedWorker._persistent_domain_spec({**base, "memory_source": "host"})
+    urma = DistributedWorker._persistent_domain_spec({**base, "workspace_engines": ("urma",)})
+    assert len({device, host, urma}) == 3
+
+
+@pytest.fixture
+def external_window_worker(patched_setup, tmp_path):
+    from pypto.runtime.comm_domain import (  # noqa: PLC0415
+        CommDomain,
+        DomainBufferSpec,
+        DomainState,
+        build_domain_layout,
+    )
+
+    compiled = _fake_compiled(
+        [_ParamInfo("a", ParamDirection.In, (4,), DataType.FP32, "ND", is_distributed=True)], []
+    )
+    compiled.output_dir = tmp_path
+    compiled.platform = "a2a3"
+    entry, _ = patched_setup["load_entry"].return_value
+    entry._window_requirements = {0: (True, (), None)}
+    patched_setup["worker"]._accepted_run_handles = set()
+    patched_setup["worker"]._abandoned_run_handles = []
+    patched_setup["worker"]._hierarchical_start_cv = threading.Condition()
+    with DistributedWorker(compiled) as worker:
+        slots, _ = build_domain_layout([DomainBufferSpec("table", (4,), DataType.FP32)])
+        domain = CommDomain(worker, (0,), slots, "device", ())
+        domain._native = MagicMock(freed=False)
+        domain._native.release.side_effect = lambda: setattr(domain._native, "freed", True)
+        domain._ref = MagicMock(owner_instance_id=b"instance", domain_id=10, generation=1)
+        domain._state = DomainState.LIVE
+        domain._tokens[0] = MagicMock()
+        worker._external_domains[domain.ref] = domain
+        yield worker, compiled, domain
+
+
+def test_external_release_fences_interrupted_submission(patched_setup, external_window_worker):
+    """An accepted run can outlive the submit() call that raised."""
+    worker, compiled, domain = external_window_worker
+    native = _ControlledNativeHandle()
+
+    def accepted(*_args, **_kwargs):
+        patched_setup["worker"]._accepted_run_handles.add(native)
+        raise KeyboardInterrupt("accepted")
+
+    patched_setup["submit_dispatch"].side_effect = accepted
+    table = domain.tensor("table")
+    with pytest.raises(KeyboardInterrupt, match="accepted"):
+        worker.submit(compiled, table)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        release = pool.submit(domain.release)
+        try:
+            assert native.result_started.wait(timeout=2)
+            domain._native.release.assert_not_called()
+            patched_setup["worker"].release_buffer.assert_not_called()
+        finally:
+            native.complete()
+        release.result(timeout=2)
+    domain._native.release.assert_called_once()
+    patched_setup["worker"].release_buffer.assert_called_once()
+    with pytest.raises(RuntimeError, match="released"):
+        worker.submit(compiled, table)
+
+
+@pytest.mark.parametrize("interrupted_pass", [1, 2])
+def test_interrupted_swimlane_pass_retains_window(patched_setup, external_window_worker, interrupted_pass):
+    worker, compiled, domain = external_window_worker
+    native = _ControlledNativeHandle()
+    handles = [_ImmediateNativeHandle()] * (interrupted_pass - 1) + [native]
+    patched_setup["submit_dispatch"].side_effect = handles
+    table = domain.tensor("table")
+    try:
+        with patch.object(native, "result", side_effect=KeyboardInterrupt), pytest.raises(KeyboardInterrupt):
+            worker.submit(compiled, table, config=RunConfig(platform="a2a3", enable_chip_swimlane=1))
+        assert patched_setup["submit_dispatch"].call_count == interrupted_pass
+        (frame,) = [f for f in worker._dispatch_frames if f.in_use]
+        assert frame.external_domains == (domain,)
+        assert table in frame.keepalive
+        assert frame.handle in worker._active_dispatch_handles
+    finally:
+        native.complete()
+    domain.release()
+    assert native.result_started.is_set()
+    assert not frame.in_use
+    domain._native.release.assert_called_once()
+
+
+def test_abandoned_submit_retains_resources_through_close_retry(patched_setup, external_window_worker):
+    worker, compiled, domain = external_window_worker
+    native = MagicMock(done=True, _finalization_abandoned=True)
+    native.result.side_effect = RuntimeError("native cancellation unsettled")
+    native_worker = patched_setup["worker"]
+    cleanup = MagicMock()
+
+    def abandon(_state, _tensors, _config, _keepalive, callbacks):
+        callbacks.append(cleanup)
+        native_worker._abandoned_run_handles.append(native)
+        raise KeyboardInterrupt("submit interrupted")
+
+    with (
+        patch.object(worker, "_submit_prepared_native", side_effect=abandon),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        worker.submit(compiled, domain.tensor("table"))
+    with pytest.raises(RuntimeError, match="native cancellation unsettled"):
+        domain.release()
+    (frame,) = [f for f in worker._dispatch_frames if f.in_use]
+    assert frame.abandoned
+    assert domain in frame.external_domains
+    native_worker.close.side_effect = RuntimeError("teardown not complete")
+    with pytest.raises(RuntimeError, match="teardown not complete"):
+        worker.close()
+    assert frame.in_use and frame.keepalive
+    cleanup.assert_not_called()
+    domain._native.release.assert_not_called()
+    native_worker.release_buffer.assert_not_called()
+
+    native_worker.close.side_effect = lambda: setattr(domain._native, "freed", True)
+    worker.close()
+    assert not frame.in_use
+    assert not frame.keepalive
+    assert not frame.cleanup
+    cleanup.assert_not_called()  # Native whole-worker teardown reclaimed the buffers.
+
+
+def test_terminal_failure_retires_frame_before_concurrent_release(patched_setup, external_window_worker):
+    worker, compiled, domain = external_window_worker
+    native = _ControlledNativeHandle()
+    patched_setup["submit_dispatch"].return_value = native
+    handle = worker.submit(compiled, domain.tensor("table"))
+    native.complete(RuntimeError("run failed"))
+    retiring = threading.Event()
+    resume = threading.Event()
+    original_retire = worker._retire_dispatch_handle
+    release_waiting = threading.Event()
+    original_wait = handle._cv.wait
+
+    def observe_wait(*args, **kwargs):
+        release_waiting.set()
+        return original_wait(*args, **kwargs)
+
+    def pause_before_retire(*args, **kwargs):
+        retiring.set()
+        assert resume.wait(timeout=5)
+        original_retire(*args, **kwargs)
+
+    with (
+        patch.object(worker, "_retire_dispatch_handle", side_effect=pause_before_retire),
+        patch.object(handle._cv, "wait", side_effect=observe_wait),
+    ):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            waiting = pool.submit(handle.result)
+            try:
+                assert retiring.wait(timeout=2)
+                assert not handle.done
+                release = pool.submit(domain.release)
+                assert release_waiting.wait(timeout=2)
+            finally:
+                resume.set()
+            with pytest.raises(RuntimeError, match="run failed"):
+                waiting.result(timeout=2)
+            with pytest.raises(RuntimeError, match="run failed"):
+                release.result(timeout=2)
+    domain._native.release.assert_called_once()
+    patched_setup["worker"].release_buffer.assert_called_once()
 
 
 if __name__ == "__main__":

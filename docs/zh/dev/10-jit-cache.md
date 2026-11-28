@@ -1,5 +1,9 @@
 # JIT 持久缓存
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](08-entry-points.md#迁移旧-platform-示例)。
+
 持久缓存（persistent cache）默认关闭，可跨进程复用生成代码和完整二进制。
 每个 JIT 函数还保留进程内编译对象。缓存包含可执行代码，因此必须信任缓存写入方。
 
@@ -26,9 +30,10 @@ print(pypto.cache_stats())
 ## 请求流程
 
 1. 捕获特化、源码命名空间、有效编译选项和缓存策略。诊断及显式输出请求重新编译。
-2. 建立源码、额外应用输入和工具链的完整内容标识。无法验证的输入报告旁路（bypass）。
+2. 建立源码、额外应用输入标识，以及所选策略对应的工具链标识。无法验证的输入报告旁路（bypass）。
 3. 查询兼容的进程内对象；持久对象还需要匹配捕获的缓存根目录及只读策略。
-4. 校验 GENERATED 元数据并查询完整 READY 契约，优先复用二进制，尚未发布二进制则恢复生成代码。
+4. 读取 GENERATED 的 JSON 提示，选择 READY 契约并完整校验 READY 产物。提示缺失或不可用时，
+   在同一 key 下进行有上限的 READY 查找；仍未命中则校验并恢复 GENERATED。
 5. 未命中时，在按 key 去重的事务中私有构建、打包 extern、重新检查可变源码，发布不可变 GENERATED。
 6. 普通执行或 warmup 完成二进制事务并发布 READY。后续进程加载 READY 时不运行编译阶段。
 
@@ -46,6 +51,11 @@ print(pypto.cache_stats())
 `pypto.runtime.kernel_compiler.KernelCompiler` 负责调用编译器、链接、临时输出目录
 和二进制校验。它查询已安装 Simpler SDK 的元数据，不再继承 SDK 编译器或调用其
 构建方法。这些行为适用于现有 runtime pin，不引入 kernel 执行，也不改变 program 调用语义。
+
+CPU 模拟器使用 SDK 提供的完整 incore 编译参数，包括请求的 A2/A3 或 A5 目标
+架构及导出的准入标记。仅使用通用 Host 编译器参数不能选择模拟器架构。未显式
+指定 PTO ISA 根目录时，编译过程解析 SDK 固定版本的根目录，使强制包含的目标
+头文件与 runtime 使用相同的指令定义。
 
 | 原来继承的职责 | 当前负责方 |
 | -------------- | ---------- |
@@ -108,46 +118,108 @@ with_ir = decode.compile(config=RunConfig(cache_config=pypto.CacheConfig(enabled
 共享发布成功。运行目录及私有构建树随编译对象保持有效；没有在线清理或淘汰 API。
 离线删除缓存条目或锁文件前须停止所有消费者。
 
-缓存策略由 JIT 在选择编译对象前消费，不传入编译器选项或逐次启动选项。私有输出通常
-位于工作目录的 `build_output`；若它位于缓存根内，则使用不可预测、权限为 0700 的临时
+缓存策略由 JIT 在选择编译对象前消费，不传入编译器选项或逐次启动选项。
+`PYPTO_PROG_BUILD_DIR` 指定新建私有构建和运行目录的父目录；未设置或为空时使用
+工作目录的 `build_output`。此设置不强制编译，也不改变产物身份。应在启动服务前设置；
+已有缓存对象保留原运行目录，新恢复对象使用当前设置，不复制共享产物，其 `output_dir`
+仍指向共享产物。若私有父目录位于缓存根内，则使用不可预测、权限为 0700 的临时
 父目录隔离私有构建和运行输出，不对 `TMPDIR` 执行写探测。此回退父目录可能在缓存命中
 时创建，并随编译对象保留，不自动清理。
 
+逐次调用显式请求输出、dump 或编译 profiling 时，仍实际执行编译。
+`PYPTO_EMIT_DEBUG_RUNNER` 和 `PYPTO_REBUILD_FROM_PTO` 仅在显式启用时请求重新编译；
+`0`、`false`、`no`（忽略大小写及两端空白）关闭此请求。已设置为空字符串时，保留
+原有的启用/默认行为。关闭调试脚本生成，不会删除不可变共享产物中已存在的脚本。
+
 ## 工具链支持与开销
 
-首个适配器支持 Linux ELF GCC 工具链、CANN BiSheng 布局、独立 ELF PTOAS，以及
-打包 CPython PTOAS 的启动脚本语法及带 NumPy 依赖的 PTOAS wheel 标准 pip/uv 入口脚本。
-wheel 清单覆盖实际虚拟环境与解释器、全部安装包资源、启动输入及原生依赖；拒绝导入重定向。
-标识覆盖安装内容、编译器子程序与资源、隐式包含
-目录、链接输入、Python/native 运行时文件以及 ELF 动态依赖。未知启动脚本、在线构建的
-PTOAS 扩展、不支持的编译器布局、sanitizer 构建，以及 `CPATH`、`LD_PRELOAD` 等隐式
-依赖覆盖会旁路持久缓存。最新原因可通过 `cache_stats().last_bypass_reason` 获取，
-无需开启 INFO 日志。每次旁路也由 `pypto.jit._persistent` 以 INFO 级别记录。
+默认的 `PYPTO_CACHE_IDENTITY=build` 标识本次编译实际选择的工具，并与缓存构建时的
+身份匹配；不会另外增加 expected 版本或 pin 一致性审计。
 
-ELF64 身份仅忽略经验证不分配内存且位于所有程序段之外的调试数据。
-所有 ELF 头、程序头和节头均保留，包括 `.bss` 大小、标志、对齐信息、符号表
-及节之外的字节。被忽略的节必须为 `SHT_PROGBITS`，且无标志或仅有
-`SHF_COMPRESSED`；例如，带有 `SHF_MERGE | SHF_STRINGS` 的 `.comment` 节
-仍参与哈希。清单读取期间发生变化的输入会返回不可用的身份。
-布局不变的调试数据修改不影响身份；改变布局的调试重编译
-可能保守地使缓存失效。不支持或格式错误的 ELF 布局回退为整文件 SHA-256。
-产物清单始终对完整文件进行哈希。
+| 组件 | 身份依据 |
+| ---- | -------- |
+| PyPTO | Python 包源码与打包的代码生成模板内容、实际导入扩展的完整 GNU ELF Build-ID、运行中 Python 解释器的版本及 ABI、解析后的可执行文件路径与原生 Build-ID（或内容摘要）。 |
+| Runtime | 干净的源码 checkout 版本或安装构建版本、实际原生扩展 Build-ID、Python 源码及可用的 runtime/PTO-ISA 构建元数据；源码 checkout 有未提交更改时绕过持久缓存。 |
+| PTO-ISA | runtime 的 `pto_isa.pin` 选定的版本；仅编译未命中时获取并校验 checkout。 |
+| PTOAS | 标准 wheel 启动器使用选中的 Python 解释器版本、ABI 缓存标记和原生 Build-ID（或内容摘要），以及该解释器实际选中的 PTOAS wheel 的 `METADATA`/`WHEEL`/`RECORD`、NumPy wheel 记录、原生编译器 Build-ID、启动 `.pth` 文件与探测实际观察到的非标准库启动模块；`ptoas`、`ptodsl`、`TileOps` 和 `SoftOps` 的包来源及搜索路径必须位于该 wheel 内，外部重定向会绕过持久缓存。仅支持 PTOAS→NumPy、NumPy→无依赖，其他声明的依赖会绕过持久缓存。缺少启动或 wheel 证据、不支持的启动器也会绕过持久缓存。独立 ELF 使用 Build-ID。 |
+| 设备及编排工具链 | 选中的编译器路径/版本、调用入口及实际执行的 GCC 驱动的 Build-ID、GCC 辅助程序 Build-ID、CANN 安装构建版本及链接器 Build-ID；无法识别编译器 wrapper、实际执行的 GCC 驱动或 CCEC 编译器或设备链接器为非 ELF 启动脚本，或缺少 CANN 构建版本时绕过持久缓存。CCEC 编译器和设备链接器必须是可执行的 ELF 文件；没有 Build-ID 的 ELF 文件使用内容摘要。 |
 
-隐式链接脚本支持绝对路径的 `INPUT`/`GROUP` 依赖、嵌套 `AS_NEEDED` 以及
-`OUTPUT_FORMAT`/`OUTPUT_ARCH` 声明，按选定的 sysroot 递归追踪依赖。
-相对路径、`-l` 名称、`SEARCH_DIR`、`INCLUDE` 和未知语法需要完整的链接器搜索上下文，
-当前会旁路持久缓存，继续普通私有编译。
+原生文件缺少可用 Build-ID 时回退到内容哈希。Build-ID 从小型 ELF note 读取，不读取
+整个动态库。wheel PTOAS 探测不导入其编译器包；选中解释器的启动搜索路径和钩子文件
+以及探测实际观察到的非标准库启动模块（包括 `sitecustomize`/`usercustomize`）
+的文件内容也参与 key。仅仅存在可执行启动钩子不会禁用持久缓存或进程内对象复用。
+此检查不会引入编译器包的完整导入。
 
-成功的安装标识在每个进程内按工具选择和解析后的组件清单记忆化（memoization）。
-工作目录变化会重新发现工具，因为相对搜索路径可能选择不同工具；清单未变的组件直接
-复用内容摘要。进程存活期间安装文件须保持不变，替换
-后重启进程。额外应用源码每次请求重新读取。当前路径也参与标识，移动安装可能未命中。
+这些是可观察的启动证据，并非完整的依赖追踪：`python -c` 探测无法复现任意控制台
+脚本启动逻辑。例如，钩子可能仅在 `sys.argv[0] != "-c"` 时导入某个辅助模块；只修改
+该模块可能不会改变缓存身份。存在此类条件启动行为的环境，在这些未被观察到的输入
+变化时，必须更新 `PYPTO_CACHE_EPOCH`、清空缓存或禁用缓存。对钩子文件计算哈希，
+并不等于识别了它在运行时可能加载的全部文件。缺少启动证据时仍绕过持久缓存，
+不生成共用的 `UNKNOWN` key。现有 runtime ABI 及 PTOAS 最低版本检查仍在原有路径执行。
+带有 `_online` 构建目录的 PTOAS 包会绕过持久缓存，因为本地扩展重编可能不会改变
+报告的版本。
 
-首次内容清单读取较保守，可能耗时较长。一套本地 CANN/PTOAS 安装的首次清单约需
-12 秒；该测量不代表通用性能结论。当前每个独立新进程都需要支付这项成本。仅依赖路径、
-大小、mtime 和 inode 的磁盘记忆不能证明内容未变，因此不采用。统计包含标识计算和
-校验时间。没有可验证本地工具链的
-部署需要另一套协议，本 API 尚不支持。
+Python 根目录和原生扩展位置来自实际导入结果，支持 `pip install`、`pip install -e`
+及 `PYTHONPATH`，包括源码 Python 配合 editable 安装扩展的布局。不单独依赖包分发
+元数据来判断实际导入的 PyPTO 编译器。
+
+此策略信任发布的原生构建/版本标识，不扫描系统头文件、Python 标准库或传递动态库
+依赖。源码 runtime checkout 必须没有已跟踪或未跟踪的 Git 更改。若修改已安装的输入而
+没有更新版本标识，应设置新的 `PYPTO_CACHE_EPOCH` 或清空缓存。进程内安装文件应保持
+不变，替换后重启进程。
+应用的额外源码仍逐请求重新读取。
+进程内 memo 和持久化身份承担不同职责：`cwd` 或 `PATH` 变化会重新发现工具，
+相对路径对应的编译器元数据也会重新解析。若最终识别出的工具和依赖相同，磁盘缓存
+身份保持不变；仅向 `PATH` 添加一个未使用的绝对目录不会使缓存失效。
+实际选中的路径/构建仍参与身份，因此切换或移动工具可能导致未命中。
+加载器、解释器等其他环境覆盖仍保守地参与 build key。
+当 `LD_LIBRARY_PATH` 包含相对路径或空条目（以 `:` 或 `;` 分隔）时，执行目录 `cwd`
+也参与身份；仅包含绝对路径时，`chdir` 不会因此使缓存失效。build 策略下的编译器
+发现以 `KernelCompiler.project_root` 解析可执行文件、GCC 辅助程序和 wrapper 配置，
+并在该目录运行编译器探测，与实际二进制编译保持一致。
+`PYPTO_CACHE_IDENTITY` 和 `PYPTO_CACHE_EPOCH` 继续提供独立命名空间。
+
+`PYPTO_CACHE_IDENTITY=content` 保留之前的 Linux 依赖清单：ELF 依赖闭包、编译器资源、
+隐式 include、链接输入和 Python/native runtime 内容。它仍保留原有 PTOAS/CANN
+报告版本及经验证 PTO-ISA revision 的快捷路径，不代表对所有厂商文件逐字节审计。
+不支持的启动器、sanitizer 构建以及 `CPATH`、`COMPILER_PATH`、`GCC_EXEC_PREFIX`、
+`LIBRARY_PATH` 等未建模隐式搜索覆盖会绕过
+缓存。两种策略均通过 `cache_stats().last_bypass_reason` 报告原因，身份相互隔离。
+
+两种策略均在以下部署契约下支持 `LD_PRELOAD` 和 `LD_AUDIT`：注入可以用于内存分配或
+观测，但不能改变编译器选择、编译输入或生成语义。不维护库名白名单，也不新增预加载
+库发现或哈希。元数据探测移除这两个变量及加载器跟踪/性能分析设置（`LD_DEBUG`、
+`LD_DEBUG_OUTPUT`、`LD_PROFILE`、`LD_PROFILE_OUTPUT`），避免注入依赖和诊断输出进入
+工具链身份。服务及实际编译保留原环境。这只规范化探测，不会卸载父进程已加载的库，
+也不是对任意注入代码的隔离。
+
+如果注入确实影响编译，部署方必须通过 `CacheConfig.extra_fingerprint` 或
+`PYPTO_CACHE_EPOCH` 标识全部相关输入，并在输入变化时更新该标识，否则应禁用缓存。
+标识应在缓存查找之外预先准备；它是调用方声明，不是自动依赖审计。`CPATH`、
+`LD_LIBRARY_PATH` 等搜索变量不能当成加载器诊断处理：前者仍不支持，后者保留现有的
+选择及身份处理。额外源码文件仍逐请求读取，不要为了开启复用而把 allocator 库加入其中。
+
+缓存产物仍进行完整 manifest/内容校验。新打包的产物携带 `kernel_config.json`，READY
+发现无需执行 Python 配置。恢复复用 lookup 已验证的 manifest，直接构造原生 callable，
+无需导入 Worker/通信初始化模块。
+若 GENERATED 槽缺失或损坏，查找最多收集同一 artifact key 下 32 个名称匹配的 spec
+目录。遇到第 33 个匹配目录即停止，不继续遍历剩余条目，也不验证候选产物。
+不匹配的名称和符号链接不计数。未超过上限时，每个候选 READY 目录自身的 JSON
+必须推导出与目录一致的 spec 摘要，且通过完整 manifest/产物
+校验；多个有效候选会被拒绝。
+
+用独立进程测量首次命中：
+
+```bash
+PYTHONPATH=python python tests/benchmarks/jit_cache_latency.py \
+  --cache-root /tmp/pypto-jit-benchmark --runs 5 --output build/jit-latency.json
+```
+
+验证 wheel 时使用安装环境的 Python 并去掉 `PYTHONPATH`。第一个子进程填充缓存，
+其余每个测量进程都必须 READY 命中且无构建、无 bypass。计时包含首次身份检查、首次
+warmup 及 callable 恢复，不包含进程启动、初始 import、张量创建和设备执行。慢速探测
+回退、文件系统冷页或大型产物可能超过 100 ms；这是测量目标，不是延迟保证。
+没有使用基于文件时间戳的跨进程身份 memo。
 
 ## 统计与 CLI
 
@@ -195,7 +267,7 @@ CLI 导入指定的可信模块，只解析显式列出的模块级 JIT 函数�
 标量为有限 JSON 数值或布尔值；它们只用于完成绑定，不再选择产物——标量参数是运行期值。
 除非请求同时给出样例张量（此时绑定按位置进行），否则可以省略标量。
 
-可序列化的 `run_config` 字段为 `platform`、`strategy`、`memory_planner`、
+可序列化的 `run_config` 字段为 `platform`、`strategy`、`memory_planner`、`enable_software_pipeline`、
 `distributed_config`、`dump_passes`、`dump_ptoas_passes`、`save_kernels`、
 `save_kernels_dir`；枚举使用 Python 成员名。分布式设置支持 `device_ids`、
 `num_sub_workers`、`runtime`、`aicpu_thread_num`。预热结果区分共享及私有准备，失败

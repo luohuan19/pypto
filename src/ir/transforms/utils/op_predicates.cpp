@@ -28,6 +28,25 @@ namespace op_predicates {
 
 using core_affinity::CrossCoreRole;
 
+bool IsMxScaleGather(const CallPtr& call) {
+  if (!IsOp(call, "tile.gather_row") || call->args_.size() < 2) return false;
+  const auto src = AsTensorTypeLike(call->args_[1]->GetType());
+  return src && src->tensor_view_ && src->tensor_view_->layout == TensorLayout::MX_A_ND;
+}
+
+bool CastRequiresDisjointSource(const CallPtr& call, bool is_a2a3) {
+  if (!IsOp(call, "tile.cast") || call->args_.empty()) return false;
+  const auto source = As<TileType>(call->args_[0]->GetType());
+  const auto result = As<TileType>(call->GetType());
+  if (!source || !result) return false;
+  // Packed FP4 reports eight storage bits per two-value carrier. A numerical
+  // cast to FP8 doubles its element count, so equal storage widths do not make
+  // that widening safe in place: early stores can overwrite unread carriers.
+  const auto source_bits = source->dtype_.IsPackedFp4() ? 4 : source->dtype_.GetBit();
+  const auto result_bits = result->dtype_.IsPackedFp4() ? 4 : result->dtype_.GetBit();
+  return result_bits > source_bits || (is_a2a3 && result_bits < source_bits);
+}
+
 namespace {
 
 bool HasRole(const CallPtr& call, CrossCoreRole expected) {
@@ -80,10 +99,21 @@ std::optional<size_t> BuiltinWritebackArgIndex(const OpPtr& op, size_t arg_count
   return aliased_idx;
 }
 
+ExprPtr GetBufferAliasSource(const ExprPtr& value) {
+  if (auto var = AsVarLike(value)) return var;
+  auto call = As<Call>(value);
+  if (!call || !call->op_) return nullptr;
+  if (auto index = BuiltinWritebackArgIndex(call->op_, call->args_.size())) {
+    return call->args_[*index];
+  }
+  if (!call->args_.empty() && IsBufferAliasingViewOp(call->op_->name_)) return call->args_[0];
+  return nullptr;
+}
+
 bool IsBuiltinOp(const std::string& op_name) {
   return op_name.rfind("tile.", 0) == 0 || op_name.rfind("tensor.", 0) == 0 ||
          op_name.rfind("system.", 0) == 0 || op_name.rfind("array.", 0) == 0 ||
-         op_name == "pld.system.get_comm_ctx";
+         op_name.rfind("reg.", 0) == 0 || op_name == "pld.system.get_comm_ctx";
 }
 
 bool IsManagedTensorCollective(const OpPtr& op) {
@@ -91,7 +121,7 @@ bool IsManagedTensorCollective(const OpPtr& op) {
   return IsOp(op, "pld.tensor.allgather") || IsOp(op, "pld.tensor.allreduce") ||
          IsOp(op, "pld.tensor.barrier") || IsOp(op, "pld.tensor.broadcast") ||
          IsOp(op, "pld.tensor.reduce_scatter") || IsOp(op, "pld.tensor.all_to_all") ||
-         IsOp(op, "pld.tensor.all_to_all_v");
+         (IsOp(op, "pld.tensor.all_to_all_v") || IsOp(op, "pld.tensor.indexed_all_to_all_v"));
 }
 
 bool IsPublishingWrite(const CallPtr& call) {

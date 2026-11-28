@@ -21,12 +21,17 @@ fix in the SPMD context: two sibling loops inside a pl.spmd block may reuse the
 same loop-local names without the renamer emitting an out-of-scope bridge.
 """
 
+import re
+
 import pypto.language as pl
 import pytest
-from pypto import backend
+from pypto import backend, passes
+from pypto.backend import BackendType
+from pypto.backend._ptoas_locate import find_ptoas_binary
+from pypto.ir import compile as compile_ir
 from pypto.jit.decorator import jit
 from pypto.pypto_core import ir
-from pypto.runtime import RunConfig
+from pypto.runtime import ExecutionMode, RunConfig
 
 # Module-level constants — the JIT specializer inlines module-level ints at
 # their use sites, but does NOT capture function-local closure variables.
@@ -35,6 +40,123 @@ _HIDDEN = 512
 _K_CHUNK = 128
 _HALF = _HIDDEN // 2  # columns of `hidden` handled by each SPMD block
 _CHUNKS = _HALF // _K_CHUNK  # pl.pipeline iterations per block
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_inline_while_carries_counter_and_store_result(tmp_path, ascend_backend):
+    """A zero-trip publish returns its input; subsequent trips use both updated values."""
+
+    @pl.jit.inline(auto_scope=False)
+    def publish(cache: pl.Tensor, targets: pl.Tile[[8], pl.INT64, pl.Mem.Vec], rows: pl.Scalar[pl.INDEX]):
+        row = 0
+        while row < rows:
+            slot = pl.tile.read(targets, [row])
+            value = pl.tile.full([1, 32], dtype=pl.UINT8, value=0)
+            cache = pl.store(value, [slot, 0], cache)
+            cache = pl.store(value, [slot, 32], cache)
+            row = row + 1
+        return cache
+
+    @pl.jit
+    def example(cache: pl.InOut[pl.Tensor[[8, 64], pl.UINT8]], rows: pl.Scalar[pl.INDEX]):
+        with pl.spmd(1):
+            targets = pl.tile.full([8], dtype=pl.INT64, value=0)
+            cache = publish(cache, targets, rows)
+        return cache
+
+    program = passes.convert_to_ssa()(passes.inline_functions()(example.specialize()))
+    loops = []
+
+    class Collect(ir.IRVisitor):
+        def visit_while_stmt(self, op):
+            loops.append(op)
+
+    main = program.get_function("example")
+    assert main is not None
+    Collect().visit_function(main)
+    (loop,) = loops
+    cache_arg = next(arg for arg in loop.iter_args if isinstance(arg.type, ir.TensorType))
+    row_arg = next(arg for arg in loop.iter_args if isinstance(arg.type, ir.ScalarType))
+    assert cache_arg.initValue.same_as(main.params[0])
+    assert loop.condition.left.same_as(row_arg)
+    store_name = ir.get_op("tile.store").name
+    first, second = [
+        stmt
+        for stmt in loop.body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == store_name
+    ]
+    assert isinstance(first.value, ir.Call) and isinstance(second.value, ir.Call)
+    assert first.value.args[-1].same_as(cache_arg)
+    assert second.value.args[-1].same_as(first.var)
+    advance, outputs = loop.body.stmts[-2:]
+    assert advance.value.left.same_as(row_arg)
+    assert advance.value.right.value == 1
+    carried = dict(zip((arg.unique_id for arg in loop.iter_args), outputs.value, strict=True))
+    assert carried[row_arg.unique_id].same_as(advance.var)
+    assert carried[cache_arg.unique_id].same_as(second.var)
+    compiled = example.compile(
+        config=RunConfig(backend_type=ascend_backend, codegen_only=True, save_kernels_dir=str(tmp_path))
+    )
+    assert compiled is not None
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_spmd_inline_reg_scope_compiles_as_device_call(tmp_path, ascend_backend):
+    @pl.jit.inline(auto_scope=False)
+    def double_tile(dst: pl.Tensor):
+        tile: pl.Tile[[1, 64], pl.FP32, pl.Mem.Vec, pl.TileView(valid_shape=[1, 64], stride=[64, 1])] = (
+            pl.tile.load(dst, [0, 0], [1, 64], [1, 64], target_memory=pl.Mem.Vec)
+        )
+        with pl.reg_scope():
+            lanes = pl.reg.load(tile, lanes=64)
+            result = pl.reg.store(tile, value=pl.reg.add(lanes, lanes))
+        return pl.store(result, [0, 0], dst)
+
+    @pl.jit
+    def entry(dst: pl.InOut[pl.Tensor[[1, 64], pl.FP32]]):
+        with pl.spmd(1):
+            dst = double_tile(dst)
+        return dst
+
+    entry.compile(
+        config=RunConfig(backend_type=ascend_backend, codegen_only=True, save_kernels_dir=str(tmp_path))
+    )
+    aiv = tmp_path / "kernels" / "aiv"
+    if find_ptoas_binary() is None:
+        # Raw PTO keeps the register work inside the AIV kernel.
+        (kernel,) = aiv.glob("*.pto")
+        emitted = kernel.read_text()
+        assert "pto.vecscope" in emitted and "pto.vmi.vadd " in emitted
+    else:
+        (kernel,) = aiv.glob("*.cpp")
+        emitted = (tmp_path / "ptoas" / f"{kernel.stem}.pto").read_text()
+        assert "func.call @__pypto_vf_" in emitted
+
+
+def test_spmd_scatter_different_output_shapes(tmp_path):
+    """Branch-local stores must preserve the two output tensor identities."""
+    torch = pytest.importorskip("torch")
+
+    @jit
+    def scatter(source: pl.Tensor, local_kv: pl.Out[pl.Tensor], predecessor_kv: pl.Out[pl.Tensor]):
+        with pl.spmd(20, name_hint="cp_swa_augmented_kv_scatter"):
+            block = pl.tile.get_block_idx()
+            if block < 4:
+                for row in pl.range(block * 64, block * 64 + 64, 16):
+                    predecessor_kv[row : row + 16, :] = source[row : row + 16, :]
+            else:
+                for row in pl.range((block - 4) * 64, (block - 4) * 64 + 64, 16):
+                    local_kv[row : row + 16, :] = source[row + 256 : row + 272, :]
+        return local_kv, predecessor_kv
+
+    program = scatter.specialize(
+        torch.empty(1280, 128, dtype=torch.bfloat16),
+        torch.empty(1024, 128, dtype=torch.bfloat16),
+        torch.empty(256, 128, dtype=torch.bfloat16),
+    )
+    compile_ir(program, output_dir=str(tmp_path), skip_ptoas=True)
 
 
 def test_jit_spmd_for_loop():
@@ -315,6 +437,114 @@ def test_inline_spmd_reads_loop_carried_tensor(tmp_path):
     compiled = repro.compile(config=RunConfig(platform="a5", save_kernels_dir=str(tmp_path / "compiled")))
     assert (compiled.output_dir / "orchestration" / "repro.cpp").is_file()
     assert list((tmp_path / "compiled").rglob("*.pto"))
+
+
+def test_constexpr_manual_parallel_tensor_and_taskid_merge_compiles(tmp_path, monkeypatch):
+    """Issue #3115: the first Simplify must preserve a wrapped branch yield.
+
+    Compile the actual inline/SPMD authoring surface through source codegen.
+    The dependency assertion below also checks that the TaskId array reaches
+    the consumer; merely accepting the early SSA shape would miss that loss.
+    """
+    monkeypatch.setenv("PTOAS_ROOT", str(tmp_path / "no_optional_ptoas"))
+    tokens_dim = pl.dynamic("T")
+
+    @pl.jit.inline(auto_scope=False)
+    def producer(
+        x: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        tmp: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        group: pl.Scalar[pl.INDEX],
+    ):
+        with pl.spmd(1) as ready:
+            row = group * 32 + pl.tile.get_block_idx() * 32
+            count = pl.min(32, pl.tensor.dim(x, 0) - row)
+            value = pl.load(x, [row, 0], [32, 32], valid_shape=[count, 32])
+            pl.store(pl.add(value, 1.0), [row, 0], tmp)
+        return tmp, ready
+
+    @pl.jit.inline(auto_scope=False)
+    def branch(
+        x: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        out: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        count: pl.constexpr,
+    ):
+        tokens = pl.tensor.dim(x, 0)
+        tmp = pl.create_tensor([tokens, 32], dtype=pl.FP32)
+        deps = pl.array.create(count, pl.TASK_ID)
+        if count == 1:
+            tmp, ready = producer(x, tmp, 0)
+            deps[0] = ready
+        else:
+            with pl.manual_scope():
+                for group in pl.parallel(count):
+                    tmp, ready = producer(x, tmp, group)
+                    deps[group] = ready
+        with pl.spmd(count, deps=[deps]):
+            row = pl.tile.get_block_idx() * 32
+            valid_rows = pl.min(32, tokens - row)
+            value = pl.load(tmp, [row, 0], [32, 32], valid_shape=[valid_rows, 32])
+            pl.store(value, [row, 0], out)
+        return out
+
+    @pl.jit(auto_scope=False)
+    def entry(
+        x: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        out: pl.Out[pl.Tensor[[tokens_dim, 32], pl.FP32]],
+    ):
+        if pl.tensor.dim(x, 0) <= 32:
+            out = branch(x, out, 1)
+        else:
+            out = branch(x, out, 2)
+        return out
+
+    compiled = entry.compile(
+        config=RunConfig(
+            backend_type=BackendType.Ascend910,
+            execution_mode=ExecutionMode.ONBOARD,
+            memory_planner=passes.MemoryPlanner.PYPTO,
+            save_kernels=True,
+            save_kernels_dir=str(tmp_path / "compiled"),
+        )
+    )
+    source = (compiled.output_dir / "orchestration" / "entry.cpp").read_text()
+    dep_arrays = re.findall(r"TaskId (params_t\d+_deps)\[(\d+)\];", source)
+    assert [int(size) for _, size in dep_arrays] == [1, 2]
+    assert source.count(".set_dependencies(") == 2
+    for target, size in dep_arrays:
+        # Both branches must gather every producer handle from the same array,
+        # including slot 1 in the parallel producer branch.
+        reads = re.findall(rf"if \((\w+)\[(\d+)\]\.is_valid\(\)\) {target}\[", source)
+        assert len({array for array, _ in reads}) == 1
+        assert [int(index) for _, index in reads] == list(range(int(size)))
+    assert list(compiled.output_dir.rglob("*.pto"))
+
+
+def test_dead_direct_call_specializes_live_spmd_submit_target():
+    """Keep the A2/A3 decode pattern that seeds a submit callee with a scratch call."""
+
+    @jit.incore
+    def copy_kernel(a: pl.Tensor, out: pl.Out[pl.Tensor]):
+        out = pl.store(pl.load(a, [0, 0], [8, 64]), [0, 0], out)
+        return out
+
+    @jit
+    def entry(a: pl.Tensor[[8, 64], pl.FP32], out: pl.Out[pl.Tensor[[8, 64], pl.FP32]]):
+        if False:
+            scratch = pl.create_tensor([8, 64], dtype=pl.FP32)
+            copy_kernel(a, scratch)
+        result, _ = pl.spmd_submit(
+            self.copy_kernel,  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            a,
+            out,
+            core_num=1,
+        )
+        return result
+
+    program = entry.specialize()
+    assert program.get_function("copy_kernel") is not None
+    source = program.as_python()
+    assert "pl.spmd_submit(self.copy_kernel," in source
+    assert "scratch" not in source
 
 
 if __name__ == "__main__":

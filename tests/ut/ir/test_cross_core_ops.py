@@ -12,7 +12,7 @@
 import pytest
 from pypto import DataType, ir, passes
 from pypto import language as pl
-from pypto.ir.op import system_ops
+from pypto.ir.op import system_ops, tile_ops
 from pypto.pypto_core.ir import ConstInt
 
 
@@ -169,6 +169,43 @@ def test_cross_core_sync_static_and_dynamic_event_ids():
     assert dynamic_wait.kwargs["core_type"] == "aic"
 
 
+def test_pipeline_flags_static_and_dynamic_ir():
+    span = ir.Span.unknown()
+    set_call = system_ops.set_flag(ir.PipeType.MTE2, ir.PipeType.V, 7, span=span)
+    event = ir.Var("event", ir.ScalarType(DataType.INDEX), span)
+    wait_call = system_ops.wait_flag(
+        ir.PipeType.MTE2, ir.PipeType.V, event, core_type=system_ops.KernelType.AIV, span=span
+    )
+    assert isinstance(set_call.type, ir.UnknownType)
+    assert set_call.args == []
+    assert set_call.kwargs["event_id"] == 7
+    assert wait_call.args == [event]
+    assert "event_id" not in wait_call.kwargs
+    assert wait_call.kwargs["core_type"] == "aiv"
+
+
+@pytest.mark.parametrize("event_id", [-1, 8, True])
+def test_pipeline_flag_rejects_invalid_static_event(event_id):
+    with pytest.raises((TypeError, ValueError)):
+        system_ops.set_flag(ir.PipeType.MTE2, ir.PipeType.V, event_id)
+
+
+def test_pipeline_flag_rejects_invalid_ir():
+    span = ir.Span.unknown()
+    with pytest.raises((TypeError, ValueError), match="different"):
+        system_ops.set_flag(ir.PipeType.V, ir.PipeType.V)
+    with pytest.raises((TypeError, ValueError), match="concrete"):
+        ir.create_op_call(
+            "system.wait_flag",
+            [],
+            {"src_pipe": ir.PipeType.ALL, "dst_pipe": ir.PipeType.V, "event_id": 0},
+            span,
+        )
+    bad_event = ir.Var("event", ir.ScalarType(DataType.INT32), span)
+    with pytest.raises((TypeError, ValueError), match="INDEX"):
+        system_ops.wait_flag(ir.PipeType.MTE2, ir.PipeType.V, bad_event)
+
+
 @pytest.mark.parametrize("core_type", ["aic", "aiv", "aic_only", "mix", 0])
 def test_cross_core_sync_rejects_non_enum_core_type(core_type):
     """``core_type`` is enum-only: the lowered attr spelling is not an input."""
@@ -297,6 +334,56 @@ def test_shard_allows_static_narrow_columns():
     shard = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
     assert isinstance(shard.type, ir.TileType)
     assert shard.type.shape == [8, 128]
+
+
+@pytest.mark.parametrize("split", [0, 1, 2])
+@pytest.mark.parametrize(
+    ("layout", "shape", "target"),
+    [
+        (ir.TileLayout.row_major, [32, 4], ir.MemorySpace.LeftScale),
+        (ir.TileLayout.col_major, [4, 32], ir.MemorySpace.RightScale),
+    ],
+)
+def test_gather_preserves_mx_scale_layout(split, layout, shape, target):
+    """A gathered public MX scale remains usable by its cube scale operand."""
+    span = ir.Span.unknown()
+    source = ir.Var(
+        "scale",
+        ir.TileType(
+            shape,
+            DataType.FP8E8M0,
+            tile_view=ir.TileView(blayout=layout, slayout=layout, fractal=32),
+            memory_space=ir.MemorySpace.Vec,
+        ),
+        span,
+    )
+    gathered = ir.create_op_call("tile.aic_gather", [source], {"split": split}, span)
+    # Exercise the actual consumer before checking metadata: this used to raise
+    # "requires the source Mat tile to use the matching row/row/32 layout".
+    moved = ir.create_op_call("tile.move", [gathered], {"target_memory": target}, span)
+    expected_shape = shape.copy()
+    if split:
+        expected_shape[split - 1] *= 2
+    assert isinstance(moved.type, ir.TileType)
+    assert isinstance(gathered.type, ir.TileType)
+    assert moved.type.shape == expected_shape
+    view = gathered.type.get_effective_tile_view()
+    assert (view.blayout, view.slayout, view.fractal) == (layout, layout, 32)
+
+
+@pytest.mark.parametrize("split", [0, 1, 2])
+@pytest.mark.parametrize("layout", [ir.TensorLayout.MX_A_ZZ, ir.TensorLayout.MX_B_NN])
+def test_tensor_gather_preserves_mx_scale_layout(split, layout):
+    span = ir.Span.unknown()
+    source = ir.Var(
+        "scale",
+        ir.TensorType([32, 32], DataType.FP8E8M0, tensor_view=ir.TensorView([], layout)),
+        span,
+    )
+    gathered = ir.create_op_call("tensor.aic_gather", [source], {"split": split}, span)
+    assert isinstance(gathered.type, ir.TensorType)
+    assert gathered.type.tensor_view is not None
+    assert gathered.type.tensor_view.layout == layout
 
 
 def test_gather_defers_the_band_rule_to_lowering():
@@ -680,6 +767,87 @@ def test_mixed_kernel_expanded_property():
 
     prop_set.remove(passes.IRProperty.MixedKernelExpanded)
     assert not prop_set.contains(passes.IRProperty.MixedKernelExpanded)
+
+
+@pytest.mark.parametrize("split", [1, 2, 3, 4])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_aiv_lane_operands(split, dynamic):
+    """The lane stays an i64 operand for both AIV-side transfers."""
+    span = ir.Span.unknown()
+    tile = ir.Var("tile", ir.TileType([16, 16], DataType.FP32, memory_space=ir.MemorySpace.Vec), span)
+    lane = ir.Var("lane", ir.ScalarType(DataType.INT64), span) if dynamic else 1
+    push = tile_ops.tpush_to_aic(tile, split=split, id=2, aiv_subblockid=lane)
+    pop = tile_ops.tpop_from_aic(shape=[16, 16], dtype=DataType.FP32, split=split, aiv_subblockid=lane)
+    assert len(push.args) == 2
+    assert len(pop.args) == 1
+    assert isinstance(push.args[-1].type, ir.ScalarType)
+    assert isinstance(pop.args[-1].type, ir.ScalarType)
+    assert push.args[-1].type.dtype == DataType.INT64
+    assert pop.args[-1].type.dtype == DataType.INT64
+    assert "aiv_subblockid" not in push.kwargs
+    assert "aiv_subblockid" not in pop.kwargs
+    if isinstance(lane, ir.Var):
+        assert push.args[-1].same_as(lane)
+        assert pop.args[-1].same_as(lane)
+    else:
+        assert isinstance(push.args[-1], ir.ConstInt)
+        assert isinstance(pop.args[-1], ir.ConstInt)
+        assert push.args[-1].value == 1
+        assert pop.args[-1].value == 1
+
+
+@pytest.mark.parametrize("dtype", [DataType.INDEX, DataType.INT32, DataType.UINT64, DataType.FP32])
+def test_aiv_lane_rejects_other_scalar_dtypes(dtype):
+    """INDEX and same-width unsigned values require an explicit INT64 cast."""
+    span = ir.Span.unknown()
+    tile = ir.Var("tile", ir.TileType([16, 16], DataType.FP32), span)
+    lane = ir.Var("lane", ir.ScalarType(dtype), span)
+    for transfer in (
+        lambda: tile_ops.tpush_to_aic(tile, split=1, aiv_subblockid=lane),
+        lambda: tile_ops.tpop_from_aic(split=1, aiv_subblockid=lane),
+        lambda: ir.create_op_call("tile.tpush_to_aic", [tile, lane], {"split": 1}, span),
+        lambda: ir.create_op_call("tile.tpop_from_aic", [lane], {"split": 1}, span),
+    ):
+        with pytest.raises((TypeError, ValueError), match="INT64"):
+            transfer()
+
+
+@pytest.mark.parametrize("lane", [True, 0.5, -1, 2, 1 << 64])
+def test_aiv_lane_rejects_invalid_literals(lane):
+    """Reject invalid literals before constructing an i64 constant."""
+    with pytest.raises((TypeError, ValueError), match="aiv_subblockid"):
+        tile_ops.tpop_from_aic(split=1, aiv_subblockid=lane)
+
+
+@pytest.mark.parametrize("split", [0, -1, 5])
+def test_aiv_lane_rejects_invalid_split(split):
+    with pytest.raises(ValueError, match="requires split"):
+        tile_ops.tpop_from_aic(split=split, aiv_subblockid=0)
+
+
+@pytest.mark.parametrize("entry", ["global", "mat", "acc"])
+def test_aiv_lane_rejects_non_vec_entry(entry):
+    span = ir.Span.unknown()
+    entry_type = (
+        ir.TensorType([16, 16], DataType.FP32)
+        if entry == "global"
+        else ir.TileType([16, 16], DataType.FP32, memory_space=getattr(ir.MemorySpace, entry.title()))
+    )
+    tile = ir.Var("tile", entry_type, span)
+    with pytest.raises((TypeError, ValueError), match="Vec Tile"):
+        tile_ops.tpush_to_aic(tile, split=1, aiv_subblockid=0)
+    with pytest.raises((TypeError, ValueError), match="Vec Tile"):
+        tile_ops.tpop_from_aic(result_type=entry_type, split=1, aiv_subblockid=0)
+
+
+def test_aiv_lane_omission_and_wrong_direction():
+    tile = ir.Var("tile", ir.TileType([16, 16], DataType.FP32), ir.Span.unknown())
+    assert len(tile_ops.tpush_to_aic(tile, split=0).args) == 1
+    assert not tile_ops.tpop_from_aic(split=0).args
+    with pytest.raises(ValueError, match="requires an explicit dst when using aiv_subblockid"):
+        tile_ops.tpush_to_aiv(tile, split=1, aiv_subblockid=0)
+    with pytest.raises(TypeError, match="aiv_subblockid"):
+        getattr(tile_ops, "tpop_from_aiv")(split=1, aiv_subblockid=0)
 
 
 if __name__ == "__main__":
